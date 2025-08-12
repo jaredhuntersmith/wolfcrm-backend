@@ -4,6 +4,7 @@ import { randomUUID } from "crypto";
 import pkg from "pg";
 
 const { Pool } = pkg;
+
 const app = express();
 const PORT = process.env.PORT || 8080;
 
@@ -19,8 +20,8 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Ensure table exists
-const ensureTable = async () => {
+// Ensure table + new columns exist
+const ensureSchema = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS contacts (
       id UUID PRIMARY KEY,
@@ -36,8 +37,17 @@ const ensureTable = async () => {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  await pool.query(`
+    ALTER TABLE contacts
+      ADD COLUMN IF NOT EXISTS job_type TEXT,
+      ADD COLUMN IF NOT EXISTS u1 TEXT,
+      ADD COLUMN IF NOT EXISTS u2 TEXT,
+      ADD COLUMN IF NOT EXISTS u3 TEXT,
+      ADD COLUMN IF NOT EXISTS u4 TEXT,
+      ADD COLUMN IF NOT EXISTS u5 TEXT;
+  `);
 };
-await ensureTable();
+await ensureSchema();
 
 // Health
 app.get("/healthz", (_, res) => res.json({ ok: true }));
@@ -48,12 +58,18 @@ app.get("/api/contacts", async (req, res) => {
   try {
     let rows;
     if (q) {
-      rows = (await pool.query(
-        `SELECT * FROM contacts
-         WHERE (name ILIKE $1 OR COALESCE(phone,'') ILIKE $1 OR COALESCE(email,'') ILIKE $1 OR COALESCE(address,'') ILIKE $1)
-         ORDER BY updated_at DESC`,
-        [`%${q}%`]
-      )).rows;
+      rows = (
+        await pool.query(
+          `
+          SELECT * FROM contacts
+          WHERE (name ILIKE $1 OR COALESCE(phone,'') ILIKE $1 OR COALESCE(email,'') ILIKE $1 OR COALESCE(address,'') ILIKE $1
+                 OR COALESCE(job_type,'') ILIKE $1 OR COALESCE(u1,'') ILIKE $1 OR COALESCE(u2,'') ILIKE $1
+                 OR COALESCE(u3,'') ILIKE $1 OR COALESCE(u4,'') ILIKE $1 OR COALESCE(u5,'') ILIKE $1)
+          ORDER BY updated_at DESC
+        `,
+          [`%${q}%`]
+        )
+      ).rows;
     } else {
       rows = (await pool.query(`SELECT * FROM contacts ORDER BY updated_at DESC`)).rows;
     }
@@ -79,8 +95,16 @@ app.get("/api/contacts/:id", async (req, res) => {
 // POST /api/contacts
 app.post("/api/contacts", async (req, res) => {
   const {
-    name, phone = null, email = null, address = null,
-    value_cents = null, lat = null, lng = null, tags = []
+    name,
+    phone = null,
+    email = null,
+    address = null,
+    value_cents = null,
+    lat = null,
+    lng = null,
+    tags = [],
+    job_type = null,
+    u1 = null, u2 = null, u3 = null, u4 = null, u5 = null
   } = req.body || {};
 
   if (!name || typeof name !== "string") {
@@ -91,9 +115,12 @@ app.post("/api/contacts", async (req, res) => {
 
   try {
     const r = await pool.query(
-      `INSERT INTO contacts (id, name, phone, email, address, value_cents, lat, lng, tags)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *;`,
-      [id, name, phone, email, address, value_cents, lat, lng, tags]
+      `
+      INSERT INTO contacts (id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      RETURNING *;
+    `,
+      [id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5]
     );
     res.status(201).json(r.rows[0]);
   } catch (e) {
@@ -104,13 +131,17 @@ app.post("/api/contacts", async (req, res) => {
 
 // PATCH /api/contacts/:id
 app.patch("/api/contacts/:id", async (req, res) => {
-  const fields = ["name","phone","email","address","value_cents","lat","lng","tags"];
+  const fields = [
+    "name","phone","email","address","value_cents","lat","lng","tags",
+    "job_type","u1","u2","u3","u4","u5"
+  ];
+
   const sets = [];
   const vals = [];
   let idx = 1;
 
   for (const f of fields) {
-    if (f in req.body) {
+    if (Object.prototype.hasOwnProperty.call(req.body, f)) {
       sets.push(`${f} = $${idx++}`);
       vals.push(req.body[f]);
     }
@@ -124,8 +155,12 @@ app.patch("/api/contacts/:id", async (req, res) => {
 
   try {
     const r = await pool.query(
-      `UPDATE contacts SET ${sets.join(", ")}, updated_at = NOW()
-       WHERE id = $${idx} RETURNING *;`,
+      `
+      UPDATE contacts
+      SET ${sets.join(", ")}, updated_at = NOW()
+      WHERE id = $${idx}
+      RETURNING *;
+    `,
       vals
     );
     if (!r.rowCount) return res.status(404).json({ error: "not_found" });
@@ -148,7 +183,7 @@ app.delete("/api/contacts/:id", async (req, res) => {
   }
 });
 
-// Optional stub for your app
+// Optional: today's todo
 app.get("/api/todo/today", async (_req, res) => res.json([]));
 
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
