@@ -1,9 +1,8 @@
-/* WolfCRM backend - 1-hour blitz auth (6-digit codes) + contacts
- * Drop-in replacement for index.js
+/* WolfCRM backend - 1-hour blitz auth (6-digit codes) + contacts + LOGOUT
  * - Creates tables if missing (users, magic_tokens, sessions, contacts)
  * - /auth/request logs code to console (no email setup needed)
  * - /auth/verify returns a bearer session token
- * - Authorization middleware available but not required yet
+ * - /auth/logout revokes current token (server-side)
  */
 import express from "express";
 import cors from "cors";
@@ -15,6 +14,7 @@ const { Pool } = pkg;
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Detect SSL automatically on Railway
 const useSSL =
   process.env.DB_SSL === "true" ||
   (process.env.DATABASE_URL && process.env.DATABASE_URL.includes("railway.app"));
@@ -27,7 +27,7 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// --- Helpers ---
+// Helpers
 const nowIso = () => new Date().toISOString();
 const toInt = (v, def = 0) => {
   const n = Number(v);
@@ -39,14 +39,17 @@ const bearer = (req) => {
   return m ? m[1] : null;
 };
 
-// --- DB Bootstrap (safe to re-run) ---
+// DB bootstrap
 async function bootstrap() {
   await pool.query(`
+    CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       email TEXT UNIQUE NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+
     CREATE TABLE IF NOT EXISTS magic_tokens (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       email TEXT NOT NULL,
@@ -56,6 +59,7 @@ async function bootstrap() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS magic_tokens_email_idx ON magic_tokens(email);
+
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -63,7 +67,6 @@ async function bootstrap() {
       last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
-    -- Minimal contacts table for existing app usage
     CREATE TABLE IF NOT EXISTS contacts (
       id UUID PRIMARY KEY,
       name TEXT NOT NULL,
@@ -81,7 +84,6 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS contacts_updated_idx ON contacts(updated_at DESC);
   `);
 
-  // Update trigger for updated_at
   await pool.query(`
     CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS TRIGGER AS $$
     BEGIN
@@ -91,9 +93,7 @@ async function bootstrap() {
 
     DO $$
     BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger WHERE tgname = 'contacts_touch_updated_at'
-      ) THEN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'contacts_touch_updated_at') THEN
         CREATE TRIGGER contacts_touch_updated_at
         BEFORE UPDATE ON contacts
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
@@ -108,7 +108,7 @@ bootstrap().catch(err => {
   process.exit(1);
 });
 
-// --- Auth middleware (optional for now) ---
+// Auth middleware
 async function authOptional(req, _res, next) {
   const token = bearer(req);
   if (!token) return next();
@@ -129,13 +129,13 @@ async function authRequired(req, res, next) {
   );
   if (!rows.length) return res.status(401).json({ error: "unauthorized" });
   req.userId = rows[0].user_id;
+  req.sessionToken = token;
   next();
 }
 
 app.use(authOptional);
 
-// --- Auth routes (blitz) ---
-// Request a 6-digit code. For speed, we LOG it instead of emailing.
+// Auth routes
 app.post("/auth/request", async (req, res) => {
   try {
     const emailRaw = (req.body.email || "").toString().trim().toLowerCase();
@@ -143,7 +143,6 @@ app.post("/auth/request", async (req, res) => {
       return res.status(400).json({ error: "invalid_email" });
     }
 
-    // Upsert user
     const user = await pool.query(
       `INSERT INTO users(email) VALUES($1)
        ON CONFLICT(email) DO UPDATE SET email = EXCLUDED.email
@@ -151,17 +150,15 @@ app.post("/auth/request", async (req, res) => {
       [emailRaw]
     );
 
-    const code = Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit
-    const expires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expires = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
 
     await pool.query(
       `INSERT INTO magic_tokens(email, code, expires_at) VALUES($1,$2,$3)`,
       [emailRaw, code, expires.toISOString()]
     );
 
-    // Blitz: log the code to server console
     console.log(`[DEV MAGIC CODE] ${emailRaw} -> ${code} (expires ${expires.toISOString()})`);
-
     res.json({ ok: true, delivery: "console", expires_at: expires.toISOString() });
   } catch (e) {
     console.error(e);
@@ -169,7 +166,6 @@ app.post("/auth/request", async (req, res) => {
   }
 });
 
-// Verify the 6-digit code, issue a session token
 app.post("/auth/verify", async (req, res) => {
   try {
     const email = (req.body.email || "").toString().trim().toLowerCase();
@@ -184,7 +180,6 @@ app.post("/auth/verify", async (req, res) => {
        LIMIT 1`,
       [email, code]
     );
-
     if (!tokens.length) return res.status(400).json({ error: "invalid_code" });
 
     const t = tokens[0];
@@ -193,25 +188,30 @@ app.post("/auth/verify", async (req, res) => {
       return res.status(400).json({ error: "code_expired" });
     }
 
-    // Mark used
     await pool.query(`UPDATE magic_tokens SET used_at = now() WHERE id = $1`, [t.id]);
 
-    // Ensure user exists
     const { rows: users } = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
     if (!users.length) return res.status(400).json({ error: "user_missing" });
     const user = users[0];
 
-    // Create session
     const token = randomUUID();
     await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, user.id]);
 
-    res.json({
-      token,
-      user: { id: user.id, email: user.email }
-    });
+    res.json({ token, user: { id: user.id, email: user.email } });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "verify_failed" });
+  }
+});
+
+// NEW: revoke current session
+app.post("/auth/logout", authRequired, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM sessions WHERE token = $1`, [req.sessionToken]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "logout_failed" });
   }
 });
 
@@ -220,7 +220,7 @@ app.get("/me", authRequired, async (req, res) => {
   res.json({ user: rows[0] });
 });
 
-// --- Contacts API (kept public for now; you can add authRequired later) ---
+// Contacts API (left open for now; we can require auth later)
 app.get("/api/contacts", async (req, res) => {
   const q = (req.query.q || "").toString().trim();
   try {
@@ -269,7 +269,6 @@ app.post("/api/contacts", async (req, res) => {
   if (!name) return res.status(400).json({ error: "name_required" });
 
   const id = randomUUID();
-
   try {
     const r = await pool.query(
       `
@@ -334,9 +333,5 @@ app.delete("/api/contacts/:id", async (req, res) => {
   }
 });
 
-// Optional: today's todo
-app.get("/api/todo/today", async (_req, res) => res.json([]));
-
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
-
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
