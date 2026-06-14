@@ -168,9 +168,22 @@ async function bootstrap() {
       status TEXT NOT NULL DEFAULT 'lead',
       phone TEXT,
       email TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS map_pins_user_idx ON map_pins(user_id);
+
+    CREATE TABLE IF NOT EXISTS measurements (
+      id TEXT PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name TEXT NOT NULL DEFAULT '',
+      points JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      linked_contact_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      units TEXT NOT NULL DEFAULT 'feet',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS measurements_user_idx ON measurements(user_id);
 
     CREATE TABLE IF NOT EXISTS todo_tasks (
       id TEXT PRIMARY KEY,
@@ -238,6 +251,10 @@ async function bootstrap() {
   await pool.query(`
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
+    ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE measurements ADD COLUMN IF NOT EXISTS linked_contact_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE measurements ADD COLUMN IF NOT EXISTS units TEXT NOT NULL DEFAULT 'feet';
+    ALTER TABLE measurements ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
   `);
 
   // Ensure user_id column exists
@@ -668,7 +685,7 @@ app.delete("/api/schedule/:id", authRequired, async (req, res) => {
 app.get("/api/map-pins", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, latitude, longitude, name, address, notes, status, phone, email
+      `SELECT id, latitude, longitude, name, address, notes, status, phone, email, created_at
        FROM map_pins WHERE user_id = $1`,
       [req.userId]
     );
@@ -677,14 +694,14 @@ app.get("/api/map-pins", authRequired, async (req, res) => {
 });
 
 app.put("/api/map-pins/:id", authRequired, async (req, res) => {
-  const { latitude, longitude, name, address, notes, status, phone, email } = req.body || {};
+  const { latitude, longitude, name, address, notes, status, phone, email, created_at } = req.body || {};
   if (typeof latitude !== "number" || typeof longitude !== "number") {
     return res.status(400).json({ error: "missing_coords" });
   }
   try {
     const r = await pool.query(
-      `INSERT INTO map_pins (id, user_id, latitude, longitude, name, address, notes, status, phone, email)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO map_pins (id, user_id, latitude, longitude, name, address, notes, status, phone, email, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::timestamptz, now()))
        ON CONFLICT (id) DO UPDATE
          SET latitude = EXCLUDED.latitude,
              longitude = EXCLUDED.longitude,
@@ -696,11 +713,11 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
              email = EXCLUDED.email,
              updated_at = now()
        WHERE map_pins.user_id = $2
-       RETURNING id, latitude, longitude, name, address, notes, status, phone, email`,
+       RETURNING id, latitude, longitude, name, address, notes, status, phone, email, created_at`,
       [
         req.params.id, req.userId, latitude, longitude,
         name || '', address || '', notes || '', status || 'lead',
-        phone || null, email || null
+        phone || null, email || null, created_at || null
       ]
     );
     res.json(r.rows[0]);
