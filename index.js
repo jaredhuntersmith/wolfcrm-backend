@@ -234,6 +234,12 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS todo_logs_user_ts_idx ON todo_logs(user_id, ts DESC);
   `);
 
+  // Schedule events extra fields (services + price)
+  await pool.query(`
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
+  `);
+
   // Ensure user_id column exists
   await pool.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS user_id UUID;`);
 
@@ -608,7 +614,7 @@ app.get("/api/schedule", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, title, start_at AS start, end_at AS "end", color, notes,
-              contact_id, reminder_minutes
+              contact_id, reminder_minutes, services, price_cents
        FROM schedule_events WHERE user_id = $1 ORDER BY start_at ASC`,
       [req.userId]
     );
@@ -617,13 +623,13 @@ app.get("/api/schedule", authRequired, async (req, res) => {
 });
 
 app.put("/api/schedule/:id", authRequired, async (req, res) => {
-  const { title, start, end, color, notes, contact_id, reminder_minutes } = req.body || {};
+  const { title, start, end, color, notes, contact_id, reminder_minutes, services, price_cents } = req.body || {};
   if (!title || !start || !end) return res.status(400).json({ error: "missing_params" });
   try {
     const r = await pool.query(
       `INSERT INTO schedule_events
-        (id, user_id, title, start_at, end_at, color, notes, contact_id, reminder_minutes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+        (id, user_id, title, start_at, end_at, color, notes, contact_id, reminder_minutes, services, price_cents)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              start_at = EXCLUDED.start_at,
@@ -632,14 +638,18 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
              notes = EXCLUDED.notes,
              contact_id = EXCLUDED.contact_id,
              reminder_minutes = EXCLUDED.reminder_minutes,
+             services = EXCLUDED.services,
+             price_cents = EXCLUDED.price_cents,
              updated_at = now()
        WHERE schedule_events.user_id = $2
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
-                 contact_id, reminder_minutes`,
+                 contact_id, reminder_minutes, services, price_cents`,
       [
         req.params.id, req.userId, title, start, end,
         color || '#3478F6', notes || null, contact_id || null,
-        JSON.stringify(reminder_minutes || [])
+        JSON.stringify(reminder_minutes || []),
+        JSON.stringify(services || []),
+        Number.isFinite(Number(price_cents)) ? Number(price_cents) : null
       ]
     );
     res.json(r.rows[0]);
