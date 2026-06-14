@@ -1334,3 +1334,4 @@ app.delete("/api/todo/logs/:id", authRequired, async (req, res) => {
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
+
