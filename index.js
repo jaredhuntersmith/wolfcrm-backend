@@ -1,7 +1,7 @@
-/* WolfCRM backend — user-scoped contacts + auto-backfill + emailed codes + logout */
+/* WolfCRM backend — email/password auth + user-scoped CRM data */
 import express from "express";
 import cors from "cors";
-import { randomUUID } from "crypto";
+import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import pkg from "pg";
 
 const { Pool } = pkg;
@@ -28,18 +28,39 @@ const bearer = (req) => {
   return m ? m[1] : null;
 };
 
+const normalizeEmail = (email) => (email || "").toString().trim().toLowerCase();
+const passwordIsValid = (password) =>
+  typeof password === "string" &&
+  password.length >= 8 &&
+  /[A-Z]/.test(password) &&
+  /[0-9]/.test(password) &&
+  /[^A-Za-z0-9]/.test(password);
+const companyCodeIsValid = (code) => /^[A-Za-z0-9]{8,15}$/.test((code || "").toString());
+const hashPassword = (password) => {
+  const salt = randomBytes(16).toString("hex");
+  const hash = scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+};
+const verifyPassword = (password, stored) => {
+  if (!stored || !stored.includes(":")) return false;
+  const [salt, key] = stored.split(":");
+  const hash = scryptSync(password, salt, 64);
+  const storedHash = Buffer.from(key, "hex");
+  return storedHash.length === hash.length && timingSafeEqual(storedHash, hash);
+};
+
 // Email via Resend (fallback to console)
-async function sendLoginCode(email, code, expiresIso) {
+async function sendEmailCode(email, code, expiresIso, purpose = "reset") {
   const key = process.env.RESEND_API_KEY;
   const from = process.env.RESEND_FROM || "WolfCRM <no-reply@wolfcrm.local>";
-  const subject = "Your WolfCRM login code";
+  const subject = purpose === "reset" ? "Your WolfCRM password reset code" : "Your WolfCRM code";
   const text =
-    `Your login code is ${code}\n\n` +
+    `Your WolfCRM code is ${code}\n\n` +
     `It expires at ${expiresIso}\n\n` +
     `If you didn’t request this, you can ignore this email.`;
 
   if (!key) {
-    console.log(`[DEV MAGIC CODE] ${email} -> ${code} (expires ${expiresIso})`);
+    console.log(`[DEV EMAIL CODE:${purpose}] ${email} -> ${code} (expires ${expiresIso})`);
     return { delivery: "console" };
   }
 
@@ -69,8 +90,38 @@ async function bootstrap() {
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       email TEXT UNIQUE NOT NULL,
+      password_hash TEXT,
+      role TEXT NOT NULL DEFAULT 'employer',
+      company_id UUID,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+
+    CREATE TABLE IF NOT EXISTS companies (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL DEFAULT 'Company',
+      join_code TEXT UNIQUE NOT NULL,
+      owner_user_id UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS companies_join_code_idx ON companies(join_code);
+
+    CREATE TABLE IF NOT EXISTS employee_permissions (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
+      can_delete_contacts BOOLEAN NOT NULL DEFAULT false,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS password_reset_codes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email TEXT NOT NULL,
+      code TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS password_reset_codes_email_idx ON password_reset_codes(email);
 
     CREATE TABLE IF NOT EXISTS magic_tokens (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -249,6 +300,9 @@ async function bootstrap() {
 
   // Schedule events extra fields (services + price)
   await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'employer';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
     ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
@@ -315,16 +369,183 @@ async function authRequired(req, res, next) {
   const token = bearer(req);
   if (!token) return res.status(401).json({ error: "unauthorized" });
   const { rows } = await pool.query(
-    `UPDATE sessions SET last_used_at = now() WHERE token = $1 RETURNING user_id`,
+    `UPDATE sessions s
+       SET last_used_at = now()
+       FROM users u
+       LEFT JOIN employee_permissions p ON p.user_id = u.id
+      WHERE s.token = $1 AND u.id = s.user_id
+      RETURNING s.user_id, u.email, u.role, u.company_id, COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts`,
     [token]
   );
   if (!rows.length) return res.status(401).json({ error: "unauthorized" });
   req.userId = rows[0].user_id;
+  req.userEmail = rows[0].email;
+  req.role = rows[0].role;
+  req.companyId = rows[0].company_id;
+  req.permissions = { canDeleteContacts: !!rows[0].can_delete_contacts };
   req.sessionToken = token;
   next();
 }
 
+function requireEmployer(req, res, next) {
+  if (req.role !== "employer") return res.status(403).json({ error: "employer_required" });
+  next();
+}
+
+function userPayload(user, permissions = null, company = null) {
+  return {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    company_id: user.company_id,
+    company,
+    permissions: permissions || { can_delete_contacts: user.role === "employer" }
+  };
+}
+
 // ---------- auth routes ----------
+app.post("/auth/signup", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    const password = (req.body.password || "").toString();
+    const role = req.body.role === "employee" ? "employee" : "employer";
+    const joinCode = (req.body.join_code || "").toString().trim();
+    const companyName = (req.body.company_name || "Company").toString().trim() || "Company";
+    const companyCode = (req.body.company_code || "").toString().trim();
+
+    if (!email || !email.includes("@")) return res.status(400).json({ error: "invalid_email" });
+    if (!passwordIsValid(password)) return res.status(400).json({ error: "weak_password" });
+
+    const existing = await pool.query(`SELECT id FROM users WHERE email = $1`, [email]);
+    if (existing.rows.length) return res.status(409).json({ error: "email_exists" });
+
+    let company;
+    if (role === "employee") {
+      if (!companyCodeIsValid(joinCode)) return res.status(400).json({ error: "invalid_join_code" });
+      const r = await pool.query(`SELECT * FROM companies WHERE join_code = $1`, [joinCode]);
+      if (!r.rows.length) return res.status(400).json({ error: "company_not_found" });
+      company = r.rows[0];
+    } else {
+      if (!companyCodeIsValid(companyCode)) return res.status(400).json({ error: "invalid_company_code" });
+      const r = await pool.query(
+        `INSERT INTO companies(name, join_code)
+         VALUES($1,$2)
+         RETURNING *`,
+        [companyName, companyCode]
+      );
+      company = r.rows[0];
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO users(email, password_hash, role, company_id)
+       VALUES($1,$2,$3,$4)
+       RETURNING id, email, role, company_id`,
+      [email, hashPassword(password), role, company.id]
+    );
+    const user = rows[0];
+
+    if (role === "employer") {
+      await pool.query(`UPDATE companies SET owner_user_id = $1 WHERE id = $2`, [user.id, company.id]);
+    } else {
+      await pool.query(
+        `INSERT INTO employee_permissions(user_id, company_id, can_delete_contacts)
+         VALUES($1,$2,false)`,
+        [user.id, company.id]
+      );
+    }
+
+    const token = randomUUID();
+    await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, user.id]);
+    res.json({ token, user: userPayload(user, { can_delete_contacts: role === "employer" }, { id: company.id, name: company.name, join_code: company.join_code }) });
+  } catch (e) {
+    if (e.code === "23505") return res.status(409).json({ error: "company_code_taken" });
+    console.error(e);
+    res.status(500).json({ error: "signup_failed" });
+  }
+});
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    const password = (req.body.password || "").toString();
+    const { rows } = await pool.query(
+      `SELECT u.*, c.name AS company_name, c.join_code, COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts
+         FROM users u
+         LEFT JOIN companies c ON c.id = u.company_id
+         LEFT JOIN employee_permissions p ON p.user_id = u.id
+        WHERE u.email = $1`,
+      [email]
+    );
+    if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
+      return res.status(401).json({ error: "invalid_login" });
+    }
+    const u = rows[0];
+    const token = randomUUID();
+    await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, u.id]);
+    res.json({
+      token,
+      user: userPayload(
+        u,
+        { can_delete_contacts: !!u.can_delete_contacts },
+        u.company_id ? { id: u.company_id, name: u.company_name, join_code: u.join_code } : null
+      )
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "login_failed" });
+  }
+});
+
+app.post("/auth/password/request-reset", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    if (!email || !email.includes("@")) return res.status(400).json({ error: "invalid_email" });
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expires = new Date(Date.now() + 10 * 60 * 1000);
+    await pool.query(
+      `INSERT INTO password_reset_codes(email, code, expires_at) VALUES($1,$2,$3)`,
+      [email, code, expires.toISOString()]
+    );
+    const delivery = await sendEmailCode(email, code, expires.toISOString(), "reset");
+    res.json({ ok: true, ...delivery });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "reset_request_failed" });
+  }
+});
+
+app.post("/auth/password/reset", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    const code = (req.body.code || "").toString().trim();
+    const password = (req.body.password || "").toString();
+    if (!passwordIsValid(password)) return res.status(400).json({ error: "weak_password" });
+    const { rows } = await pool.query(
+      `SELECT * FROM password_reset_codes
+       WHERE email = $1 AND code = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [email, code]
+    );
+    if (!rows.length) return res.status(400).json({ error: "invalid_code" });
+    const reset = rows[0];
+    if (reset.used_at) return res.status(400).json({ error: "code_used" });
+    if (new Date(reset.expires_at).getTime() < Date.now()) return res.status(400).json({ error: "code_expired" });
+
+    await pool.query(`UPDATE password_reset_codes SET used_at = now() WHERE id = $1`, [reset.id]);
+    const r = await pool.query(
+      `UPDATE users SET password_hash = $1 WHERE email = $2 RETURNING id`,
+      [hashPassword(password), email]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: "user_not_found" });
+    await pool.query(`DELETE FROM sessions WHERE user_id = $1`, [r.rows[0].id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "reset_failed" });
+  }
+});
+
 app.post("/auth/request", async (req, res) => {
   try {
     const emailRaw = (req.body.email || "").toString().trim().toLowerCase();
@@ -345,7 +566,7 @@ app.post("/auth/request", async (req, res) => {
       [emailRaw, code, expires.toISOString()]
     );
 
-    const delivery = await sendLoginCode(emailRaw, code, expires.toISOString());
+    const delivery = await sendEmailCode(emailRaw, code, expires.toISOString(), "login");
     res.json({ ok: true, ...delivery, expires_at: expires.toISOString() });
   } catch (e) {
     console.error(e);
@@ -401,8 +622,84 @@ app.post("/auth/logout", authRequired, async (req, res) => {
 });
 
 app.get("/me", authRequired, async (req, res) => {
-  const { rows } = await pool.query(`SELECT id, email, created_at FROM users WHERE id = $1`, [req.userId]);
-  res.json({ user: rows[0] });
+  const { rows } = await pool.query(
+    `SELECT u.id, u.email, u.role, u.company_id, u.created_at,
+            c.name AS company_name, c.join_code,
+            COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts
+       FROM users u
+       LEFT JOIN companies c ON c.id = u.company_id
+       LEFT JOIN employee_permissions p ON p.user_id = u.id
+      WHERE u.id = $1`,
+    [req.userId]
+  );
+  const u = rows[0];
+  res.json({
+    user: userPayload(
+      u,
+      { can_delete_contacts: !!u.can_delete_contacts },
+      u.company_id ? { id: u.company_id, name: u.company_name, join_code: u.join_code } : null
+    )
+  });
+});
+
+app.get("/api/company/settings", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const company = await pool.query(`SELECT id, name, join_code FROM companies WHERE id = $1`, [req.companyId]);
+    const employees = await pool.query(
+      `SELECT u.id, u.email, COALESCE(p.can_delete_contacts,false) AS can_delete_contacts
+         FROM users u
+         LEFT JOIN employee_permissions p ON p.user_id = u.id
+        WHERE u.company_id = $1 AND u.role = 'employee'
+        ORDER BY u.email ASC`,
+      [req.companyId]
+    );
+    res.json({ company: company.rows[0], employees: employees.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "company_settings_failed" });
+  }
+});
+
+app.put("/api/company/join-code", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const code = (req.body.join_code || "").toString().trim();
+    if (!companyCodeIsValid(code)) return res.status(400).json({ error: "invalid_company_code" });
+    const { rows } = await pool.query(
+      `UPDATE companies SET join_code = $1, updated_at = now()
+       WHERE id = $2
+       RETURNING id, name, join_code`,
+      [code, req.companyId]
+    );
+    res.json({ company: rows[0] });
+  } catch (e) {
+    if (e.code === "23505") return res.status(409).json({ error: "company_code_taken" });
+    console.error(e);
+    res.status(500).json({ error: "join_code_update_failed" });
+  }
+});
+
+app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const canDelete = !!req.body.can_delete_contacts;
+    const employee = await pool.query(
+      `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND role = 'employee'`,
+      [req.params.id, req.companyId]
+    );
+    if (!employee.rowCount) return res.status(404).json({ error: "employee_not_found" });
+    const { rows } = await pool.query(
+      `INSERT INTO employee_permissions(user_id, company_id, can_delete_contacts)
+       VALUES($1,$2,$3)
+       ON CONFLICT(user_id) DO UPDATE
+         SET can_delete_contacts = EXCLUDED.can_delete_contacts,
+             updated_at = now()
+       RETURNING user_id AS id, can_delete_contacts`,
+      [req.params.id, req.companyId, canDelete]
+    );
+    res.json(rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "permissions_update_failed" });
+  }
 });
 
 // ---------- contacts (AUTH REQUIRED + USER-SCOPED) ----------
@@ -531,6 +828,9 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
 
 app.delete("/api/contacts/:id", authRequired, async (req, res) => {
   try {
+    if (!req.permissions.canDeleteContacts) {
+      return res.status(403).json({ error: "permission_denied" });
+    }
     await pool.query(
       `UPDATE schedule_events
        SET contact_id = NULL, updated_at = now()
