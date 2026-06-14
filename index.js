@@ -416,8 +416,10 @@ app.post("/auth/signup", async (req, res) => {
     if (!email || !email.includes("@")) return res.status(400).json({ error: "invalid_email" });
     if (!passwordIsValid(password)) return res.status(400).json({ error: "weak_password" });
 
-    const existing = await pool.query(`SELECT id FROM users WHERE email = $1`, [email]);
-    if (existing.rows.length) return res.status(409).json({ error: "email_exists" });
+    const existing = await pool.query(`SELECT id, password_hash FROM users WHERE email = $1`, [email]);
+    if (existing.rows.length && existing.rows[0].password_hash) {
+      return res.status(409).json({ error: "email_exists" });
+    }
 
     let company;
     if (role === "employee") {
@@ -436,12 +438,20 @@ app.post("/auth/signup", async (req, res) => {
       company = r.rows[0];
     }
 
-    const { rows } = await pool.query(
-      `INSERT INTO users(email, password_hash, role, company_id)
-       VALUES($1,$2,$3,$4)
-       RETURNING id, email, role, company_id`,
-      [email, hashPassword(password), role, company.id]
-    );
+    const { rows } = existing.rows.length
+      ? await pool.query(
+          `UPDATE users
+           SET password_hash = $1, role = $2, company_id = $3
+           WHERE email = $4
+           RETURNING id, email, role, company_id`,
+          [hashPassword(password), role, company.id, email]
+        )
+      : await pool.query(
+          `INSERT INTO users(email, password_hash, role, company_id)
+           VALUES($1,$2,$3,$4)
+           RETURNING id, email, role, company_id`,
+          [email, hashPassword(password), role, company.id]
+        );
     const user = rows[0];
 
     if (role === "employer") {
