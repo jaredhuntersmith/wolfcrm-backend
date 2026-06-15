@@ -296,6 +296,27 @@ async function bootstrap() {
       note TEXT
     );
     CREATE INDEX IF NOT EXISTS todo_logs_user_ts_idx ON todo_logs(user_id, ts DESC);
+
+    CREATE TABLE IF NOT EXISTS time_clock_settings (
+      company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+      week_start INTEGER NOT NULL DEFAULT 1,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS time_clock_entries (
+      id TEXT PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
+      start_at TIMESTAMPTZ NOT NULL,
+      end_at TIMESTAMPTZ,
+      note TEXT,
+      created_by UUID REFERENCES users(id),
+      updated_by UUID REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS time_clock_entries_user_start_idx ON time_clock_entries(user_id, start_at DESC);
+    CREATE INDEX IF NOT EXISTS time_clock_entries_company_start_idx ON time_clock_entries(company_id, start_at DESC);
   `);
 
   // Schedule events extra fields (services + price)
@@ -710,6 +731,162 @@ app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer,
     console.error(e);
     res.status(500).json({ error: "permissions_update_failed" });
   }
+});
+
+function weekRangeFromQuery(req) {
+  const startRaw = (req.query.week_start || "").toString();
+  const start = startRaw ? new Date(startRaw) : new Date();
+  if (Number.isNaN(start.getTime())) return null;
+  start.setUTCHours(0, 0, 0, 0);
+  const end = new Date(start.getTime() + 7 * 24 * 60 * 60 * 1000);
+  return { start, end };
+}
+
+function entrySelect(prefix = "e") {
+  return `${prefix}.id, ${prefix}.user_id, u.email AS user_email, ${prefix}.company_id,
+          ${prefix}.start_at, ${prefix}.end_at, ${prefix}.note,
+          ${prefix}.created_at, ${prefix}.updated_at`;
+}
+
+// ---------- TIME CLOCK ----------
+app.get("/api/time-clock/settings", authRequired, async (req, res) => {
+  try {
+    if (!req.companyId) return res.json({ week_start: 1 });
+    const { rows } = await pool.query(
+      `INSERT INTO time_clock_settings(company_id, week_start)
+       VALUES($1, 1)
+       ON CONFLICT(company_id) DO UPDATE SET company_id = EXCLUDED.company_id
+       RETURNING week_start`,
+      [req.companyId]
+    );
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "time_settings_failed" }); }
+});
+
+app.put("/api/time-clock/settings", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const weekStart = Number(req.body.week_start);
+    if (!Number.isInteger(weekStart) || weekStart < 0 || weekStart > 6) {
+      return res.status(400).json({ error: "invalid_week_start" });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO time_clock_settings(company_id, week_start)
+       VALUES($1,$2)
+       ON CONFLICT(company_id) DO UPDATE
+         SET week_start = EXCLUDED.week_start,
+             updated_at = now()
+       RETURNING week_start`,
+      [req.companyId, weekStart]
+    );
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "time_settings_update_failed" }); }
+});
+
+app.get("/api/time-clock/me", authRequired, async (req, res) => {
+  try {
+    const range = weekRangeFromQuery(req);
+    if (!range) return res.status(400).json({ error: "invalid_week_start" });
+    const open = await pool.query(
+      `SELECT ${entrySelect("e")}
+         FROM time_clock_entries e
+         JOIN users u ON u.id = e.user_id
+        WHERE e.user_id = $1 AND e.end_at IS NULL
+        ORDER BY e.start_at DESC LIMIT 1`,
+      [req.userId]
+    );
+    const entries = await pool.query(
+      `SELECT ${entrySelect("e")}
+         FROM time_clock_entries e
+         JOIN users u ON u.id = e.user_id
+        WHERE e.user_id = $1 AND e.start_at >= $2 AND e.start_at < $3
+        ORDER BY e.start_at DESC`,
+      [req.userId, range.start.toISOString(), range.end.toISOString()]
+    );
+    res.json({ open_entry: open.rows[0] || null, entries: entries.rows });
+  } catch (e) { console.error(e); res.status(500).json({ error: "time_me_failed" }); }
+});
+
+app.post("/api/time-clock/clock-in", authRequired, async (req, res) => {
+  try {
+    const existing = await pool.query(
+      `SELECT id FROM time_clock_entries WHERE user_id = $1 AND end_at IS NULL LIMIT 1`,
+      [req.userId]
+    );
+    if (existing.rowCount) return res.status(409).json({ error: "already_clocked_in" });
+    const start = req.body.start_at ? new Date(req.body.start_at) : new Date();
+    if (Number.isNaN(start.getTime())) return res.status(400).json({ error: "invalid_start" });
+    const note = req.body.note || null;
+    const { rows } = await pool.query(
+      `INSERT INTO time_clock_entries(id, user_id, company_id, start_at, note, created_by, updated_by)
+       VALUES($1,$2,$3,$4,$5,$2,$2)
+       RETURNING *`,
+      [randomUUID(), req.userId, req.companyId, start.toISOString(), note]
+    );
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "clock_in_failed" }); }
+});
+
+app.post("/api/time-clock/clock-out", authRequired, async (req, res) => {
+  try {
+    const end = req.body.end_at ? new Date(req.body.end_at) : new Date();
+    if (Number.isNaN(end.getTime())) return res.status(400).json({ error: "invalid_end" });
+    const { rows } = await pool.query(
+      `UPDATE time_clock_entries
+          SET end_at = $3, updated_by = $2, updated_at = now()
+        WHERE id = (
+          SELECT id FROM time_clock_entries
+          WHERE user_id = $1 AND end_at IS NULL
+          ORDER BY start_at DESC LIMIT 1
+        )
+        RETURNING *`,
+      [req.userId, req.userId, end.toISOString()]
+    );
+    if (!rows.length) return res.status(404).json({ error: "not_clocked_in" });
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "clock_out_failed" }); }
+});
+
+app.get("/api/time-clock/company", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const range = weekRangeFromQuery(req);
+    if (!range) return res.status(400).json({ error: "invalid_week_start" });
+    const employees = await pool.query(
+      `SELECT id, email, role FROM users WHERE company_id = $1 ORDER BY email ASC`,
+      [req.companyId]
+    );
+    const entries = await pool.query(
+      `SELECT ${entrySelect("e")}
+         FROM time_clock_entries e
+         JOIN users u ON u.id = e.user_id
+        WHERE e.company_id = $1 AND e.start_at >= $2 AND e.start_at < $3
+        ORDER BY u.email ASC, e.start_at DESC`,
+      [req.companyId, range.start.toISOString(), range.end.toISOString()]
+    );
+    res.json({ employees: employees.rows, entries: entries.rows });
+  } catch (e) { console.error(e); res.status(500).json({ error: "time_company_failed" }); }
+});
+
+app.patch("/api/time-clock/entries/:id", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const start = new Date(req.body.start_at);
+    const end = req.body.end_at ? new Date(req.body.end_at) : null;
+    if (Number.isNaN(start.getTime()) || (end && Number.isNaN(end.getTime()))) {
+      return res.status(400).json({ error: "invalid_dates" });
+    }
+    const { rows } = await pool.query(
+      `UPDATE time_clock_entries
+          SET start_at = $3,
+              end_at = $4,
+              note = $5,
+              updated_by = $2,
+              updated_at = now()
+        WHERE id = $1 AND company_id = $6
+        RETURNING *`,
+      [req.params.id, req.userId, start.toISOString(), end ? end.toISOString() : null, req.body.note || null, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "entry_not_found" });
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_update_failed" }); }
 });
 
 // ---------- contacts (AUTH REQUIRED + USER-SCOPED) ----------
@@ -1334,4 +1511,3 @@ app.delete("/api/todo/logs/:id", authRequired, async (req, res) => {
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
-
