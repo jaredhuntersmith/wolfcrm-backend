@@ -325,6 +325,80 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS time_clock_entries_user_start_idx ON time_clock_entries(user_id, start_at DESC);
     CREATE INDEX IF NOT EXISTS time_clock_entries_company_start_idx ON time_clock_entries(company_id, start_at DESC);
+
+    CREATE TABLE IF NOT EXISTS conversations (
+      id TEXT PRIMARY KEY,
+      company_id UUID,
+      title TEXT,
+      is_group BOOLEAN NOT NULL DEFAULT false,
+      created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS conversations_company_updated_idx ON conversations(company_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS conversation_participants (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_read_at TIMESTAMPTZ,
+      UNIQUE(conversation_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS conversation_participants_user_idx ON conversation_participants(user_id);
+
+    CREATE TABLE IF NOT EXISTS channels (
+      id TEXT PRIMARY KEY,
+      company_id UUID,
+      name TEXT NOT NULL,
+      description TEXT,
+      created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      archived_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS channels_company_idx ON channels(company_id, archived_at);
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+      channel_id TEXT REFERENCES channels(id) ON DELETE CASCADE,
+      sender_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      body TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      deleted_at TIMESTAMPTZ,
+      CHECK ((conversation_id IS NOT NULL AND channel_id IS NULL) OR (conversation_id IS NULL AND channel_id IS NOT NULL))
+    );
+    CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS messages_channel_idx ON messages(channel_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS message_attachments (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      object_key TEXT,
+      url TEXT,
+      thumbnail_object_key TEXT,
+      thumbnail_url TEXT,
+      file_name TEXT,
+      mime_type TEXT,
+      byte_size INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS message_attachments_message_idx ON message_attachments(message_id);
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id TEXT PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID,
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      read_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS notifications_user_unread_idx ON notifications(user_id, read_at, created_at DESC);
   `);
 
   // Schedule events extra fields (services + price)
@@ -440,6 +514,66 @@ function userPayload(user, permissions = null, company = null) {
     company,
     permissions: permissions || { can_delete_contacts: user.role === "employer" }
   };
+}
+
+async function createNotification(userId, companyId, kind, title, body, data = {}) {
+  if (!userId) return;
+  await pool.query(
+    `INSERT INTO notifications(id, user_id, company_id, kind, title, body, data)
+     VALUES($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+    [randomUUID(), userId, companyId || null, kind, title, body || null, JSON.stringify(data || {})]
+  );
+}
+
+async function notifyMany(userIds, companyId, kind, title, body, data = {}, skipUserId = null) {
+  const unique = [...new Set((userIds || []).filter(Boolean))].filter((id) => id !== skipUserId);
+  for (const userId of unique) {
+    await createNotification(userId, companyId, kind, title, body, data);
+  }
+}
+
+function parseAttachments(input) {
+  if (!Array.isArray(input)) return [];
+  return input.slice(0, 10).map((a) => ({
+    kind: ["photo", "video", "file"].includes(a.kind) ? a.kind : "file",
+    object_key: (a.object_key || "").toString() || null,
+    url: (a.url || "").toString() || null,
+    thumbnail_object_key: (a.thumbnail_object_key || "").toString() || null,
+    thumbnail_url: (a.thumbnail_url || "").toString() || null,
+    file_name: (a.file_name || "").toString() || null,
+    mime_type: (a.mime_type || "").toString() || null,
+    byte_size: Number.isFinite(Number(a.byte_size)) ? Number(a.byte_size) : null
+  }));
+}
+
+async function attachRows(messageId, attachments) {
+  for (const a of parseAttachments(attachments)) {
+    await pool.query(
+      `INSERT INTO message_attachments
+        (id, message_id, kind, object_key, url, thumbnail_object_key, thumbnail_url, file_name, mime_type, byte_size)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [randomUUID(), messageId, a.kind, a.object_key, a.url, a.thumbnail_object_key, a.thumbnail_url, a.file_name, a.mime_type, a.byte_size]
+    );
+  }
+}
+
+async function messageRowsWithAttachments(rows) {
+  if (!rows.length) return rows;
+  const ids = rows.map((r) => r.id);
+  const { rows: atts } = await pool.query(
+    `SELECT id, message_id, kind, object_key, url, thumbnail_object_key, thumbnail_url,
+            file_name, mime_type, byte_size, created_at
+       FROM message_attachments
+      WHERE message_id = ANY($1::text[])
+      ORDER BY created_at ASC`,
+    [ids]
+  );
+  const byMessage = new Map();
+  for (const a of atts) {
+    if (!byMessage.has(a.message_id)) byMessage.set(a.message_id, []);
+    byMessage.get(a.message_id).push(a);
+  }
+  return rows.map((r) => ({ ...r, attachments: byMessage.get(r.id) || [] }));
 }
 
 // ---------- auth routes ----------
@@ -695,7 +829,10 @@ app.get("/me", authRequired, async (req, res) => {
 app.patch("/api/profile", authRequired, async (req, res) => {
   try {
     const displayName = (req.body.display_name || "").toString().trim();
-    const photoUrl = (req.body.photo_url || "").toString().trim();
+    const photoUrl = (req.body.photo_url || req.body.photo_data_url || "").toString().trim();
+    if (photoUrl && photoUrl.length > 350000) {
+      return res.status(413).json({ error: "profile_photo_too_large" });
+    }
     const { rows } = await pool.query(
       `UPDATE users
           SET display_name = $2,
@@ -808,6 +945,250 @@ function entrySelect(prefix = "e") {
           ${prefix}.start_at, ${prefix}.end_at, ${prefix}.note,
           ${prefix}.created_at, ${prefix}.updated_at`;
 }
+
+// ---------- INTERNAL MESSAGING ----------
+app.get("/api/notifications", authRequired, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, kind, title, body, data, created_at, read_at
+         FROM notifications
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 100`,
+      [req.userId]
+    );
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "notifications_failed" }); }
+});
+
+app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
+  try {
+    await pool.query(`UPDATE notifications SET read_at = now() WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: "notification_read_failed" }); }
+});
+
+app.get("/api/internal/conversations", authRequired, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT c.id, c.company_id, c.title, c.is_group, c.created_by, c.created_at, c.updated_at,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'id', u.id, 'email', u.email, 'role', u.role,
+                  'display_name', u.display_name, 'photo_url', u.photo_url
+                ) ORDER BY COALESCE(u.display_name, u.email))
+                FROM conversation_participants cp2
+                JOIN users u ON u.id = cp2.user_id
+                WHERE cp2.conversation_id = c.id
+              ), '[]'::json) AS participants,
+              lm.body AS latest_body,
+              lm.created_at AS latest_at,
+              (
+                SELECT COUNT(*)
+                  FROM messages m
+                 WHERE m.conversation_id = c.id
+                   AND m.sender_id <> $1
+                   AND m.deleted_at IS NULL
+                   AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01'::timestamptz)
+              )::int AS unread_count
+         FROM conversation_participants cp
+         JOIN conversations c ON c.id = cp.conversation_id
+         LEFT JOIN LATERAL (
+           SELECT body, created_at FROM messages
+            WHERE conversation_id = c.id
+            ORDER BY created_at DESC
+            LIMIT 1
+         ) lm ON true
+        WHERE cp.user_id = $1
+        ORDER BY COALESCE(lm.created_at, c.updated_at) DESC`,
+      [req.userId]
+    );
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "conversation_list_failed" }); }
+});
+
+app.post("/api/internal/conversations/private", authRequired, async (req, res) => {
+  const otherUserId = (req.body.user_id || "").toString();
+  if (!otherUserId || otherUserId === req.userId) return res.status(400).json({ error: "invalid_user" });
+  try {
+    const member = await pool.query(
+      req.companyId ? `SELECT id FROM users WHERE id = $1 AND company_id = $2` : `SELECT id FROM users WHERE id = $1`,
+      req.companyId ? [otherUserId, req.companyId] : [otherUserId]
+    );
+    if (!member.rows.length) return res.status(404).json({ error: "user_not_found" });
+    const existing = await pool.query(
+      `SELECT c.id
+         FROM conversations c
+         JOIN conversation_participants a ON a.conversation_id = c.id AND a.user_id = $1
+         JOIN conversation_participants b ON b.conversation_id = c.id AND b.user_id = $2
+        WHERE c.is_group = false
+          AND (SELECT COUNT(*) FROM conversation_participants cp WHERE cp.conversation_id = c.id) = 2
+        LIMIT 1`,
+      [req.userId, otherUserId]
+    );
+    if (existing.rows.length) return res.json({ id: existing.rows[0].id });
+    const id = randomUUID();
+    await pool.query(`INSERT INTO conversations(id, company_id, is_group, created_by) VALUES($1,$2,false,$3)`, [id, req.companyId || null, req.userId]);
+    await pool.query(
+      `INSERT INTO conversation_participants(id, conversation_id, user_id) VALUES($1,$2,$3),($4,$2,$5)`,
+      [randomUUID(), id, req.userId, randomUUID(), otherUserId]
+    );
+    res.status(201).json({ id });
+  } catch (e) { console.error(e); res.status(500).json({ error: "private_conversation_failed" }); }
+});
+
+app.post("/api/internal/conversations/group", authRequired, async (req, res) => {
+  const title = (req.body.title || "Group").toString().trim() || "Group";
+  const ids = [...new Set([req.userId, ...((Array.isArray(req.body.participant_ids) ? req.body.participant_ids : []).map(String))])];
+  if (ids.length < 2) return res.status(400).json({ error: "group_needs_members" });
+  try {
+    if (req.companyId) {
+      const valid = await pool.query(`SELECT id FROM users WHERE company_id = $1 AND id = ANY($2::uuid[])`, [req.companyId, ids]);
+      if (valid.rows.length !== ids.length) return res.status(400).json({ error: "invalid_participant" });
+    }
+    const id = randomUUID();
+    await pool.query(`INSERT INTO conversations(id, company_id, title, is_group, created_by) VALUES($1,$2,$3,true,$4)`, [id, req.companyId || null, title, req.userId]);
+    for (const userId of ids) {
+      await pool.query(`INSERT INTO conversation_participants(id, conversation_id, user_id) VALUES($1,$2,$3)`, [randomUUID(), id, userId]);
+    }
+    res.status(201).json({ id });
+  } catch (e) { console.error(e); res.status(500).json({ error: "group_conversation_failed" }); }
+});
+
+app.get("/api/internal/conversations/:id/messages", authRequired, async (req, res) => {
+  try {
+    const member = await pool.query(`SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    if (!member.rows.length) return res.status(403).json({ error: "not_participant" });
+    const { rows } = await pool.query(
+      `SELECT m.id, m.conversation_id, m.channel_id, m.sender_id, m.body, m.created_at, m.updated_at, m.deleted_at,
+              u.display_name AS sender_name, u.email AS sender_email, u.photo_url AS sender_photo_url
+         FROM messages m
+         JOIN users u ON u.id = m.sender_id
+        WHERE m.conversation_id = $1
+        ORDER BY m.created_at ASC
+        LIMIT 200`,
+      [req.params.id]
+    );
+    res.json(await messageRowsWithAttachments(rows));
+  } catch (e) { console.error(e); res.status(500).json({ error: "conversation_messages_failed" }); }
+});
+
+app.post("/api/internal/conversations/:id/messages", authRequired, async (req, res) => {
+  const body = (req.body.body || "").toString();
+  const attachments = parseAttachments(req.body.attachments);
+  if (!body.trim() && !attachments.length) return res.status(400).json({ error: "empty_message" });
+  try {
+    const member = await pool.query(`SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    if (!member.rows.length) return res.status(403).json({ error: "not_participant" });
+    const id = randomUUID();
+    const { rows } = await pool.query(
+      `INSERT INTO messages(id, conversation_id, sender_id, body) VALUES($1,$2,$3,$4)
+       RETURNING id, conversation_id, channel_id, sender_id, body, created_at, updated_at, deleted_at`,
+      [id, req.params.id, req.userId, body]
+    );
+    await attachRows(id, attachments);
+    await pool.query(`UPDATE conversations SET updated_at = now() WHERE id = $1`, [req.params.id]);
+    const recipients = await pool.query(`SELECT user_id FROM conversation_participants WHERE conversation_id = $1`, [req.params.id]);
+    await notifyMany(recipients.rows.map((r) => r.user_id), req.companyId, "internal_message", "New message", body || "Attachment", { conversation_id: req.params.id, message_id: id }, req.userId);
+    res.status(201).json((await messageRowsWithAttachments(rows))[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "send_conversation_message_failed" }); }
+});
+
+app.post("/api/internal/conversations/:id/read", authRequired, async (req, res) => {
+  try {
+    await pool.query(`UPDATE conversation_participants SET last_read_at = now() WHERE conversation_id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: "mark_read_failed" }); }
+});
+
+app.get("/api/internal/channels", authRequired, async (req, res) => {
+  try {
+    const where = req.companyId ? `company_id = $1` : `created_by = $1`;
+    const { rows } = await pool.query(
+      `SELECT id, company_id, name, description, created_by, created_at, archived_at
+         FROM channels
+        WHERE ${where} AND archived_at IS NULL
+        ORDER BY lower(name) ASC`,
+      [req.companyId || req.userId]
+    );
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "channels_failed" }); }
+});
+
+app.post("/api/internal/channels", authRequired, async (req, res) => {
+  const name = (req.body.name || "").toString().trim();
+  const description = (req.body.description || "").toString().trim();
+  if (!name) return res.status(400).json({ error: "missing_name" });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO channels(id, company_id, name, description, created_by)
+       VALUES($1,$2,$3,$4,$5)
+       RETURNING id, company_id, name, description, created_by, created_at, archived_at`,
+      [randomUUID(), req.companyId || null, name, description || null, req.userId]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "create_channel_failed" }); }
+});
+
+app.get("/api/internal/channels/:id/messages", authRequired, async (req, res) => {
+  try {
+    const channel = await pool.query(
+      req.companyId ? `SELECT id FROM channels WHERE id = $1 AND company_id = $2 AND archived_at IS NULL` : `SELECT id FROM channels WHERE id = $1 AND created_by = $2 AND archived_at IS NULL`,
+      req.companyId ? [req.params.id, req.companyId] : [req.params.id, req.userId]
+    );
+    if (!channel.rows.length) return res.status(404).json({ error: "channel_not_found" });
+    const { rows } = await pool.query(
+      `SELECT m.id, m.conversation_id, m.channel_id, m.sender_id, m.body, m.created_at, m.updated_at, m.deleted_at,
+              u.display_name AS sender_name, u.email AS sender_email, u.photo_url AS sender_photo_url
+         FROM messages m
+         JOIN users u ON u.id = m.sender_id
+        WHERE m.channel_id = $1
+        ORDER BY m.created_at ASC
+        LIMIT 200`,
+      [req.params.id]
+    );
+    res.json(await messageRowsWithAttachments(rows));
+  } catch (e) { console.error(e); res.status(500).json({ error: "channel_messages_failed" }); }
+});
+
+app.post("/api/internal/channels/:id/messages", authRequired, async (req, res) => {
+  const body = (req.body.body || "").toString();
+  const attachments = parseAttachments(req.body.attachments);
+  if (!body.trim() && !attachments.length) return res.status(400).json({ error: "empty_message" });
+  try {
+    const channel = await pool.query(
+      req.companyId ? `SELECT id, name FROM channels WHERE id = $1 AND company_id = $2 AND archived_at IS NULL` : `SELECT id, name FROM channels WHERE id = $1 AND created_by = $2 AND archived_at IS NULL`,
+      req.companyId ? [req.params.id, req.companyId] : [req.params.id, req.userId]
+    );
+    if (!channel.rows.length) return res.status(404).json({ error: "channel_not_found" });
+    const id = randomUUID();
+    const { rows } = await pool.query(
+      `INSERT INTO messages(id, channel_id, sender_id, body) VALUES($1,$2,$3,$4)
+       RETURNING id, conversation_id, channel_id, sender_id, body, created_at, updated_at, deleted_at`,
+      [id, req.params.id, req.userId, body]
+    );
+    await attachRows(id, attachments);
+    const recipients = await pool.query(
+      req.companyId ? `SELECT id FROM users WHERE company_id = $1` : `SELECT id FROM users WHERE id = $1`,
+      [req.companyId || req.userId]
+    );
+    await notifyMany(recipients.rows.map((r) => r.id), req.companyId, "channel_message", `#${channel.rows[0].name}`, body || "Attachment", { channel_id: req.params.id, message_id: id }, req.userId);
+    res.status(201).json((await messageRowsWithAttachments(rows))[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "send_channel_message_failed" }); }
+});
+
+app.delete("/api/internal/messages/:id", authRequired, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE messages SET deleted_at = now(), body = ''
+        WHERE id = $1 AND sender_id = $2 AND deleted_at IS NULL
+        RETURNING id`,
+      [req.params.id, req.userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "message_not_found" });
+    res.status(204).end();
+  } catch (e) { console.error(e); res.status(500).json({ error: "delete_message_failed" }); }
+});
 
 // ---------- TIME CLOCK ----------
 app.get("/api/time-clock/settings", authRequired, async (req, res) => {
@@ -1209,6 +1590,13 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
   const salesIDs = Array.isArray(sales_user_ids) ? sales_user_ids.slice(0, 2) : [req.userId];
   const workerIDs = Array.isArray(worker_user_ids) ? worker_user_ids : [];
   try {
+    const previous = await pool.query(
+      `SELECT worker_user_ids FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
+      [req.params.id, req.userId, req.companyId]
+    );
+    const oldWorkerIDs = previous.rows.length && Array.isArray(previous.rows[0].worker_user_ids)
+      ? previous.rows[0].worker_user_ids
+      : [];
     const r = await pool.query(
       `INSERT INTO schedule_events
         (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id,
@@ -1245,6 +1633,16 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
         finished_at || null,
         finished_by || null
       ]
+    );
+    const addedWorkers = workerIDs.filter((id) => !oldWorkerIDs.includes(id));
+    await notifyMany(
+      addedWorkers,
+      req.companyId,
+      "job_assignment",
+      "Assigned to job",
+      title,
+      { schedule_event_id: req.params.id },
+      req.userId
     );
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_schedule" }); }
