@@ -93,6 +93,8 @@ async function bootstrap() {
       password_hash TEXT,
       role TEXT NOT NULL DEFAULT 'employer',
       company_id UUID,
+      display_name TEXT,
+      photo_url TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
@@ -203,6 +205,12 @@ async function bootstrap() {
       notes TEXT,
       contact_id TEXT,
       reminder_minutes JSONB NOT NULL DEFAULT '[]'::jsonb,
+      company_id UUID,
+      created_by UUID,
+      sales_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      worker_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      finished_at TIMESTAMPTZ,
+      finished_by UUID,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS schedule_user_start_idx
@@ -324,8 +332,16 @@ async function bootstrap() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'employer';
     ALTER TABLE users ADD COLUMN IF NOT EXISTS company_id UUID;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS company_id UUID;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS created_by UUID;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS sales_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS worker_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS finished_by UUID;
     ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
     ALTER TABLE measurements ADD COLUMN IF NOT EXISTS linked_contact_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE measurements ADD COLUMN IF NOT EXISTS units TEXT NOT NULL DEFAULT 'feet';
@@ -419,6 +435,8 @@ function userPayload(user, permissions = null, company = null) {
     email: user.email,
     role: user.role,
     company_id: user.company_id,
+    display_name: user.display_name,
+    photo_url: user.photo_url,
     company,
     permissions: permissions || { can_delete_contacts: user.role === "employer" }
   };
@@ -655,6 +673,7 @@ app.post("/auth/logout", authRequired, async (req, res) => {
 app.get("/me", authRequired, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT u.id, u.email, u.role, u.company_id, u.created_at,
+            u.display_name, u.photo_url,
             c.name AS company_name, c.join_code,
             COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts
        FROM users u
@@ -671,6 +690,48 @@ app.get("/me", authRequired, async (req, res) => {
       u.company_id ? { id: u.company_id, name: u.company_name, join_code: u.join_code } : null
     )
   });
+});
+
+app.patch("/api/profile", authRequired, async (req, res) => {
+  try {
+    const displayName = (req.body.display_name || "").toString().trim();
+    const photoUrl = (req.body.photo_url || "").toString().trim();
+    const { rows } = await pool.query(
+      `UPDATE users
+          SET display_name = $2,
+              photo_url = $3
+        WHERE id = $1
+        RETURNING id, email, role, company_id, display_name, photo_url`,
+      [req.userId, displayName || null, photoUrl || null]
+    );
+    res.json({ user: userPayload(rows[0], req.permissions, null) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "profile_update_failed" });
+  }
+});
+
+app.get("/api/company/users", authRequired, async (req, res) => {
+  try {
+    if (!req.companyId) {
+      const { rows } = await pool.query(
+        `SELECT id, email, role, display_name, photo_url FROM users WHERE id = $1`,
+        [req.userId]
+      );
+      return res.json(rows);
+    }
+    const { rows } = await pool.query(
+      `SELECT id, email, role, display_name, photo_url
+         FROM users
+        WHERE company_id = $1
+        ORDER BY COALESCE(display_name, email) ASC`,
+      [req.companyId]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "company_users_failed" });
+  }
 });
 
 app.get("/api/company/settings", authRequired, requireEmployer, async (req, res) => {
@@ -1125,24 +1186,34 @@ app.delete("/api/opportunities/:id", authRequired, async (req, res) => {
 // ---------- SCHEDULE EVENTS ----------
 app.get("/api/schedule", authRequired, async (req, res) => {
   try {
+    const where = req.companyId
+      ? { sql: `company_id = $1`, values: [req.companyId] }
+      : { sql: `user_id = $1`, values: [req.userId] };
     const { rows } = await pool.query(
       `SELECT id, title, start_at AS start, end_at AS "end", color, notes,
-              contact_id, reminder_minutes, services, price_cents
-       FROM schedule_events WHERE user_id = $1 ORDER BY start_at ASC`,
-      [req.userId]
+              contact_id, reminder_minutes, services, price_cents,
+              company_id, created_by, sales_user_ids, worker_user_ids, finished_at, finished_by
+       FROM schedule_events WHERE ${where.sql} ORDER BY start_at ASC`,
+      where.values
     );
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_schedule" }); }
 });
 
 app.put("/api/schedule/:id", authRequired, async (req, res) => {
-  const { title, start, end, color, notes, contact_id, reminder_minutes, services, price_cents } = req.body || {};
+  const {
+    title, start, end, color, notes, contact_id, reminder_minutes, services, price_cents,
+    sales_user_ids, worker_user_ids, finished_at, finished_by
+  } = req.body || {};
   if (!title || !start || !end) return res.status(400).json({ error: "missing_params" });
+  const salesIDs = Array.isArray(sales_user_ids) ? sales_user_ids.slice(0, 2) : [req.userId];
+  const workerIDs = Array.isArray(worker_user_ids) ? worker_user_ids : [];
   try {
     const r = await pool.query(
       `INSERT INTO schedule_events
-        (id, user_id, title, start_at, end_at, color, notes, contact_id, reminder_minutes, services, price_cents)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11)
+        (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id,
+         reminder_minutes, services, price_cents, sales_user_ids, worker_user_ids, finished_at, finished_by)
+       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13::jsonb, $14::jsonb, $15, $16)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              start_at = EXCLUDED.start_at,
@@ -1153,16 +1224,26 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
              reminder_minutes = EXCLUDED.reminder_minutes,
              services = EXCLUDED.services,
              price_cents = EXCLUDED.price_cents,
+             company_id = EXCLUDED.company_id,
+             sales_user_ids = EXCLUDED.sales_user_ids,
+             worker_user_ids = EXCLUDED.worker_user_ids,
+             finished_at = EXCLUDED.finished_at,
+             finished_by = EXCLUDED.finished_by,
              updated_at = now()
-       WHERE schedule_events.user_id = $2
+       WHERE schedule_events.user_id = $2 OR schedule_events.company_id = $3
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
-                 contact_id, reminder_minutes, services, price_cents`,
+                 contact_id, reminder_minutes, services, price_cents,
+                 company_id, created_by, sales_user_ids, worker_user_ids, finished_at, finished_by`,
       [
-        req.params.id, req.userId, title, start, end,
+        req.params.id, req.userId, req.companyId, title, start, end,
         color || '#3478F6', notes || null, contact_id || null,
         JSON.stringify(reminder_minutes || []),
         JSON.stringify(services || []),
-        Number.isFinite(Number(price_cents)) ? Number(price_cents) : null
+        Number.isFinite(Number(price_cents)) ? Number(price_cents) : null,
+        JSON.stringify(salesIDs),
+        JSON.stringify(workerIDs),
+        finished_at || null,
+        finished_by || null
       ]
     );
     res.json(r.rows[0]);
@@ -1171,8 +1252,13 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
 
 app.delete("/api/schedule/:id", authRequired, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM schedule_events WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]);
+    if (req.companyId) {
+      await pool.query(`DELETE FROM schedule_events WHERE id = $1 AND company_id = $2`,
+        [req.params.id, req.companyId]);
+    } else {
+      await pool.query(`DELETE FROM schedule_events WHERE id = $1 AND user_id = $2`,
+        [req.params.id, req.userId]);
+    }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_schedule" }); }
 });
