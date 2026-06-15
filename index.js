@@ -3,6 +3,8 @@ import express from "express";
 import cors from "cors";
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import pkg from "pg";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const { Pool } = pkg;
 const app = express();
@@ -19,6 +21,34 @@ const pool = new Pool({
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+
+const mediaBucketConfig = () => {
+  const endpoint = process.env.MEDIA_ENDPOINT || process.env.AWS_ENDPOINT_URL;
+  const bucket = process.env.MEDIA_BUCKET || process.env.AWS_S3_BUCKET_NAME;
+  const region = process.env.MEDIA_REGION || process.env.AWS_DEFAULT_REGION || "auto";
+  const accessKeyId = process.env.MEDIA_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.MEDIA_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY;
+  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
+  return { endpoint, bucket, region, accessKeyId, secretAccessKey };
+};
+
+let mediaS3Client = null;
+const getMediaS3Client = () => {
+  const cfg = mediaBucketConfig();
+  if (!cfg) return null;
+  if (!mediaS3Client) {
+    mediaS3Client = new S3Client({
+      endpoint: cfg.endpoint,
+      region: cfg.region,
+      forcePathStyle: true,
+      credentials: {
+        accessKeyId: cfg.accessKeyId,
+        secretAccessKey: cfg.secretAccessKey
+      }
+    });
+  }
+  return mediaS3Client;
+};
 
 // ---------- helpers ----------
 const nowIso = () => new Date().toISOString();
@@ -966,6 +996,55 @@ app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
     await pool.query(`UPDATE notifications SET read_at = now() WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
     res.json({ ok: true });
   } catch (e) { console.error(e); res.status(500).json({ error: "notification_read_failed" }); }
+});
+
+app.post("/api/internal/media/upload-url", authRequired, async (req, res) => {
+  try {
+    const cfg = mediaBucketConfig();
+    const s3 = getMediaS3Client();
+    if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured" });
+
+    const kind = ["photo", "video", "file"].includes(req.body.kind) ? req.body.kind : "file";
+    const fileName = (req.body.file_name || "upload").toString().replace(/[^\w.\- ]+/g, "_").slice(0, 160);
+    const mimeType = (req.body.mime_type || "application/octet-stream").toString().slice(0, 120);
+    const byteSize = Number(req.body.byte_size || 0);
+    if (!Number.isFinite(byteSize) || byteSize <= 0) return res.status(400).json({ error: "invalid_file_size" });
+    if (byteSize > 200 * 1024 * 1024) return res.status(413).json({ error: "file_too_large" });
+
+    const scope = req.companyId || req.userId;
+    const objectKey = `companies/${scope}/messages/${new Date().toISOString().slice(0, 10)}/${randomUUID()}-${fileName}`;
+    const command = new PutObjectCommand({
+      Bucket: cfg.bucket,
+      Key: objectKey,
+      ContentType: mimeType
+    });
+    const upload_url = await getSignedUrl(s3, command, { expiresIn: 900 });
+    res.json({
+      object_key: objectKey,
+      upload_url,
+      kind,
+      file_name: fileName,
+      mime_type: mimeType,
+      byte_size: byteSize
+    });
+  } catch (e) { console.error(e); res.status(500).json({ error: "media_upload_url_failed" }); }
+});
+
+app.get("/api/internal/media/download-url", authRequired, async (req, res) => {
+  try {
+    const cfg = mediaBucketConfig();
+    const s3 = getMediaS3Client();
+    if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured" });
+
+    const objectKey = (req.query.object_key || "").toString();
+    const scope = req.companyId || req.userId;
+    if (!objectKey.startsWith(`companies/${scope}/messages/`)) {
+      return res.status(403).json({ error: "media_forbidden" });
+    }
+    const command = new GetObjectCommand({ Bucket: cfg.bucket, Key: objectKey });
+    const download_url = await getSignedUrl(s3, command, { expiresIn: 900 });
+    res.json({ download_url });
+  } catch (e) { console.error(e); res.status(500).json({ error: "media_download_url_failed" }); }
 });
 
 app.get("/api/internal/conversations", authRequired, async (req, res) => {
