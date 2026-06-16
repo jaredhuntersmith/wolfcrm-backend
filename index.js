@@ -358,6 +358,8 @@ async function bootstrap() {
       note TEXT,
       created_by UUID REFERENCES users(id),
       updated_by UUID REFERENCES users(id),
+      manual_entry BOOLEAN NOT NULL DEFAULT false,
+      manual_status TEXT NOT NULL DEFAULT 'approved',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -446,6 +448,8 @@ async function bootstrap() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;
+    ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS manual_entry BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS manual_status TEXT NOT NULL DEFAULT 'approved';
     ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS contact_id TEXT;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_data_url TEXT;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS website TEXT;
@@ -1038,7 +1042,18 @@ function weekRangeFromQuery(req) {
 function entrySelect(prefix = "e") {
   return `${prefix}.id, ${prefix}.user_id, u.email AS user_email, ${prefix}.company_id,
           ${prefix}.start_at, ${prefix}.end_at, ${prefix}.note,
+          ${prefix}.manual_entry, ${prefix}.manual_status,
           ${prefix}.created_at, ${prefix}.updated_at`;
+}
+
+function canEmployeeChangeTimeEntry(start, now = new Date()) {
+  const weekStart = new Date(start);
+  weekStart.setUTCHours(0, 0, 0, 0);
+  const weekday = weekStart.getUTCDay();
+  weekStart.setUTCDate(weekStart.getUTCDate() - weekday);
+  const cutoff = new Date(weekStart.getTime() + 9 * 24 * 60 * 60 * 1000);
+  cutoff.setUTCHours(0, 0, 0, 0);
+  return now < cutoff;
 }
 
 // ---------- INTERNAL MESSAGING ----------
@@ -1376,7 +1391,7 @@ app.get("/api/time-clock/me", authRequired, async (req, res) => {
       `SELECT ${entrySelect("e")}
          FROM time_clock_entries e
          JOIN users u ON u.id = e.user_id
-        WHERE e.user_id = $1 AND e.end_at IS NULL
+        WHERE e.user_id = $1 AND e.end_at IS NULL AND e.manual_status <> 'disapproved'
         ORDER BY e.start_at DESC LIMIT 1`,
       [req.userId]
     );
@@ -1384,7 +1399,7 @@ app.get("/api/time-clock/me", authRequired, async (req, res) => {
       `SELECT ${entrySelect("e")}
          FROM time_clock_entries e
          JOIN users u ON u.id = e.user_id
-        WHERE e.user_id = $1 AND e.start_at >= $2 AND e.start_at < $3
+        WHERE e.user_id = $1 AND e.start_at >= $2 AND e.start_at < $3 AND e.manual_status <> 'disapproved'
         ORDER BY e.start_at DESC`,
       [req.userId, range.start.toISOString(), range.end.toISOString()]
     );
@@ -1401,6 +1416,7 @@ app.post("/api/time-clock/clock-in", authRequired, async (req, res) => {
     if (existing.rowCount) return res.status(409).json({ error: "already_clocked_in" });
     const start = req.body.start_at ? new Date(req.body.start_at) : new Date();
     if (Number.isNaN(start.getTime())) return res.status(400).json({ error: "invalid_start" });
+    if (start > new Date()) return res.status(400).json({ error: "future_time_not_allowed" });
     const note = req.body.note || null;
     const { rows } = await pool.query(
       `INSERT INTO time_clock_entries(id, user_id, company_id, start_at, note, created_by, updated_by)
@@ -1416,6 +1432,7 @@ app.post("/api/time-clock/clock-out", authRequired, async (req, res) => {
   try {
     const end = req.body.end_at ? new Date(req.body.end_at) : new Date();
     if (Number.isNaN(end.getTime())) return res.status(400).json({ error: "invalid_end" });
+    if (end > new Date()) return res.status(400).json({ error: "future_time_not_allowed" });
     const { rows } = await pool.query(
       `UPDATE time_clock_entries
           SET end_at = $3, updated_by = $2, updated_at = now()
@@ -1444,7 +1461,7 @@ app.get("/api/time-clock/company", authRequired, requireEmployer, async (req, re
       `SELECT ${entrySelect("e")}
          FROM time_clock_entries e
          JOIN users u ON u.id = e.user_id
-        WHERE e.company_id = $1 AND e.start_at >= $2 AND e.start_at < $3
+        WHERE e.company_id = $1 AND e.start_at >= $2 AND e.start_at < $3 AND e.manual_status <> 'disapproved'
         ORDER BY u.email ASC, e.start_at DESC`,
       [req.companyId, range.start.toISOString(), range.end.toISOString()]
     );
@@ -1467,7 +1484,7 @@ app.get("/api/time-clock/range", authRequired, requireEmployer, async (req, res)
       `SELECT ${entrySelect("e")}
          FROM time_clock_entries e
          JOIN users u ON u.id = e.user_id
-        WHERE e.company_id = $1 AND e.start_at >= $2 AND e.start_at < $3
+        WHERE e.company_id = $1 AND e.start_at >= $2 AND e.start_at < $3 AND e.manual_status <> 'disapproved'
         ORDER BY u.email ASC, e.start_at DESC`,
       [req.companyId, start.toISOString(), end.toISOString()]
     );
@@ -1475,27 +1492,107 @@ app.get("/api/time-clock/range", authRequired, requireEmployer, async (req, res)
   } catch (e) { console.error(e); res.status(500).json({ error: "time_range_failed" }); }
 });
 
-app.patch("/api/time-clock/entries/:id", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/time-clock/entries", authRequired, async (req, res) => {
+  try {
+    const start = new Date(req.body.start_at);
+    const end = req.body.end_at ? new Date(req.body.end_at) : null;
+    if (Number.isNaN(start.getTime()) || !end || Number.isNaN(end.getTime()) || end <= start) {
+      return res.status(400).json({ error: "invalid_dates" });
+    }
+    if (start > new Date() || end > new Date()) return res.status(400).json({ error: "future_time_not_allowed" });
+    if (req.role !== "employer" && !canEmployeeChangeTimeEntry(start)) {
+      return res.status(403).json({ error: "Cannot change previous week time cards at this Time" });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO time_clock_entries(id, user_id, company_id, start_at, end_at, note, created_by, updated_by, manual_entry, manual_status)
+       VALUES($1,$2,$3,$4,$5,$6,$2,$2,true,'approved')
+       RETURNING *`,
+      [randomUUID(), req.userId, req.companyId, start.toISOString(), end.toISOString(), req.body.note || "Manual employee entry"]
+    );
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_create_failed" }); }
+});
+
+app.patch("/api/time-clock/entries/:id", authRequired, async (req, res) => {
   try {
     const start = new Date(req.body.start_at);
     const end = req.body.end_at ? new Date(req.body.end_at) : null;
     if (Number.isNaN(start.getTime()) || (end && Number.isNaN(end.getTime()))) {
       return res.status(400).json({ error: "invalid_dates" });
     }
+    if (start > new Date() || (end && end > new Date())) return res.status(400).json({ error: "future_time_not_allowed" });
+    if (req.role !== "employer" && !canEmployeeChangeTimeEntry(start)) {
+      return res.status(403).json({ error: "Cannot change previous week time cards at this Time" });
+    }
+    const ownerClause = req.role === "employer"
+      ? `id = $1 AND company_id = $6`
+      : `id = $1 AND user_id = $2`;
     const { rows } = await pool.query(
       `UPDATE time_clock_entries
           SET start_at = $3,
               end_at = $4,
               note = $5,
               updated_by = $2,
+              manual_entry = CASE WHEN user_id = $2 THEN true ELSE manual_entry END,
+              manual_status = CASE WHEN user_id = $2 THEN 'approved' ELSE manual_status END,
               updated_at = now()
-        WHERE id = $1 AND company_id = $6
+        WHERE ${ownerClause}
         RETURNING *`,
       [req.params.id, req.userId, start.toISOString(), end ? end.toISOString() : null, req.body.note || null, req.companyId]
     );
     if (!rows.length) return res.status(404).json({ error: "entry_not_found" });
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_update_failed" }); }
+});
+
+app.delete("/api/time-clock/entries/:id", authRequired, async (req, res) => {
+  try {
+    const existing = await pool.query(`SELECT start_at FROM time_clock_entries WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    if (req.role !== "employer") {
+      if (!existing.rowCount) return res.status(404).json({ error: "entry_not_found" });
+      if (!canEmployeeChangeTimeEntry(existing.rows[0].start_at)) {
+        return res.status(403).json({ error: "Cannot change previous week time cards at this Time" });
+      }
+    }
+    const { rowCount } = await pool.query(
+      req.role === "employer"
+        ? `DELETE FROM time_clock_entries WHERE id = $1 AND company_id = $2`
+        : `DELETE FROM time_clock_entries WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.role === "employer" ? req.companyId : req.userId]
+    );
+    if (!rowCount) return res.status(404).json({ error: "entry_not_found" });
+    res.status(204).end();
+  } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_delete_failed" }); }
+});
+
+app.get("/api/time-clock/manual-entries", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT ${entrySelect("e")}
+         FROM time_clock_entries e
+         JOIN users u ON u.id = e.user_id
+        WHERE e.company_id = $1 AND e.manual_entry = true
+        ORDER BY e.updated_at DESC
+        LIMIT 200`,
+      [req.companyId]
+    );
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "manual_entries_failed" }); }
+});
+
+app.post("/api/time-clock/manual-entries/:id/:status", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const status = req.params.status === "disapproved" ? "disapproved" : "approved";
+    const { rows } = await pool.query(
+      `UPDATE time_clock_entries
+          SET manual_status = $3, updated_by = $2, updated_at = now()
+        WHERE id = $1 AND company_id = $4 AND manual_entry = true
+        RETURNING *`,
+      [req.params.id, req.userId, status, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "entry_not_found" });
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "manual_entry_status_failed" }); }
 });
 
 // ---------- contacts (AUTH REQUIRED + USER-SCOPED) ----------
