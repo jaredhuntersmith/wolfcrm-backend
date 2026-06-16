@@ -452,6 +452,7 @@ async function bootstrap() {
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS service_items JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS material_cost_cents INTEGER;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS created_by UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS sales_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
@@ -1448,6 +1449,29 @@ app.get("/api/time-clock/company", authRequired, requireEmployer, async (req, re
   } catch (e) { console.error(e); res.status(500).json({ error: "time_company_failed" }); }
 });
 
+app.get("/api/time-clock/range", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const start = new Date(req.query.start);
+    const end = new Date(req.query.end);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start >= end) {
+      return res.status(400).json({ error: "invalid_range" });
+    }
+    const employees = await pool.query(
+      `SELECT id, email, role FROM users WHERE company_id = $1 ORDER BY email ASC`,
+      [req.companyId]
+    );
+    const entries = await pool.query(
+      `SELECT ${entrySelect("e")}
+         FROM time_clock_entries e
+         JOIN users u ON u.id = e.user_id
+        WHERE e.company_id = $1 AND e.start_at >= $2 AND e.start_at < $3
+        ORDER BY u.email ASC, e.start_at DESC`,
+      [req.companyId, start.toISOString(), end.toISOString()]
+    );
+    res.json({ employees: employees.rows, entries: entries.rows });
+  } catch (e) { console.error(e); res.status(500).json({ error: "time_range_failed" }); }
+});
+
 app.patch("/api/time-clock/entries/:id", authRequired, requireEmployer, async (req, res) => {
   try {
     const start = new Date(req.body.start_at);
@@ -1712,7 +1736,7 @@ app.get("/api/schedule", authRequired, async (req, res) => {
       : { sql: `user_id = $1`, values: [req.userId] };
     const { rows } = await pool.query(
       `SELECT id, title, start_at AS start, end_at AS "end", color, notes,
-              contact_id, reminder_minutes, services, service_items, price_cents,
+              contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
               company_id, created_by, sales_user_ids, worker_user_ids, finished_at, finished_by
        FROM schedule_events WHERE ${where.sql} ORDER BY start_at ASC`,
       where.values
@@ -1723,7 +1747,7 @@ app.get("/api/schedule", authRequired, async (req, res) => {
 
 app.put("/api/schedule/:id", authRequired, async (req, res) => {
   const {
-    title, start, end, color, notes, contact_id, reminder_minutes, services, service_items, price_cents,
+    title, start, end, color, notes, contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
     sales_user_ids, worker_user_ids, finished_at, finished_by
   } = req.body || {};
   if (!title || !start || !end) return res.status(400).json({ error: "missing_params" });
@@ -1740,8 +1764,8 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
     const r = await pool.query(
       `INSERT INTO schedule_events
         (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id,
-         reminder_minutes, services, service_items, price_cents, sales_user_ids, worker_user_ids, finished_at, finished_by)
-       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14::jsonb, $15::jsonb, $16, $17)
+         reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, finished_at, finished_by)
+       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14, $15::jsonb, $16::jsonb, $17, $18)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              start_at = EXCLUDED.start_at,
@@ -1753,6 +1777,7 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
              services = EXCLUDED.services,
              service_items = EXCLUDED.service_items,
              price_cents = EXCLUDED.price_cents,
+             material_cost_cents = EXCLUDED.material_cost_cents,
              company_id = EXCLUDED.company_id,
              sales_user_ids = EXCLUDED.sales_user_ids,
              worker_user_ids = EXCLUDED.worker_user_ids,
@@ -1761,7 +1786,7 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
              updated_at = now()
        WHERE schedule_events.user_id = $2 OR schedule_events.company_id = $3
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
-                 contact_id, reminder_minutes, services, price_cents,
+                 contact_id, reminder_minutes, services, price_cents, material_cost_cents,
                  service_items, company_id, created_by, sales_user_ids, worker_user_ids, finished_at, finished_by`,
       [
         req.params.id, req.userId, req.companyId, title, start, end,
@@ -1770,6 +1795,7 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
         JSON.stringify(services || []),
         JSON.stringify(Array.isArray(service_items) ? service_items : []),
         Number.isFinite(Number(price_cents)) ? Number(price_cents) : null,
+        Number.isFinite(Number(material_cost_cents)) ? Number(material_cost_cents) : null,
         JSON.stringify(salesIDs),
         JSON.stringify(workerIDs),
         finished_at || null,
