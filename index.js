@@ -263,6 +263,7 @@ async function bootstrap() {
       status TEXT NOT NULL DEFAULT 'lead',
       phone TEXT,
       email TEXT,
+      contact_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -445,6 +446,7 @@ async function bootstrap() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;
+    ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS contact_id TEXT;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_data_url TEXT;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS website TEXT;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS address TEXT;
@@ -1839,7 +1841,7 @@ app.get("/api/map-pins", authRequired, async (req, res) => {
       : { sql: `p.user_id = $1`, values: [req.userId] };
     const { rows } = await pool.query(
       `SELECT p.id, p.user_id, p.latitude, p.longitude, p.name, p.address, p.notes,
-              p.status, p.phone, p.email, p.created_at,
+              p.status, p.phone, p.email, p.contact_id, p.created_at,
               COALESCE(NULLIF(u.display_name, ''), u.email) AS owner_name
          FROM map_pins p
          JOIN users u ON u.id = p.user_id
@@ -1852,7 +1854,7 @@ app.get("/api/map-pins", authRequired, async (req, res) => {
 });
 
 app.put("/api/map-pins/:id", authRequired, async (req, res) => {
-  const { latitude, longitude, name, address, notes, status, phone, email, created_at } = req.body || {};
+  const { latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at } = req.body || {};
   if (typeof latitude !== "number" || typeof longitude !== "number") {
     return res.status(400).json({ error: "missing_coords" });
   }
@@ -1872,8 +1874,8 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
       ownerUserId = row.user_id;
     }
     const r = await pool.query(
-      `INSERT INTO map_pins (id, user_id, latitude, longitude, name, address, notes, status, phone, email, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::timestamptz, now()))
+      `INSERT INTO map_pins (id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()))
        ON CONFLICT (id) DO UPDATE
          SET latitude = EXCLUDED.latitude,
              longitude = EXCLUDED.longitude,
@@ -1883,12 +1885,13 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
              status = EXCLUDED.status,
              phone = EXCLUDED.phone,
              email = EXCLUDED.email,
+             contact_id = EXCLUDED.contact_id,
              updated_at = now()
-      RETURNING id, user_id, latitude, longitude, name, address, notes, status, phone, email, created_at`,
+       RETURNING id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at`,
       [
         req.params.id, ownerUserId, latitude, longitude,
         name || '', address || '', notes || '', status || 'lead',
-        phone || null, email || null, created_at || null
+        phone || null, email || null, contact_id || null, created_at || null
       ]
     );
     res.json(r.rows[0]);
