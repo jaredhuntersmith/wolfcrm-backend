@@ -267,6 +267,7 @@ async function bootstrap() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS map_pins_user_idx ON map_pins(user_id);
+    CREATE INDEX IF NOT EXISTS map_pins_user_created_idx ON map_pins(user_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS measurements (
       id TEXT PRIMARY KEY,
@@ -1832,10 +1833,19 @@ app.delete("/api/schedule/:id", authRequired, async (req, res) => {
 // ---------- MAP PINS ----------
 app.get("/api/map-pins", authRequired, async (req, res) => {
   try {
+    const companyScope = req.query.scope === "company" && req.companyId;
+    const where = companyScope
+      ? { sql: `u.company_id = $1`, values: [req.companyId] }
+      : { sql: `p.user_id = $1`, values: [req.userId] };
     const { rows } = await pool.query(
-      `SELECT id, latitude, longitude, name, address, notes, status, phone, email, created_at
-       FROM map_pins WHERE user_id = $1`,
-      [req.userId]
+      `SELECT p.id, p.user_id, p.latitude, p.longitude, p.name, p.address, p.notes,
+              p.status, p.phone, p.email, p.created_at,
+              COALESCE(NULLIF(u.display_name, ''), u.email) AS owner_name
+         FROM map_pins p
+         JOIN users u ON u.id = p.user_id
+        WHERE ${where.sql}
+        ORDER BY p.created_at DESC`,
+      where.values
     );
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_pins" }); }
@@ -1847,6 +1857,20 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
     return res.status(400).json({ error: "missing_coords" });
   }
   try {
+    const existing = await pool.query(
+      `SELECT p.user_id, u.company_id
+         FROM map_pins p
+         JOIN users u ON u.id = p.user_id
+        WHERE p.id = $1`,
+      [req.params.id]
+    );
+    let ownerUserId = req.userId;
+    if (existing.rowCount) {
+      const row = existing.rows[0];
+      const canEdit = row.user_id === req.userId || (req.role === "employer" && row.company_id === req.companyId);
+      if (!canEdit) return res.status(403).json({ error: "pin_owner_required" });
+      ownerUserId = row.user_id;
+    }
     const r = await pool.query(
       `INSERT INTO map_pins (id, user_id, latitude, longitude, name, address, notes, status, phone, email, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::timestamptz, now()))
@@ -1860,10 +1884,9 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
              phone = EXCLUDED.phone,
              email = EXCLUDED.email,
              updated_at = now()
-       WHERE map_pins.user_id = $2
-       RETURNING id, latitude, longitude, name, address, notes, status, phone, email, created_at`,
+      RETURNING id, user_id, latitude, longitude, name, address, notes, status, phone, email, created_at`,
       [
-        req.params.id, req.userId, latitude, longitude,
+        req.params.id, ownerUserId, latitude, longitude,
         name || '', address || '', notes || '', status || 'lead',
         phone || null, email || null, created_at || null
       ]
@@ -1874,8 +1897,14 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
 
 app.delete("/api/map-pins/:id", authRequired, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM map_pins WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]);
+    await pool.query(
+      `DELETE FROM map_pins p
+        USING users u
+        WHERE p.id = $1
+          AND u.id = p.user_id
+          AND (p.user_id = $2 OR ($3 = 'employer' AND u.company_id = $4))`,
+      [req.params.id, req.userId, req.role, req.companyId]
+    );
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_pin" }); }
 });
