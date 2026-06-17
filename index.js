@@ -1469,12 +1469,25 @@ app.get("/api/time-clock/company", authRequired, requireEmployer, async (req, re
   } catch (e) { console.error(e); res.status(500).json({ error: "time_company_failed" }); }
 });
 
-app.get("/api/time-clock/range", authRequired, requireEmployer, async (req, res) => {
+app.get("/api/time-clock/range", authRequired, async (req, res) => {
   try {
     const start = new Date(req.query.start);
     const end = new Date(req.query.end);
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start >= end) {
       return res.status(400).json({ error: "invalid_range" });
+    }
+    if (req.role !== "employer") {
+      const entries = await pool.query(
+        `SELECT ${entrySelect("e")}
+           FROM time_clock_entries e
+          WHERE e.user_id = $1 AND e.start_at >= $2 AND e.start_at < $3 AND e.manual_status <> 'disapproved'
+          ORDER BY e.start_at DESC`,
+        [req.userId, start.toISOString(), end.toISOString()]
+      );
+      return res.json({
+        employees: [{ id: req.userId, email: req.userEmail, role: req.role }],
+        entries: entries.rows
+      });
     }
     const employees = await pool.query(
       `SELECT id, email, role FROM users WHERE company_id = $1 ORDER BY email ASC`,
@@ -1907,7 +1920,7 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
       addedWorkers,
       req.companyId,
       "job_assignment",
-      "Assigned to job",
+      "New Job Assigned to You",
       title,
       { schedule_event_id: req.params.id },
       req.userId
