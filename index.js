@@ -180,6 +180,7 @@ async function bootstrap() {
     CREATE TABLE IF NOT EXISTS contacts (
       id UUID PRIMARY KEY,
       -- We'll add user_id below if missing
+      company_id UUID,
       name TEXT NOT NULL,
       phone TEXT,
       email TEXT,
@@ -448,8 +449,11 @@ async function bootstrap() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS notify_all_members_on_jobs BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS manual_entry BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS manual_status TEXT NOT NULL DEFAULT 'approved';
+    ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS break_seconds INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS break_started_at TIMESTAMPTZ;
     ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS contact_id TEXT;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_data_url TEXT;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS website TEXT;
@@ -474,6 +478,7 @@ async function bootstrap() {
 
   // Ensure user_id column exists
   await pool.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS user_id UUID;`);
+  await pool.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS company_id UUID;`);
 
   // Ensure owner user exists (from env) and backfill any NULL user_id rows to this owner
   const ownerEmail = (process.env.OWNER_EMAIL || "").trim().toLowerCase();
@@ -517,6 +522,17 @@ async function bootstrap() {
   } else {
     console.warn("[bootstrap] OWNER_EMAIL not set; skipping contacts backfill/enforcement");
   }
+
+  await pool.query(`
+    UPDATE contacts c
+       SET company_id = u.company_id
+      FROM users u
+     WHERE c.user_id = u.id
+       AND c.company_id IS NULL;
+
+    CREATE INDEX IF NOT EXISTS contacts_company_updated_idx
+      ON contacts(company_id, updated_at DESC);
+  `);
 
   console.log(`[bootstrap] DB ready @ ${nowIso()}`);
 }
@@ -924,7 +940,7 @@ app.get("/api/company/users", authRequired, async (req, res) => {
 app.get("/api/company/settings", authRequired, requireEmployer, async (req, res) => {
   try {
     const company = await pool.query(
-      `SELECT id, name, join_code, logo_data_url, website, address, phone, email
+      `SELECT id, name, join_code, logo_data_url, website, address, phone, email, notify_all_members_on_jobs
          FROM companies WHERE id = $1`,
       [req.companyId]
     );
@@ -973,11 +989,29 @@ app.patch("/api/company/invoice-settings", authRequired, requireEmployer, async 
   }
 });
 
+app.patch("/api/company/job-notification-settings", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const notifyAll = !!req.body.notify_all_members_on_jobs;
+    const { rows } = await pool.query(
+      `UPDATE companies
+          SET notify_all_members_on_jobs = $2,
+              updated_at = now()
+        WHERE id = $1
+        RETURNING id, name, join_code, logo_data_url, website, address, phone, email, notify_all_members_on_jobs`,
+      [req.companyId, notifyAll]
+    );
+    res.json({ company: rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "job_notification_settings_update_failed" });
+  }
+});
+
 app.get("/api/company/invoice-settings", authRequired, async (req, res) => {
   try {
     if (!req.companyId) return res.status(404).json({ error: "company_not_found" });
     const { rows } = await pool.query(
-      `SELECT id, name, join_code, logo_data_url, website, address, phone, email
+      `SELECT id, name, join_code, logo_data_url, website, address, phone, email, notify_all_members_on_jobs
          FROM companies WHERE id = $1`,
       [req.companyId]
     );
@@ -1043,6 +1077,7 @@ function entrySelect(prefix = "e") {
   return `${prefix}.id, ${prefix}.user_id, u.email AS user_email, ${prefix}.company_id,
           ${prefix}.start_at, ${prefix}.end_at, ${prefix}.note,
           ${prefix}.manual_entry, ${prefix}.manual_status,
+          ${prefix}.break_seconds, ${prefix}.break_started_at,
           ${prefix}.created_at, ${prefix}.updated_at`;
 }
 
@@ -1435,7 +1470,14 @@ app.post("/api/time-clock/clock-out", authRequired, async (req, res) => {
     if (end > new Date()) return res.status(400).json({ error: "future_time_not_allowed" });
     const { rows } = await pool.query(
       `UPDATE time_clock_entries
-          SET end_at = $3, updated_by = $2, updated_at = now()
+          SET end_at = $3,
+              break_seconds = break_seconds + CASE
+                WHEN break_started_at IS NULL THEN 0
+                ELSE GREATEST(0, EXTRACT(EPOCH FROM ($3::timestamptz - break_started_at))::integer)
+              END,
+              break_started_at = NULL,
+              updated_by = $2,
+              updated_at = now()
         WHERE id = (
           SELECT id FROM time_clock_entries
           WHERE user_id = $1 AND end_at IS NULL
@@ -1447,6 +1489,47 @@ app.post("/api/time-clock/clock-out", authRequired, async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "not_clocked_in" });
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "clock_out_failed" }); }
+});
+
+app.post("/api/time-clock/break-start", authRequired, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE time_clock_entries
+          SET break_started_at = COALESCE(break_started_at, now()),
+              updated_by = $2,
+              updated_at = now()
+        WHERE id = (
+          SELECT id FROM time_clock_entries
+          WHERE user_id = $1 AND end_at IS NULL
+          ORDER BY start_at DESC LIMIT 1
+        )
+        RETURNING *`,
+      [req.userId, req.userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "not_clocked_in" });
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "break_start_failed" }); }
+});
+
+app.post("/api/time-clock/break-end", authRequired, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE time_clock_entries
+          SET break_seconds = break_seconds + GREATEST(0, EXTRACT(EPOCH FROM (now() - break_started_at))::integer),
+              break_started_at = NULL,
+              updated_by = $2,
+              updated_at = now()
+        WHERE id = (
+          SELECT id FROM time_clock_entries
+          WHERE user_id = $1 AND end_at IS NULL AND break_started_at IS NOT NULL
+          ORDER BY start_at DESC LIMIT 1
+        )
+        RETURNING *`,
+      [req.userId, req.userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "not_on_break" });
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "break_end_failed" }); }
 });
 
 app.get("/api/time-clock/company", authRequired, requireEmployer, async (req, res) => {
@@ -1608,17 +1691,25 @@ app.post("/api/time-clock/manual-entries/:id/:status", authRequired, requireEmpl
   } catch (e) { console.error(e); res.status(500).json({ error: "manual_entry_status_failed" }); }
 });
 
-// ---------- contacts (AUTH REQUIRED + USER-SCOPED) ----------
+function companyOrUserContactWhere(req, alias = "") {
+  const p = alias ? `${alias}.` : "";
+  return req.companyId
+    ? { sql: `${p}company_id = $1`, values: [req.companyId] }
+    : { sql: `${p}user_id = $1`, values: [req.userId] };
+}
+
+// ---------- contacts (AUTH REQUIRED + COMPANY-SCOPED) ----------
 app.get("/api/contacts", authRequired, async (req, res) => {
   const q = (req.query.q || "").toString().trim();
   try {
+    const scope = companyOrUserContactWhere(req);
     let rows;
     if (q) {
       rows = (
         await pool.query(
           `
           SELECT * FROM contacts
-          WHERE user_id = $1
+          WHERE ${scope.sql}
             AND (name ILIKE $2 OR COALESCE(phone,'') ILIKE $2 OR COALESCE(email,'') ILIKE $2
                  OR COALESCE(address,'') ILIKE $2 OR COALESCE(job_type,'') ILIKE $2
                  OR COALESCE(u1,'') ILIKE $2 OR COALESCE(u2,'') ILIKE $2
@@ -1626,14 +1717,14 @@ app.get("/api/contacts", authRequired, async (req, res) => {
                  OR COALESCE(u5,'') ILIKE $2)
           ORDER BY updated_at DESC
         `,
-          [req.userId, `%${q}%`]
+          [...scope.values, `%${q}%`]
         )
       ).rows;
     } else {
       rows = (
         await pool.query(
-          `SELECT * FROM contacts WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 200`,
-          [req.userId]
+          `SELECT * FROM contacts WHERE ${scope.sql} ORDER BY updated_at DESC LIMIT 200`,
+          scope.values
         )
       ).rows;
     }
@@ -1646,9 +1737,10 @@ app.get("/api/contacts", authRequired, async (req, res) => {
 
 app.get("/api/contacts/:id", authRequired, async (req, res) => {
   try {
+    const scope = companyOrUserContactWhere(req);
     const { rows } = await pool.query(
-      `SELECT * FROM contacts WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]
+      `SELECT * FROM contacts WHERE id = $1 AND ${scope.sql.replace("$1", "$2")}`,
+      [req.params.id, ...scope.values]
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
     res.json(rows[0]);
@@ -1671,13 +1763,13 @@ app.post("/api/contacts", authRequired, async (req, res) => {
     const r = await pool.query(
       `
       INSERT INTO contacts (
-        id, user_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5
+        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
       ) RETURNING *;
       `,
       [
-        id, req.userId, name || "", phone || "", email || "", address || "",
+        id, req.userId, req.companyId, name || "", phone || "", email || "", address || "",
         Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
         lat ?? null, lng ?? null, tags || "", job_type || "",
         u1 || "", u2 || "", u3 || "", u4 || "", u5 || ""
@@ -1697,31 +1789,32 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
     u1, u2, u3, u4, u5
   } = req.body || {};
   try {
+    const scope = companyOrUserContactWhere(req);
     const r = await pool.query(
       `
       UPDATE contacts SET
-        name = COALESCE($3,name),
-        phone = COALESCE($4,phone),
-        email = COALESCE($5,email),
-        address = COALESCE($6,address),
-        value_cents = COALESCE($7,value_cents),
-        lat = COALESCE($8,lat),
-        lng = COALESCE($9,lng),
-        tags = COALESCE($10,tags),
-        job_type = COALESCE($11,job_type),
-        u1 = COALESCE($12,u1),
-        u2 = COALESCE($13,u2),
-        u3 = COALESCE($14,u3),
-        u4 = COALESCE($15,u4),
-        u5 = COALESCE($16,u5)
-      WHERE id = $1 AND user_id = $2
+        name = COALESCE($2,name),
+        phone = COALESCE($3,phone),
+        email = COALESCE($4,email),
+        address = COALESCE($5,address),
+        value_cents = COALESCE($6,value_cents),
+        lat = COALESCE($7,lat),
+        lng = COALESCE($8,lng),
+        tags = COALESCE($9,tags),
+        job_type = COALESCE($10,job_type),
+        u1 = COALESCE($11,u1),
+        u2 = COALESCE($12,u2),
+        u3 = COALESCE($13,u3),
+        u4 = COALESCE($14,u4),
+        u5 = COALESCE($15,u5)
+      WHERE id = $1 AND ${scope.sql.replace("$1", "$16")}
       RETURNING *;
       `,
       [
-        req.params.id, req.userId,
-        name, phone, email, address,
+        req.params.id, name, phone, email, address,
         Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
-        lat ?? null, lng ?? null, tags, job_type, u1, u2, u3, u4, u5
+        lat ?? null, lng ?? null, tags, job_type, u1, u2, u3, u4, u5,
+        ...scope.values
       ]
     );
     if (!r.rowCount) return res.status(404).json({ error: "not_found" });
@@ -1737,19 +1830,20 @@ app.delete("/api/contacts/:id", authRequired, async (req, res) => {
     if (!req.permissions.canDeleteContacts) {
       return res.status(403).json({ error: "permission_denied" });
     }
+    const scope = companyOrUserContactWhere(req);
     await pool.query(
       `UPDATE schedule_events
        SET contact_id = NULL, updated_at = now()
-       WHERE contact_id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]
+       WHERE contact_id = $1 AND ${req.companyId ? "company_id = $2" : "user_id = $2"}`,
+      [req.params.id, req.companyId || req.userId]
     );
     await pool.query(
-      `DELETE FROM opportunities WHERE contact_id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]
+      `DELETE FROM opportunities WHERE contact_id = $1 AND user_id IN (SELECT id FROM users WHERE ${req.companyId ? "company_id = $2" : "id = $2"})`,
+      [req.params.id, req.companyId || req.userId]
     );
     const r = await pool.query(
-      `DELETE FROM contacts WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]
+      `DELETE FROM contacts WHERE id = $1 AND ${scope.sql.replace("$1", "$2")}`,
+      [req.params.id, ...scope.values]
     );
     res.status(204).end();
   } catch (e) {
@@ -1874,6 +1968,7 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
     const oldWorkerIDs = previous.rows.length && Array.isArray(previous.rows[0].worker_user_ids)
       ? previous.rows[0].worker_user_ids
       : [];
+    const isNewJob = previous.rowCount === 0;
     const r = await pool.query(
       `INSERT INTO schedule_events
         (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id,
@@ -1925,6 +2020,27 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
       { schedule_event_id: req.params.id },
       req.userId
     );
+    if (isNewJob && req.companyId) {
+      const setting = await pool.query(
+        `SELECT notify_all_members_on_jobs FROM companies WHERE id = $1`,
+        [req.companyId]
+      );
+      if (setting.rows[0]?.notify_all_members_on_jobs) {
+        const members = await pool.query(
+          `SELECT id FROM users WHERE company_id = $1`,
+          [req.companyId]
+        );
+        await notifyMany(
+          members.rows.map((m) => m.id),
+          req.companyId,
+          "job_scheduled",
+          "New Job Scheduled",
+          title,
+          { schedule_event_id: req.params.id },
+          req.userId
+        );
+      }
+    }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_schedule" }); }
 });
@@ -1940,6 +2056,45 @@ app.delete("/api/schedule/:id", authRequired, async (req, res) => {
     }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_schedule" }); }
+});
+
+app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
+  try {
+    const range = statsRange("week", req.query.date);
+    if (!range) return res.status(400).json({ error: "invalid_range" });
+    const requestedUser = (req.query.user_id || "").toString();
+    const userID = req.role === "employer" && requestedUser ? requestedUser : req.userId;
+    if (req.role === "employer") {
+      const allowed = await pool.query(`SELECT id FROM users WHERE id = $1 AND company_id = $2`, [userID, req.companyId]);
+      if (!allowed.rowCount) return res.status(404).json({ error: "employee_not_found" });
+    }
+    const { rows } = await pool.query(
+      `SELECT id, title, start_at AS start, end_at AS "end", contact_id, price_cents,
+              material_cost_cents, finished_at, sales_user_ids
+         FROM schedule_events
+        WHERE company_id = $1
+          AND finished_at >= $2
+          AND finished_at < $3
+          AND (
+            sales_user_ids ? $4
+            OR (jsonb_array_length(sales_user_ids) = 0 AND created_by = $5)
+          )
+        ORDER BY finished_at DESC`,
+      [req.companyId, range.start.toISOString(), range.end.toISOString(), userID, userID]
+    );
+    const jobs = rows.map((job) => {
+      const ids = Array.isArray(job.sales_user_ids) && job.sales_user_ids.length ? job.sales_user_ids : [userID];
+      const share = Math.round(Number(job.price_cents || 0) / Math.max(ids.length, 1));
+      return { ...job, credited_revenue_cents: share };
+    });
+    res.json({
+      user_id: userID,
+      start: range.start.toISOString(),
+      end: range.end.toISOString(),
+      total_revenue_cents: jobs.reduce((sum, job) => sum + Number(job.credited_revenue_cents || 0), 0),
+      jobs
+    });
+  } catch (e) { console.error(e); res.status(500).json({ error: "weekly_sales_report_failed" }); }
 });
 
 // ---------- MAP PINS ----------
@@ -2020,6 +2175,76 @@ app.delete("/api/map-pins/:id", authRequired, async (req, res) => {
     );
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_pin" }); }
+});
+
+function statsRange(kind, dateValue) {
+  const now = dateValue ? new Date(dateValue) : new Date();
+  if (Number.isNaN(now.getTime())) return null;
+  if (kind === "all") return { start: null, end: null };
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  if (kind === "week") {
+    const day = start.getDay();
+    start.setDate(start.getDate() - day);
+  } else if (kind === "month") {
+    start.setDate(1);
+  }
+  const end = new Date(start);
+  if (kind === "day") end.setDate(end.getDate() + 1);
+  else if (kind === "week") end.setDate(end.getDate() + 7);
+  else if (kind === "month") end.setMonth(end.getMonth() + 1);
+  else return null;
+  return { start, end };
+}
+
+app.get("/api/map-stats", authRequired, async (req, res) => {
+  try {
+    const period = ["day", "week", "month", "all"].includes(req.query.period) ? req.query.period : "day";
+    const range = statsRange(period, req.query.date);
+    if (!range) return res.status(400).json({ error: "invalid_range" });
+    const requestedUser = (req.query.user_id || "").toString();
+    const userID = req.role === "employer" && requestedUser ? requestedUser : req.userId;
+    const values = [req.companyId || null, userID];
+    let dateClause = "";
+    if (range.start && range.end) {
+      values.push(range.start.toISOString(), range.end.toISOString());
+      dateClause = `AND p.created_at >= $3 AND p.created_at < $4`;
+    }
+    const { rows } = await pool.query(
+      `SELECT
+          p.user_id,
+          COALESCE(NULLIF(u.display_name, ''), u.email) AS owner_name,
+          COUNT(*)::int AS total_pins,
+          COUNT(*) FILTER (WHERE p.status <> 'lead')::int AS doors_knocked,
+          COUNT(*) FILTER (WHERE p.status = 'lead')::int AS leads,
+          COUNT(*) FILTER (WHERE p.status = 'won')::int AS sold,
+          COUNT(*) FILTER (WHERE p.status = 'reloop')::int AS follow_up,
+          COUNT(*) FILTER (WHERE p.status = 'later')::int AS na,
+          COUNT(*) FILTER (WHERE p.status = 'lost')::int AS no,
+          CASE WHEN COUNT(*) FILTER (WHERE p.status <> 'lead') = 0 THEN 0
+               ELSE ROUND((COUNT(*) FILTER (WHERE p.status = 'won')::numeric / COUNT(*) FILTER (WHERE p.status <> 'lead')::numeric) * 100, 2)
+          END::double precision AS conversion_rate
+         FROM map_pins p
+         JOIN users u ON u.id = p.user_id
+        WHERE ($1::uuid IS NULL OR u.company_id = $1)
+          AND p.user_id = $2
+          ${dateClause}
+        GROUP BY p.user_id, owner_name`,
+      values
+    );
+    res.json(rows[0] || {
+      user_id: userID,
+      owner_name: null,
+      total_pins: 0,
+      doors_knocked: 0,
+      leads: 0,
+      sold: 0,
+      follow_up: 0,
+      na: 0,
+      no: 0,
+      conversion_rate: 0
+    });
+  } catch (e) { console.error(e); res.status(500).json({ error: "map_stats_failed" }); }
 });
 
 // ---------- MEASUREMENTS ----------
