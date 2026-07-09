@@ -5,6 +5,7 @@ import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import pkg from "pg";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import Stripe from "stripe";
 
 const { Pool } = pkg;
 const app = express();
@@ -19,7 +20,43 @@ const pool = new Pool({
   ssl: useSSL ? { rejectUnauthorized: false } : false
 });
 
+// ---------- Stripe client (lazy) ----------
+// Only initialised when a route actually needs it, so missing keys never
+// crash the process. Every Stripe route below calls `requireStripe(res)`
+// which returns a live client or sends a clear 503 error.
+let stripeClient = null;
+function getStripe() {
+  if (stripeClient) return stripeClient;
+  const secret = process.env.STRIPE_SECRET_KEY;
+  if (!secret) return null;
+  stripeClient = new Stripe(secret, { apiVersion: "2024-06-20" });
+  return stripeClient;
+}
+function requireStripe(res) {
+  const s = getStripe();
+  if (!s) {
+    res.status(503).json({ error: "stripe_not_configured" });
+    return null;
+  }
+  return s;
+}
+const STRIPE_PLATFORM_FEE_BPS = Math.max(
+  0,
+  Math.min(10000, parseInt(process.env.STRIPE_PLATFORM_FEE_BPS || "0", 10) || 0)
+);
+const STRIPE_CONNECT_RETURN_URL = process.env.STRIPE_CONNECT_RETURN_URL
+  || "https://wolfcrm-backend-production.up.railway.app/stripe/connect/return";
+const STRIPE_CONNECT_REFRESH_URL = process.env.STRIPE_CONNECT_REFRESH_URL
+  || "https://wolfcrm-backend-production.up.railway.app/stripe/connect/refresh";
+
 app.use(cors());
+
+// Stripe webhook MUST see the raw request body for signature verification.
+// It has to be registered BEFORE the global JSON body parser below so the
+// raw bytes aren't consumed. The handler is defined further down but the
+// raw-body middleware for that exact path lives here.
+app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }));
+
 app.use(express.json({ limit: "2mb" }));
 
 const mediaBucketConfig = () => {
@@ -534,6 +571,133 @@ async function bootstrap() {
       ON contacts(company_id, updated_at DESC);
   `);
 
+  // ---------- Stripe / Service Plans / Payments schema ----------
+  // business_settings is scoped by the employer/owner user, but every row
+  // also carries company_id so employee lookups can share the connected
+  // Stripe account without querying by user_id.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS business_settings (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID,
+      business_name TEXT,
+      stripe_account_id TEXT,
+      stripe_connect_status TEXT NOT NULL DEFAULT 'not_connected',
+      stripe_charges_enabled BOOLEAN NOT NULL DEFAULT false,
+      stripe_payouts_enabled BOOLEAN NOT NULL DEFAULT false,
+      stripe_details_submitted BOOLEAN NOT NULL DEFAULT false,
+      stripe_default_currency TEXT NOT NULL DEFAULT 'usd',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS company_id UUID;
+    CREATE INDEX IF NOT EXISTS business_settings_user_idx ON business_settings(user_id);
+    CREATE INDEX IF NOT EXISTS business_settings_company_idx ON business_settings(company_id);
+    CREATE INDEX IF NOT EXISTS business_settings_stripe_account_idx ON business_settings(stripe_account_id);
+
+    CREATE TABLE IF NOT EXISTS service_plans (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID,
+      created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      contact_id UUID,
+      plan_name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft',
+      price_cents INTEGER NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'usd',
+      billing_interval TEXT NOT NULL,
+      billing_interval_count INTEGER NOT NULL DEFAULT 1,
+      service_interval TEXT NOT NULL,
+      service_interval_count INTEGER NOT NULL DEFAULT 1,
+      first_service_date DATE,
+      next_service_date DATE,
+      last_service_date DATE,
+      included_services TEXT,
+      notes TEXT,
+      stripe_connected_account_id TEXT,
+      stripe_customer_id TEXT,
+      stripe_product_id TEXT,
+      stripe_price_id TEXT,
+      stripe_subscription_id TEXT,
+      stripe_payment_intent_id TEXT,
+      stripe_subscription_status TEXT,
+      stripe_latest_invoice_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS service_plans_user_status_idx ON service_plans(user_id, status);
+    CREATE INDEX IF NOT EXISTS service_plans_company_status_idx ON service_plans(company_id, status);
+    CREATE INDEX IF NOT EXISTS service_plans_created_by_idx ON service_plans(created_by_user_id);
+    CREATE INDEX IF NOT EXISTS service_plans_contact_idx ON service_plans(contact_id);
+    CREATE INDEX IF NOT EXISTS service_plans_stripe_sub_idx ON service_plans(stripe_subscription_id);
+    CREATE INDEX IF NOT EXISTS service_plans_stripe_acct_idx ON service_plans(stripe_connected_account_id);
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'service_plans_touch_updated_at') THEN
+        CREATE TRIGGER service_plans_touch_updated_at
+        BEFORE UPDATE ON service_plans
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+    END $$;
+
+    CREATE TABLE IF NOT EXISTS service_plan_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID,
+      created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      service_plan_id UUID NOT NULL REFERENCES service_plans(id) ON DELETE CASCADE,
+      contact_id UUID,
+      event_type TEXT NOT NULL,
+      scheduled_date DATE,
+      completed_date DATE,
+      notes TEXT,
+      stripe_event_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS service_plan_events_plan_idx ON service_plan_events(service_plan_id);
+    CREATE INDEX IF NOT EXISTS service_plan_events_stripe_event_idx ON service_plan_events(stripe_event_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS service_plan_events_stripe_event_unique
+      ON service_plan_events(stripe_event_id) WHERE stripe_event_id IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS payment_records (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID,
+      created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      contact_id UUID,
+      service_plan_id UUID REFERENCES service_plans(id) ON DELETE SET NULL,
+      payment_type TEXT NOT NULL DEFAULT 'one_time',
+      status TEXT NOT NULL DEFAULT 'pending',
+      amount_cents INTEGER NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'usd',
+      description TEXT,
+      stripe_connected_account_id TEXT,
+      stripe_customer_id TEXT,
+      stripe_payment_intent_id TEXT,
+      stripe_invoice_id TEXT,
+      stripe_subscription_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS payment_records_user_status_idx ON payment_records(user_id, status);
+    CREATE INDEX IF NOT EXISTS payment_records_company_status_idx ON payment_records(company_id, status);
+    CREATE INDEX IF NOT EXISTS payment_records_contact_idx ON payment_records(contact_id);
+    CREATE INDEX IF NOT EXISTS payment_records_service_plan_idx ON payment_records(service_plan_id);
+    CREATE INDEX IF NOT EXISTS payment_records_pi_idx ON payment_records(stripe_payment_intent_id);
+    CREATE INDEX IF NOT EXISTS payment_records_sub_idx ON payment_records(stripe_subscription_id);
+    CREATE INDEX IF NOT EXISTS payment_records_invoice_idx ON payment_records(stripe_invoice_id);
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'payment_records_touch_updated_at') THEN
+        CREATE TRIGGER payment_records_touch_updated_at
+        BEFORE UPDATE ON payment_records
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+    END $$;
+  `);
+
   console.log(`[bootstrap] DB ready @ ${nowIso()}`);
 }
 bootstrap().catch((err) => {
@@ -567,6 +731,187 @@ async function authRequired(req, res, next) {
 function requireEmployer(req, res, next) {
   if (req.role !== "employer") return res.status(403).json({ error: "employer_required" });
   next();
+}
+
+// ---------- Service plan permission helpers ----------
+// Both employers and employees can create new plans and collect the initial
+// payment. Only employers can view aggregate financial data, edit existing
+// plans, or manage Stripe connectivity.
+function canCreateServicePlan(req) { return req.role === "employer" || req.role === "employee"; }
+function canCollectServicePlanPayment(req) { return req.role === "employer" || req.role === "employee"; }
+function canManageServicePlan(req) { return req.role === "employer"; }
+function canViewPaymentDashboard(req) { return req.role === "employer"; }
+function canTakeContactPayment(req) { return req.role === "employer" || req.role === "employee"; }
+
+// Resolve the "owning" employer user for the current session.
+// Contacts, plans, and business_settings are all scoped to the employer's
+// user id even when an employee performs the action, so the whole team
+// sees the same data. Falls back to req.userId (employer creating their
+// own workspace) when no company owner is recorded.
+async function resolveEmployerUserId(req) {
+  if (req.role === "employer") return req.userId;
+  if (!req.companyId) return req.userId;
+  const { rows } = await pool.query(
+    `SELECT owner_user_id FROM companies WHERE id = $1`,
+    [req.companyId]
+  );
+  return (rows[0] && rows[0].owner_user_id) || req.userId;
+}
+
+async function ensureBusinessSettings(employerUserId, companyId) {
+  const existing = await pool.query(
+    `SELECT * FROM business_settings WHERE user_id = $1`,
+    [employerUserId]
+  );
+  if (existing.rows.length) {
+    if (companyId && !existing.rows[0].company_id) {
+      await pool.query(
+        `UPDATE business_settings SET company_id = $1, updated_at = now() WHERE user_id = $2`,
+        [companyId, employerUserId]
+      );
+      existing.rows[0].company_id = companyId;
+    }
+    return existing.rows[0];
+  }
+  const inserted = await pool.query(
+    `INSERT INTO business_settings (user_id, company_id)
+     VALUES ($1, $2)
+     RETURNING *`,
+    [employerUserId, companyId || null]
+  );
+  return inserted.rows[0];
+}
+
+function sanitizeBusinessSettings(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    company_id: row.company_id,
+    business_name: row.business_name,
+    stripe_account_id: row.stripe_account_id,
+    stripe_connect_status: row.stripe_connect_status,
+    stripe_charges_enabled: row.stripe_charges_enabled,
+    stripe_payouts_enabled: row.stripe_payouts_enabled,
+    stripe_details_submitted: row.stripe_details_submitted,
+    stripe_default_currency: row.stripe_default_currency,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function mapStripeSubscriptionStatus(s) {
+  switch (s) {
+    case "active":
+    case "trialing":
+      return "active";
+    case "incomplete":
+      return "payment_pending";
+    case "past_due":
+    case "unpaid":
+      return "past_due";
+    case "canceled":
+      return "canceled";
+    case "incomplete_expired":
+      return "failed";
+    default:
+      return null;
+  }
+}
+
+function serviceIntervalDays(interval, count) {
+  const n = Math.max(1, parseInt(count || 1, 10));
+  switch ((interval || "month").toLowerCase()) {
+    case "day":  return n;
+    case "week": return n * 7;
+    case "year": return n * 365;
+    case "month":
+    default:     return n * 30;
+  }
+}
+
+function addDaysISO(dateInput, days) {
+  const d = dateInput ? new Date(dateInput) : new Date();
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function stripeIntervalMap(interval, count) {
+  const c = Math.max(1, parseInt(count || 1, 10));
+  const iv = (interval || "month").toLowerCase();
+  if (iv === "day" || iv === "week" || iv === "month" || iv === "year") {
+    return { interval: iv, interval_count: c };
+  }
+  return { interval: "month", interval_count: c };
+}
+
+function sanitizeServicePlan(row, { employeeSafe = false } = {}) {
+  if (!row) return null;
+  const base = {
+    id: row.id,
+    contact_id: row.contact_id,
+    plan_name: row.plan_name,
+    status: row.status,
+    price_cents: row.price_cents,
+    currency: row.currency,
+    billing_interval: row.billing_interval,
+    billing_interval_count: row.billing_interval_count,
+    service_interval: row.service_interval,
+    service_interval_count: row.service_interval_count,
+    first_service_date: row.first_service_date,
+    next_service_date: row.next_service_date,
+    last_service_date: row.last_service_date,
+    included_services: row.included_services,
+    notes: row.notes,
+    stripe_subscription_status: row.stripe_subscription_status,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    // Contact info if joined
+    contact_name: row.contact_name,
+    contact_phone: row.contact_phone,
+    contact_email: row.contact_email,
+    contact_address: row.contact_address
+  };
+  if (employeeSafe) return base;
+  return {
+    ...base,
+    user_id: row.user_id,
+    created_by_user_id: row.created_by_user_id,
+    stripe_connected_account_id: row.stripe_connected_account_id,
+    stripe_customer_id: row.stripe_customer_id,
+    stripe_product_id: row.stripe_product_id,
+    stripe_price_id: row.stripe_price_id,
+    stripe_subscription_id: row.stripe_subscription_id,
+    stripe_payment_intent_id: row.stripe_payment_intent_id,
+    stripe_latest_invoice_id: row.stripe_latest_invoice_id
+  };
+}
+
+function sanitizePaymentRecord(row, { employeeSafe = false } = {}) {
+  if (!row) return null;
+  const base = {
+    id: row.id,
+    contact_id: row.contact_id,
+    service_plan_id: row.service_plan_id,
+    payment_type: row.payment_type,
+    status: row.status,
+    amount_cents: row.amount_cents,
+    currency: row.currency,
+    description: row.description,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+  if (employeeSafe) return base;
+  return {
+    ...base,
+    user_id: row.user_id,
+    created_by_user_id: row.created_by_user_id,
+    stripe_connected_account_id: row.stripe_connected_account_id,
+    stripe_customer_id: row.stripe_customer_id,
+    stripe_payment_intent_id: row.stripe_payment_intent_id,
+    stripe_invoice_id: row.stripe_invoice_id,
+    stripe_subscription_id: row.stripe_subscription_id
+  };
 }
 
 function userPayload(user, permissions = null, company = null) {
@@ -2526,6 +2871,1076 @@ app.delete("/api/todo/logs/:id", authRequired, async (req, res) => {
       [req.params.id, req.userId]);
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_log" }); }
+});
+
+// ==========================================================================
+//                           STRIPE CONNECT ROUTES
+// ==========================================================================
+// All of these are employer-only. Employees never touch Stripe onboarding
+// or account settings.
+
+app.get("/api/payments/connect/status", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const settings = await ensureBusinessSettings(req.userId, req.companyId);
+    const stripe = getStripe();
+    if (settings.stripe_account_id && stripe) {
+      try {
+        const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
+        const status = acct.details_submitted
+          ? (acct.charges_enabled ? "ready" : "verification_pending")
+          : "setup_incomplete";
+        const updated = await pool.query(
+          `UPDATE business_settings
+              SET stripe_charges_enabled = $2,
+                  stripe_payouts_enabled = $3,
+                  stripe_details_submitted = $4,
+                  stripe_default_currency = COALESCE($5, stripe_default_currency),
+                  stripe_connect_status = $6,
+                  updated_at = now()
+            WHERE user_id = $1
+            RETURNING *`,
+          [
+            req.userId,
+            !!acct.charges_enabled,
+            !!acct.payouts_enabled,
+            !!acct.details_submitted,
+            acct.default_currency || null,
+            status
+          ]
+        );
+        return res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
+      } catch (err) {
+        console.error("stripe accounts.retrieve failed:", err.message);
+      }
+    }
+    res.json({ settings: sanitizeBusinessSettings(settings) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "connect_status_failed" });
+  }
+});
+
+app.post("/api/payments/connect/create-account", authRequired, requireEmployer, async (req, res) => {
+  const stripe = requireStripe(res); if (!stripe) return;
+  try {
+    const settings = await ensureBusinessSettings(req.userId, req.companyId);
+    if (settings.stripe_account_id) {
+      return res.json({ settings: sanitizeBusinessSettings(settings) });
+    }
+    const account = await stripe.accounts.create({
+      type: "standard",
+      email: req.userEmail,
+      metadata: { wolfcrm_user_id: req.userId, wolfcrm_company_id: req.companyId || "" }
+    });
+    const updated = await pool.query(
+      `UPDATE business_settings
+          SET stripe_account_id = $2,
+              stripe_connect_status = 'setup_incomplete',
+              updated_at = now()
+        WHERE user_id = $1
+        RETURNING *`,
+      [req.userId, account.id]
+    );
+    res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "connect_create_account_failed", detail: e.message });
+  }
+});
+
+app.post("/api/payments/connect/create-account-link", authRequired, requireEmployer, async (req, res) => {
+  const stripe = requireStripe(res); if (!stripe) return;
+  try {
+    let settings = await ensureBusinessSettings(req.userId, req.companyId);
+    if (!settings.stripe_account_id) {
+      const account = await stripe.accounts.create({
+        type: "standard",
+        email: req.userEmail,
+        metadata: { wolfcrm_user_id: req.userId, wolfcrm_company_id: req.companyId || "" }
+      });
+      const upd = await pool.query(
+        `UPDATE business_settings
+            SET stripe_account_id = $2,
+                stripe_connect_status = 'setup_incomplete',
+                updated_at = now()
+          WHERE user_id = $1
+          RETURNING *`,
+        [req.userId, account.id]
+      );
+      settings = upd.rows[0];
+    }
+    const link = await stripe.accountLinks.create({
+      account: settings.stripe_account_id,
+      return_url: STRIPE_CONNECT_RETURN_URL,
+      refresh_url: STRIPE_CONNECT_REFRESH_URL,
+      type: "account_onboarding"
+    });
+    res.json({
+      url: link.url,
+      expires_at: link.expires_at,
+      settings: sanitizeBusinessSettings(settings)
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "connect_account_link_failed", detail: e.message });
+  }
+});
+
+app.post("/api/payments/connect/refresh-status", authRequired, requireEmployer, async (req, res) => {
+  const stripe = requireStripe(res); if (!stripe) return;
+  try {
+    const settings = await ensureBusinessSettings(req.userId, req.companyId);
+    if (!settings.stripe_account_id) {
+      return res.json({ settings: sanitizeBusinessSettings(settings) });
+    }
+    const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
+    const status = acct.details_submitted
+      ? (acct.charges_enabled ? "ready" : "verification_pending")
+      : "setup_incomplete";
+    const updated = await pool.query(
+      `UPDATE business_settings
+          SET stripe_charges_enabled = $2,
+              stripe_payouts_enabled = $3,
+              stripe_details_submitted = $4,
+              stripe_default_currency = COALESCE($5, stripe_default_currency),
+              stripe_connect_status = $6,
+              updated_at = now()
+        WHERE user_id = $1
+        RETURNING *`,
+      [
+        req.userId,
+        !!acct.charges_enabled,
+        !!acct.payouts_enabled,
+        !!acct.details_submitted,
+        acct.default_currency || null,
+        status
+      ]
+    );
+    res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "connect_refresh_failed", detail: e.message });
+  }
+});
+
+// Simple return/refresh pages the hosted onboarding will send the employer
+// back to. They just tell the user they can close the window and return
+// to the app; the app itself will call /refresh-status when it comes back.
+app.get("/stripe/connect/return", (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>WolfCRM — Stripe Setup</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0F1420;color:#F5F7FA;text-align:center;padding:60px 24px"><h1 style="font-weight:800">All set</h1><p style="opacity:.75">Stripe onboarding is complete. You can close this window and return to WolfCRM.</p></body></html>`);
+});
+app.get("/stripe/connect/refresh", (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>WolfCRM — Stripe Setup</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0F1420;color:#F5F7FA;text-align:center;padding:60px 24px"><h1 style="font-weight:800">Setup link expired</h1><p style="opacity:.75">Please return to WolfCRM and tap "Finish Stripe Setup" again.</p></body></html>`);
+});
+
+// ==========================================================================
+//                          SERVICE PLAN ROUTES
+// ==========================================================================
+
+app.get("/api/service-plans", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `SELECT sp.*,
+              c.name    AS contact_name,
+              c.phone   AS contact_phone,
+              c.email   AS contact_email,
+              c.address AS contact_address
+         FROM service_plans sp
+         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
+        WHERE sp.user_id = $1
+        ORDER BY sp.created_at DESC`,
+      [employerId]
+    );
+    res.json(rows.map((r) => sanitizeServicePlan(r)));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "list_service_plans_failed" });
+  }
+});
+
+app.get("/api/service-plans/dashboard", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `SELECT status, COUNT(*)::int AS n, COALESCE(SUM(price_cents),0)::bigint AS total_cents,
+              billing_interval, billing_interval_count
+         FROM service_plans
+        WHERE user_id = $1
+        GROUP BY status, billing_interval, billing_interval_count`,
+      [employerId]
+    );
+    let active = 0, pending = 0, pastDue = 0, canceled = 0, paused = 0, mrrCents = 0;
+    for (const r of rows) {
+      const n = r.n;
+      if (r.status === "active")          active   += n;
+      if (r.status === "payment_pending") pending  += n;
+      if (r.status === "past_due")        pastDue  += n;
+      if (r.status === "canceled")        canceled += n;
+      if (r.status === "paused")          paused   += n;
+    }
+    // Estimated MRR: normalize each active plan's price to a monthly figure.
+    const active_plans = await pool.query(
+      `SELECT price_cents, billing_interval, billing_interval_count
+         FROM service_plans
+        WHERE user_id = $1 AND status = 'active'`,
+      [employerId]
+    );
+    for (const p of active_plans.rows) {
+      const cnt = Math.max(1, p.billing_interval_count || 1);
+      const iv = (p.billing_interval || "month").toLowerCase();
+      let monthly = 0;
+      if (iv === "day")   monthly = (p.price_cents / cnt) * 30;
+      if (iv === "week")  monthly = (p.price_cents / cnt) * (30 / 7);
+      if (iv === "month") monthly = p.price_cents / cnt;
+      if (iv === "year")  monthly = p.price_cents / (cnt * 12);
+      mrrCents += monthly;
+    }
+    const { rows: upcoming } = await pool.query(
+      `SELECT sp.*, c.name AS contact_name
+         FROM service_plans sp
+         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
+        WHERE sp.user_id = $1
+          AND sp.status IN ('active','payment_pending','past_due')
+          AND sp.next_service_date IS NOT NULL
+          AND sp.next_service_date >= (CURRENT_DATE - INTERVAL '1 day')
+        ORDER BY sp.next_service_date ASC
+        LIMIT 25`,
+      [employerId]
+    );
+    const { rows: events } = await pool.query(
+      `SELECT e.*, sp.plan_name, c.name AS contact_name
+         FROM service_plan_events e
+         LEFT JOIN service_plans sp ON sp.id = e.service_plan_id
+         LEFT JOIN contacts c ON c.id::text = e.contact_id::text
+        WHERE e.user_id = $1
+        ORDER BY e.created_at DESC
+        LIMIT 20`,
+      [employerId]
+    );
+    res.json({
+      active_count: active,
+      pending_payment_count: pending,
+      past_due_count: pastDue,
+      canceled_count: canceled,
+      paused_count: paused,
+      estimated_mrr_cents: Math.round(mrrCents),
+      upcoming: upcoming.map((r) => sanitizeServicePlan(r)),
+      recent_events: events.map((e) => ({
+        id: e.id,
+        service_plan_id: e.service_plan_id,
+        plan_name: e.plan_name,
+        contact_name: e.contact_name,
+        event_type: e.event_type,
+        notes: e.notes,
+        created_at: e.created_at
+      }))
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "dashboard_failed" });
+  }
+});
+
+app.get("/api/service-plans/:id", authRequired, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `SELECT sp.*, c.name AS contact_name, c.phone AS contact_phone,
+              c.email AS contact_email, c.address AS contact_address
+         FROM service_plans sp
+         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
+        WHERE sp.id = $1 AND sp.user_id = $2`,
+      [req.params.id, employerId]
+    );
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: "not_found" });
+    if (req.role !== "employer" && row.created_by_user_id !== req.userId) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    res.json(sanitizeServicePlan(row, { employeeSafe: req.role !== "employer" }));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "get_service_plan_failed" });
+  }
+});
+
+app.get("/api/contacts/:contactId/service-plans", authRequired, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    // verify contact belongs to this employer scope
+    const c = await pool.query(`SELECT id FROM contacts WHERE id = $1 AND user_id = $2`,
+      [req.params.contactId, employerId]);
+    if (!c.rows.length) return res.status(404).json({ error: "contact_not_found" });
+    if (req.role === "employer") {
+      const { rows } = await pool.query(
+        `SELECT sp.*, c.name AS contact_name, c.phone AS contact_phone,
+                c.email AS contact_email, c.address AS contact_address
+           FROM service_plans sp
+           LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
+          WHERE sp.user_id = $1 AND sp.contact_id::text = $2
+          ORDER BY sp.created_at DESC`,
+        [employerId, req.params.contactId]
+      );
+      return res.json(rows.map((r) => sanitizeServicePlan(r)));
+    }
+    // Employees only see limited data for plans they themselves created.
+    const { rows } = await pool.query(
+      `SELECT sp.*, c.name AS contact_name
+         FROM service_plans sp
+         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
+        WHERE sp.user_id = $1
+          AND sp.contact_id::text = $2
+          AND sp.created_by_user_id = $3
+        ORDER BY sp.created_at DESC`,
+      [employerId, req.params.contactId, req.userId]
+    );
+    res.json(rows.map((r) => sanitizeServicePlan(r, { employeeSafe: true })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "list_contact_plans_failed" });
+  }
+});
+
+app.post("/api/service-plans", authRequired, async (req, res) => {
+  if (!canCreateServicePlan(req)) return res.status(403).json({ error: "forbidden" });
+  try {
+    const {
+      contact_id, contact,
+      plan_name, price_cents, currency,
+      billing_interval, billing_interval_count,
+      service_interval, service_interval_count,
+      first_service_date, included_services, notes
+    } = req.body || {};
+
+    if (!plan_name || typeof plan_name !== "string") return res.status(400).json({ error: "plan_name_required" });
+    const priceInt = parseInt(price_cents, 10);
+    if (!Number.isFinite(priceInt) || priceInt < 1) return res.status(400).json({ error: "invalid_price" });
+    if (!billing_interval) return res.status(400).json({ error: "billing_interval_required" });
+    if (!service_interval) return res.status(400).json({ error: "service_interval_required" });
+
+    const employerId = await resolveEmployerUserId(req);
+    let contactId = contact_id || null;
+
+    // If no contact_id, allow creating a contact inline.
+    if (!contactId && contact && contact.name) {
+      const cid = randomUUID();
+      await pool.query(
+        `INSERT INTO contacts (id, user_id, company_id, name, phone, email, address)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          cid, employerId, req.companyId || null,
+          (contact.name || "").toString(),
+          contact.phone || null,
+          contact.email || null,
+          contact.address || null
+        ]
+      );
+      contactId = cid;
+    }
+
+    // Verify contact ownership if one was supplied.
+    if (contactId) {
+      const cRow = await pool.query(
+        `SELECT id FROM contacts WHERE id = $1 AND user_id = $2`,
+        [contactId, employerId]
+      );
+      if (!cRow.rows.length) return res.status(404).json({ error: "contact_not_found" });
+    }
+
+    const firstDate = first_service_date ? new Date(first_service_date).toISOString().slice(0, 10) : null;
+    const inserted = await pool.query(
+      `INSERT INTO service_plans (
+         user_id, company_id, created_by_user_id, contact_id, plan_name,
+         status, price_cents, currency, billing_interval, billing_interval_count,
+         service_interval, service_interval_count, first_service_date, next_service_date,
+         included_services, notes
+       ) VALUES ($1,$2,$3,$4,$5,'draft',$6,$7,$8,$9,$10,$11,$12,$12,$13,$14)
+       RETURNING *`,
+      [
+        employerId, req.companyId || null, req.userId, contactId, plan_name,
+        priceInt, (currency || "usd").toLowerCase(),
+        billing_interval, Math.max(1, parseInt(billing_interval_count || 1, 10)),
+        service_interval, Math.max(1, parseInt(service_interval_count || 1, 10)),
+        firstDate,
+        included_services || null, notes || null
+      ]
+    );
+    await pool.query(
+      `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
+       VALUES ($1,$2,$3,$4,$5,'created',$6)`,
+      [employerId, req.companyId || null, req.userId, inserted.rows[0].id, contactId, `Created by ${req.userEmail || req.userId}`]
+    );
+    // Join contact info for the response so the client shows the customer.
+    const joined = await pool.query(
+      `SELECT sp.*, c.name AS contact_name, c.phone AS contact_phone,
+              c.email AS contact_email, c.address AS contact_address
+         FROM service_plans sp
+         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
+        WHERE sp.id = $1`,
+      [inserted.rows[0].id]
+    );
+    res.json(sanitizeServicePlan(joined.rows[0], { employeeSafe: req.role !== "employer" }));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "create_service_plan_failed", detail: e.message });
+  }
+});
+
+app.put("/api/service-plans/:id", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const b = req.body || {};
+    const owned = await pool.query(
+      `SELECT id FROM service_plans WHERE id = $1 AND user_id = $2`,
+      [req.params.id, employerId]
+    );
+    if (!owned.rows.length) return res.status(404).json({ error: "not_found" });
+    const { rows } = await pool.query(
+      `UPDATE service_plans
+          SET plan_name = COALESCE($2, plan_name),
+              price_cents = COALESCE($3, price_cents),
+              billing_interval = COALESCE($4, billing_interval),
+              billing_interval_count = COALESCE($5, billing_interval_count),
+              service_interval = COALESCE($6, service_interval),
+              service_interval_count = COALESCE($7, service_interval_count),
+              first_service_date = COALESCE($8::date, first_service_date),
+              next_service_date  = COALESCE($9::date, next_service_date),
+              included_services  = COALESCE($10, included_services),
+              notes = COALESCE($11, notes),
+              updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [
+        req.params.id,
+        b.plan_name || null,
+        Number.isFinite(parseInt(b.price_cents, 10)) ? parseInt(b.price_cents, 10) : null,
+        b.billing_interval || null,
+        Number.isFinite(parseInt(b.billing_interval_count, 10)) ? parseInt(b.billing_interval_count, 10) : null,
+        b.service_interval || null,
+        Number.isFinite(parseInt(b.service_interval_count, 10)) ? parseInt(b.service_interval_count, 10) : null,
+        b.first_service_date || null,
+        b.next_service_date || null,
+        b.included_services || null,
+        b.notes || null
+      ]
+    );
+    res.json(sanitizeServicePlan(rows[0]));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "update_service_plan_failed" });
+  }
+});
+
+// Start the connected-account subscription. Both employer and employee can
+// call this because the whole point is to collect the customer's first
+// payment at signup time.
+app.post("/api/service-plans/:id/start-connected-subscription", authRequired, async (req, res) => {
+  if (!canCollectServicePlanPayment(req)) return res.status(403).json({ error: "forbidden" });
+  const stripe = requireStripe(res); if (!stripe) return;
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `SELECT sp.*, c.name AS contact_name, c.phone AS contact_phone,
+              c.email AS contact_email, c.address AS contact_address
+         FROM service_plans sp
+         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
+        WHERE sp.id = $1 AND sp.user_id = $2`,
+      [req.params.id, employerId]
+    );
+    const plan = rows[0];
+    if (!plan) return res.status(404).json({ error: "not_found" });
+    if (req.role !== "employer" && plan.created_by_user_id !== req.userId) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    const settings = await ensureBusinessSettings(employerId, req.companyId);
+    if (!settings.stripe_account_id) return res.status(400).json({ error: "stripe_not_connected" });
+
+    // Confirm the connected account can charge right now.
+    const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
+    if (!acct.charges_enabled) {
+      await pool.query(
+        `UPDATE business_settings
+            SET stripe_charges_enabled = $2,
+                stripe_payouts_enabled = $3,
+                stripe_details_submitted = $4,
+                updated_at = now()
+          WHERE user_id = $1`,
+        [employerId, !!acct.charges_enabled, !!acct.payouts_enabled, !!acct.details_submitted]
+      );
+      return res.status(400).json({ error: "charges_not_enabled" });
+    }
+
+    const connectedAccountId = settings.stripe_account_id;
+    const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
+    if (!publishableKey) return res.status(503).json({ error: "publishable_key_missing" });
+
+    // Create or reuse the Stripe customer ON THE CONNECTED ACCOUNT.
+    let customerId = plan.stripe_customer_id;
+    if (!customerId || plan.stripe_connected_account_id !== connectedAccountId) {
+      const customer = await stripe.customers.create(
+        {
+          name: plan.contact_name || undefined,
+          email: plan.contact_email || undefined,
+          phone: plan.contact_phone || undefined,
+          address: plan.contact_address ? { line1: plan.contact_address } : undefined,
+          metadata: { wolfcrm_contact_id: plan.contact_id || "", wolfcrm_plan_id: plan.id }
+        },
+        { stripeAccount: connectedAccountId }
+      );
+      customerId = customer.id;
+    }
+
+    // Create ephemeral key so PaymentSheet can render the saved-cards flow.
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: customerId },
+      { apiVersion: "2024-06-20", stripeAccount: connectedAccountId }
+    );
+
+    // Product + price on the connected account.
+    let productId = plan.stripe_product_id;
+    if (!productId) {
+      const product = await stripe.products.create(
+        { name: plan.plan_name, metadata: { wolfcrm_plan_id: plan.id } },
+        { stripeAccount: connectedAccountId }
+      );
+      productId = product.id;
+    }
+    let priceId = plan.stripe_price_id;
+    if (!priceId) {
+      const iv = stripeIntervalMap(plan.billing_interval, plan.billing_interval_count);
+      const price = await stripe.prices.create(
+        {
+          currency: (plan.currency || "usd").toLowerCase(),
+          product: productId,
+          unit_amount: plan.price_cents,
+          recurring: iv,
+          metadata: { wolfcrm_plan_id: plan.id }
+        },
+        { stripeAccount: connectedAccountId }
+      );
+      priceId = price.id;
+    }
+
+    // Subscription that requires initial payment via PaymentIntent (mobile-friendly).
+    const subParams = {
+      customer: customerId,
+      items: [{ price: priceId }],
+      payment_behavior: "default_incomplete",
+      payment_settings: {
+        save_default_payment_method: "on_subscription",
+        payment_method_types: ["card"]
+      },
+      expand: ["latest_invoice.payment_intent"],
+      metadata: {
+        wolfcrm_plan_id: plan.id,
+        wolfcrm_user_id: employerId,
+        wolfcrm_contact_id: plan.contact_id || ""
+      }
+    };
+    if (STRIPE_PLATFORM_FEE_BPS > 0) {
+      subParams.application_fee_percent = STRIPE_PLATFORM_FEE_BPS / 100;
+    }
+    const subscription = await stripe.subscriptions.create(
+      subParams,
+      { stripeAccount: connectedAccountId }
+    );
+
+    const invoice = subscription.latest_invoice;
+    const pi = invoice && invoice.payment_intent;
+    if (!pi || !pi.client_secret) {
+      return res.status(500).json({ error: "no_payment_intent" });
+    }
+
+    // Persist Stripe IDs and mark local plan as payment_pending.
+    await pool.query(
+      `UPDATE service_plans
+          SET stripe_connected_account_id = $2,
+              stripe_customer_id = $3,
+              stripe_product_id = $4,
+              stripe_price_id = $5,
+              stripe_subscription_id = $6,
+              stripe_subscription_status = $7,
+              stripe_payment_intent_id = $8,
+              stripe_latest_invoice_id = $9,
+              status = 'payment_pending',
+              updated_at = now()
+        WHERE id = $1`,
+      [
+        plan.id, connectedAccountId, customerId, productId, priceId,
+        subscription.id, subscription.status,
+        pi.id, invoice.id
+      ]
+    );
+
+    // Payment record for the initial invoice.
+    const paymentRecord = await pool.query(
+      `INSERT INTO payment_records (
+         user_id, company_id, created_by_user_id, contact_id, service_plan_id,
+         payment_type, status, amount_cents, currency, description,
+         stripe_connected_account_id, stripe_customer_id, stripe_payment_intent_id,
+         stripe_invoice_id, stripe_subscription_id
+       ) VALUES ($1,$2,$3,$4,$5,'service_plan_first_payment','pending',$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      [
+        employerId, req.companyId || null, req.userId,
+        plan.contact_id, plan.id,
+        plan.price_cents, (plan.currency || "usd").toLowerCase(),
+        `Initial payment for ${plan.plan_name}`,
+        connectedAccountId, customerId, pi.id, invoice.id, subscription.id
+      ]
+    );
+
+    await pool.query(
+      `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
+       VALUES ($1,$2,$3,$4,$5,'payment_started',$6)`,
+      [employerId, req.companyId || null, req.userId, plan.id, plan.contact_id,
+       `Started by ${req.userEmail || req.userId}`]
+    );
+
+    res.json({
+      publishable_key: publishableKey,
+      connected_account_id: connectedAccountId,
+      customer_id: customerId,
+      ephemeral_key_secret: ephemeralKey.secret,
+      payment_intent_client_secret: pi.client_secret,
+      subscription_id: subscription.id,
+      service_plan_id: plan.id,
+      payment_record_id: paymentRecord.rows[0].id
+    });
+  } catch (e) {
+    console.error("start-connected-subscription:", e);
+    res.status(500).json({ error: "start_subscription_failed", detail: e.message });
+  }
+});
+
+app.post("/api/service-plans/:id/mark-serviced", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `SELECT * FROM service_plans WHERE id = $1 AND user_id = $2`,
+      [req.params.id, employerId]
+    );
+    const plan = rows[0];
+    if (!plan) return res.status(404).json({ error: "not_found" });
+    const completed = req.body && req.body.completed_date
+      ? new Date(req.body.completed_date).toISOString().slice(0, 10)
+      : new Date().toISOString().slice(0, 10);
+    const days = serviceIntervalDays(plan.service_interval, plan.service_interval_count);
+    const next = addDaysISO(completed, days);
+    const updated = await pool.query(
+      `UPDATE service_plans
+          SET last_service_date = $2::date,
+              next_service_date = $3::date,
+              updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [plan.id, completed, next]
+    );
+    await pool.query(
+      `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, completed_date, notes)
+       VALUES ($1,$2,$3,$4,$5,'serviced',$6,$7)`,
+      [employerId, req.companyId || null, req.userId, plan.id, plan.contact_id, completed,
+       `Marked serviced by ${req.userEmail || req.userId}`]
+    );
+    res.json(sanitizeServicePlan(updated.rows[0]));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "mark_serviced_failed" });
+  }
+});
+
+app.post("/api/service-plans/:id/pause", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `UPDATE service_plans
+          SET status = 'paused', updated_at = now()
+        WHERE id = $1 AND user_id = $2
+        RETURNING *`,
+      [req.params.id, employerId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "not_found" });
+    await pool.query(
+      `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
+       VALUES ($1,$2,$3,$4,$5,'paused',$6)`,
+      [employerId, req.companyId || null, req.userId, rows[0].id, rows[0].contact_id,
+       `Paused by ${req.userEmail || req.userId}`]
+    );
+    // TODO: also pause the Stripe subscription (`pause_collection`) when a
+    // clear resume UX exists — leaving local-only for now so we never
+    // accidentally break Stripe billing state.
+    res.json(sanitizeServicePlan(rows[0]));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "pause_failed" });
+  }
+});
+
+app.post("/api/service-plans/:id/cancel", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `SELECT * FROM service_plans WHERE id = $1 AND user_id = $2`,
+      [req.params.id, employerId]
+    );
+    const plan = rows[0];
+    if (!plan) return res.status(404).json({ error: "not_found" });
+    const stripe = getStripe();
+    if (stripe && plan.stripe_subscription_id && plan.stripe_connected_account_id) {
+      try {
+        await stripe.subscriptions.cancel(plan.stripe_subscription_id,
+          { stripeAccount: plan.stripe_connected_account_id });
+      } catch (err) {
+        console.error("stripe cancel failed:", err.message);
+      }
+    }
+    const updated = await pool.query(
+      `UPDATE service_plans
+          SET status = 'canceled', updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [plan.id]
+    );
+    await pool.query(
+      `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
+       VALUES ($1,$2,$3,$4,$5,'canceled',$6)`,
+      [employerId, req.companyId || null, req.userId, plan.id, plan.contact_id,
+       `Canceled by ${req.userEmail || req.userId}`]
+    );
+    res.json(sanitizeServicePlan(updated.rows[0]));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "cancel_failed" });
+  }
+});
+
+// ==========================================================================
+//                       CONTACT PAYMENT ROUTES
+// ==========================================================================
+
+app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, res) => {
+  if (!canTakeContactPayment(req)) return res.status(403).json({ error: "forbidden" });
+  const stripe = requireStripe(res); if (!stripe) return;
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const c = await pool.query(
+      `SELECT * FROM contacts WHERE id = $1 AND user_id = $2`,
+      [req.params.contactId, employerId]
+    );
+    if (!c.rows.length) return res.status(404).json({ error: "contact_not_found" });
+    const contact = c.rows[0];
+
+    const settings = await ensureBusinessSettings(employerId, req.companyId);
+    if (!settings.stripe_account_id) return res.status(400).json({ error: "stripe_not_connected" });
+    const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
+    if (!acct.charges_enabled) return res.status(400).json({ error: "charges_not_enabled" });
+
+    const amountInt = parseInt((req.body || {}).amount_cents, 10);
+    if (!Number.isFinite(amountInt) || amountInt < 50) return res.status(400).json({ error: "invalid_amount" });
+    const currency = ((req.body || {}).currency || "usd").toLowerCase();
+    const description = ((req.body || {}).description || "").toString();
+    const paymentType = ((req.body || {}).payment_type || "one_time").toString();
+    const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
+    if (!publishableKey) return res.status(503).json({ error: "publishable_key_missing" });
+
+    const connectedAccountId = settings.stripe_account_id;
+    const customer = await stripe.customers.create(
+      {
+        name: contact.name || undefined,
+        email: contact.email || undefined,
+        phone: contact.phone || undefined,
+        address: contact.address ? { line1: contact.address } : undefined,
+        metadata: { wolfcrm_contact_id: contact.id }
+      },
+      { stripeAccount: connectedAccountId }
+    );
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: customer.id },
+      { apiVersion: "2024-06-20", stripeAccount: connectedAccountId }
+    );
+
+    const piParams = {
+      amount: amountInt,
+      currency,
+      customer: customer.id,
+      description: description || `Payment from ${contact.name}`,
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        wolfcrm_contact_id: contact.id,
+        wolfcrm_user_id: employerId,
+        wolfcrm_payment_type: paymentType
+      }
+    };
+    if (STRIPE_PLATFORM_FEE_BPS > 0) {
+      piParams.application_fee_amount = Math.floor((amountInt * STRIPE_PLATFORM_FEE_BPS) / 10000);
+    }
+    const intent = await stripe.paymentIntents.create(piParams, { stripeAccount: connectedAccountId });
+
+    const record = await pool.query(
+      `INSERT INTO payment_records (
+         user_id, company_id, created_by_user_id, contact_id, service_plan_id,
+         payment_type, status, amount_cents, currency, description,
+         stripe_connected_account_id, stripe_customer_id, stripe_payment_intent_id
+       ) VALUES ($1,$2,$3,$4,NULL,$5,'pending',$6,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [
+        employerId, req.companyId || null, req.userId, contact.id,
+        paymentType, amountInt, currency, description || null,
+        connectedAccountId, customer.id, intent.id
+      ]
+    );
+    res.json({
+      publishable_key: publishableKey,
+      connected_account_id: connectedAccountId,
+      customer_id: customer.id,
+      ephemeral_key_secret: ephemeralKey.secret,
+      payment_intent_client_secret: intent.client_secret,
+      payment_record_id: record.rows[0].id
+    });
+  } catch (e) {
+    console.error("contact payment start:", e);
+    res.status(500).json({ error: "start_payment_failed", detail: e.message });
+  }
+});
+
+app.get("/api/contacts/:contactId/payments", authRequired, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const c = await pool.query(`SELECT id FROM contacts WHERE id = $1 AND user_id = $2`,
+      [req.params.contactId, employerId]);
+    if (!c.rows.length) return res.status(404).json({ error: "contact_not_found" });
+    if (req.role === "employer") {
+      const { rows } = await pool.query(
+        `SELECT * FROM payment_records
+          WHERE user_id = $1 AND contact_id::text = $2
+          ORDER BY created_at DESC`,
+        [employerId, req.params.contactId]
+      );
+      return res.json(rows.map((r) => sanitizePaymentRecord(r)));
+    }
+    const { rows } = await pool.query(
+      `SELECT * FROM payment_records
+        WHERE user_id = $1 AND contact_id::text = $2 AND created_by_user_id = $3
+        ORDER BY created_at DESC`,
+      [employerId, req.params.contactId, req.userId]
+    );
+    res.json(rows.map((r) => sanitizePaymentRecord(r, { employeeSafe: true })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "list_payments_failed" });
+  }
+});
+
+app.get("/api/payments/:id", authRequired, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `SELECT * FROM payment_records WHERE id = $1 AND user_id = $2`,
+      [req.params.id, employerId]
+    );
+    const rec = rows[0];
+    if (!rec) return res.status(404).json({ error: "not_found" });
+    if (req.role !== "employer" && rec.created_by_user_id !== req.userId) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    res.json(sanitizePaymentRecord(rec, { employeeSafe: req.role !== "employer" }));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "get_payment_failed" });
+  }
+});
+
+// ==========================================================================
+//                            STRIPE WEBHOOK
+// ==========================================================================
+// The raw body middleware is registered near the top of the file. Here we
+// verify the signature and update local state to match Stripe's authoritative
+// view of the world.
+app.post("/stripe/webhook", async (req, res) => {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  const stripe = getStripe();
+  if (!secret || !stripe) return res.status(503).send("stripe_not_configured");
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      secret
+    );
+  } catch (err) {
+    console.error("webhook signature failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  const connectedAccountId = event.account || null;
+
+  try {
+    // Duplicate protection: check if we've already recorded this stripe_event_id.
+    const dupe = await pool.query(
+      `SELECT id FROM service_plan_events WHERE stripe_event_id = $1 LIMIT 1`,
+      [event.id]
+    );
+    if (dupe.rows.length) return res.json({ received: true, duplicate: true });
+
+    async function markServicePlanEvent(planId, contactId, employerId, companyId, type, notes = null) {
+      if (!planId) return;
+      await pool.query(
+        `INSERT INTO service_plan_events (user_id, company_id, service_plan_id, contact_id, event_type, notes, stripe_event_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT DO NOTHING`,
+        [employerId, companyId || null, planId, contactId || null, type, notes, event.id]
+      );
+    }
+
+    switch (event.type) {
+      case "account.updated": {
+        const acct = event.data.object;
+        await pool.query(
+          `UPDATE business_settings
+              SET stripe_charges_enabled = $2,
+                  stripe_payouts_enabled = $3,
+                  stripe_details_submitted = $4,
+                  stripe_default_currency = COALESCE($5, stripe_default_currency),
+                  stripe_connect_status = CASE
+                    WHEN $4 = false THEN 'setup_incomplete'
+                    WHEN $2 = true THEN 'ready'
+                    ELSE 'verification_pending'
+                  END,
+                  updated_at = now()
+            WHERE stripe_account_id = $1`,
+          [acct.id, !!acct.charges_enabled, !!acct.payouts_enabled, !!acct.details_submitted, acct.default_currency || null]
+        );
+        break;
+      }
+
+      case "customer.subscription.created":
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted": {
+        const sub = event.data.object;
+        const localStatus = event.type === "customer.subscription.deleted"
+          ? "canceled"
+          : (mapStripeSubscriptionStatus(sub.status) || null);
+        const { rows } = await pool.query(
+          `UPDATE service_plans
+              SET stripe_subscription_status = $2,
+                  status = COALESCE($3, status),
+                  updated_at = now()
+            WHERE stripe_subscription_id = $1
+              AND (stripe_connected_account_id = $4 OR $4 IS NULL)
+            RETURNING id, user_id, company_id, contact_id`,
+          [sub.id, sub.status, localStatus, connectedAccountId]
+        );
+        if (rows.length) {
+          await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
+            `stripe_${event.type}`, `Subscription is ${sub.status}`);
+        }
+        break;
+      }
+
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object;
+        // Update payment record.
+        await pool.query(
+          `UPDATE payment_records
+              SET status = 'succeeded', updated_at = now()
+            WHERE stripe_invoice_id = $1
+               OR stripe_subscription_id = $2`,
+          [invoice.id, invoice.subscription || null]
+        );
+        // If this is the initial invoice, mark plan active.
+        if (invoice.subscription) {
+          const { rows } = await pool.query(
+            `UPDATE service_plans
+                SET status = 'active',
+                    stripe_subscription_status = 'active',
+                    updated_at = now()
+              WHERE stripe_subscription_id = $1
+                AND (stripe_connected_account_id = $2 OR $2 IS NULL)
+              RETURNING id, user_id, company_id, contact_id`,
+            [invoice.subscription, connectedAccountId]
+          );
+          if (rows.length) {
+            await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
+              "invoice_paid", `Invoice ${invoice.id} paid`);
+          }
+        }
+        break;
+      }
+
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+        await pool.query(
+          `UPDATE payment_records
+              SET status = 'failed', updated_at = now()
+            WHERE stripe_invoice_id = $1`,
+          [invoice.id]
+        );
+        if (invoice.subscription) {
+          const { rows } = await pool.query(
+            `UPDATE service_plans
+                SET status = 'past_due', updated_at = now()
+              WHERE stripe_subscription_id = $1
+              RETURNING id, user_id, company_id, contact_id`,
+            [invoice.subscription]
+          );
+          if (rows.length) {
+            await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
+              "invoice_failed", `Invoice ${invoice.id} failed`);
+          }
+        }
+        break;
+      }
+
+      case "payment_intent.succeeded": {
+        const pi = event.data.object;
+        await pool.query(
+          `UPDATE payment_records
+              SET status = 'succeeded', updated_at = now()
+            WHERE stripe_payment_intent_id = $1`,
+          [pi.id]
+        );
+        break;
+      }
+
+      case "payment_intent.payment_failed": {
+        const pi = event.data.object;
+        await pool.query(
+          `UPDATE payment_records
+              SET status = 'failed', updated_at = now()
+            WHERE stripe_payment_intent_id = $1`,
+          [pi.id]
+        );
+        break;
+      }
+
+      case "charge.refunded": {
+        const charge = event.data.object;
+        if (charge.payment_intent) {
+          await pool.query(
+            `UPDATE payment_records
+                SET status = 'refunded', updated_at = now()
+              WHERE stripe_payment_intent_id = $1`,
+            [charge.payment_intent]
+          );
+        }
+        break;
+      }
+
+      default:
+        // no-op — we simply acknowledge unhandled events.
+        break;
+    }
+
+    res.json({ received: true });
+  } catch (e) {
+    console.error("webhook handling error:", e);
+    res.status(500).json({ error: "webhook_handler_failed" });
+  }
 });
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
