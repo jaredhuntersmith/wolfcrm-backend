@@ -238,9 +238,38 @@ async function bootstrap() {
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       token TEXT UNIQUE NOT NULL,
       auto_stage_id TEXT,
+      auto_assign_stage_enabled BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS zapier_tokens_token_idx ON zapier_tokens(token);
+    ALTER TABLE zapier_tokens ADD COLUMN IF NOT EXISTS auto_assign_stage_enabled BOOLEAN NOT NULL DEFAULT false;
+
+    -- Contact provenance for webhook-imported leads
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS source TEXT;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS external_lead_id TEXT;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS lead_form_id TEXT;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS lead_page_id TEXT;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS lead_submitted_at TIMESTAMPTZ;
+
+    -- Full raw webhook payload (kept separately so we can debug without touching contacts)
+    CREATE TABLE IF NOT EXISTS lead_imports (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID,
+      user_id UUID NOT NULL,
+      contact_id TEXT,
+      source TEXT NOT NULL DEFAULT 'zapier',
+      external_lead_id TEXT,
+      form_id TEXT,
+      page_id TEXT,
+      submitted_at TIMESTAMPTZ,
+      raw_payload JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS lead_imports_company_idx ON lead_imports(company_id, created_at DESC);
+    -- Dedup by external lead id per company (partial unique index skips rows without an id)
+    CREATE UNIQUE INDEX IF NOT EXISTS lead_imports_unique_ext
+      ON lead_imports(company_id, source, external_lead_id)
+      WHERE external_lead_id IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS stage_reminders (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2254,25 +2283,52 @@ function toBool(v, fallback = false) {
 
 // ---------- INTEGRATIONS: Zapier / Meta Lead webhook ----------
 
+// Shape returned by all integration endpoints. Never includes internals.
+function integrationPayload(row) {
+  return {
+    token: row.token,
+    auto_stage_id: row.auto_stage_id,
+    auto_assign_stage_enabled: !!row.auto_assign_stage_enabled
+  };
+}
+
 // GET current token (create if missing)
 app.get("/api/integrations/zapier/token", authRequired, async (req, res) => {
   try {
     let { rows } = await pool.query(
-      `SELECT token, auto_stage_id FROM zapier_tokens WHERE user_id = $1`,
+      `SELECT token, auto_stage_id, auto_assign_stage_enabled FROM zapier_tokens WHERE user_id = $1`,
       [req.userId]
     );
     if (!rows.length) {
       const token = randomBytes(24).toString("hex");
       await pool.query(
-        `INSERT INTO zapier_tokens (user_id, token) VALUES ($1, $2)`,
+        `INSERT INTO zapier_tokens (user_id, token, auto_assign_stage_enabled) VALUES ($1, $2, false)`,
         [req.userId, token]
       );
-      rows = [{ token, auto_stage_id: null }];
+      rows = [{ token, auto_stage_id: null, auto_assign_stage_enabled: false }];
     }
-    res.json(rows[0]);
+    // Self-heal: if the saved stage no longer belongs to the account, quietly clear it.
+    const row = rows[0];
+    if (row.auto_stage_id) {
+      const check = await pool.query(
+        `SELECT 1 FROM stages
+         WHERE id = $1 AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))
+         LIMIT 1`,
+        [row.auto_stage_id, req.userId, req.companyId || null]
+      );
+      if (!check.rowCount) {
+        await pool.query(
+          `UPDATE zapier_tokens SET auto_stage_id = NULL, auto_assign_stage_enabled = false WHERE user_id = $1`,
+          [req.userId]
+        );
+        row.auto_stage_id = null;
+        row.auto_assign_stage_enabled = false;
+      }
+    }
+    res.json(integrationPayload(row));
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "failed_get_token" });
+    console.error("[integrations] get token failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_get_token", message: "Could not load your integration configuration." });
   }
 });
 
@@ -2284,21 +2340,25 @@ app.post("/api/integrations/zapier/token/rotate", authRequired, async (req, res)
       `INSERT INTO zapier_tokens (user_id, token)
        VALUES ($1, $2)
        ON CONFLICT (user_id) DO UPDATE SET token = EXCLUDED.token, created_at = now()
-       RETURNING token, auto_stage_id`,
+       RETURNING token, auto_stage_id, auto_assign_stage_enabled`,
       [req.userId, token]
     );
-    res.json(rows[0]);
+    res.json(integrationPayload(rows[0]));
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "failed_rotate_token" });
+    console.error("[integrations] rotate failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_rotate_token", message: "Could not rotate the webhook token." });
   }
 });
 
-// Set stage to auto-assign new leads into. The stage_id must belong to the
-// caller (either their user_id or their company). Passing null clears it.
+// Set stage to auto-assign new leads into.
+// This endpoint is intentionally TOLERANT: it never returns 4xx for a stale/missing
+// stage — it silently clears the invalid ref instead. This lets the app self-heal
+// during migrations, deletes, and cross-account edge cases.
 app.put("/api/integrations/zapier/auto-stage", authRequired, async (req, res) => {
   const { stage_id } = req.body || {};
   try {
+    let effectiveStageId = null;
+    let warning = null;
     if (stage_id) {
       const check = await pool.query(
         `SELECT 1 FROM stages
@@ -2307,20 +2367,46 @@ app.put("/api/integrations/zapier/auto-stage", authRequired, async (req, res) =>
          LIMIT 1`,
         [stage_id, req.userId, req.companyId || null]
       );
-      if (!check.rowCount) {
-        return res.status(400).json({ error: "stage_not_in_scope", message: "That stage does not belong to your account." });
+      if (check.rowCount) {
+        effectiveStageId = stage_id;
+      } else {
+        warning = "stage_not_in_scope_cleared";
       }
     }
     const { rows } = await pool.query(
-      `UPDATE zapier_tokens SET auto_stage_id = $2 WHERE user_id = $1
-       RETURNING token, auto_stage_id`,
-      [req.userId, stage_id || null]
+      `UPDATE zapier_tokens
+         SET auto_stage_id = $2,
+             auto_assign_stage_enabled = CASE WHEN $2::text IS NULL THEN false ELSE auto_assign_stage_enabled END
+       WHERE user_id = $1
+       RETURNING token, auto_stage_id, auto_assign_stage_enabled`,
+      [req.userId, effectiveStageId]
     );
-    if (!rows.length) return res.status(404).json({ error: "token_not_found" });
-    res.json(rows[0]);
+    if (!rows.length) return res.status(404).json({ error: "token_not_found", message: "No webhook is set up for this account yet." });
+    const payload = integrationPayload(rows[0]);
+    if (warning) payload.warning = warning;
+    res.json(payload);
   } catch (e) {
-    console.error("[zapier] set auto_stage failed:", e);
-    res.status(500).json({ error: "failed_set_auto_stage" });
+    console.error("[integrations] set auto_stage failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_set_auto_stage", message: "Could not save your stage selection." });
+  }
+});
+
+// Toggle whether new imported leads are auto-assigned to a stage at all.
+app.put("/api/integrations/zapier/auto-assign-enabled", authRequired, async (req, res) => {
+  const enabled = !!(req.body && req.body.enabled);
+  try {
+    const { rows } = await pool.query(
+      `UPDATE zapier_tokens
+         SET auto_assign_stage_enabled = $2
+       WHERE user_id = $1
+       RETURNING token, auto_stage_id, auto_assign_stage_enabled`,
+      [req.userId, enabled]
+    );
+    if (!rows.length) return res.status(404).json({ error: "token_not_found", message: "No webhook is set up for this account yet." });
+    res.json(integrationPayload(rows[0]));
+  } catch (e) {
+    console.error("[integrations] set auto_assign_enabled failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_set_toggle", message: "Could not save that setting." });
   }
 });
 
@@ -2379,33 +2465,42 @@ app.delete("/api/stage-reminders/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_reminder" }); }
 });
 
-// ---------- Public webhook (no auth) ----------
-// Accepts:
-//   * Structured shape:  { full_name/name/first_name+last_name, phone, email, address,
-//                          questions: [{question, answer}, ...] }
-//   * Zapier Facebook Lead Ads raw shape (POST Data left blank in Zapier):
-//                        { id, created_time, form_id, field_data: [{name, values:[]}], ... }
-//   * Any mix — everything unknown becomes a Lead Info box so nothing is lost.
+// ============================================================================
+// Public webhook (no auth) — POST /webhooks/leads/:token
+// ============================================================================
 //
-// Behavior:
-//   * ALWAYS creates the contact (200/201) as long as the token is valid, even
-//     if auto-assignment is off or the configured stage was deleted.
-//   * Detailed [zapier] console logs at every step so Railway logs make issues
-//     obvious.
-//   * Never leaks internals in the JSON response.
+// PRIMARY GUARANTEE: contact creation is mandatory. Stage assignment is
+// optional and MUST NEVER block, undo, or roll back the contact/lead_info.
+//
+// Processing steps (in strict order):
+//   1) Validate the webhook token → resolve user + company
+//   2) Parse payload (structured "questions" shape OR raw Facebook Lead Ads
+//      field_data OR any mix)
+//   3) Duplicate check via (company_id, source, external_lead_id)
+//   4) Create the contact
+//   5) Save Lead Info + lead_imports record (with raw payload)
+//   6) OPTIONAL stage assignment — only if enabled + stage still valid
+//
+// Only returns a non-2xx status when the token is bad, payload is totally
+// unusable, or the contact itself couldn't be saved. Stage errors → warning
+// in the 2xx response.
+// ============================================================================
+
 function zLog(...args) { console.log("[zapier]", ...args); }
 function zWarn(...args) { console.warn("[zapier]", ...args); }
 function zErr(...args) { console.error("[zapier]", ...args); }
 
-// Meta / Facebook Lead Ads uses fixed field slugs. We recognize the most common
-// ones so we auto-populate the contact's structured fields as well as putting
-// them in Lead Info boxes.
+// Facebook Lead Ads uses fixed field slugs — recognize them so structured
+// columns get populated in addition to Lead Info boxes.
 const FB_NAME_KEYS  = new Set(["full_name", "name"]);
 const FB_FIRST_KEYS = new Set(["first_name", "firstname"]);
 const FB_LAST_KEYS  = new Set(["last_name", "lastname", "surname"]);
-const FB_PHONE_KEYS = new Set(["phone_number", "phone", "mobile_number", "mobile", "cell_phone"]);
+const FB_PHONE_KEYS = new Set(["phone_number", "phone", "mobile_number", "mobile", "cell_phone", "work_phone"]);
 const FB_EMAIL_KEYS = new Set(["email", "e_mail", "email_address"]);
 const FB_ADDR_KEYS  = new Set(["address", "street_address", "full_address", "city_state_zip"]);
+const FB_CITY_KEYS  = new Set(["city"]);
+const FB_STATE_KEYS = new Set(["state", "province"]);
+const FB_ZIP_KEYS   = new Set(["zip", "postal_code", "zip_code", "postcode"]);
 
 function firstAnswer(field) {
   if (!field) return "";
@@ -2417,170 +2512,311 @@ function firstAnswer(field) {
 
 function normalizedFieldData(fieldData) {
   if (!Array.isArray(fieldData)) return [];
-  return fieldData.map(f => {
-    if (!f || typeof f !== "object") return { question: "", answer: "" };
-    return {
+  return fieldData
+    .filter(f => f && typeof f === "object")
+    .map(f => ({
       key: (f.name || f.key || f.label || "").toString().trim(),
       question: (f.label || f.question || f.name || "").toString().trim(),
       answer: firstAnswer(f).trim()
-    };
-  });
+    }));
+}
+
+function composeAddress(base, city, state, zip) {
+  const parts = [];
+  if (base) parts.push(base);
+  const tail = [city, state].filter(Boolean).join(", ");
+  if (tail) parts.push(tail);
+  if (zip) parts.push(zip);
+  return parts.join(" ").trim() || null;
+}
+
+function tokenTail(token) {
+  // Safe identifier for logs: last 4 chars only.
+  return token && token.length >= 4 ? `…${token.slice(-4)}` : "";
 }
 
 app.post("/webhooks/leads/:token", async (req, res) => {
   const startedAt = Date.now();
   const { token } = req.params;
   const bodyKeys = Object.keys(req.body || {});
-  zLog("request received", { tokenPrefix: (token || "").slice(0, 6), bodyKeys });
+  zLog("webhook_received", { tokenTail: tokenTail(token), bodyKeys });
 
+  // ---- STEP 1: TOKEN VALIDATION ---------------------------------------------
+  if (!token || token.length < 16) {
+    zWarn("token_validation_failed", { reason: "bad_format" });
+    return res.status(400).json({
+      success: false,
+      error: "bad_token",
+      message: "Webhook URL is malformed."
+    });
+  }
+
+  let tokenRow;
   try {
-    if (!token || token.length < 16) {
-      zWarn("bad token format");
-      return res.status(400).json({ ok: false, error: "bad_token", message: "Webhook token missing or malformed." });
-    }
-
-    // ---- 1) look up the account this token belongs to
-    const tokenRows = await pool.query(
-      `SELECT zt.user_id, zt.auto_stage_id, u.company_id
+    const q = await pool.query(
+      `SELECT zt.user_id, zt.auto_stage_id, zt.auto_assign_stage_enabled, u.company_id
        FROM zapier_tokens zt
        JOIN users u ON u.id = zt.user_id
        WHERE zt.token = $1`,
       [token]
     );
-    if (!tokenRows.rows.length) {
-      zWarn("token not found");
-      return res.status(404).json({ ok: false, error: "token_not_found", message: "Unknown webhook token." });
-    }
-    const { user_id: userId, company_id: companyId, auto_stage_id: autoStageId } = tokenRows.rows[0];
-    zLog("token matched", { userId, companyId, hasAutoStage: !!autoStageId });
-
-    // ---- 2) parse payload — support structured, FB Lead Ads, and mixed shapes
-    const body = req.body || {};
-    const fieldEntries = normalizedFieldData(body.field_data);
-
-    // Look up FB-style fields for structured columns
-    const findFB = (matcher) => {
-      const e = fieldEntries.find(x => matcher.has(x.key.toLowerCase()));
-      return e ? e.answer : "";
-    };
-
-    const fullName = (body.full_name || body.name || findFB(FB_NAME_KEYS) || "").toString().trim();
-    const first    = (body.first_name || findFB(FB_FIRST_KEYS) || "").toString().trim();
-    const last     = (body.last_name  || findFB(FB_LAST_KEYS)  || "").toString().trim();
-    const composed = [first, last].filter(Boolean).join(" ").trim();
-    const name     = fullName || composed || "New Lead";
-
-    const phone   = (body.phone   || body.phone_number || findFB(FB_PHONE_KEYS) || "").toString().trim() || null;
-    const email   = (body.email   || findFB(FB_EMAIL_KEYS) || "").toString().trim() || null;
-    const address = (body.address || body.street_address || findFB(FB_ADDR_KEYS) || "").toString().trim() || null;
-
-    zLog("payload parsed", { name, hasPhone: !!phone, hasEmail: !!email, hasAddress: !!address, fieldCount: fieldEntries.length });
-
-    // ---- 3) build Lead Info boxes
-    // Questions come from body.questions (structured) OR from field_data
-    // (Facebook). Skip entries we already captured in structured columns so
-    // Lead Info doesn't just repeat the contact's phone/email/etc.
-    const usedFBKeys = new Set([
-      ...FB_NAME_KEYS, ...FB_FIRST_KEYS, ...FB_LAST_KEYS,
-      ...FB_PHONE_KEYS, ...FB_EMAIL_KEYS, ...FB_ADDR_KEYS,
-    ]);
-
-    let questions = [];
-    if (Array.isArray(body.questions)) {
-      questions = body.questions.map(q => ({
-        question: (q && q.question) || "",
-        answer:   (q && q.answer)   || ""
-      }));
-    } else if (fieldEntries.length) {
-      questions = fieldEntries
-        .filter(e => !usedFBKeys.has(e.key.toLowerCase()))
-        .map(e => ({ question: e.question || e.key, answer: e.answer }));
-    }
-
-    const leadInfo = questions
-      .filter(q => q && (q.question || q.answer))
-      .slice(0, 25)
-      .map(q => {
-        const question = (q.question || "").toString().trim();
-        const answer   = (q.answer   || "").toString().trim();
-        if (!question && !answer) return "";
-        if (!answer) return question;
-        if (!question) return `**${answer}**`;
-        return `${question}\n**${answer}**`;
-      });
-
-    zLog("lead_info built", { boxes: leadInfo.length });
-
-    // ---- 4) create the contact (this MUST succeed for the response to be 201)
-    const contactId = randomUUID();
-    let contactRow;
-    try {
-      const inserted = await pool.query(
-        `INSERT INTO contacts (
-          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type,
-          u1, u2, u3, u4, u5, lead_info
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, $8, NULL,
-          NULL, NULL, NULL, NULL, NULL, $9
-        ) RETURNING *`,
-        [
-          contactId, userId, companyId, name, phone || "", email || "", address || "",
-          "lead,zapier",
-          JSON.stringify(leadInfo)
-        ]
-      );
-      contactRow = inserted.rows[0];
-      zLog("contact created", { contactId, name });
-    } catch (e) {
-      zErr("contact insert failed:", e && e.message ? e.message : e);
-      return res.status(500).json({ ok: false, error: "contact_create_failed", message: "Could not save the incoming lead. Check server logs." });
-    }
-
-    // ---- 5) auto-assign to a stage IF configured AND that stage still exists
-    let stageAssignment = { attempted: !!autoStageId, applied: false, reason: null };
-    if (autoStageId) {
-      try {
-        const stageCheck = await pool.query(
-          `SELECT id FROM stages
-           WHERE id = $1
-             AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))
-           LIMIT 1`,
-          [autoStageId, userId, companyId || null]
-        );
-        if (!stageCheck.rowCount) {
-          stageAssignment.reason = "stage_not_found_or_out_of_scope";
-          zWarn("auto-assign skipped — stage missing or out of scope", { autoStageId, userId, companyId });
-        } else {
-          const oppId = randomUUID();
-          await pool.query(
-            `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id)
-             VALUES ($1, $2, $3, $4, 'stage', $5)`,
-            [oppId, userId, companyId || null, contactId, autoStageId]
-          );
-          stageAssignment.applied = true;
-          zLog("opportunity created", { oppId, stageId: autoStageId });
-        }
-      } catch (e) {
-        stageAssignment.reason = "opportunity_insert_failed";
-        zErr("auto-assign failed (contact still created):", e && e.message ? e.message : e);
-      }
-    } else {
-      stageAssignment.reason = "no_auto_stage_configured";
-      zLog("auto-assign skipped — none configured");
-    }
-
-    zLog("done", { ms: Date.now() - startedAt, stageAssignment });
-    return res.status(201).json({
-      ok: true,
-      contact_id: contactRow.id,
-      name: contactRow.name,
-      lead_info_boxes: leadInfo.length,
-      stage_assignment: stageAssignment
-    });
+    tokenRow = q.rows[0];
   } catch (e) {
-    zErr("unhandled webhook error:", e && e.message ? e.message : e, e && e.stack ? e.stack : "");
-    return res.status(500).json({ ok: false, error: "webhook_failed", message: "Unexpected server error while processing the lead." });
+    zErr("token_lookup_failed", { message: e && e.message ? e.message : "unknown" });
+    return res.status(500).json({
+      success: false,
+      error: "auth_lookup_failed",
+      message: "Authentication check failed. Please retry."
+    });
   }
+
+  if (!tokenRow) {
+    zWarn("token_not_found");
+    return res.status(404).json({
+      success: false,
+      error: "token_not_found",
+      message: "Unknown webhook token."
+    });
+  }
+
+  const userId     = tokenRow.user_id;
+  const companyId  = tokenRow.company_id || null;
+  const autoStageId = tokenRow.auto_stage_id;
+  const autoAssignEnabled = !!tokenRow.auto_assign_stage_enabled;
+
+  zLog("token_validated", { hasCompany: !!companyId });
+  zLog("company_resolved", { companyId: companyId || "user-scope" });
+
+  // ---- STEP 2: PARSE PAYLOAD ------------------------------------------------
+  const body = req.body || {};
+  const fieldEntries = normalizedFieldData(body.field_data);
+  const findFB = (matcher) => {
+    const e = fieldEntries.find(x => matcher.has(x.key.toLowerCase()));
+    return e ? e.answer : "";
+  };
+
+  const fullName = (body.full_name || body.name || findFB(FB_NAME_KEYS) || "").toString().trim();
+  const first    = (body.first_name || findFB(FB_FIRST_KEYS) || "").toString().trim();
+  const last     = (body.last_name  || findFB(FB_LAST_KEYS)  || "").toString().trim();
+  const composed = [first, last].filter(Boolean).join(" ").trim();
+  let   name     = fullName || composed || "";
+
+  const phone = (body.phone || body.phone_number || findFB(FB_PHONE_KEYS) || "").toString().trim() || null;
+  const email = (body.email || findFB(FB_EMAIL_KEYS) || "").toString().trim() || null;
+  const baseAddress = (body.address || body.street_address || findFB(FB_ADDR_KEYS) || "").toString().trim();
+  const city  = (body.city  || findFB(FB_CITY_KEYS)  || "").toString().trim();
+  const state = (body.state || findFB(FB_STATE_KEYS) || "").toString().trim();
+  const zip   = (body.zip   || body.postal_code || findFB(FB_ZIP_KEYS) || "").toString().trim();
+  const address = composeAddress(baseAddress, city, state, zip);
+
+  // A lead is "usable" if we have at least one useful identifier.
+  const haveAnyIdentifier = !!(name || phone || email || address);
+  if (!haveAnyIdentifier) {
+    zWarn("payload_unusable");
+    return res.status(400).json({
+      success: false,
+      error: "payload_unusable",
+      message: "Lead had no name, phone, email or address — nothing to save."
+    });
+  }
+  if (!name) name = phone || email || "New Lead";
+
+  // Facebook / Meta metadata
+  const externalLeadId = (body.id || body.leadgen_id || body.lead_id || "").toString().trim() || null;
+  const formId  = (body.form_id || body.form || "").toString().trim() || null;
+  const pageId  = (body.page_id || body.page || "").toString().trim() || null;
+  const submittedAt = body.created_time || body.submitted_at || null;
+
+  const source = externalLeadId ? "facebook_zapier" : "zapier";
+
+  zLog("payload_parsed", {
+    hasName: !!name, hasPhone: !!phone, hasEmail: !!email, hasAddress: !!address,
+    fieldCount: fieldEntries.length, externalLeadId: externalLeadId ? "yes" : "no"
+  });
+
+  // Build Lead Info boxes from questions or field_data (skip fields already
+  // captured in structured columns so we don't repeat phone/email/etc.).
+  const usedFBKeys = new Set([
+    ...FB_NAME_KEYS, ...FB_FIRST_KEYS, ...FB_LAST_KEYS,
+    ...FB_PHONE_KEYS, ...FB_EMAIL_KEYS, ...FB_ADDR_KEYS,
+    ...FB_CITY_KEYS, ...FB_STATE_KEYS, ...FB_ZIP_KEYS
+  ]);
+
+  let questions = [];
+  if (Array.isArray(body.questions)) {
+    questions = body.questions
+      .filter(q => q && typeof q === "object")
+      .map(q => ({ question: (q.question || "").toString(), answer: (q.answer || "").toString() }));
+  } else if (fieldEntries.length) {
+    questions = fieldEntries
+      .filter(e => !usedFBKeys.has(e.key.toLowerCase()))
+      .map(e => ({ question: e.question || e.key, answer: e.answer }));
+  }
+
+  const leadInfo = questions
+    .filter(q => q.question || q.answer)
+    .slice(0, 25)
+    .map(q => {
+      const question = q.question.trim();
+      const answer = q.answer.trim();
+      if (!question && !answer) return "";
+      if (!answer) return question;
+      if (!question) return `**${answer}**`;
+      return `${question}\n**${answer}**`;
+    });
+
+  // ---- STEP 3: DUPLICATE CHECK ---------------------------------------------
+  let duplicateContactId = null;
+  if (externalLeadId) {
+    try {
+      const scopeSQL = companyId
+        ? `company_id = $1 AND source = $2 AND external_lead_id = $3`
+        : `user_id = $1 AND source = $2 AND external_lead_id = $3`;
+      const scopeVal = companyId || userId;
+      const dup = await pool.query(
+        `SELECT id FROM contacts WHERE ${scopeSQL} LIMIT 1`,
+        [scopeVal, source, externalLeadId]
+      );
+      if (dup.rowCount) duplicateContactId = dup.rows[0].id;
+    } catch (e) {
+      // Duplicate check is a nice-to-have; log and continue.
+      zWarn("duplicate_check_failed", { message: e && e.message ? e.message : "unknown" });
+    }
+  }
+  zLog("duplicate_check_completed", { duplicate: !!duplicateContactId });
+
+  if (duplicateContactId) {
+    zLog("webhook_completed", { ms: Date.now() - startedAt, duplicate: true });
+    return res.status(200).json({
+      success: true,
+      contact_created: false,
+      duplicate: true,
+      contact_id: duplicateContactId
+    });
+  }
+
+  // ---- STEP 4: CREATE CONTACT (mandatory) -----------------------------------
+  const contactId = randomUUID();
+  let contactRow;
+  try {
+    const inserted = await pool.query(
+      `INSERT INTO contacts (
+        id, user_id, company_id, name, phone, email, address,
+        value_cents, lat, lng, tags, job_type,
+        u1, u2, u3, u4, u5, lead_info,
+        source, external_lead_id, lead_form_id, lead_page_id, lead_submitted_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7,
+        NULL, NULL, NULL, $8, NULL,
+        NULL, NULL, NULL, NULL, NULL, $9,
+        $10, $11, $12, $13, $14
+      ) RETURNING *`,
+      [
+        contactId, userId, companyId, name, phone || "", email || "", address || "",
+        "lead,zapier",
+        JSON.stringify(leadInfo),
+        source, externalLeadId, formId, pageId, submittedAt
+      ]
+    );
+    contactRow = inserted.rows[0];
+    zLog("contact_created", { contactId, source });
+  } catch (e) {
+    zErr("contact_create_failed", { step: "insert_contact", message: e && e.message ? e.message : "unknown" });
+    return res.status(500).json({
+      success: false,
+      contact_created: false,
+      error: "contact_create_failed",
+      message: "We couldn't save this lead. Please retry."
+    });
+  }
+
+  // ---- STEP 4b: SAVE RAW PAYLOAD FOR DEBUGGING ------------------------------
+  // Stored separately from contacts so debugging doesn't clutter normal reads.
+  try {
+    await pool.query(
+      `INSERT INTO lead_imports
+         (company_id, user_id, contact_id, source, external_lead_id, form_id, page_id, submitted_at, raw_payload)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [companyId, userId, contactId, source, externalLeadId, formId, pageId, submittedAt, body]
+    );
+    zLog("lead_info_saved", { boxes: leadInfo.length });
+  } catch (e) {
+    // Non-fatal — the contact & lead_info are safely on the contact row.
+    zWarn("lead_import_record_failed", { message: e && e.message ? e.message : "unknown" });
+  }
+
+  // ---- STEP 5: OPTIONAL STAGE ASSIGNMENT ------------------------------------
+  // Isolated from everything above. Failures here NEVER touch the contact.
+  const stageResult = {
+    attempted: false,
+    applied: false,
+    reason: null,
+    stage_id: null
+  };
+
+  if (!autoAssignEnabled) {
+    stageResult.reason = "auto_assign_disabled";
+    zLog("stage_assignment_skipped", { reason: stageResult.reason });
+  } else if (!autoStageId) {
+    stageResult.reason = "no_stage_selected";
+    zLog("stage_assignment_skipped", { reason: stageResult.reason });
+  } else {
+    stageResult.attempted = true;
+    zLog("stage_assignment_attempted", { stageId: autoStageId });
+    try {
+      const stageCheck = await pool.query(
+        `SELECT id FROM stages
+         WHERE id = $1
+           AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))
+         LIMIT 1`,
+        [autoStageId, userId, companyId || null]
+      );
+      if (!stageCheck.rowCount) {
+        stageResult.reason = "stage_missing_or_out_of_scope";
+        zWarn("stage_assignment_skipped", { reason: stageResult.reason, stageId: autoStageId });
+        // Self-heal: clear the bad reference so it stops firing.
+        try {
+          await pool.query(
+            `UPDATE zapier_tokens SET auto_stage_id = NULL, auto_assign_stage_enabled = false WHERE user_id = $1`,
+            [userId]
+          );
+        } catch (_) { /* ignore */ }
+      } else {
+        const oppId = randomUUID();
+        await pool.query(
+          `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id)
+           VALUES ($1, $2, $3, $4, 'stage', $5)`,
+          [oppId, userId, companyId || null, contactId, autoStageId]
+        );
+        stageResult.applied = true;
+        stageResult.stage_id = autoStageId;
+        zLog("stage_assignment_succeeded", { oppId, stageId: autoStageId });
+      }
+    } catch (e) {
+      stageResult.reason = "opportunity_insert_failed";
+      zErr("stage_assignment_error_soft", {
+        contactId, stageId: autoStageId,
+        message: e && e.message ? e.message : "unknown"
+      });
+    }
+  }
+
+  zLog("webhook_completed", { ms: Date.now() - startedAt, contactId, stageResult });
+
+  // ---- RESPONSE -------------------------------------------------------------
+  const responseBody = {
+    success: true,
+    contact_created: true,
+    contact_id: contactRow.id,
+    stage_assigned: stageResult.applied
+  };
+  if (stageResult.applied) {
+    responseBody.stage_id = stageResult.stage_id;
+  } else if (stageResult.attempted) {
+    responseBody.warning = "stage_assignment_skipped";
+    responseBody.stage_skip_reason = stageResult.reason;
+  }
+  return res.status(201).json(responseBody);
 });
 
 
@@ -2631,6 +2867,15 @@ app.put("/api/stages/:id", authRequired, async (req, res) => {
 
 app.delete("/api/stages/:id", authRequired, async (req, res) => {
   try {
+    // Null out any zapier_tokens auto-assign refs that pointed here so future
+    // webhooks don't try to assign to a deleted stage.
+    await pool.query(
+      `UPDATE zapier_tokens
+         SET auto_stage_id = NULL,
+             auto_assign_stage_enabled = false
+       WHERE auto_stage_id = $1`,
+      [req.params.id]
+    );
     await pool.query(
       `DELETE FROM stages
        WHERE id = $1
