@@ -279,6 +279,26 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS stages_user_idx ON stages(user_id, order_idx);
 
+    -- Migrate stages to company-scoping so every teammate sees the same set.
+    ALTER TABLE stages ADD COLUMN IF NOT EXISTS company_id UUID;
+    UPDATE stages s
+      SET company_id = u.company_id
+      FROM users u
+      WHERE u.id = s.user_id
+        AND s.company_id IS NULL
+        AND u.company_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS stages_company_idx ON stages(company_id, order_idx);
+
+    -- Same for opportunities so auto-assigned webhook leads are visible company-wide.
+    ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS company_id UUID;
+    UPDATE opportunities o
+      SET company_id = u.company_id
+      FROM users u
+      WHERE u.id = o.user_id
+        AND o.company_id IS NULL
+        AND u.company_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS opportunities_company_idx ON opportunities(company_id);
+
     CREATE TABLE IF NOT EXISTS opportunities (
       id TEXT PRIMARY KEY,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -2274,10 +2294,23 @@ app.post("/api/integrations/zapier/token/rotate", authRequired, async (req, res)
   }
 });
 
-// Set stage to auto-assign new leads into
+// Set stage to auto-assign new leads into. The stage_id must belong to the
+// caller (either their user_id or their company). Passing null clears it.
 app.put("/api/integrations/zapier/auto-stage", authRequired, async (req, res) => {
   const { stage_id } = req.body || {};
   try {
+    if (stage_id) {
+      const check = await pool.query(
+        `SELECT 1 FROM stages
+         WHERE id = $1
+           AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))
+         LIMIT 1`,
+        [stage_id, req.userId, req.companyId || null]
+      );
+      if (!check.rowCount) {
+        return res.status(400).json({ error: "stage_not_in_scope", message: "That stage does not belong to your account." });
+      }
+    }
     const { rows } = await pool.query(
       `UPDATE zapier_tokens SET auto_stage_id = $2 WHERE user_id = $1
        RETURNING token, auto_stage_id`,
@@ -2286,7 +2319,7 @@ app.put("/api/integrations/zapier/auto-stage", authRequired, async (req, res) =>
     if (!rows.length) return res.status(404).json({ error: "token_not_found" });
     res.json(rows[0]);
   } catch (e) {
-    console.error(e);
+    console.error("[zapier] set auto_stage failed:", e);
     res.status(500).json({ error: "failed_set_auto_stage" });
   }
 });
@@ -2346,106 +2379,233 @@ app.delete("/api/stage-reminders/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_reminder" }); }
 });
 
-// Public webhook — no auth. Zapier / Meta lead forwarders POST here.
-// Accepts { name?, full_name?, first_name?, last_name?, phone?, email?, address?, questions: [{question, answer}, ...] }
+// ---------- Public webhook (no auth) ----------
+// Accepts:
+//   * Structured shape:  { full_name/name/first_name+last_name, phone, email, address,
+//                          questions: [{question, answer}, ...] }
+//   * Zapier Facebook Lead Ads raw shape (POST Data left blank in Zapier):
+//                        { id, created_time, form_id, field_data: [{name, values:[]}], ... }
+//   * Any mix — everything unknown becomes a Lead Info box so nothing is lost.
+//
+// Behavior:
+//   * ALWAYS creates the contact (200/201) as long as the token is valid, even
+//     if auto-assignment is off or the configured stage was deleted.
+//   * Detailed [zapier] console logs at every step so Railway logs make issues
+//     obvious.
+//   * Never leaks internals in the JSON response.
+function zLog(...args) { console.log("[zapier]", ...args); }
+function zWarn(...args) { console.warn("[zapier]", ...args); }
+function zErr(...args) { console.error("[zapier]", ...args); }
+
+// Meta / Facebook Lead Ads uses fixed field slugs. We recognize the most common
+// ones so we auto-populate the contact's structured fields as well as putting
+// them in Lead Info boxes.
+const FB_NAME_KEYS  = new Set(["full_name", "name"]);
+const FB_FIRST_KEYS = new Set(["first_name", "firstname"]);
+const FB_LAST_KEYS  = new Set(["last_name", "lastname", "surname"]);
+const FB_PHONE_KEYS = new Set(["phone_number", "phone", "mobile_number", "mobile", "cell_phone"]);
+const FB_EMAIL_KEYS = new Set(["email", "e_mail", "email_address"]);
+const FB_ADDR_KEYS  = new Set(["address", "street_address", "full_address", "city_state_zip"]);
+
+function firstAnswer(field) {
+  if (!field) return "";
+  if (Array.isArray(field.values) && field.values.length) return String(field.values[0]);
+  if (field.value != null) return String(field.value);
+  if (field.answer != null) return String(field.answer);
+  return "";
+}
+
+function normalizedFieldData(fieldData) {
+  if (!Array.isArray(fieldData)) return [];
+  return fieldData.map(f => {
+    if (!f || typeof f !== "object") return { question: "", answer: "" };
+    return {
+      key: (f.name || f.key || f.label || "").toString().trim(),
+      question: (f.label || f.question || f.name || "").toString().trim(),
+      answer: firstAnswer(f).trim()
+    };
+  });
+}
+
 app.post("/webhooks/leads/:token", async (req, res) => {
+  const startedAt = Date.now();
+  const { token } = req.params;
+  const bodyKeys = Object.keys(req.body || {});
+  zLog("request received", { tokenPrefix: (token || "").slice(0, 6), bodyKeys });
+
   try {
-    const { token } = req.params;
     if (!token || token.length < 16) {
-      return res.status(400).json({ error: "bad_token" });
+      zWarn("bad token format");
+      return res.status(400).json({ ok: false, error: "bad_token", message: "Webhook token missing or malformed." });
     }
-    const { rows } = await pool.query(
+
+    // ---- 1) look up the account this token belongs to
+    const tokenRows = await pool.query(
       `SELECT zt.user_id, zt.auto_stage_id, u.company_id
        FROM zapier_tokens zt
        JOIN users u ON u.id = zt.user_id
        WHERE zt.token = $1`,
       [token]
     );
-    if (!rows.length) return res.status(404).json({ error: "token_not_found" });
-    const { user_id: userId, company_id: companyId, auto_stage_id: autoStageId } = rows[0];
+    if (!tokenRows.rows.length) {
+      zWarn("token not found");
+      return res.status(404).json({ ok: false, error: "token_not_found", message: "Unknown webhook token." });
+    }
+    const { user_id: userId, company_id: companyId, auto_stage_id: autoStageId } = tokenRows.rows[0];
+    zLog("token matched", { userId, companyId, hasAutoStage: !!autoStageId });
 
+    // ---- 2) parse payload — support structured, FB Lead Ads, and mixed shapes
     const body = req.body || {};
-    // Name resolution
-    const fullName = (body.full_name || body.name || "").toString().trim();
-    const first = (body.first_name || "").toString().trim();
-    const last = (body.last_name || "").toString().trim();
+    const fieldEntries = normalizedFieldData(body.field_data);
+
+    // Look up FB-style fields for structured columns
+    const findFB = (matcher) => {
+      const e = fieldEntries.find(x => matcher.has(x.key.toLowerCase()));
+      return e ? e.answer : "";
+    };
+
+    const fullName = (body.full_name || body.name || findFB(FB_NAME_KEYS) || "").toString().trim();
+    const first    = (body.first_name || findFB(FB_FIRST_KEYS) || "").toString().trim();
+    const last     = (body.last_name  || findFB(FB_LAST_KEYS)  || "").toString().trim();
     const composed = [first, last].filter(Boolean).join(" ").trim();
-    const name = fullName || composed || "New Lead";
+    const name     = fullName || composed || "New Lead";
 
-    const phone = (body.phone || body.phone_number || "").toString().trim() || null;
-    const email = (body.email || "").toString().trim() || null;
-    const address = (body.address || body.street_address || "").toString().trim() || null;
+    const phone   = (body.phone   || body.phone_number || findFB(FB_PHONE_KEYS) || "").toString().trim() || null;
+    const email   = (body.email   || findFB(FB_EMAIL_KEYS) || "").toString().trim() || null;
+    const address = (body.address || body.street_address || findFB(FB_ADDR_KEYS) || "").toString().trim() || null;
 
-    // Build lead_info boxes from questions
+    zLog("payload parsed", { name, hasPhone: !!phone, hasEmail: !!email, hasAddress: !!address, fieldCount: fieldEntries.length });
+
+    // ---- 3) build Lead Info boxes
+    // Questions come from body.questions (structured) OR from field_data
+    // (Facebook). Skip entries we already captured in structured columns so
+    // Lead Info doesn't just repeat the contact's phone/email/etc.
+    const usedFBKeys = new Set([
+      ...FB_NAME_KEYS, ...FB_FIRST_KEYS, ...FB_LAST_KEYS,
+      ...FB_PHONE_KEYS, ...FB_EMAIL_KEYS, ...FB_ADDR_KEYS,
+    ]);
+
     let questions = [];
     if (Array.isArray(body.questions)) {
-      questions = body.questions;
-    } else if (Array.isArray(body.field_data)) {
-      // Meta Lead Ads Facebook Graph shape
-      questions = body.field_data.map(f => ({
-        question: f.name || f.label || "",
-        answer: Array.isArray(f.values) ? f.values.join(", ") : (f.value || "")
+      questions = body.questions.map(q => ({
+        question: (q && q.question) || "",
+        answer:   (q && q.answer)   || ""
       }));
+    } else if (fieldEntries.length) {
+      questions = fieldEntries
+        .filter(e => !usedFBKeys.has(e.key.toLowerCase()))
+        .map(e => ({ question: e.question || e.key, answer: e.answer }));
     }
+
     const leadInfo = questions
       .filter(q => q && (q.question || q.answer))
       .slice(0, 25)
       .map(q => {
         const question = (q.question || "").toString().trim();
-        const answer = (q.answer || "").toString().trim();
+        const answer   = (q.answer   || "").toString().trim();
         if (!question && !answer) return "";
         if (!answer) return question;
         if (!question) return `**${answer}**`;
         return `${question}\n**${answer}**`;
       });
 
-    const contactId = randomUUID();
-    const inserted = await pool.query(
-      `INSERT INTO contacts (
-        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type,
-        u1, u2, u3, u4, u5, lead_info
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, $8, NULL,
-        NULL, NULL, NULL, NULL, NULL, $9
-      ) RETURNING *`,
-      [
-        contactId, userId, companyId, name, phone || "", email || "", address || "",
-        "lead,zapier",
-        JSON.stringify(leadInfo)
-      ]
-    );
+    zLog("lead_info built", { boxes: leadInfo.length });
 
-    // Auto-assign to a stage if configured
-    if (autoStageId) {
-      try {
-        const oppId = randomUUID();
-        await pool.query(
-          `INSERT INTO opportunities (id, user_id, contact_id, state, stage_id)
-           VALUES ($1, $2, $3, 'stage', $4)`,
-          [oppId, userId, contactId, autoStageId]
-        );
-      } catch (e) {
-        console.error("auto-assign failed:", e);
-      }
+    // ---- 4) create the contact (this MUST succeed for the response to be 201)
+    const contactId = randomUUID();
+    let contactRow;
+    try {
+      const inserted = await pool.query(
+        `INSERT INTO contacts (
+          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type,
+          u1, u2, u3, u4, u5, lead_info
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, $8, NULL,
+          NULL, NULL, NULL, NULL, NULL, $9
+        ) RETURNING *`,
+        [
+          contactId, userId, companyId, name, phone || "", email || "", address || "",
+          "lead,zapier",
+          JSON.stringify(leadInfo)
+        ]
+      );
+      contactRow = inserted.rows[0];
+      zLog("contact created", { contactId, name });
+    } catch (e) {
+      zErr("contact insert failed:", e && e.message ? e.message : e);
+      return res.status(500).json({ ok: false, error: "contact_create_failed", message: "Could not save the incoming lead. Check server logs." });
     }
 
-    res.status(201).json({ ok: true, contact: inserted.rows[0] });
+    // ---- 5) auto-assign to a stage IF configured AND that stage still exists
+    let stageAssignment = { attempted: !!autoStageId, applied: false, reason: null };
+    if (autoStageId) {
+      try {
+        const stageCheck = await pool.query(
+          `SELECT id FROM stages
+           WHERE id = $1
+             AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))
+           LIMIT 1`,
+          [autoStageId, userId, companyId || null]
+        );
+        if (!stageCheck.rowCount) {
+          stageAssignment.reason = "stage_not_found_or_out_of_scope";
+          zWarn("auto-assign skipped — stage missing or out of scope", { autoStageId, userId, companyId });
+        } else {
+          const oppId = randomUUID();
+          await pool.query(
+            `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id)
+             VALUES ($1, $2, $3, $4, 'stage', $5)`,
+            [oppId, userId, companyId || null, contactId, autoStageId]
+          );
+          stageAssignment.applied = true;
+          zLog("opportunity created", { oppId, stageId: autoStageId });
+        }
+      } catch (e) {
+        stageAssignment.reason = "opportunity_insert_failed";
+        zErr("auto-assign failed (contact still created):", e && e.message ? e.message : e);
+      }
+    } else {
+      stageAssignment.reason = "no_auto_stage_configured";
+      zLog("auto-assign skipped — none configured");
+    }
+
+    zLog("done", { ms: Date.now() - startedAt, stageAssignment });
+    return res.status(201).json({
+      ok: true,
+      contact_id: contactRow.id,
+      name: contactRow.name,
+      lead_info_boxes: leadInfo.length,
+      stage_assignment: stageAssignment
+    });
   } catch (e) {
-    console.error("zapier webhook error:", e);
-    res.status(500).json({ error: "webhook_failed" });
+    zErr("unhandled webhook error:", e && e.message ? e.message : e, e && e.stack ? e.stack : "");
+    return res.status(500).json({ ok: false, error: "webhook_failed", message: "Unexpected server error while processing the lead." });
   }
 });
 
 
 // ---------- STAGES ----------
+// Stages are company-scoped when the user belongs to a company; otherwise they
+// fall back to the individual user. This is the SAME set of rows both the
+// Stages tab and the Integrations "auto-assign" picker read from.
 app.get("/api/stages", authRequired, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, name, order_idx FROM stages WHERE user_id = $1 ORDER BY order_idx ASC`,
-      [req.userId]
-    );
+    const { rows } = req.companyId
+      ? await pool.query(
+          `SELECT id, name, order_idx FROM stages
+           WHERE company_id = $1
+              OR (company_id IS NULL AND user_id = $2)
+           ORDER BY order_idx ASC`,
+          [req.companyId, req.userId]
+        )
+      : await pool.query(
+          `SELECT id, name, order_idx FROM stages
+           WHERE user_id = $1
+           ORDER BY order_idx ASC`,
+          [req.userId]
+        );
     res.json(rows);
-  } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_stages" }); }
+  } catch (e) { console.error("[stages] list failed:", e); res.status(500).json({ error: "failed_list_stages" }); }
 });
 
 app.put("/api/stages/:id", authRequired, async (req, res) => {
@@ -2453,38 +2613,52 @@ app.put("/api/stages/:id", authRequired, async (req, res) => {
   if (!name) return res.status(400).json({ error: "name_required" });
   try {
     const r = await pool.query(
-      `INSERT INTO stages (id, user_id, name, order_idx)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO stages (id, user_id, company_id, name, order_idx)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (id) DO UPDATE
          SET name = EXCLUDED.name,
              order_idx = EXCLUDED.order_idx,
+             company_id = COALESCE(EXCLUDED.company_id, stages.company_id),
              updated_at = now()
        WHERE stages.user_id = $2
+          OR (stages.company_id IS NOT NULL AND stages.company_id = $3)
        RETURNING id, name, order_idx`,
-      [req.params.id, req.userId, name, Number(order_idx) || 0]
+      [req.params.id, req.userId, req.companyId || null, name, Number(order_idx) || 0]
     );
     res.json(r.rows[0]);
-  } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_stage" }); }
+  } catch (e) { console.error("[stages] upsert failed:", e); res.status(500).json({ error: "failed_upsert_stage" }); }
 });
 
 app.delete("/api/stages/:id", authRequired, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM stages WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]);
+    await pool.query(
+      `DELETE FROM stages
+       WHERE id = $1
+         AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))`,
+      [req.params.id, req.userId, req.companyId || null]);
     res.status(204).end();
-  } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_stage" }); }
+  } catch (e) { console.error("[stages] delete failed:", e); res.status(500).json({ error: "failed_delete_stage" }); }
 });
 
 // ---------- OPPORTUNITIES (each contact has at most one) ----------
+// Company-scoped when the caller belongs to a company; user-scoped otherwise.
+// This is important so webhook-created opportunities show up for every teammate.
 app.get("/api/opportunities", authRequired, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, contact_id, state, stage_id, created_at
-       FROM opportunities WHERE user_id = $1`,
-      [req.userId]
-    );
+    const { rows } = req.companyId
+      ? await pool.query(
+          `SELECT id, contact_id, state, stage_id, created_at
+           FROM opportunities
+           WHERE company_id = $1 OR (company_id IS NULL AND user_id = $2)`,
+          [req.companyId, req.userId]
+        )
+      : await pool.query(
+          `SELECT id, contact_id, state, stage_id, created_at
+           FROM opportunities WHERE user_id = $1`,
+          [req.userId]
+        );
     res.json(rows);
-  } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_opportunities" }); }
+  } catch (e) { console.error("[opportunities] list failed:", e); res.status(500).json({ error: "failed_list_opportunities" }); }
 });
 
 app.put("/api/opportunities/:id", authRequired, async (req, res) => {
@@ -2492,25 +2666,29 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
   if (!contact_id || !state) return res.status(400).json({ error: "missing_params" });
   try {
     const r = await pool.query(
-      `INSERT INTO opportunities (id, user_id, contact_id, state, stage_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))
+      `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
        ON CONFLICT (user_id, contact_id) DO UPDATE
          SET state = EXCLUDED.state,
              stage_id = EXCLUDED.stage_id,
+             company_id = COALESCE(EXCLUDED.company_id, opportunities.company_id),
              updated_at = now()
        RETURNING id, contact_id, state, stage_id, created_at`,
-      [req.params.id, req.userId, contact_id, state, stage_id || null, created_at || null]
+      [req.params.id, req.userId, req.companyId || null, contact_id, state, stage_id || null, created_at || null]
     );
     res.json(r.rows[0]);
-  } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_opportunity" }); }
+  } catch (e) { console.error("[opportunities] upsert failed:", e); res.status(500).json({ error: "failed_upsert_opportunity" }); }
 });
 
 app.delete("/api/opportunities/:id", authRequired, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM opportunities WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]);
+    await pool.query(
+      `DELETE FROM opportunities
+       WHERE id = $1
+         AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))`,
+      [req.params.id, req.userId, req.companyId || null]);
     res.status(204).end();
-  } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_opportunity" }); }
+  } catch (e) { console.error("[opportunities] delete failed:", e); res.status(500).json({ error: "failed_delete_opportunity" }); }
 });
 
 // ---------- SCHEDULE EVENTS ----------
@@ -4178,4 +4356,3 @@ app.post("/stripe/webhook", async (req, res) => {
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
-
