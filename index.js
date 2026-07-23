@@ -2629,9 +2629,22 @@ app.post("/webhooks/leads/:token", async (req, res) => {
 
   const source = externalLeadId ? "facebook_zapier" : "zapier";
 
+  // Coerce submittedAt into either a valid ISO string or null. Postgres
+  // otherwise rejects empty strings / numbers with an "invalid input syntax
+  // for type timestamp with time zone" error that would fail the whole insert.
+  let submittedAtSafe = null;
+  if (submittedAt) {
+    try {
+      const d = new Date(submittedAt);
+      if (!isNaN(d.getTime())) submittedAtSafe = d.toISOString();
+    } catch (_) { /* leave as null */ }
+  }
+
   zLog("payload_parsed", {
     hasName: !!name, hasPhone: !!phone, hasEmail: !!email, hasAddress: !!address,
-    fieldCount: fieldEntries.length, externalLeadId: externalLeadId ? "yes" : "no"
+    fieldCount: fieldEntries.length,
+    externalLeadId: externalLeadId ? "yes" : "no",
+    submittedAtSafe: submittedAtSafe ? "yes" : "no"
   });
 
   // Build Lead Info boxes from questions or field_data (skip fields already
@@ -2696,8 +2709,15 @@ app.post("/webhooks/leads/:token", async (req, res) => {
   }
 
   // ---- STEP 4: CREATE CONTACT (mandatory) -----------------------------------
+  // Two-stage insert. Primary attempt writes source/external_lead_id/etc.
+  // If that fails for ANY reason (missing columns on a stale schema, bad
+  // Facebook timestamp, JSONB weirdness, whatever), fall back to a minimal
+  // insert that only uses columns present since day one. This guarantees
+  // contact creation is never blocked by webhook-specific metadata.
   const contactId = randomUUID();
   let contactRow;
+  let fallbackUsed = false;
+
   try {
     const inserted = await pool.query(
       `INSERT INTO contacts (
@@ -2715,19 +2735,68 @@ app.post("/webhooks/leads/:token", async (req, res) => {
         contactId, userId, companyId, name, phone || "", email || "", address || "",
         "lead,zapier",
         JSON.stringify(leadInfo),
-        source, externalLeadId, formId, pageId, submittedAt
+        source, externalLeadId, formId, pageId, submittedAtSafe
       ]
     );
     contactRow = inserted.rows[0];
     zLog("contact_created", { contactId, source });
-  } catch (e) {
-    zErr("contact_create_failed", { step: "insert_contact", message: e && e.message ? e.message : "unknown" });
-    return res.status(500).json({
-      success: false,
-      contact_created: false,
-      error: "contact_create_failed",
-      message: "We couldn't save this lead. Please retry."
+  } catch (primaryErr) {
+    zErr("contact_insert_primary_failed", {
+      code: primaryErr && primaryErr.code ? primaryErr.code : null,
+      message: primaryErr && primaryErr.message ? primaryErr.message : "unknown"
     });
+    // Fallback: minimal insert using only columns that have been on
+    // `contacts` from the beginning. Lead Info is still saved.
+    try {
+      const fallback = await pool.query(
+        `INSERT INTO contacts (
+          id, user_id, company_id, name, phone, email, address,
+          tags, lead_info
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING *`,
+        [
+          contactId, userId, companyId, name, phone || "", email || "", address || "",
+          "lead,zapier",
+          JSON.stringify(leadInfo)
+        ]
+      );
+      contactRow = fallback.rows[0];
+      fallbackUsed = true;
+      zWarn("contact_created_via_fallback", { contactId });
+    } catch (fallbackErr) {
+      // Very last try: minimal-minimal insert without lead_info, in case
+      // the lead_info column also isn't present on ancient schemas.
+      try {
+        const minimal = await pool.query(
+          `INSERT INTO contacts (
+            id, user_id, company_id, name, phone, email, address, tags
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          RETURNING *`,
+          [
+            contactId, userId, companyId, name, phone || "", email || "", address || "",
+            "lead,zapier"
+          ]
+        );
+        contactRow = minimal.rows[0];
+        fallbackUsed = true;
+        zWarn("contact_created_via_minimal_fallback", { contactId });
+      } catch (finalErr) {
+        zErr("contact_create_failed_all_paths", {
+          primaryCode: primaryErr && primaryErr.code,
+          primaryMessage: primaryErr && primaryErr.message,
+          fallbackCode: fallbackErr && fallbackErr.code,
+          fallbackMessage: fallbackErr && fallbackErr.message,
+          finalCode: finalErr && finalErr.code,
+          finalMessage: finalErr && finalErr.message
+        });
+        return res.status(500).json({
+          success: false,
+          contact_created: false,
+          error: "contact_create_failed",
+          message: "We couldn't save this lead. Please retry."
+        });
+      }
+    }
   }
 
   // ---- STEP 4b: SAVE RAW PAYLOAD FOR DEBUGGING ------------------------------
@@ -2737,7 +2806,7 @@ app.post("/webhooks/leads/:token", async (req, res) => {
       `INSERT INTO lead_imports
          (company_id, user_id, contact_id, source, external_lead_id, form_id, page_id, submitted_at, raw_payload)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [companyId, userId, contactId, source, externalLeadId, formId, pageId, submittedAt, body]
+      [companyId, userId, contactId, source, externalLeadId, formId, pageId, submittedAtSafe, body]
     );
     zLog("lead_info_saved", { boxes: leadInfo.length });
   } catch (e) {
