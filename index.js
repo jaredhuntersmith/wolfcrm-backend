@@ -2840,8 +2840,17 @@ app.get("/api/stages", authRequired, async (req, res) => {
            ORDER BY order_idx ASC`,
           [req.userId]
         );
+    console.log("[stages] list", {
+      userId: req.userId,
+      companyId: req.companyId || "none",
+      returned: rows.length,
+      ids: rows.map(r => r.id)
+    });
     res.json(rows);
-  } catch (e) { console.error("[stages] list failed:", e); res.status(500).json({ error: "failed_list_stages" }); }
+  } catch (e) {
+    console.error("[stages] list failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_list_stages" });
+  }
 });
 
 app.put("/api/stages/:id", authRequired, async (req, res) => {
