@@ -2718,6 +2718,10 @@ app.post("/webhooks/leads/:token", async (req, res) => {
   let contactRow;
   let fallbackUsed = false;
 
+  // `contacts.tags` is TEXT[] in production. Pass a real array, not a
+  // comma-joined string — Postgres error 22P02 otherwise.
+  const tagsArray = ["lead", "zapier"];
+
   try {
     const inserted = await pool.query(
       `INSERT INTO contacts (
@@ -2733,7 +2737,7 @@ app.post("/webhooks/leads/:token", async (req, res) => {
       ) RETURNING *`,
       [
         contactId, userId, companyId, name, phone || "", email || "", address || "",
-        "lead,zapier",
+        tagsArray,
         JSON.stringify(leadInfo),
         source, externalLeadId, formId, pageId, submittedAtSafe
       ]
@@ -2756,7 +2760,7 @@ app.post("/webhooks/leads/:token", async (req, res) => {
         RETURNING *`,
         [
           contactId, userId, companyId, name, phone || "", email || "", address || "",
-          "lead,zapier",
+          tagsArray,
           JSON.stringify(leadInfo)
         ]
       );
@@ -2774,7 +2778,7 @@ app.post("/webhooks/leads/:token", async (req, res) => {
           RETURNING *`,
           [
             contactId, userId, companyId, name, phone || "", email || "", address || "",
-            "lead,zapier"
+            tagsArray
           ]
         );
         contactRow = minimal.rows[0];
