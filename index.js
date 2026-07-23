@@ -228,9 +228,32 @@ async function bootstrap() {
       tags TEXT,
       job_type TEXT,
       u1 TEXT, u2 TEXT, u3 TEXT, u4 TEXT, u5 TEXT,
+      lead_info JSONB,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS contacts_updated_idx ON contacts(updated_at DESC);
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS lead_info JSONB;
+
+    CREATE TABLE IF NOT EXISTS zapier_tokens (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      token TEXT UNIQUE NOT NULL,
+      auto_stage_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS zapier_tokens_token_idx ON zapier_tokens(token);
+
+    CREATE TABLE IF NOT EXISTS stage_reminders (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      contact_id TEXT NOT NULL,
+      opportunity_id TEXT,
+      remind_at TIMESTAMPTZ NOT NULL,
+      note TEXT,
+      archived BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS stage_reminders_user_idx ON stage_reminders(user_id, remind_at);
 
     CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS TRIGGER AS $$
     BEGIN
@@ -2099,7 +2122,7 @@ app.post("/api/contacts", authRequired, async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
-    u1, u2, u3, u4, u5
+    u1, u2, u3, u4, u5, lead_info
   } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
 
@@ -2108,16 +2131,17 @@ app.post("/api/contacts", authRequired, async (req, res) => {
     const r = await pool.query(
       `
       INSERT INTO contacts (
-        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5
+        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
       ) RETURNING *;
       `,
       [
         id, req.userId, req.companyId, name || "", phone || "", email || "", address || "",
         Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
         lat ?? null, lng ?? null, tags || "", job_type || "",
-        u1 || "", u2 || "", u3 || "", u4 || "", u5 || ""
+        u1 || "", u2 || "", u3 || "", u4 || "", u5 || "",
+        Array.isArray(lead_info) ? JSON.stringify(lead_info) : null
       ]
     );
     res.status(201).json(r.rows[0]);
@@ -2131,10 +2155,12 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
-    u1, u2, u3, u4, u5
+    u1, u2, u3, u4, u5, lead_info
   } = req.body || {};
   try {
     const scope = companyOrUserContactWhere(req);
+    // lead_info: null means "leave as-is"; explicit array (even empty) overwrites.
+    const leadInfoParam = Array.isArray(lead_info) ? JSON.stringify(lead_info) : null;
     const r = await pool.query(
       `
       UPDATE contacts SET
@@ -2151,14 +2177,16 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
         u2 = COALESCE($12,u2),
         u3 = COALESCE($13,u3),
         u4 = COALESCE($14,u4),
-        u5 = COALESCE($15,u5)
-      WHERE id = $1 AND ${scope.sql.replace("$1", "$16")}
+        u5 = COALESCE($15,u5),
+        lead_info = COALESCE($16::jsonb, lead_info)
+      WHERE id = $1 AND ${scope.sql.replace("$1", "$17")}
       RETURNING *;
       `,
       [
         req.params.id, name, phone, email, address,
         Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
         lat ?? null, lng ?? null, tags, job_type, u1, u2, u3, u4, u5,
+        leadInfoParam,
         ...scope.values
       ]
     );
@@ -2203,6 +2231,211 @@ function toBool(v, fallback = false) {
   if (v === undefined || v === null) return fallback;
   return !!v;
 }
+
+// ---------- INTEGRATIONS: Zapier / Meta Lead webhook ----------
+
+// GET current token (create if missing)
+app.get("/api/integrations/zapier/token", authRequired, async (req, res) => {
+  try {
+    let { rows } = await pool.query(
+      `SELECT token, auto_stage_id FROM zapier_tokens WHERE user_id = $1`,
+      [req.userId]
+    );
+    if (!rows.length) {
+      const token = randomBytes(24).toString("hex");
+      await pool.query(
+        `INSERT INTO zapier_tokens (user_id, token) VALUES ($1, $2)`,
+        [req.userId, token]
+      );
+      rows = [{ token, auto_stage_id: null }];
+    }
+    res.json(rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "failed_get_token" });
+  }
+});
+
+// Rotate token
+app.post("/api/integrations/zapier/token/rotate", authRequired, async (req, res) => {
+  try {
+    const token = randomBytes(24).toString("hex");
+    const { rows } = await pool.query(
+      `INSERT INTO zapier_tokens (user_id, token)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET token = EXCLUDED.token, created_at = now()
+       RETURNING token, auto_stage_id`,
+      [req.userId, token]
+    );
+    res.json(rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "failed_rotate_token" });
+  }
+});
+
+// Set stage to auto-assign new leads into
+app.put("/api/integrations/zapier/auto-stage", authRequired, async (req, res) => {
+  const { stage_id } = req.body || {};
+  try {
+    const { rows } = await pool.query(
+      `UPDATE zapier_tokens SET auto_stage_id = $2 WHERE user_id = $1
+       RETURNING token, auto_stage_id`,
+      [req.userId, stage_id || null]
+    );
+    if (!rows.length) return res.status(404).json({ error: "token_not_found" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "failed_set_auto_stage" });
+  }
+});
+
+// ---------- STAGE REMINDERS ----------
+app.get("/api/stage-reminders", authRequired, async (req, res) => {
+  const includeArchived = String(req.query.includeArchived || "").toLowerCase() === "true";
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, contact_id, opportunity_id, remind_at, note, archived
+       FROM stage_reminders
+       WHERE user_id = $1 ${includeArchived ? "" : "AND archived = false"}
+       ORDER BY remind_at ASC`,
+      [req.userId]
+    );
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_reminders" }); }
+});
+
+app.post("/api/stage-reminders", authRequired, async (req, res) => {
+  const { contact_id, opportunity_id, remind_at, note } = req.body || {};
+  if (!contact_id || !remind_at) return res.status(400).json({ error: "missing_fields" });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO stage_reminders (user_id, contact_id, opportunity_id, remind_at, note)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, contact_id, opportunity_id, remind_at, note, archived`,
+      [req.userId, contact_id, opportunity_id || null, remind_at, note || null]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "failed_create_reminder" }); }
+});
+
+app.put("/api/stage-reminders/:id", authRequired, async (req, res) => {
+  const { remind_at, note, archived } = req.body || {};
+  try {
+    const { rows } = await pool.query(
+      `UPDATE stage_reminders SET
+         remind_at = COALESCE($2, remind_at),
+         note = COALESCE($3, note),
+         archived = COALESCE($4, archived),
+         updated_at = now()
+       WHERE id = $1 AND user_id = $5
+       RETURNING id, contact_id, opportunity_id, remind_at, note, archived`,
+      [req.params.id, remind_at || null, note ?? null, typeof archived === "boolean" ? archived : null, req.userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "not_found" });
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "failed_update_reminder" }); }
+});
+
+app.delete("/api/stage-reminders/:id", authRequired, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM stage_reminders WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.userId]);
+    res.status(204).end();
+  } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_reminder" }); }
+});
+
+// Public webhook — no auth. Zapier / Meta lead forwarders POST here.
+// Accepts { name?, full_name?, first_name?, last_name?, phone?, email?, address?, questions: [{question, answer}, ...] }
+app.post("/webhooks/leads/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    if (!token || token.length < 16) {
+      return res.status(400).json({ error: "bad_token" });
+    }
+    const { rows } = await pool.query(
+      `SELECT zt.user_id, zt.auto_stage_id, u.company_id
+       FROM zapier_tokens zt
+       JOIN users u ON u.id = zt.user_id
+       WHERE zt.token = $1`,
+      [token]
+    );
+    if (!rows.length) return res.status(404).json({ error: "token_not_found" });
+    const { user_id: userId, company_id: companyId, auto_stage_id: autoStageId } = rows[0];
+
+    const body = req.body || {};
+    // Name resolution
+    const fullName = (body.full_name || body.name || "").toString().trim();
+    const first = (body.first_name || "").toString().trim();
+    const last = (body.last_name || "").toString().trim();
+    const composed = [first, last].filter(Boolean).join(" ").trim();
+    const name = fullName || composed || "New Lead";
+
+    const phone = (body.phone || body.phone_number || "").toString().trim() || null;
+    const email = (body.email || "").toString().trim() || null;
+    const address = (body.address || body.street_address || "").toString().trim() || null;
+
+    // Build lead_info boxes from questions
+    let questions = [];
+    if (Array.isArray(body.questions)) {
+      questions = body.questions;
+    } else if (Array.isArray(body.field_data)) {
+      // Meta Lead Ads Facebook Graph shape
+      questions = body.field_data.map(f => ({
+        question: f.name || f.label || "",
+        answer: Array.isArray(f.values) ? f.values.join(", ") : (f.value || "")
+      }));
+    }
+    const leadInfo = questions
+      .filter(q => q && (q.question || q.answer))
+      .slice(0, 25)
+      .map(q => {
+        const question = (q.question || "").toString().trim();
+        const answer = (q.answer || "").toString().trim();
+        if (!question && !answer) return "";
+        if (!answer) return question;
+        if (!question) return `**${answer}**`;
+        return `${question}\n**${answer}**`;
+      });
+
+    const contactId = randomUUID();
+    const inserted = await pool.query(
+      `INSERT INTO contacts (
+        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type,
+        u1, u2, u3, u4, u5, lead_info
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, $8, NULL,
+        NULL, NULL, NULL, NULL, NULL, $9
+      ) RETURNING *`,
+      [
+        contactId, userId, companyId, name, phone || "", email || "", address || "",
+        "lead,zapier",
+        JSON.stringify(leadInfo)
+      ]
+    );
+
+    // Auto-assign to a stage if configured
+    if (autoStageId) {
+      try {
+        const oppId = randomUUID();
+        await pool.query(
+          `INSERT INTO opportunities (id, user_id, contact_id, state, stage_id)
+           VALUES ($1, $2, $3, 'stage', $4)`,
+          [oppId, userId, contactId, autoStageId]
+        );
+      } catch (e) {
+        console.error("auto-assign failed:", e);
+      }
+    }
+
+    res.status(201).json({ ok: true, contact: inserted.rows[0] });
+  } catch (e) {
+    console.error("zapier webhook error:", e);
+    res.status(500).json({ error: "webhook_failed" });
+  }
+});
+
 
 // ---------- STAGES ----------
 app.get("/api/stages", authRequired, async (req, res) => {
@@ -3945,3 +4178,4 @@ app.post("/stripe/webhook", async (req, res) => {
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
+
