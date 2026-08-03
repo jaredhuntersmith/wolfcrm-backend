@@ -324,6 +324,23 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS lead_notifications_user_idx ON lead_notifications(user_id, created_at DESC);
 
+    -- Quotes (contact-scoped, with JSON line items and cached total).
+    CREATE TABLE IF NOT EXISTS quotes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      company_id UUID,
+      contact_id TEXT NOT NULL,
+      title TEXT,
+      line_items JSONB NOT NULL DEFAULT '[]'::jsonb,
+      total_cents INTEGER NOT NULL DEFAULT 0,
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS quotes_contact_idx ON quotes(contact_id);
+    CREATE INDEX IF NOT EXISTS quotes_company_idx ON quotes(company_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS quotes_user_idx ON quotes(user_id, updated_at DESC);
+
     -- APNs device tokens for real push notifications.
     CREATE TABLE IF NOT EXISTS device_tokens (
       token TEXT PRIMARY KEY,
@@ -3162,6 +3179,131 @@ app.post("/webhooks/leads/:token", async (req, res) => {
   return res.status(201).json(responseBody);
 });
 
+
+// ---------- QUOTES ----------
+// Line items are stored as JSON: [{ name: string, qty: number, price_cents: number }]
+// total_cents is the server-authoritative sum so listing/cards don't have to compute.
+function computeQuoteTotalCents(lineItems) {
+  if (!Array.isArray(lineItems)) return 0;
+  return lineItems.reduce((sum, li) => {
+    if (!li || typeof li !== "object") return sum;
+    const qty = Number(li.qty) || 0;
+    const price = Number(li.price_cents) || 0;
+    return sum + Math.max(0, Math.round(qty * price));
+  }, 0);
+}
+
+function quoteScopeSQL(req, alias = "q") {
+  const p = `${alias}.`;
+  return req.companyId
+    ? { sql: `(${p}company_id = $1 OR (${p}company_id IS NULL AND ${p}user_id = $2))`, values: [req.companyId, req.userId] }
+    : { sql: `${p}user_id = $1`, values: [req.userId] };
+}
+
+app.get("/api/quotes", authRequired, async (req, res) => {
+  try {
+    const scope = quoteScopeSQL(req);
+    const contactID = (req.query.contact_id || "").toString().trim();
+    let rows;
+    if (contactID) {
+      rows = (await pool.query(
+        `SELECT id, contact_id, title, line_items, total_cents, notes, created_at, updated_at
+         FROM quotes q
+         WHERE ${scope.sql} AND contact_id = $${scope.values.length + 1}
+         ORDER BY updated_at DESC`,
+        [...scope.values, contactID]
+      )).rows;
+    } else {
+      rows = (await pool.query(
+        `SELECT id, contact_id, title, line_items, total_cents, notes, created_at, updated_at
+         FROM quotes q
+         WHERE ${scope.sql}
+         ORDER BY updated_at DESC
+         LIMIT 500`,
+        scope.values
+      )).rows;
+    }
+    res.json(rows);
+  } catch (e) {
+    console.error("[quotes] list failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_list_quotes" });
+  }
+});
+
+app.get("/api/quotes/totals", authRequired, async (req, res) => {
+  try {
+    const scope = quoteScopeSQL(req);
+    const { rows } = await pool.query(
+      `SELECT contact_id, SUM(total_cents)::int AS total_cents, COUNT(*)::int AS quote_count
+       FROM quotes q
+       WHERE ${scope.sql}
+       GROUP BY contact_id`,
+      scope.values
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[quotes] totals failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_quote_totals" });
+  }
+});
+
+app.post("/api/quotes", authRequired, async (req, res) => {
+  const { contact_id, title, line_items, notes } = req.body || {};
+  if (!contact_id) return res.status(400).json({ error: "contact_id_required" });
+  const items = Array.isArray(line_items) ? line_items : [];
+  const total = computeQuoteTotalCents(items);
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO quotes (user_id, company_id, contact_id, title, line_items, total_cents, notes)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+       RETURNING id, contact_id, title, line_items, total_cents, notes, created_at, updated_at`,
+      [req.userId, req.companyId || null, contact_id, title || null, JSON.stringify(items), total, notes || null]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error("[quotes] create failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_create_quote" });
+  }
+});
+
+app.put("/api/quotes/:id", authRequired, async (req, res) => {
+  const { title, line_items, notes } = req.body || {};
+  const items = Array.isArray(line_items) ? line_items : null;
+  const total = items ? computeQuoteTotalCents(items) : null;
+  try {
+    const scope = quoteScopeSQL(req);
+    const { rows } = await pool.query(
+      `UPDATE quotes q SET
+         title = COALESCE($2, title),
+         line_items = COALESCE($3::jsonb, line_items),
+         total_cents = COALESCE($4, total_cents),
+         notes = COALESCE($5, notes),
+         updated_at = now()
+       WHERE id = $1 AND ${scope.sql}
+       RETURNING id, contact_id, title, line_items, total_cents, notes, created_at, updated_at`,
+      [req.params.id, title || null, items ? JSON.stringify(items) : null, total, notes || null, ...scope.values]
+    );
+    if (!rows.length) return res.status(404).json({ error: "not_found" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("[quotes] update failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_update_quote" });
+  }
+});
+
+app.delete("/api/quotes/:id", authRequired, async (req, res) => {
+  try {
+    const scope = quoteScopeSQL(req);
+    await pool.query(
+      `DELETE FROM quotes q WHERE id = $1 AND ${scope.sql}`,
+      [req.params.id, ...scope.values]
+    );
+    res.status(204).end();
+  } catch (e) {
+    console.error("[quotes] delete failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_delete_quote" });
+  }
+});
 
 // ---------- STAGES ----------
 // Stages are company-scoped when the user belongs to a company; otherwise they
