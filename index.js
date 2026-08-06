@@ -229,6 +229,12 @@ async function bootstrap() {
       photo_url TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    -- Soft-delete columns for revoking employee access without destroying
+    -- their historical contributions (contacts, quotes, jobs, etc.).
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_by UUID;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS pre_delete_email TEXT;
+    CREATE INDEX IF NOT EXISTS users_deleted_at_idx ON users(deleted_at);
 
     CREATE TABLE IF NOT EXISTS companies (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -893,7 +899,7 @@ async function authRequired(req, res, next) {
        SET last_used_at = now()
        FROM users u
        LEFT JOIN employee_permissions p ON p.user_id = u.id
-      WHERE s.token = $1 AND u.id = s.user_id
+      WHERE s.token = $1 AND u.id = s.user_id AND u.deleted_at IS NULL
       RETURNING s.user_id, u.email, u.role, u.company_id, COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts`,
     [token]
   );
@@ -1252,6 +1258,10 @@ app.post("/auth/login", async (req, res) => {
     if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
       return res.status(401).json({ error: "invalid_login" });
     }
+    if (rows[0].deleted_at) {
+      // Account was revoked by the employer.
+      return res.status(403).json({ error: "account_disabled", message: "This account has been removed. Contact your employer to restore access." });
+    }
     const u = rows[0];
     const token = randomUUID();
     await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, u.id]);
@@ -1442,15 +1452,16 @@ app.get("/api/company/users", authRequired, async (req, res) => {
   try {
     if (!req.companyId) {
       const { rows } = await pool.query(
-        `SELECT id, email, role, display_name, photo_url FROM users WHERE id = $1`,
+        `SELECT id, email, role, display_name, photo_url FROM users WHERE id = $1 AND deleted_at IS NULL`,
         [req.userId]
       );
       return res.json(rows);
     }
+    // Hide removed employees from pickers (worker assignment, salesperson, etc.)
     const { rows } = await pool.query(
       `SELECT id, email, role, display_name, photo_url
          FROM users
-        WHERE company_id = $1
+        WHERE company_id = $1 AND deleted_at IS NULL
         ORDER BY COALESCE(display_name, email) ASC`,
       [req.companyId]
     );
@@ -1469,11 +1480,17 @@ app.get("/api/company/settings", authRequired, requireEmployer, async (req, res)
       [req.companyId]
     );
     const employees = await pool.query(
-      `SELECT u.id, u.email, COALESCE(p.can_delete_contacts,false) AS can_delete_contacts
+      `SELECT u.id,
+              u.email,
+              u.display_name,
+              u.photo_url,
+              u.deleted_at,
+              COALESCE(u.pre_delete_email, u.email) AS original_email,
+              COALESCE(p.can_delete_contacts,false) AS can_delete_contacts
          FROM users u
          LEFT JOIN employee_permissions p ON p.user_id = u.id
         WHERE u.company_id = $1 AND u.role = 'employee'
-        ORDER BY u.email ASC`,
+        ORDER BY u.deleted_at IS NOT NULL, COALESCE(u.display_name, u.email) ASC`,
       [req.companyId]
     );
     res.json({ company: company.rows[0], employees: employees.rows });
@@ -1561,6 +1578,108 @@ app.put("/api/company/join-code", authRequired, requireEmployer, async (req, res
     if (e.code === "23505") return res.status(409).json({ error: "company_code_taken" });
     console.error(e);
     res.status(500).json({ error: "join_code_update_failed" });
+  }
+});
+
+// Soft-delete an employee: revoke login access and scrub credentials/photo,
+// but keep the row + display_name intact so historical records still resolve.
+// Restore is always available via /api/company/employees/:id/restore.
+app.delete("/api/company/employees/:id", authRequired, requireEmployer, async (req, res) => {
+  const targetId = req.params.id;
+  if (!targetId) return res.status(400).json({ error: "bad_id" });
+  if (targetId === req.userId) {
+    return res.status(400).json({ error: "cannot_delete_self", message: "You cannot remove your own account here." });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Verify target is an employee in this company and is not an employer.
+    const check = await client.query(
+      `SELECT id, role, deleted_at FROM users WHERE id = $1 AND company_id = $2 FOR UPDATE`,
+      [targetId, req.companyId]
+    );
+    if (!check.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "employee_not_found" });
+    }
+    if (check.rows[0].role === "employer") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "cannot_delete_employer", message: "The employer/owner account cannot be removed." });
+    }
+    if (check.rows[0].deleted_at) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "already_deleted", message: "This employee has already been removed." });
+    }
+    // Scrub credentials/PII; preserve original email so restore can put it back.
+    await client.query(
+      `UPDATE users SET
+         pre_delete_email = COALESCE(pre_delete_email, email),
+         email = 'deleted+' || id::text || '@wolfcrm.deleted',
+         password_hash = NULL,
+         photo_url = NULL,
+         deleted_at = now(),
+         deleted_by = $2
+       WHERE id = $1`,
+      [targetId, req.userId]
+    );
+    // Kill all their sessions / recovery tokens / device tokens.
+    await client.query(`DELETE FROM sessions WHERE user_id = $1`, [targetId]);
+    await client.query(`DELETE FROM password_reset_codes WHERE email IN (SELECT pre_delete_email FROM users WHERE id = $1)`, [targetId]);
+    await client.query(`DELETE FROM magic_tokens WHERE user_id = $1`, [targetId]).catch(() => {});
+    await client.query(`DELETE FROM device_tokens WHERE user_id = $1`, [targetId]).catch(() => {});
+    await client.query(`DELETE FROM employee_permissions WHERE user_id = $1`, [targetId]).catch(() => {});
+    await client.query("COMMIT");
+    console.log("[employees] removed", { targetId, by: req.userId, company: req.companyId });
+    res.json({ success: true });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[employees] delete failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "delete_failed", message: "Could not remove that employee." });
+  } finally {
+    client.release();
+  }
+});
+
+// Restore a previously removed employee. Their old email is put back, but
+// password_hash stays NULL — they'll need to request a password reset to
+// regain access.
+app.post("/api/company/employees/:id/restore", authRequired, requireEmployer, async (req, res) => {
+  const targetId = req.params.id;
+  if (!targetId) return res.status(400).json({ error: "bad_id" });
+  try {
+    const check = await pool.query(
+      `SELECT id, deleted_at, pre_delete_email FROM users WHERE id = $1 AND company_id = $2`,
+      [targetId, req.companyId]
+    );
+    if (!check.rowCount) return res.status(404).json({ error: "employee_not_found" });
+    if (!check.rows[0].deleted_at) {
+      return res.status(409).json({ error: "not_deleted", message: "This employee is already active." });
+    }
+    const originalEmail = check.rows[0].pre_delete_email;
+    // Check the original email isn't now taken by someone else.
+    if (originalEmail) {
+      const collision = await pool.query(
+        `SELECT id FROM users WHERE email = $1 AND id <> $2 LIMIT 1`,
+        [originalEmail, targetId]
+      );
+      if (collision.rowCount) {
+        return res.status(409).json({ error: "email_taken", message: "The original email is already in use by another account. Update the employee's email after restoring." });
+      }
+    }
+    await pool.query(
+      `UPDATE users SET
+         email = COALESCE(pre_delete_email, email),
+         pre_delete_email = NULL,
+         deleted_at = NULL,
+         deleted_by = NULL
+       WHERE id = $1`,
+      [targetId]
+    );
+    console.log("[employees] restored", { targetId, by: req.userId, company: req.companyId });
+    res.json({ success: true });
+  } catch (e) {
+    console.error("[employees] restore failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "restore_failed", message: "Could not restore that employee." });
   }
 });
 
