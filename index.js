@@ -3405,7 +3405,24 @@ app.put("/api/quotes/:id", authRequired, async (req, res) => {
   const items = Array.isArray(line_items) ? line_items : null;
   const total = items ? computeQuoteTotalCents(items) : null;
   try {
-    const scope = quoteScopeSQL(req);
+    // Fixed placeholder numbering — $1 is the quote id, $2..$5 are the
+    // updatable fields, then scope filters follow at $6+ so they never
+    // collide with the id.
+    const params = [
+      req.params.id,
+      title || null,
+      items ? JSON.stringify(items) : null,
+      total,
+      notes || null
+    ];
+    let whereScope;
+    if (req.companyId) {
+      params.push(req.companyId, req.userId);
+      whereScope = `(q.company_id = $${params.length - 1} OR (q.company_id IS NULL AND q.user_id = $${params.length}))`;
+    } else {
+      params.push(req.userId);
+      whereScope = `q.user_id = $${params.length}`;
+    }
     const { rows } = await pool.query(
       `UPDATE quotes q SET
          title = COALESCE($2, title),
@@ -3413,9 +3430,9 @@ app.put("/api/quotes/:id", authRequired, async (req, res) => {
          total_cents = COALESCE($4, total_cents),
          notes = COALESCE($5, notes),
          updated_at = now()
-       WHERE id = $1 AND ${scope.sql}
+       WHERE id = $1 AND ${whereScope}
        RETURNING id, contact_id, title, line_items, total_cents, notes, created_at, updated_at`,
-      [req.params.id, title || null, items ? JSON.stringify(items) : null, total, notes || null, ...scope.values]
+      params
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
     res.json(rows[0]);
@@ -3427,11 +3444,22 @@ app.put("/api/quotes/:id", authRequired, async (req, res) => {
 
 app.delete("/api/quotes/:id", authRequired, async (req, res) => {
   try {
-    const scope = quoteScopeSQL(req);
-    await pool.query(
-      `DELETE FROM quotes q WHERE id = $1 AND ${scope.sql}`,
-      [req.params.id, ...scope.values]
+    // Fixed placeholder numbering (see PUT above).
+    const params = [req.params.id];
+    let whereScope;
+    if (req.companyId) {
+      params.push(req.companyId, req.userId);
+      whereScope = `(q.company_id = $2 OR (q.company_id IS NULL AND q.user_id = $3))`;
+    } else {
+      params.push(req.userId);
+      whereScope = `q.user_id = $2`;
+    }
+    const result = await pool.query(
+      `DELETE FROM quotes q WHERE id = $1 AND ${whereScope}`,
+      params
     );
+    console.log("[quotes] delete", { id: req.params.id, deleted: result.rowCount });
+    if (!result.rowCount) return res.status(404).json({ error: "not_found" });
     res.status(204).end();
   } catch (e) {
     console.error("[quotes] delete failed:", e && e.message ? e.message : e);
@@ -5201,34 +5229,6 @@ app.post("/stripe/webhook", async (req, res) => {
         );
         break;
       }
-
-      case "charge.refunded": {
-        const charge = event.data.object;
-        if (charge.payment_intent) {
-          await pool.query(
-            `UPDATE payment_records
-                SET status = 'refunded', updated_at = now()
-              WHERE stripe_payment_intent_id = $1`,
-            [charge.payment_intent]
-          );
-        }
-        break;
-      }
-
-      default:
-        // no-op — we simply acknowledge unhandled events.
-        break;
-    }
-
-    res.json({ received: true });
-  } catch (e) {
-    console.error("webhook handling error:", e);
-    res.status(500).json({ error: "webhook_handler_failed" });
-  }
-});
-
-app.get("/", (_req, res) => res.send("WolfCRM backend up"));
-app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 
       case "charge.refunded": {
         const charge = event.data.object;
