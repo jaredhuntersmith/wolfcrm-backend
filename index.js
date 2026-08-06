@@ -2617,6 +2617,70 @@ app.get("/api/integrations/zapier/pending-notifications", authRequired, async (r
   }
 });
 
+// One-shot backfill: re-processes every stored lead_import belonging to this
+// caller and writes Lead Info onto any contact whose lead_info is empty/null.
+// Idempotent — running it twice is safe.
+app.post("/api/integrations/zapier/backfill-lead-info", authRequired, async (req, res) => {
+  const force = !!(req.body && req.body.force);
+  try {
+    // Company-scoped when available (so any teammate can trigger the backfill
+    // for the whole company), user-scoped otherwise.
+    const scopeSQL = req.companyId
+      ? `(li.company_id = $1 OR (li.company_id IS NULL AND li.user_id = $2))`
+      : `li.user_id = $1`;
+    const scopeVals = req.companyId ? [req.companyId, req.userId] : [req.userId];
+
+    const { rows } = await pool.query(
+      `SELECT li.id AS import_id, li.contact_id, li.raw_payload, c.lead_info
+       FROM lead_imports li
+       JOIN contacts c ON c.id::text = li.contact_id
+       WHERE ${scopeSQL}
+       ORDER BY li.created_at ASC`,
+      scopeVals
+    );
+
+    let updated = 0, skippedEmpty = 0, skippedAlreadyHas = 0, errored = 0;
+
+    for (const row of rows) {
+      const existing = row.lead_info;
+      const alreadyHas = Array.isArray(existing) && existing.length > 0;
+      if (alreadyHas && !force) { skippedAlreadyHas++; continue; }
+
+      const questions = buildQuestionsFromPayload(row.raw_payload || {});
+      const leadInfo = buildLeadInfoStrings(questions);
+      if (leadInfo.length === 0) { skippedEmpty++; continue; }
+
+      try {
+        await pool.query(
+          `UPDATE contacts SET lead_info = $1::jsonb, updated_at = now() WHERE id = $2`,
+          [JSON.stringify(leadInfo), row.contact_id]
+        );
+        updated++;
+      } catch (e) {
+        console.error("[backfill] update failed for", row.contact_id, e && e.message ? e.message : e);
+        errored++;
+      }
+    }
+
+    console.log("[backfill] done", {
+      userId: req.userId, companyId: req.companyId || "user-scope",
+      scanned: rows.length, updated, skippedEmpty, skippedAlreadyHas, errored, force
+    });
+
+    res.json({
+      success: true,
+      scanned: rows.length,
+      updated,
+      skipped_empty: skippedEmpty,
+      skipped_already_populated: skippedAlreadyHas,
+      errored
+    });
+  } catch (e) {
+    console.error("[backfill] failed:", e && e.message ? e.message : e);
+    res.status(500).json({ success: false, error: "backfill_failed", message: "Could not run the backfill." });
+  }
+});
+
 // ---------- STAGE REMINDERS ----------
 app.get("/api/stage-reminders", authRequired, async (req, res) => {
   const includeArchived = String(req.query.includeArchived || "").toLowerCase() === "true";
@@ -2740,6 +2804,102 @@ function composeAddress(base, city, state, zip) {
 function tokenTail(token) {
   // Safe identifier for logs: last 4 chars only.
   return token && token.length >= 4 ? `…${token.slice(-4)}` : "";
+}
+
+// Zapier's "unflatten" mode explodes Facebook Lead Ads field_data into
+// top-level JSON keys. Anything that isn't a known contact/metadata key is
+// treated as a lead-form question. Meta uses keys like
+// "interested_in_our_window_cleaning_maintenance_plan?" and "vehicle".
+const RESERVED_TOP_LEVEL_KEYS = new Set([
+  // Structured contact keys we already extract above
+  "name", "full_name", "first_name", "last_name",
+  "phone", "phone_number", "mobile_number", "mobile", "cell_phone", "work_phone",
+  "email", "e_mail", "email_address",
+  "address", "street_address", "full_address", "city_state_zip",
+  "city", "state", "province", "zip", "postal_code", "zip_code", "postcode",
+  // Facebook/Meta metadata
+  "id", "leadgen_id", "lead_id", "created_time", "submitted_at",
+  "form_id", "form", "form_name",
+  "page_id", "page", "page_name",
+  "ad_id", "ad_name", "adset_id", "adset_name", "campaign_id", "campaign_name",
+  "platform", "inbox_url", "partner_name", "retailer_item_id",
+  "custom_disclaimer_responses", "raw",
+  // Structured fallback keys we already parse
+  "field_data", "questions"
+]);
+
+function humanizeFieldKey(key) {
+  // "interested_in_our_window_cleaning_maintenance_plan?" → "Interested In Our Window Cleaning Maintenance Plan?"
+  return key
+    .replace(/[_\-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .map(w => w.length ? w[0].toUpperCase() + w.slice(1) : w)
+    .join(" ");
+}
+
+function extractQuestionsFromTopLevel(body) {
+  const results = [];
+  for (const key of Object.keys(body || {})) {
+    if (RESERVED_TOP_LEVEL_KEYS.has(key.toLowerCase())) continue;
+    const raw = body[key];
+    // Skip nested objects / arrays that aren't simple scalar answers
+    let answer = "";
+    if (raw == null) continue;
+    if (typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean") {
+      answer = String(raw).trim();
+    } else if (Array.isArray(raw)) {
+      answer = raw.map(v => (v == null ? "" : String(v))).filter(Boolean).join(", ");
+    } else if (typeof raw === "object") {
+      // Zapier occasionally hands nested objects — flatten to JSON string
+      try { answer = JSON.stringify(raw); } catch (_) { answer = ""; }
+    }
+    if (!answer) continue;
+    results.push({ question: humanizeFieldKey(key), answer });
+  }
+  return results;
+}
+
+const FB_USED_KEYS = new Set([
+  ...FB_NAME_KEYS, ...FB_FIRST_KEYS, ...FB_LAST_KEYS,
+  ...FB_PHONE_KEYS, ...FB_EMAIL_KEYS, ...FB_ADDR_KEYS,
+  ...FB_CITY_KEYS, ...FB_STATE_KEYS, ...FB_ZIP_KEYS
+]);
+
+/// Given a raw webhook payload, return the extracted Q&A pairs.
+/// Handles all three shapes: structured `questions`, Facebook `field_data`,
+/// or Zapier's "unflatten" top-level keys.
+function buildQuestionsFromPayload(body) {
+  if (!body || typeof body !== "object") return [];
+  if (Array.isArray(body.questions)) {
+    return body.questions
+      .filter(q => q && typeof q === "object")
+      .map(q => ({ question: (q.question || "").toString(), answer: (q.answer || "").toString() }));
+  }
+  const fieldEntries = normalizedFieldData(body.field_data);
+  if (fieldEntries.length) {
+    return fieldEntries
+      .filter(e => !FB_USED_KEYS.has(e.key.toLowerCase()))
+      .map(e => ({ question: e.question || e.key, answer: e.answer }));
+  }
+  return extractQuestionsFromTopLevel(body);
+}
+
+/// Convert [{question, answer}] into the Lead Info string boxes
+/// (`Question\n**Answer**`), capped at 25.
+function buildLeadInfoStrings(questions) {
+  return (questions || [])
+    .filter(q => q && (q.question || q.answer))
+    .slice(0, 25)
+    .map(q => {
+      const question = (q.question || "").toString().trim();
+      const answer = (q.answer || "").toString().trim();
+      if (!question && !answer) return "";
+      if (!answer) return question;
+      if (!question) return `**${answer}**`;
+      return `${question}\n**${answer}**`;
+    });
 }
 
 // Formats the notification body from a lead using the user's chosen fields.
@@ -2885,36 +3045,10 @@ app.post("/webhooks/leads/:token", async (req, res) => {
     submittedAtSafe: submittedAtSafe ? "yes" : "no"
   });
 
-  // Build Lead Info boxes from questions or field_data (skip fields already
-  // captured in structured columns so we don't repeat phone/email/etc.).
-  const usedFBKeys = new Set([
-    ...FB_NAME_KEYS, ...FB_FIRST_KEYS, ...FB_LAST_KEYS,
-    ...FB_PHONE_KEYS, ...FB_EMAIL_KEYS, ...FB_ADDR_KEYS,
-    ...FB_CITY_KEYS, ...FB_STATE_KEYS, ...FB_ZIP_KEYS
-  ]);
-
-  let questions = [];
-  if (Array.isArray(body.questions)) {
-    questions = body.questions
-      .filter(q => q && typeof q === "object")
-      .map(q => ({ question: (q.question || "").toString(), answer: (q.answer || "").toString() }));
-  } else if (fieldEntries.length) {
-    questions = fieldEntries
-      .filter(e => !usedFBKeys.has(e.key.toLowerCase()))
-      .map(e => ({ question: e.question || e.key, answer: e.answer }));
-  }
-
-  const leadInfo = questions
-    .filter(q => q.question || q.answer)
-    .slice(0, 25)
-    .map(q => {
-      const question = q.question.trim();
-      const answer = q.answer.trim();
-      if (!question && !answer) return "";
-      if (!answer) return question;
-      if (!question) return `**${answer}**`;
-      return `${question}\n**${answer}**`;
-    });
+  // Build Lead Info boxes from whatever shape Zapier / Meta delivered.
+  const questions = buildQuestionsFromPayload(body);
+  zLog("questions_extracted", { count: questions.length });
+  const leadInfo = buildLeadInfoStrings(questions);
 
   // ---- STEP 3: DUPLICATE CHECK ---------------------------------------------
   let duplicateContactId = null;
