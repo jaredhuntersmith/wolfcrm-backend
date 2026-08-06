@@ -5229,3 +5229,31 @@ app.post("/stripe/webhook", async (req, res) => {
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
+
+      case "charge.refunded": {
+        const charge = event.data.object;
+        if (charge.payment_intent) {
+          await pool.query(
+            `UPDATE payment_records
+                SET status = 'refunded', updated_at = now()
+              WHERE stripe_payment_intent_id = $1`,
+            [charge.payment_intent]
+          );
+        }
+        break;
+      }
+
+      default:
+        // no-op — we simply acknowledge unhandled events.
+        break;
+    }
+
+    res.json({ received: true });
+  } catch (e) {
+    console.error("webhook handling error:", e);
+    res.status(500).json({ error: "webhook_handler_failed" });
+  }
+});
+
+app.get("/", (_req, res) => res.send("WolfCRM backend up"));
+app.listen(PORT, () => console.log(`API listening on ${PORT}`));
