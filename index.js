@@ -124,6 +124,7 @@ app.use(cors());
 app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }));
 
 app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: false, limit: "2mb" }));
 
 const mediaBucketConfig = () => {
   const endpoint = process.env.MEDIA_ENDPOINT || process.env.AWS_ENDPOINT_URL;
@@ -175,6 +176,72 @@ const createTwilioClient = () => {
   if (!configured) return null;
   return twilio(apiKeySid, apiKeySecret, { accountSid });
 };
+
+const normalizeE164Phone = (value) => {
+  const raw = (value || "").toString().trim();
+  if (!raw) return "";
+  if (raw.startsWith("+")) {
+    const digits = raw.slice(1).replace(/[^\d]/g, "");
+    return digits ? `+${digits}` : "";
+  }
+  const digits = raw.replace(/[^\d]/g, "");
+  return digits ? `+${digits}` : "";
+};
+
+const phoneDigits = (value) => (value || "").toString().replace(/[^\d]/g, "");
+
+const emptyMessagingResponse = () => {
+  const response = new twilio.twiml.MessagingResponse();
+  return response.toString();
+};
+
+const twilioWebhookUrl = (req) => {
+  const base = (process.env.TWILIO_WEBHOOK_BASE_URL || "").trim().replace(/\/+$/, "");
+  return `${base}${req.originalUrl}`;
+};
+
+const validateTwilioWebhook = (req) => {
+  const authToken = (process.env.TWILIO_AUTH_TOKEN || "").trim();
+  if (!authToken) return { ok: false, error: "twilio_auth_token_missing" };
+  const signature = req.header("X-Twilio-Signature") || "";
+  if (!signature) return { ok: false, error: "twilio_signature_missing" };
+  const valid = twilio.validateRequest(authToken, signature, twilioWebhookUrl(req), req.body || {});
+  return { ok: valid, error: valid ? null : "twilio_signature_invalid" };
+};
+
+const twilioMediaMetadata = (body) => {
+  const count = Math.max(0, parseInt(body.NumMedia || "0", 10) || 0);
+  const media = [];
+  for (let i = 0; i < count; i += 1) {
+    media.push({
+      index: i,
+      url: body[`MediaUrl${i}`] || null,
+      contentType: body[`MediaContentType${i}`] || null
+    });
+  }
+  return { count, media };
+};
+
+async function findSmsContactID({ companyId, externalPhone }) {
+  const digits = phoneDigits(externalPhone);
+  if (!companyId || !digits) return null;
+  const localDigits = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+  const { rows } = await pool.query(
+    `SELECT id
+       FROM contacts
+      WHERE company_id = $1
+        AND (
+          regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g') = $2
+          OR (
+            length($3) = 10
+            AND right(regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g'), 10) = $3
+          )
+        )
+      LIMIT 2`,
+    [companyId, digits, localDigits]
+  );
+  return rows.length === 1 ? rows[0].id : null;
+}
 
 const normalizeEmail = (email) => (email || "").toString().trim().toLowerCase();
 const passwordIsValid = (password) =>
@@ -424,6 +491,74 @@ async function bootstrap() {
       IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'contacts_touch_updated_at') THEN
         CREATE TRIGGER contacts_touch_updated_at
         BEFORE UPDATE ON contacts
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+    END $$;
+
+    CREATE TABLE IF NOT EXISTS phone_lines (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      phone_number TEXT NOT NULL,
+      twilio_phone_number_sid TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      active BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS phone_lines_phone_number_uidx ON phone_lines(phone_number);
+    CREATE INDEX IF NOT EXISTS phone_lines_company_idx ON phone_lines(company_id, active);
+    CREATE INDEX IF NOT EXISTS phone_lines_twilio_sid_idx ON phone_lines(twilio_phone_number_sid);
+
+    CREATE TABLE IF NOT EXISTS sms_conversations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      phone_line_id UUID NOT NULL REFERENCES phone_lines(id) ON DELETE CASCADE,
+      external_phone_number TEXT NOT NULL,
+      contact_id UUID REFERENCES contacts(id) ON DELETE SET NULL,
+      last_message_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(phone_line_id, external_phone_number)
+    );
+    CREATE INDEX IF NOT EXISTS sms_conversations_line_last_idx ON sms_conversations(phone_line_id, last_message_at DESC);
+    CREATE INDEX IF NOT EXISTS sms_conversations_contact_idx ON sms_conversations(contact_id);
+
+    CREATE TABLE IF NOT EXISTS sms_messages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      conversation_id UUID NOT NULL REFERENCES sms_conversations(id) ON DELETE CASCADE,
+      twilio_message_sid TEXT,
+      direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+      from_number TEXT NOT NULL,
+      to_number TEXT NOT NULL,
+      body TEXT,
+      message_status TEXT,
+      media_count INTEGER NOT NULL DEFAULT 0,
+      media JSONB NOT NULL DEFAULT '[]'::jsonb,
+      twilio_error_code TEXT,
+      twilio_error_message TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS sms_messages_twilio_sid_uidx
+      ON sms_messages(twilio_message_sid)
+      WHERE twilio_message_sid IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS sms_messages_conversation_created_idx ON sms_messages(conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS sms_messages_conversation_updated_idx ON sms_messages(conversation_id, updated_at DESC);
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'phone_lines_touch_updated_at') THEN
+        CREATE TRIGGER phone_lines_touch_updated_at
+        BEFORE UPDATE ON phone_lines
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'sms_conversations_touch_updated_at') THEN
+        CREATE TRIGGER sms_conversations_touch_updated_at
+        BEFORE UPDATE ON sms_conversations
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'sms_messages_touch_updated_at') THEN
+        CREATE TRIGGER sms_messages_touch_updated_at
+        BEFORE UPDATE ON sms_messages
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
       END IF;
     END $$;
@@ -1472,6 +1607,201 @@ app.get("/api/twilio/status", authRequired, async (_req, res) => {
       connected: false,
       error: "twilio_connection_failed"
     });
+  }
+});
+
+// Public Twilio inbound SMS/MMS webhook. Authenticated by Twilio signature,
+// not by WolfCRM bearer sessions.
+app.post("/webhooks/twilio/sms", async (req, res) => {
+  const messageSid = (req.body.MessageSid || req.body.SmsSid || "").toString().trim();
+  const fromNumber = normalizeE164Phone(req.body.From);
+  const toNumber = normalizeE164Phone(req.body.To);
+
+  try {
+    const validation = validateTwilioWebhook(req);
+    if (!validation.ok) {
+      console.error("[twilio/sms] webhook validation failed:", validation.error);
+      if (validation.error === "twilio_auth_token_missing") {
+        return res.status(500).type("text/plain").send("Twilio webhook auth is not configured");
+      }
+      return res.status(403).type("text/plain").send("Forbidden");
+    }
+
+    if (!fromNumber || !toNumber) {
+      console.warn("[twilio/sms] missing from/to", { messageSid, hasFrom: !!fromNumber, hasTo: !!toNumber });
+      return res.status(200).type("text/xml").send(emptyMessagingResponse());
+    }
+
+    const { rows: lineRows } = await pool.query(
+      `SELECT id, company_id
+         FROM phone_lines
+        WHERE phone_number = $1 AND active = true
+        LIMIT 1`,
+      [toNumber]
+    );
+    if (!lineRows.length) {
+      console.warn("[twilio/sms] destination phone line not provisioned", { messageSid, toNumber });
+      return res.status(200).type("text/xml").send(emptyMessagingResponse());
+    }
+    const phoneLine = lineRows[0];
+
+    if (messageSid) {
+      const existing = await pool.query(
+        `SELECT id FROM sms_messages WHERE twilio_message_sid = $1 LIMIT 1`,
+        [messageSid]
+      );
+      if (existing.rowCount) {
+        console.log("[twilio/sms] duplicate webhook ignored", { messageSid });
+        return res.status(200).type("text/xml").send(emptyMessagingResponse());
+      }
+    }
+
+    const contactID = await findSmsContactID({
+      companyId: phoneLine.company_id,
+      externalPhone: fromNumber
+    });
+    const { count: mediaCount, media } = twilioMediaMetadata(req.body);
+    const messageStatus = (req.body.SmsStatus || req.body.MessageStatus || "received").toString();
+    const body = (req.body.Body || "").toString();
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+      const { rows: conversationRows } = await client.query(
+        `INSERT INTO sms_conversations(phone_line_id, external_phone_number, contact_id, last_message_at)
+         VALUES($1, $2, $3, now())
+         ON CONFLICT(phone_line_id, external_phone_number)
+         DO UPDATE SET
+           contact_id = COALESCE(sms_conversations.contact_id, EXCLUDED.contact_id),
+           last_message_at = now(),
+           updated_at = now()
+         RETURNING id`,
+        [phoneLine.id, fromNumber, contactID]
+      );
+      const conversationID = conversationRows[0].id;
+
+      try {
+        await client.query(
+          `INSERT INTO sms_messages(
+             conversation_id, twilio_message_sid, direction, from_number, to_number,
+             body, message_status, media_count, media, twilio_error_code, twilio_error_message
+           )
+           VALUES($1,$2,'inbound',$3,$4,$5,$6,$7,$8::jsonb,$9,$10)`,
+          [
+            conversationID,
+            messageSid || null,
+            fromNumber,
+            toNumber,
+            body,
+            messageStatus,
+            mediaCount,
+            JSON.stringify(media),
+            req.body.ErrorCode || null,
+            req.body.ErrorMessage || null
+          ]
+        );
+      } catch (e) {
+        if (e?.code === "23505" && messageSid) {
+          await client.query("ROLLBACK");
+          console.log("[twilio/sms] duplicate webhook ignored after unique check", { messageSid });
+          return res.status(200).type("text/xml").send(emptyMessagingResponse());
+        }
+        throw e;
+      }
+
+      await client.query(
+        `UPDATE sms_conversations
+            SET last_message_at = now(), updated_at = now()
+          WHERE id = $1`,
+        [conversationID]
+      );
+      await client.query("COMMIT");
+      console.log("[twilio/sms] inbound stored", { messageSid, phoneLineID: phoneLine.id, conversationID, mediaCount });
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    res.status(200).type("text/xml").send(emptyMessagingResponse());
+  } catch (e) {
+    console.error("[twilio/sms] processing failed:", {
+      messageSid,
+      status: e?.status,
+      code: e?.code,
+      message: e?.message
+    });
+    res.status(500).type("text/plain").send("Twilio webhook processing failed");
+  }
+});
+
+app.get("/api/phone/conversations", authRequired, async (req, res) => {
+  if (!req.companyId) return res.json([]);
+  try {
+    const { rows } = await pool.query(
+      `SELECT sc.id,
+              sc.phone_line_id,
+              pl.phone_number AS phone_line_number,
+              sc.external_phone_number,
+              sc.contact_id,
+              c.name AS contact_name,
+              sc.last_message_at,
+              sc.created_at,
+              sc.updated_at
+         FROM sms_conversations sc
+         JOIN phone_lines pl ON pl.id = sc.phone_line_id
+         LEFT JOIN contacts c ON c.id = sc.contact_id AND c.company_id = pl.company_id
+        WHERE pl.company_id = $1
+        ORDER BY sc.last_message_at DESC NULLS LAST, sc.updated_at DESC
+        LIMIT 200`,
+      [req.companyId]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[phone/conversations] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "phone_conversations_failed" });
+  }
+});
+
+app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
+  try {
+    const owned = await pool.query(
+      `SELECT sc.id
+         FROM sms_conversations sc
+         JOIN phone_lines pl ON pl.id = sc.phone_line_id
+        WHERE sc.id = $1 AND pl.company_id = $2
+        LIMIT 1`,
+      [req.params.id, req.companyId]
+    );
+    if (!owned.rowCount) return res.status(404).json({ error: "conversation_not_found" });
+
+    const { rows } = await pool.query(
+      `SELECT id,
+              conversation_id,
+              twilio_message_sid,
+              direction,
+              from_number,
+              to_number,
+              body,
+              message_status,
+              media_count,
+              media,
+              twilio_error_code,
+              twilio_error_message,
+              created_at,
+              updated_at
+         FROM sms_messages
+        WHERE conversation_id = $1
+        ORDER BY created_at ASC, id ASC
+        LIMIT 500`,
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[phone/conversation/messages] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "phone_messages_failed" });
   }
 });
 
