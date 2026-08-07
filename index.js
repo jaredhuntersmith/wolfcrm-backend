@@ -1769,6 +1769,87 @@ app.get("/api/phone/conversations", authRequired, async (req, res) => {
   }
 });
 
+app.get("/api/phone/lines", authRequired, async (req, res) => {
+  if (!req.companyId) return res.json([]);
+  try {
+    const { rows } = await pool.query(
+      `SELECT id,
+              company_id,
+              phone_number,
+              twilio_phone_number_sid,
+              status,
+              active,
+              created_at,
+              updated_at
+         FROM phone_lines
+        WHERE company_id = $1
+        ORDER BY created_at ASC`,
+      [req.companyId]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[phone/lines] list failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "phone_lines_failed" });
+  }
+});
+
+app.post("/api/phone/lines/attach-existing", authRequired, requireEmployer, async (req, res) => {
+  if (!req.companyId) return res.status(400).json({ error: "company_required" });
+
+  const phoneNumber = normalizeE164Phone(req.body?.phoneNumber);
+  if (!isUsableE164(phoneNumber)) {
+    return res.status(400).json({ error: "invalid_phone_number" });
+  }
+
+  const client = createTwilioClient();
+  if (!client) return res.status(503).json({ error: "twilio_not_configured" });
+
+  try {
+    const numbers = await client.incomingPhoneNumbers.list({
+      phoneNumber,
+      limit: 1
+    });
+    const ownedNumber = numbers.find((number) => normalizeE164Phone(number.phoneNumber) === phoneNumber);
+    if (!ownedNumber) {
+      return res.status(404).json({ error: "twilio_number_not_found" });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO phone_lines(company_id, phone_number, twilio_phone_number_sid, status, active)
+       VALUES($1, $2, $3, 'active', true)
+       ON CONFLICT(phone_number)
+       DO UPDATE SET
+         company_id = EXCLUDED.company_id,
+         twilio_phone_number_sid = EXCLUDED.twilio_phone_number_sid,
+         status = 'active',
+         active = true,
+         updated_at = now()
+       WHERE phone_lines.company_id = EXCLUDED.company_id
+       RETURNING id,
+                 company_id,
+                 phone_number,
+                 twilio_phone_number_sid,
+                 status,
+                 active,
+                 created_at,
+                 updated_at`,
+      [req.companyId, phoneNumber, ownedNumber.sid || null]
+    );
+    if (!rows.length) {
+      return res.status(409).json({ error: "phone_line_already_attached" });
+    }
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("[phone/lines/attach-existing] failed:", {
+      status: e?.status,
+      code: e?.code,
+      message: e?.message
+    });
+    res.status(500).json({ error: "phone_line_attach_failed" });
+  }
+});
+
 app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
   try {
