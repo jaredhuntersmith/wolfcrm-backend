@@ -189,16 +189,21 @@ const normalizeE164Phone = (value) => {
 };
 
 const phoneDigits = (value) => (value || "").toString().replace(/[^\d]/g, "");
+const MAX_SMS_BODY_LENGTH = 1600;
+const isUsableE164 = (value) => /^\+[1-9]\d{6,14}$/.test((value || "").toString());
 
 const emptyMessagingResponse = () => {
   const response = new twilio.twiml.MessagingResponse();
   return response.toString();
 };
 
-const twilioWebhookUrl = (req) => {
+const twilioPublicUrl = (path) => {
   const base = (process.env.TWILIO_WEBHOOK_BASE_URL || "").trim().replace(/\/+$/, "");
-  return `${base}${req.originalUrl}`;
+  const cleanPath = (path || "").toString().startsWith("/") ? path : `/${path || ""}`;
+  return `${base}${cleanPath}`;
 };
+
+const twilioWebhookUrl = (req) => twilioPublicUrl(req.originalUrl);
 
 const validateTwilioWebhook = (req) => {
   const authToken = (process.env.TWILIO_AUTH_TOKEN || "").trim();
@@ -1802,6 +1807,161 @@ app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) 
   } catch (e) {
     console.error("[phone/conversation/messages] failed:", { code: e?.code, message: e?.message });
     res.status(500).json({ error: "phone_messages_failed" });
+  }
+});
+
+app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
+
+  const rawBody = req.body?.body;
+  if (typeof rawBody !== "string") {
+    return res.status(400).json({ error: "message_body_required" });
+  }
+  const body = rawBody.trim();
+  if (!body) return res.status(400).json({ error: "message_body_required" });
+  if (body.length > MAX_SMS_BODY_LENGTH) {
+    return res.status(400).json({ error: "message_too_long", max_length: MAX_SMS_BODY_LENGTH });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT sc.id AS conversation_id,
+              sc.external_phone_number,
+              pl.id AS phone_line_id,
+              pl.phone_number,
+              pl.status,
+              pl.active
+         FROM sms_conversations sc
+         JOIN phone_lines pl ON pl.id = sc.phone_line_id
+        WHERE sc.id = $1 AND pl.company_id = $2
+        LIMIT 1`,
+      [req.params.id, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "conversation_not_found" });
+
+    const conversation = rows[0];
+    const lineStatus = (conversation.status || "").toString().trim().toLowerCase();
+    const fromNumber = normalizeE164Phone(conversation.phone_number);
+    const toNumber = normalizeE164Phone(conversation.external_phone_number);
+    if (!conversation.active || lineStatus !== "active" || !isUsableE164(fromNumber) || !isUsableE164(toNumber)) {
+      return res.status(400).json({ error: "phone_line_inactive" });
+    }
+
+    const client = createTwilioClient();
+    if (!client) return res.status(503).json({ error: "twilio_not_configured" });
+
+    let sent;
+    try {
+      sent = await client.messages.create({
+        from: fromNumber,
+        to: toNumber,
+        body,
+        statusCallback: twilioPublicUrl("/webhooks/twilio/message-status")
+      });
+    } catch (e) {
+      console.error("[phone/messages] Twilio send failed:", {
+        status: e?.status,
+        code: e?.code,
+        message: e?.message
+      });
+      return res.status(502).json({ error: "twilio_send_failed" });
+    }
+
+    const db = await pool.connect();
+    try {
+      await db.query("BEGIN");
+      const inserted = await db.query(
+        `INSERT INTO sms_messages(
+           conversation_id, twilio_message_sid, direction, from_number, to_number,
+           body, message_status, media_count, media
+         )
+         VALUES($1,$2,'outbound',$3,$4,$5,$6,0,'[]'::jsonb)
+         RETURNING id,
+                   conversation_id,
+                   twilio_message_sid,
+                   direction,
+                   from_number,
+                   to_number,
+                   body,
+                   message_status,
+                   media_count,
+                   media,
+                   twilio_error_code,
+                   twilio_error_message,
+                   created_at,
+                   updated_at`,
+        [
+          conversation.conversation_id,
+          sent.sid || null,
+          fromNumber,
+          toNumber,
+          body,
+          sent.status || "queued"
+        ]
+      );
+      await db.query(
+        `UPDATE sms_conversations
+            SET last_message_at = now(), updated_at = now()
+          WHERE id = $1`,
+        [conversation.conversation_id]
+      );
+      await db.query("COMMIT");
+      res.status(201).json(inserted.rows[0]);
+    } catch (e) {
+      await db.query("ROLLBACK").catch(() => {});
+      console.error("[phone/messages] outbound persistence failed:", { code: e?.code, message: e?.message });
+      res.status(500).json({ error: "message_store_failed" });
+    } finally {
+      db.release();
+    }
+  } catch (e) {
+    console.error("[phone/messages] outbound failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "phone_message_send_failed" });
+  }
+});
+
+app.post("/webhooks/twilio/message-status", async (req, res) => {
+  const messageSid = (req.body.MessageSid || "").toString().trim();
+
+  try {
+    const validation = validateTwilioWebhook(req);
+    if (!validation.ok) {
+      console.error("[twilio/message-status] webhook validation failed:", validation.error);
+      if (validation.error === "twilio_auth_token_missing") {
+        return res.status(500).type("text/plain").send("Twilio webhook auth is not configured");
+      }
+      return res.status(403).type("text/plain").send("Forbidden");
+    }
+
+    if (!messageSid) {
+      console.warn("[twilio/message-status] missing MessageSid");
+      return res.status(200).type("text/plain").send("OK");
+    }
+
+    const status = (req.body.MessageStatus || req.body.SmsStatus || "").toString().trim() || null;
+    const errorCode = req.body.ErrorCode ? req.body.ErrorCode.toString() : null;
+    const errorMessage = req.body.ErrorMessage ? req.body.ErrorMessage.toString() : null;
+    const { rowCount } = await pool.query(
+      `UPDATE sms_messages
+          SET message_status = COALESCE($2, message_status),
+              twilio_error_code = $3,
+              twilio_error_message = $4,
+              updated_at = now()
+        WHERE twilio_message_sid = $1`,
+      [messageSid, status, errorCode, errorMessage]
+    );
+    if (!rowCount) {
+      console.log("[twilio/message-status] message not found", { messageSid, status });
+    }
+    res.status(200).type("text/plain").send("OK");
+  } catch (e) {
+    console.error("[twilio/message-status] processing failed:", {
+      messageSid,
+      status: e?.status,
+      code: e?.code,
+      message: e?.message
+    });
+    res.status(500).type("text/plain").send("Twilio status processing failed");
   }
 });
 
