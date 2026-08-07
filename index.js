@@ -2750,7 +2750,7 @@ app.post("/api/integrations/zapier/backfill-lead-info", authRequired, async (req
     const scopeVals = req.companyId ? [req.companyId, req.userId] : [req.userId];
 
     const { rows } = await pool.query(
-      `SELECT li.id AS import_id, li.contact_id, li.raw_payload, c.lead_info
+      `SELECT li.id AS import_id, li.contact_id, li.raw_payload, li.submitted_at, c.lead_info, c.lead_submitted_at
        FROM lead_imports li
        JOIN contacts c ON c.id::text = li.contact_id
        WHERE ${scopeSQL}
@@ -2763,16 +2763,57 @@ app.post("/api/integrations/zapier/backfill-lead-info", authRequired, async (req
     for (const row of rows) {
       const existing = row.lead_info;
       const alreadyHas = Array.isArray(existing) && existing.length > 0;
-      if (alreadyHas && !force) { skippedAlreadyHas++; continue; }
+      const shouldRepairSubmittedAt = !row.lead_submitted_at && row.submitted_at;
+      if (alreadyHas && !force) {
+        if (shouldRepairSubmittedAt) {
+          try {
+            await pool.query(
+              `UPDATE contacts
+               SET lead_submitted_at = $1::timestamptz,
+                   updated_at = now()
+               WHERE id = $2 AND lead_submitted_at IS NULL`,
+              [row.submitted_at, row.contact_id]
+            );
+            updated++;
+          } catch (e) {
+            console.error("[backfill] timestamp repair failed for", row.contact_id, e && e.message ? e.message : e);
+            errored++;
+          }
+        }
+        skippedAlreadyHas++;
+        continue;
+      }
 
       const questions = buildQuestionsFromPayload(row.raw_payload || {});
       const leadInfo = buildLeadInfoStrings(questions);
-      if (leadInfo.length === 0) { skippedEmpty++; continue; }
+      if (leadInfo.length === 0) {
+        if (shouldRepairSubmittedAt) {
+          try {
+            await pool.query(
+              `UPDATE contacts
+               SET lead_submitted_at = $1::timestamptz,
+                   updated_at = now()
+               WHERE id = $2 AND lead_submitted_at IS NULL`,
+              [row.submitted_at, row.contact_id]
+            );
+            updated++;
+          } catch (e) {
+            console.error("[backfill] timestamp repair failed for", row.contact_id, e && e.message ? e.message : e);
+            errored++;
+          }
+        }
+        skippedEmpty++;
+        continue;
+      }
 
       try {
         await pool.query(
-          `UPDATE contacts SET lead_info = $1::jsonb, updated_at = now() WHERE id = $2`,
-          [JSON.stringify(leadInfo), row.contact_id]
+          `UPDATE contacts
+           SET lead_info = $1::jsonb,
+               lead_submitted_at = COALESCE(lead_submitted_at, $3::timestamptz),
+               updated_at = now()
+           WHERE id = $2`,
+          [JSON.stringify(leadInfo), row.contact_id, row.submitted_at || null]
         );
         updated++;
       } catch (e) {
