@@ -191,6 +191,29 @@ const normalizeE164Phone = (value) => {
 const phoneDigits = (value) => (value || "").toString().replace(/[^\d]/g, "");
 const MAX_SMS_BODY_LENGTH = 1600;
 const isUsableE164 = (value) => /^\+[1-9]\d{6,14}$/.test((value || "").toString());
+const VOICE_TOKEN_TTL_SECONDS = 3600;
+
+const twilioVoiceConfig = () => {
+  const { accountSid, apiKeySid, apiKeySecret } = twilioConfig();
+  const twimlAppSid = (process.env.TWILIO_TWIML_APP_SID || "").trim();
+  const configured = Boolean(accountSid && apiKeySid && apiKeySecret && twimlAppSid);
+  return { configured, accountSid, apiKeySid, apiKeySecret, twimlAppSid };
+};
+
+const voiceIdentityForUserID = (userID) => {
+  const hex = (userID || "").toString().replace(/-/g, "").toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(hex)) return null;
+  return `wolfcrm_${hex}`;
+};
+
+const uuidFromVoiceIdentity = (identity) => {
+  const raw = (identity || "").toString().trim();
+  const clean = raw.startsWith("client:") ? raw.slice("client:".length) : raw;
+  const match = clean.match(/^wolfcrm_([0-9a-f]{32})$/i);
+  if (!match) return null;
+  const hex = match[1].toLowerCase();
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+};
 
 const emptyMessagingResponse = () => {
   const response = new twilio.twiml.MessagingResponse();
@@ -1847,6 +1870,124 @@ app.post("/api/phone/lines/attach-existing", authRequired, requireEmployer, asyn
       message: e?.message
     });
     res.status(500).json({ error: "phone_line_attach_failed" });
+  }
+});
+
+app.get("/api/voice/token", authRequired, async (req, res) => {
+  if (!req.userId || !req.companyId) {
+    return res.status(400).json({ error: "company_required" });
+  }
+
+  const { configured, accountSid, apiKeySid, apiKeySecret, twimlAppSid } = twilioVoiceConfig();
+  if (!configured) {
+    return res.status(503).json({ error: "twilio_voice_not_configured" });
+  }
+
+  const identity = voiceIdentityForUserID(req.userId);
+  if (!identity) {
+    return res.status(400).json({ error: "invalid_voice_identity" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT id
+         FROM phone_lines
+        WHERE company_id = $1
+          AND active = true
+          AND status = 'active'
+          AND phone_number ~ '^\\+[1-9][0-9]{6,14}$'
+        ORDER BY created_at ASC
+        LIMIT 1`,
+      [req.companyId]
+    );
+    if (!rows.length) {
+      return res.status(400).json({ error: "phone_line_required" });
+    }
+
+    const AccessToken = twilio.jwt.AccessToken;
+    const VoiceGrant = AccessToken.VoiceGrant;
+    const token = new AccessToken(accountSid, apiKeySid, apiKeySecret, {
+      identity,
+      ttl: VOICE_TOKEN_TTL_SECONDS
+    });
+    token.addGrant(new VoiceGrant({
+      outgoingApplicationSid: twimlAppSid
+    }));
+
+    res.json({
+      token: token.toJwt(),
+      identity,
+      expiresIn: VOICE_TOKEN_TTL_SECONDS
+    });
+  } catch (e) {
+    console.error("[voice/token] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "voice_token_failed" });
+  }
+});
+
+app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
+  try {
+    const validation = validateTwilioWebhook(req);
+    if (!validation.ok) {
+      console.error("[twilio/voice/outgoing] webhook validation failed:", validation.error);
+      if (validation.error === "twilio_auth_token_missing") {
+        return res.status(500).type("text/plain").send("Twilio webhook auth is not configured");
+      }
+      return res.status(403).type("text/plain").send("Forbidden");
+    }
+
+    const voiceResponse = new twilio.twiml.VoiceResponse();
+    const identity = req.body.ClientIdentity || req.body.From || req.body.Caller || "";
+    const userID = uuidFromVoiceIdentity(identity);
+    const toNumber = normalizeE164Phone(req.body.to || req.body.To);
+
+    if (!userID) {
+      console.warn("[twilio/voice/outgoing] invalid identity");
+      return res.status(200).type("text/xml").send(voiceResponse.toString());
+    }
+    if (!isUsableE164(toNumber)) {
+      console.warn("[twilio/voice/outgoing] invalid destination", { userID });
+      return res.status(200).type("text/xml").send(voiceResponse.toString());
+    }
+
+    const { rows } = await pool.query(
+      `SELECT u.id AS user_id,
+              u.company_id,
+              pl.phone_number
+         FROM users u
+         JOIN phone_lines pl ON pl.company_id = u.company_id
+        WHERE u.id = $1
+          AND u.deleted_at IS NULL
+          AND u.company_id IS NOT NULL
+          AND pl.active = true
+          AND pl.status = 'active'
+          AND pl.phone_number ~ '^\\+[1-9][0-9]{6,14}$'
+        ORDER BY pl.created_at ASC
+        LIMIT 1`,
+      [userID]
+    );
+    if (!rows.length) {
+      console.warn("[twilio/voice/outgoing] no active phone line", { userID });
+      return res.status(200).type("text/xml").send(voiceResponse.toString());
+    }
+
+    const callerId = normalizeE164Phone(rows[0].phone_number);
+    if (!isUsableE164(callerId)) {
+      console.warn("[twilio/voice/outgoing] invalid caller ID", { userID, companyID: rows[0].company_id });
+      return res.status(200).type("text/xml").send(voiceResponse.toString());
+    }
+
+    const dial = voiceResponse.dial({ callerId });
+    dial.number(toNumber);
+    res.status(200).type("text/xml").send(voiceResponse.toString());
+  } catch (e) {
+    console.error("[twilio/voice/outgoing] failed:", {
+      status: e?.status,
+      code: e?.code,
+      message: e?.message
+    });
+    const voiceResponse = new twilio.twiml.VoiceResponse();
+    res.status(200).type("text/xml").send(voiceResponse.toString());
   }
 });
 
