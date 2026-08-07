@@ -7,6 +7,7 @@ import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Stripe from "stripe";
 import apn from "@parse/node-apn";
+import twilio from "twilio";
 
 const { Pool } = pkg;
 const app = express();
@@ -158,6 +159,21 @@ const bearer = (req) => {
   const h = req.header("authorization") || req.header("Authorization") || "";
   const m = h.match(/^Bearer (.+)$/i);
   return m ? m[1] : null;
+};
+
+const twilioConfig = () => {
+  const accountSid = (process.env.TWILIO_ACCOUNT_SID || "").trim();
+  const apiKeySid = (process.env.TWILIO_API_KEY_SID || "").trim();
+  const apiKeySecret = (process.env.TWILIO_API_KEY_SECRET || "").trim();
+  const webhookBaseUrl = (process.env.TWILIO_WEBHOOK_BASE_URL || "").trim();
+  const configured = Boolean(accountSid && apiKeySid && apiKeySecret && webhookBaseUrl);
+  return { configured, accountSid, apiKeySid, apiKeySecret, webhookBaseUrl };
+};
+
+const createTwilioClient = () => {
+  const { configured, accountSid, apiKeySid, apiKeySecret } = twilioConfig();
+  if (!configured) return null;
+  return twilio(apiKeySid, apiKeySecret, { accountSid });
 };
 
 const normalizeEmail = (email) => (email || "").toString().trim().toLowerCase();
@@ -1424,6 +1440,40 @@ app.get("/me", authRequired, async (req, res) => {
       u.company_id ? { id: u.company_id, name: u.company_name, join_code: u.join_code } : null
     )
   });
+});
+
+// ---------- Twilio diagnostics ----------
+app.get("/api/twilio/status", authRequired, async (_req, res) => {
+  const { configured, accountSid } = twilioConfig();
+  if (!configured) {
+    return res.json({
+      configured: false,
+      connected: false,
+      error: "twilio_not_configured"
+    });
+  }
+
+  try {
+    const client = createTwilioClient();
+    const account = await client.api.accounts(accountSid).fetch();
+    res.json({
+      configured: true,
+      connected: true,
+      accountSid: account.sid,
+      accountStatus: account.status
+    });
+  } catch (e) {
+    console.error("[twilio/status] connection failed:", {
+      status: e?.status,
+      code: e?.code,
+      message: e?.message
+    });
+    res.json({
+      configured: true,
+      connected: false,
+      error: "twilio_connection_failed"
+    });
+  }
 });
 
 app.patch("/api/profile", authRequired, async (req, res) => {
