@@ -2947,6 +2947,51 @@ const RESERVED_TOP_LEVEL_KEYS = new Set([
   "field_data", "questions"
 ]);
 
+const RESERVED_TOP_LEVEL_PREFIXES = [
+  "ad_",
+  "adgroup",
+  "ad_group",
+  "adset",
+  "ad_set",
+  "campaign",
+  "event_",
+  "leadgen_",
+  "lead_",
+  "account_",
+  "business_",
+  "page_",
+  "form_",
+  "platform_",
+  "partner_",
+  "retailer_",
+  "inbox_",
+  "custom_disclaimer_"
+];
+
+const RESERVED_TOP_LEVEL_SUFFIXES = [
+  "_id",
+  "_ids",
+  "_url",
+  "_urls",
+  "_time",
+  "_timestamp",
+  "_created_time"
+];
+
+function isReservedTopLevelKey(key) {
+  const normalized = (key || "").toString().trim().toLowerCase();
+  if (!normalized) return true;
+  if (RESERVED_TOP_LEVEL_KEYS.has(normalized)) return true;
+  if (RESERVED_TOP_LEVEL_PREFIXES.some(prefix => normalized.startsWith(prefix))) return true;
+  if (RESERVED_TOP_LEVEL_SUFFIXES.some(suffix => normalized.endsWith(suffix))) {
+    // Most top-level *_id values from Meta/Zapier are system identifiers, not
+    // lead-form answers. Real Q&A should come through `questions`, `field_data`,
+    // or a human question label such as `vehicle`.
+    return true;
+  }
+  return false;
+}
+
 function humanizeFieldKey(key) {
   // "interested_in_our_window_cleaning_maintenance_plan?" → "Interested In Our Window Cleaning Maintenance Plan?"
   return key
@@ -2961,7 +3006,7 @@ function humanizeFieldKey(key) {
 function extractQuestionsFromTopLevel(body) {
   const results = [];
   for (const key of Object.keys(body || {})) {
-    if (RESERVED_TOP_LEVEL_KEYS.has(key.toLowerCase())) continue;
+    if (isReservedTopLevelKey(key)) continue;
     const raw = body[key];
     // Skip nested objects / arrays that aren't simple scalar answers
     let answer = "";
