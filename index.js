@@ -1455,12 +1455,11 @@ app.get("/api/twilio/status", authRequired, async (_req, res) => {
 
   try {
     const client = createTwilioClient();
-    const account = await client.api.accounts(accountSid).fetch();
+    await client.incomingPhoneNumbers.list({ limit: 1 });
     res.json({
       configured: true,
       connected: true,
-      accountSid: account.sid,
-      accountStatus: account.status
+      accountSid
     });
   } catch (e) {
     console.error("[twilio/status] connection failed:", {
