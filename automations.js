@@ -4621,6 +4621,19 @@ function hashNumber(input) {
   return (h >>> 0) / 4294967296;
 }
 
+function parseJsonObject(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string" && value.trim().startsWith("{")) {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
 function evaluateCondition(config, context) {
   if (!config || typeof config !== "object") return true;
   const operator = (config.operator || "equals").toString().toLowerCase();
@@ -7310,7 +7323,7 @@ async function executeCollectionFilter(run, _node, config, scopeKey = "root") {
 async function executeCollectionMap(run, _node, config, scopeKey = "root") {
   const context = await buildRunContext(run, { scopeKey });
   const items = resolveCollection(config.collection, context);
-  const mappings = config.mappings || {};
+  const mappings = parseJsonObject(config.mappings || {});
   const out = items.map((item, index) => resolveConfig(mappings, { ...context, item, item_index: index, iteration: { ...(context.iteration || {}), item, index } }));
   return { items: capCollection(out), count: out.length };
 }
@@ -7428,7 +7441,7 @@ async function executeObjectGet(run, _node, config, scopeKey = "root") {
 
 async function executeObjectBuild(run, _node, config, scopeKey = "root") {
   const context = await buildRunContext(run, { scopeKey });
-  return { object: safeJsonLimited(resolveConfig(config.mappings || {}, context)) };
+  return { object: safeJsonLimited(resolveConfig(parseJsonObject(config.mappings || {}), context)) };
 }
 
 async function executeCoalesce(run, _node, config, scopeKey = "root") {
