@@ -231,6 +231,75 @@ const triggerCatalog = [
   ["service_plan.subscription_past_due", "Subscription Past Due", "Subscriptions", "A subscription became past due.", ["service_plan"], ["service_plan.subscription_past_due"]],
   ["service_plan.subscription_unpaid", "Subscription Unpaid", "Subscriptions", "A subscription became unpaid.", ["service_plan"], ["service_plan.subscription_unpaid"]],
   ["service_plan.subscription_trial_ending", "Subscription Trial Ending", "Subscriptions", "Stripe reported a subscription trial ending.", ["service_plan"], ["service_plan.subscription_trial_ending"]],
+  ["map.pin_created", "Map Pin Created", "Map & Canvassing", "A field map pin was created.", ["map_pin"], ["map.pin_created"]],
+  ["map.pin_updated", "Map Pin Updated", "Map & Canvassing", "A field map pin was updated.", ["map_pin"], ["map.pin_updated"]],
+  ["map.pin_deleted", "Map Pin Deleted", "Map & Canvassing", "A field map pin was deleted.", ["map_pin"], ["map.pin_deleted"]],
+  ["map.pin_status_changed", "Pin Status Changed", "Map & Canvassing", "A map pin changed status.", ["map_pin"], ["map.pin_status_changed"]],
+  ["map.pin_list_changed", "Pin List Changed", "Map & Canvassing", "A map pin moved between durable lists.", ["map_pin"], ["map.pin_list_changed"]],
+  ["map.pin_added_to_list", "Pin Added to List", "Map & Canvassing", "A map pin was added to a durable list.", ["map_pin"], ["map.pin_added_to_list"]],
+  ["map.pin_removed_from_list", "Pin Removed from List", "Map & Canvassing", "A map pin was removed from a durable list.", ["map_pin"], ["map.pin_removed_from_list"]],
+  ["map.pin_contact_linked", "Pin Contact Linked", "Map & Canvassing", "A contact was linked to a pin.", ["map_pin", "contact"], ["map.pin_contact_linked"]],
+  ["map.pin_contact_unlinked", "Pin Contact Unlinked", "Map & Canvassing", "A contact was unlinked from a pin.", ["map_pin"], ["map.pin_contact_unlinked"]],
+  ["map.pin_address_changed", "Pin Address Changed", "Map & Canvassing", "A map pin address changed.", ["map_pin"], ["map.pin_address_changed"]],
+  ["map.pin_location_changed", "Pin Location Changed", "Map & Canvassing", "A map pin coordinate changed.", ["map_pin"], ["map.pin_location_changed"]],
+  ["map.pin_note_added", "Pin Note Added", "Map & Canvassing", "A field note was added to a map pin.", ["map_pin"], ["map.pin_note_added"]],
+  ["map.pin_converted_to_contact", "Pin Converted to Contact", "Map & Canvassing", "A contact was created from a map pin.", ["map_pin", "contact"], ["map.pin_converted_to_contact"]],
+  ["map.pin_converted_to_lead", "Pin Converted to Lead", "Map & Canvassing", "A map pin became a lead.", ["map_pin"], ["map.pin_converted_to_lead"]],
+  ["map.pin_marked_won", "Pin Marked Won", "Map & Canvassing", "A map pin was marked won.", ["map_pin"], ["map.pin_marked_won"]],
+  ["map.pin_marked_lost", "Pin Marked Lost", "Map & Canvassing", "A map pin was marked lost.", ["map_pin"], ["map.pin_marked_lost"]],
+  ["map.pin_marked_reloop", "Pin Marked Reloop", "Map & Canvassing", "A map pin was marked for reloop.", ["map_pin"], ["map.pin_marked_reloop"]],
+  ["map.pin_marked_later", "Pin Marked Later", "Map & Canvassing", "A map pin was marked later/no-answer.", ["map_pin"], ["map.pin_marked_later"]],
+  ["map.pin_visited", "Pin Visited", "Map & Canvassing", "A field visit was recorded for a pin.", ["map_pin"], ["map.pin_visited"]],
+  ["map.pin_knocked", "Pin Knock Recorded", "Map & Canvassing", "A door knock was recorded for a pin.", ["map_pin"], ["map.pin_knocked"]],
+  ["map.pin_followup_due", "Pin Follow-Up Due", "Map & Canvassing", "A configured map follow-up became due.", ["map_pin"], ["map.pin_followup_due"]],
+  ["canvass.knock_recorded", "Door Knock Recorded", "Map & Canvassing", "A door knock was recorded.", ["map_pin"], ["canvass.knock_recorded"]],
+  ["canvass.outcome_recorded", "Canvass Outcome Recorded", "Map & Canvassing", "A door-knocking outcome was recorded.", ["map_pin"], ["canvass.outcome_recorded"]],
+  ["canvass.lead_created", "Canvass Lead Created", "Map & Canvassing", "A canvassing pin became a lead.", ["map_pin"], ["canvass.lead_created"]],
+  ["canvass.reloop_created", "Canvass Reloop Created", "Map & Canvassing", "A canvassing pin was marked for reloop.", ["map_pin"], ["canvass.reloop_created"]],
+  ["canvass.no_answer", "Canvass No Answer", "Map & Canvassing", "A canvassing pin was marked later/no-answer.", ["map_pin"], ["canvass.no_answer"]],
+  ["canvass.not_interested", "Canvass Not Interested", "Map & Canvassing", "A canvassing pin was marked lost/not interested.", ["map_pin"], ["canvass.not_interested"]],
+  ["canvass.sale_recorded", "Canvass Sale Recorded", "Map & Canvassing", "A canvassing pin was marked won.", ["map_pin"], ["canvass.sale_recorded"]],
+  ["route.created", "Route Created", "Routes", "A field route was created.", ["route"], ["route.created"]],
+  ["route.updated", "Route Updated", "Routes", "A field route was updated.", ["route"], ["route.updated"]],
+  ["route.deleted", "Route Deleted", "Routes", "A field route was deleted.", ["route"], ["route.deleted"]],
+  ["route.stop_added", "Route Stop Added", "Routes", "A stop was added to a field route.", ["route", "route_stop"], ["route.stop_added"]],
+  ["route.stop_removed", "Route Stop Removed", "Routes", "A stop was removed from a field route.", ["route", "route_stop"], ["route.stop_removed"]],
+  ["route.reordered", "Route Reordered", "Routes", "Route stop order changed.", ["route"], ["route.reordered"]],
+  ["route.assigned", "Route Assigned", "Routes", "A route was assigned to a rep.", ["route", "employee"], ["route.assigned"]],
+  ["route.started", "Route Started", "Routes", "A field route was marked started.", ["route"], ["route.started"]],
+  ["route.completed", "Route Completed", "Routes", "A field route was completed.", ["route"], ["route.completed"]],
+  ["route.stop_completed", "Route Stop Completed", "Routes", "A route stop was completed.", ["route_stop"], ["route.stop_completed"]],
+  ["route.stop_skipped", "Route Stop Skipped", "Routes", "A route stop was skipped.", ["route_stop"], ["route.stop_skipped"]],
+  ["route.all_stops_completed", "All Route Stops Completed", "Routes", "Every route stop reached a terminal state.", ["route"], ["route.all_stops_completed"]],
+  ["route.scheduled", "Route Scheduled", "Routes", "A route was scheduled for a date.", ["route"], ["route.scheduled"]],
+  ["employee.created", "Employee Created", "Employees & Team", "An employee account was created.", ["employee"], ["employee.created"]],
+  ["employee.invited", "Employee Invited", "Employees & Team", "An employee invite/account was created.", ["employee"], ["employee.invited"]],
+  ["employee.joined", "Employee Joined", "Employees & Team", "An employee joined the company.", ["employee"], ["employee.joined"]],
+  ["employee.updated", "Employee Updated", "Employees & Team", "An employee profile changed.", ["employee"], ["employee.updated"]],
+  ["employee.role_changed", "Employee Role Changed", "Employees & Team", "An employee role changed.", ["employee"], ["employee.role_changed"]],
+  ["employee.deactivated", "Employee Deactivated", "Employees & Team", "An employee was deactivated/removed.", ["employee"], ["employee.deactivated"]],
+  ["employee.reactivated", "Employee Reactivated", "Employees & Team", "An employee was restored.", ["employee"], ["employee.reactivated"]],
+  ["employee.removed", "Employee Removed", "Employees & Team", "An employee was removed from active access.", ["employee"], ["employee.removed"]],
+  ["employee.permission_changed", "Employee Permission Changed", "Employees & Team", "A persisted employee permission changed.", ["employee"], ["employee.permission_changed"]],
+  ["time_clock.clocked_in", "Employee Clocked In", "Time Clock", "An employee clocked in.", ["time_entry", "employee"], ["time_clock.clocked_in"]],
+  ["time_clock.clocked_out", "Employee Clocked Out", "Time Clock", "An employee clocked out.", ["time_entry", "employee"], ["time_clock.clocked_out"]],
+  ["time_clock.shift_started", "Shift Started", "Time Clock", "A time-clock shift started.", ["time_entry", "employee"], ["time_clock.shift_started"]],
+  ["time_clock.shift_completed", "Shift Completed", "Time Clock", "A time-clock shift completed.", ["time_entry", "employee"], ["time_clock.shift_completed"]],
+  ["time_clock.shift_updated", "Shift Updated", "Time Clock", "A time-clock entry changed.", ["time_entry"], ["time_clock.shift_updated"]],
+  ["time_clock.manual_edit", "Time Entry Manual Edit", "Time Clock", "A time-clock entry was manually edited.", ["time_entry"], ["time_clock.manual_edit"]],
+  ["time_clock.break_started", "Break Started", "Time Clock", "An employee started a break.", ["time_entry", "employee"], ["time_clock.break_started"]],
+  ["time_clock.break_ended", "Break Ended", "Time Clock", "An employee ended a break.", ["time_entry", "employee"], ["time_clock.break_ended"]],
+  ["time_clock.shift_duration_reached", "Shift Duration Reached", "Time Clock", "An active shift reached a configured duration.", ["time_entry", "employee"], ["time_clock.shift_duration_reached"]],
+  ["time_clock.overtime_threshold_reached", "Overtime Threshold Reached", "Time Clock", "A configured operational overtime threshold was reached.", ["time_entry", "employee"], ["time_clock.overtime_threshold_reached"]],
+  ["time_clock.missed_clock_out", "Missed Clock-Out", "Time Clock", "An employee remained clocked in past a configured threshold.", ["time_entry", "employee"], ["time_clock.missed_clock_out"]],
+  ["measurement.created", "Measurement Created", "Measurements", "A property measurement was created.", ["measurement"], ["measurement.created"]],
+  ["measurement.updated", "Measurement Updated", "Measurements", "A property measurement changed.", ["measurement"], ["measurement.updated"]],
+  ["measurement.deleted", "Measurement Deleted", "Measurements", "A property measurement was deleted.", ["measurement"], ["measurement.deleted"]],
+  ["measurement.completed", "Measurement Completed", "Measurements", "A measurement with enough points was saved.", ["measurement"], ["measurement.completed"]],
+  ["measurement.area_changed", "Measurement Area Changed", "Measurements", "A measurement area changed.", ["measurement"], ["measurement.area_changed"]],
+  ["measurement.distance_changed", "Measurement Distance Changed", "Measurements", "A measurement distance changed.", ["measurement"], ["measurement.distance_changed"]],
+  ["measurement.linked_to_contact", "Measurement Linked to Contact", "Measurements", "A measurement was linked to a contact.", ["measurement", "contact"], ["measurement.linked_to_contact"]],
+  ["measurement.linked_to_pin", "Measurement Linked to Pin", "Measurements", "Reserved for future pin-linked measurements.", ["measurement", "map_pin"], ["measurement.linked_to_pin"]],
   ["task.created", "Task Created", "Tasks", "A task was created.", ["task"], ["task.created"]],
   ["task.updated", "Task Updated", "Tasks", "A task was updated.", ["task"], ["task.updated"]],
   ["task.assigned", "Task Assigned", "Tasks", "A task was assigned to a user.", ["task"], ["task.assigned"]],
@@ -375,6 +444,50 @@ const actionCatalog = [
   ["service_plan.create_service_task", "Create Service Task", "Service Plans", "Creates a service scheduling task.", ["service_plan"], ["default"]],
   ["service_plan.send_scheduling_sms", "Send Service Scheduling SMS", "Service Plans", "Sends scheduling SMS through the shared SMS safety path.", ["service_plan"], ["default"]],
   ["service_plan.create_payment_followup", "Create Service Payment Follow-Up", "Service Plans", "Creates a payment follow-up task.", ["service_plan"], ["default"]],
+  ["map.create_pin", "Create Map Pin", "Map & Canvassing", "Creates a company-scoped field map pin.", ["contact", "map_pin"], ["default"]],
+  ["map.update_pin", "Update Map Pin", "Map & Canvassing", "Updates safe map pin fields.", ["map_pin"], ["default"]],
+  ["map.delete_pin", "Delete Map Pin", "Map & Canvassing", "Deletes a map pin after explicit confirmation.", ["map_pin"], ["default"]],
+  ["map.set_status", "Set Map Status", "Map & Canvassing", "Sets a pin status using WolfCRM map states.", ["map_pin"], ["default"]],
+  ["map.add_to_list", "Add Pin to List", "Map & Canvassing", "Adds a pin to a durable automation map list.", ["map_pin"], ["default"]],
+  ["map.remove_from_list", "Remove Pin from List", "Map & Canvassing", "Removes a pin from its durable automation map list.", ["map_pin"], ["default"]],
+  ["map.move_to_list", "Move Pin to List", "Map & Canvassing", "Moves a pin to a durable automation map list.", ["map_pin"], ["default"]],
+  ["map.link_contact", "Link Pin to Contact", "Map & Canvassing", "Links a pin to a company contact.", ["map_pin", "contact"], ["default"]],
+  ["map.unlink_contact", "Unlink Pin Contact", "Map & Canvassing", "Removes the contact link from a pin.", ["map_pin"], ["default"]],
+  ["map.create_contact", "Create Contact from Pin", "Map & Canvassing", "Creates a contact from a pin and links it.", ["map_pin"], ["default"]],
+  ["map.add_note", "Add Pin Note", "Map & Canvassing", "Adds a durable map activity note.", ["map_pin"], ["default"]],
+  ["map.mark_visited", "Mark Pin Visited", "Map & Canvassing", "Records a field visit for a pin.", ["map_pin"], ["default"]],
+  ["map.record_knock", "Record Door Knock", "Map & Canvassing", "Records a door knock/outcome for a pin.", ["map_pin"], ["default"]],
+  ["map.schedule_followup", "Schedule Pin Follow-Up", "Map & Canvassing", "Schedules a pin follow-up event.", ["map_pin"], ["default"]],
+  ["map.add_to_route", "Add Pin to Route", "Map & Canvassing", "Adds a pin as a route stop.", ["map_pin", "route"], ["default"]],
+  ["route.create", "Create Route", "Routes", "Creates a durable field route.", ["generic"], ["default"]],
+  ["route.delete", "Delete Route", "Routes", "Deletes a route after confirmation.", ["route"], ["default"]],
+  ["route.add_stop", "Add Route Stop", "Routes", "Adds a stop to a route.", ["route"], ["default"]],
+  ["route.remove_stop", "Remove Route Stop", "Routes", "Removes a route stop.", ["route_stop"], ["default"]],
+  ["route.add_contact", "Add Contact to Route", "Routes", "Adds a contact location to a route.", ["route", "contact"], ["default"]],
+  ["route.add_pin", "Add Pin to Route", "Routes", "Adds a map pin to a route.", ["route", "map_pin"], ["default"]],
+  ["route.add_job", "Add Job to Route", "Routes", "Adds a job location to a route.", ["route", "job"], ["default"]],
+  ["route.assign_user", "Assign Route Rep", "Routes", "Assigns a route to a company user.", ["route", "employee"], ["default"]],
+  ["route.set_date", "Set Route Date", "Routes", "Sets the scheduled route date.", ["route"], ["default"]],
+  ["route.optimize", "Optimize Stop Order", "Routes", "Deterministically reorders stops by coordinate distance.", ["route"], ["default"]],
+  ["route.mark_started", "Mark Route Started", "Routes", "Marks a route started.", ["route"], ["default"]],
+  ["route.mark_completed", "Mark Route Completed", "Routes", "Marks a route completed.", ["route"], ["default"]],
+  ["route.complete_stop", "Complete Route Stop", "Routes", "Marks a route stop completed.", ["route_stop"], ["default"]],
+  ["route.skip_stop", "Skip Route Stop", "Routes", "Marks a route stop skipped.", ["route_stop"], ["default"]],
+  ["employee.update_role", "Update Employee Role", "Employees & Team", "Updates an employee role with safeguards.", ["employee"], ["default"]],
+  ["employee.deactivate", "Deactivate Employee", "Employees & Team", "Soft-deactivates an employee with confirmation.", ["employee"], ["default"]],
+  ["employee.reactivate", "Reactivate Employee", "Employees & Team", "Restores a deactivated employee.", ["employee"], ["default"]],
+  ["employee.send_push", "Send Employee Push", "Employees & Team", "Sends a push notification to an employee.", ["employee"], ["default"]],
+  ["employee.send_internal_message", "Send Employee Internal Message", "Employees & Team", "Sends an internal DM to an employee.", ["employee"], ["default"]],
+  ["employee.create_task", "Create Employee Task", "Employees & Team", "Creates a task assigned to an employee.", ["employee"], ["default"]],
+  ["time_clock.create_review_task", "Create Time Review Task", "Time Clock", "Creates a task to review a time entry.", ["time_entry"], ["default"]],
+  ["time_clock.send_employee_reminder", "Send Time Reminder", "Time Clock", "Sends an internal reminder to an employee.", ["time_entry", "employee"], ["default"]],
+  ["time_clock.notify_manager", "Notify Manager", "Time Clock", "Sends an operational notification to managers.", ["time_entry"], ["default"]],
+  ["time_clock.flag_for_review", "Flag Time Entry", "Time Clock", "Flags a time entry for employer review.", ["time_entry"], ["default"]],
+  ["time_clock.clear_review_flag", "Clear Time Review Flag", "Time Clock", "Clears a time entry review flag.", ["time_entry"], ["default"]],
+  ["measurement.create_record", "Create Measurement Record", "Measurements", "Creates a saved measurement record.", ["generic"], ["default"]],
+  ["measurement.update_label", "Update Measurement Label", "Measurements", "Updates a measurement name.", ["measurement"], ["default"]],
+  ["measurement.link_contact", "Link Measurement to Contact", "Measurements", "Links a measurement to a contact.", ["measurement", "contact"], ["default"]],
+  ["measurement.link_pin", "Link Measurement to Pin", "Measurements", "Deferred until measurements persist pin links.", ["measurement", "map_pin"], ["default"]],
   ["job.create", "Create Job", "Schedule", "Creates a scheduled job.", ["contact"], ["default"]],
   ["job.update", "Update Job", "Schedule & Jobs", "Updates whitelisted job fields.", ["job"], ["default"]],
   ["job.reschedule", "Reschedule Job", "Schedule & Jobs", "Changes a job start/end time.", ["job"], ["default"]],
@@ -531,6 +644,50 @@ const actionExecutors = {
   "service_plan.create_service_task": executeServicePlanCreateTask,
   "service_plan.send_scheduling_sms": executeServicePlanSendSchedulingSms,
   "service_plan.create_payment_followup": executeServicePlanPaymentFollowup,
+  "map.create_pin": executeMapCreatePin,
+  "map.update_pin": executeMapUpdatePin,
+  "map.delete_pin": executeMapDeletePin,
+  "map.set_status": executeMapSetStatus,
+  "map.add_to_list": executeMapAddToList,
+  "map.remove_from_list": executeMapRemoveFromList,
+  "map.move_to_list": executeMapMoveToList,
+  "map.link_contact": executeMapLinkContact,
+  "map.unlink_contact": executeMapUnlinkContact,
+  "map.create_contact": executeMapCreateContact,
+  "map.add_note": executeMapAddNote,
+  "map.mark_visited": executeMapMarkVisited,
+  "map.record_knock": executeMapRecordKnock,
+  "map.schedule_followup": executeMapScheduleFollowup,
+  "map.add_to_route": executeMapAddToRoute,
+  "route.create": executeRouteCreate,
+  "route.delete": executeRouteDelete,
+  "route.add_stop": executeRouteAddStop,
+  "route.remove_stop": executeRouteRemoveStop,
+  "route.add_contact": executeRouteAddContact,
+  "route.add_pin": executeRouteAddPin,
+  "route.add_job": executeRouteAddJob,
+  "route.assign_user": executeRouteAssignUser,
+  "route.set_date": executeRouteSetDate,
+  "route.optimize": executeRouteOptimize,
+  "route.mark_started": executeRouteMarkStarted,
+  "route.mark_completed": executeRouteMarkCompleted,
+  "route.complete_stop": executeRouteCompleteStop,
+  "route.skip_stop": executeRouteSkipStop,
+  "employee.update_role": executeEmployeeUpdateRole,
+  "employee.deactivate": executeEmployeeDeactivate,
+  "employee.reactivate": executeEmployeeReactivate,
+  "employee.send_push": executeEmployeeSendPush,
+  "employee.send_internal_message": executeEmployeeSendInternalMessage,
+  "employee.create_task": executeEmployeeCreateTask,
+  "time_clock.create_review_task": executeTimeClockCreateReviewTask,
+  "time_clock.send_employee_reminder": executeTimeClockSendEmployeeReminder,
+  "time_clock.notify_manager": executeTimeClockNotifyManager,
+  "time_clock.flag_for_review": executeTimeClockFlagForReview,
+  "time_clock.clear_review_flag": executeTimeClockClearReviewFlag,
+  "measurement.create_record": executeMeasurementCreateRecord,
+  "measurement.update_label": executeMeasurementUpdateLabel,
+  "measurement.link_contact": executeMeasurementLinkContact,
+  "measurement.link_pin": executeDeferredAction,
   "job.create": executeJobCreate,
   "job.update": executeJobUpdate,
   "job.reschedule": executeJobReschedule,
@@ -762,6 +919,78 @@ function actionConfigFields(key) {
     case "service_plan.send_scheduling_sms":
     case "payment.send_payment_sms":
       return [commonText("body", "Message"), { key: "business_hours_policy", label: "Business Hours", type: "select", options: ["send_immediately", "defer_until_business_hours", "skip_if_outside_business_hours"] }];
+    case "map.create_pin":
+    case "map.update_pin":
+      return [commonText("pin_id", "Pin ID"), commonText("name", "Name"), commonText("address", "Address"), commonText("notes", "Notes"), { key: "latitude", label: "Latitude", type: "number" }, { key: "longitude", label: "Longitude", type: "number" }, { key: "status", label: "Status", type: "select", options: mapStatusOptions() }, commonText("contact_id", "Contact ID"), commonText("list_id", "List ID")];
+    case "map.set_status":
+      return [{ key: "pin_id", label: "Pin", type: "map_pin" }, { key: "status", label: "Status", type: "select", options: mapStatusOptions() }];
+    case "map.delete_pin":
+      return [{ key: "pin_id", label: "Pin", type: "map_pin" }, { key: "confirm_delete", label: "Confirm Delete", type: "boolean" }];
+    case "map.add_to_list":
+    case "map.move_to_list":
+      return [{ key: "pin_id", label: "Pin", type: "map_pin" }, commonText("list_id", "List ID"), commonText("list_name", "List Name")];
+    case "map.remove_from_list":
+      return [{ key: "pin_id", label: "Pin", type: "map_pin" }];
+    case "map.link_contact":
+      return [{ key: "pin_id", label: "Pin", type: "map_pin" }, commonText("contact_id", "Contact ID")];
+    case "map.unlink_contact":
+      return [{ key: "pin_id", label: "Pin", type: "map_pin" }];
+    case "map.create_contact":
+      return [{ key: "pin_id", label: "Pin", type: "map_pin" }, commonText("name", "Name"), commonText("phone", "Phone"), commonText("email", "Email"), { key: "tags", label: "Tags", type: "tag_list" }, commonText("job_type", "Job Type"), { key: "value_cents", label: "Value", type: "money" }];
+    case "map.add_note":
+    case "map.mark_visited":
+    case "map.record_knock":
+      return [{ key: "pin_id", label: "Pin", type: "map_pin" }, commonText("note", "Note"), { key: "outcome_status", label: "Outcome Status", type: "select", options: mapStatusOptions() }];
+    case "map.schedule_followup":
+      return [{ key: "pin_id", label: "Pin", type: "map_pin" }, { key: "amount", label: "Amount", type: "number" }, { key: "unit", label: "Unit", type: "select", options: ["minutes", "hours", "days", "weeks"] }];
+    case "map.add_to_route":
+    case "route.add_pin":
+      return [commonText("route_id", "Route ID"), { key: "pin_id", label: "Pin", type: "map_pin" }];
+    case "route.create":
+      return [commonText("name", "Route Name"), { key: "assigned_user_id", label: "Rep", type: "user" }, { key: "scheduled_date", label: "Date", type: "date" }, { key: "optimize", label: "Optimize Stops", type: "boolean" }];
+    case "route.delete":
+      return [commonText("route_id", "Route ID"), { key: "confirm_delete", label: "Confirm Delete", type: "boolean" }];
+    case "route.add_stop":
+      return [commonText("route_id", "Route ID"), commonText("pin_id", "Pin ID"), commonText("contact_id", "Contact ID"), commonText("job_id", "Job ID"), commonText("address", "Address"), { key: "latitude", label: "Latitude", type: "number" }, { key: "longitude", label: "Longitude", type: "number" }];
+    case "route.remove_stop":
+    case "route.complete_stop":
+    case "route.skip_stop":
+      return [commonText("stop_id", "Stop ID"), commonText("notes", "Notes")];
+    case "route.add_contact":
+      return [commonText("route_id", "Route ID"), commonText("contact_id", "Contact ID")];
+    case "route.add_job":
+      return [commonText("route_id", "Route ID"), commonText("job_id", "Job ID")];
+    case "route.assign_user":
+      return [commonText("route_id", "Route ID"), { key: "assigned_user_id", label: "Rep", type: "user" }];
+    case "route.set_date":
+      return [commonText("route_id", "Route ID"), { key: "scheduled_date", label: "Date", type: "date" }];
+    case "route.optimize":
+    case "route.mark_started":
+    case "route.mark_completed":
+      return [commonText("route_id", "Route ID")];
+    case "employee.update_role":
+      return [{ key: "employee_id", label: "Employee", type: "user" }, { key: "role", label: "Role", type: "select", options: ["employee", "employer"] }, { key: "confirm_sensitive_change", label: "Confirm Role Change", type: "boolean" }];
+    case "employee.deactivate":
+      return [{ key: "employee_id", label: "Employee", type: "user" }, { key: "confirm_deactivate", label: "Confirm Deactivate", type: "boolean" }];
+    case "employee.reactivate":
+    case "employee.send_push":
+    case "employee.send_internal_message":
+    case "employee.create_task":
+      return [{ key: "employee_id", label: "Employee", type: "user" }, commonText("title", "Title"), commonText("body", "Message"), { key: "due_date", label: "Due Date", type: "datetime_expression" }];
+    case "time_clock.create_review_task":
+    case "time_clock.send_employee_reminder":
+    case "time_clock.notify_manager":
+      return [commonText("title", "Title"), commonText("body", "Message"), commonText("time_entry_id", "Time Entry ID")];
+    case "time_clock.flag_for_review":
+      return [commonText("time_entry_id", "Time Entry ID"), commonText("review_reason", "Review Reason")];
+    case "time_clock.clear_review_flag":
+      return [commonText("time_entry_id", "Time Entry ID")];
+    case "measurement.create_record":
+      return [commonText("name", "Name"), { key: "points", label: "Points", type: "json" }, { key: "units", label: "Units", type: "select", options: ["feet", "meters"] }, { key: "linked_contact_ids", label: "Contacts", type: "string_list" }];
+    case "measurement.update_label":
+      return [commonText("measurement_id", "Measurement ID"), commonText("name", "Name")];
+    case "measurement.link_contact":
+      return [commonText("measurement_id", "Measurement ID"), commonText("contact_id", "Contact ID")];
     case "webhook.send":
       return [commonText("url", "URL"), { key: "method", label: "Method", type: "select", options: ["GET", "POST", "PUT", "PATCH", "DELETE"] }, { key: "headers", label: "Headers", type: "json" }, { key: "body", label: "JSON Body", type: "json" }];
     case "automation.start":
@@ -794,6 +1023,26 @@ function triggerConfigFields(key) {
     fields.push({ key: "amount", label: "Amount", type: "number" });
     fields.push({ key: "unit", label: "Unit", type: "select", options: ["days", "weeks"] });
   }
+  if (key === "map.pin_followup_due") {
+    fields.push({ key: "basis", label: "After", type: "select", options: ["status_changed", "last_knock", "last_visit"] });
+    fields.push({ key: "amount", label: "Amount", type: "number" });
+    fields.push({ key: "unit", label: "Unit", type: "select", options: ["minutes", "hours", "days", "weeks"] });
+  }
+  if (key.startsWith("map.") || key.startsWith("canvass.")) {
+    fields.push({ key: "statuses", label: "Statuses", type: "string_list", options: mapStatusOptions() });
+    fields.push({ key: "from_status", label: "From Status", type: "select", options: ["any", ...mapStatusOptions()] });
+    fields.push({ key: "to_status", label: "To Status", type: "select", options: ["any", ...mapStatusOptions()] });
+    fields.push({ key: "list_id", label: "List", type: "map_list" });
+    fields.push({ key: "known_contact", label: "Contact Link", type: "boolean" });
+  }
+  if (key.startsWith("route.")) fields.push({ key: "route_statuses", label: "Route Statuses", type: "string_list" }, { key: "assigned_user_id", label: "Assigned Rep", type: "user" });
+  if (key.startsWith("employee.")) fields.push({ key: "employee_id", label: "Employee", type: "user" }, { key: "role", label: "Role", type: "select", options: ["employee", "employer"] }, { key: "active", label: "Active", type: "boolean" });
+  if (key === "time_clock.shift_duration_reached" || key === "time_clock.overtime_threshold_reached" || key === "time_clock.missed_clock_out") {
+    fields.push({ key: "amount", label: "Amount", type: "number" });
+    fields.push({ key: "unit", label: "Unit", type: "select", options: ["minutes", "hours"] });
+    fields.push({ key: "employee_id", label: "Employee", type: "user" });
+  }
+  if (key.startsWith("time_clock.") && !["time_clock.shift_duration_reached", "time_clock.overtime_threshold_reached", "time_clock.missed_clock_out"].includes(key)) fields.push({ key: "employee_id", label: "Employee", type: "user" });
   if (key.startsWith("quote.")) fields.push({ key: "statuses", label: "Statuses", type: "string_list" });
   if (key.startsWith("payment.")) fields.push({ key: "status", label: "Status", type: "text" }, { key: "min_amount_cents", label: "Minimum Amount", type: "money" }, { key: "max_amount_cents", label: "Maximum Amount", type: "money" });
   if (key.startsWith("service_plan.") || key.startsWith("subscription.")) fields.push({ key: "statuses", label: "Statuses", type: "string_list" });
@@ -810,6 +1059,11 @@ function triggerConfigFields(key) {
 }
 
 function triggerIcon(key) {
+  if (key.startsWith("map.") || key.startsWith("canvass.")) return "mappin";
+  if (key.startsWith("route.")) return "point.topleft.down.curvedto.point.bottomright.up";
+  if (key.startsWith("employee.")) return "person.2";
+  if (key.startsWith("time_clock.")) return "clock";
+  if (key.startsWith("measurement.")) return "ruler";
   if (key.startsWith("lead.")) return "person.badge.plus";
   if (key.includes("tag")) return "tag";
   if (key.startsWith("pipeline.won")) return "trophy";
@@ -820,6 +1074,11 @@ function triggerIcon(key) {
 }
 
 function actionIcon(key) {
+  if (key.startsWith("map.")) return "mappin";
+  if (key.startsWith("route.")) return "point.topleft.down.curvedto.point.bottomright.up";
+  if (key.startsWith("employee.")) return "person.2";
+  if (key.startsWith("time_clock.")) return "stopwatch";
+  if (key.startsWith("measurement.")) return "ruler";
   if (key.includes("tag")) return "tag";
   if (key.includes("delete") || key.includes("remove") || key.includes("lost")) return "xmark.circle";
   if (key.includes("won")) return "trophy";
@@ -828,6 +1087,10 @@ function actionIcon(key) {
   if (key.startsWith("sms.")) return "message";
   if (key.startsWith("notification.")) return "bell";
   return "bolt";
+}
+
+function mapStatusOptions() {
+  return ["lead", "won", "reloop", "later", "lost"];
 }
 
 function conditionFieldCatalog() {
@@ -969,6 +1232,67 @@ function conditionFieldCatalog() {
     ["servicePlan.is_due", "Service Plan Is Due", "Service Plans", "boolean", boolOps],
     ["servicePlan.is_overdue", "Service Plan Is Overdue", "Service Plans", "boolean", boolOps],
     ["servicePlan.subscription_status", "Subscription Status", "Subscriptions", "text", textOps],
+    ["map.pin_exists", "Pin Exists", "Map & Canvassing", "boolean", boolOps],
+    ["map.pin_id", "Pin ID", "Map & Canvassing", "text", textOps],
+    ["map.status", "Pin Status", "Map & Canvassing", "text", textOps],
+    ["map.list_id", "Map List", "Map & Canvassing", "text", textOps],
+    ["map.list_name", "Map List Name", "Map & Canvassing", "text", textOps],
+    ["map.address", "Pin Address", "Map & Canvassing", "text", textOps],
+    ["map.latitude", "Latitude", "Map & Canvassing", "number", numberOps],
+    ["map.longitude", "Longitude", "Map & Canvassing", "number", numberOps],
+    ["map.contact_id", "Linked Contact", "Map & Canvassing", "text", textOps],
+    ["map.has_contact", "Has Linked Contact", "Map & Canvassing", "boolean", boolOps],
+    ["map.source", "Pin Source", "Map & Canvassing", "text", textOps],
+    ["map.last_visit_at", "Last Visit", "Map & Canvassing", "date", dateOps],
+    ["map.last_knock_at", "Last Knock", "Map & Canvassing", "date", dateOps],
+    ["map.days_since_visit", "Days Since Visit", "Map & Canvassing", "number", numberOps],
+    ["map.knock_count", "Knock Count", "Map & Canvassing", "number", numberOps],
+    ["map.visit_count", "Visit Count", "Map & Canvassing", "number", numberOps],
+    ["map.is_lead", "Is Lead", "Map & Canvassing", "boolean", boolOps],
+    ["map.is_won", "Is Won", "Map & Canvassing", "boolean", boolOps],
+    ["map.is_lost", "Is Lost", "Map & Canvassing", "boolean", boolOps],
+    ["map.is_reloop", "Is Reloop", "Map & Canvassing", "boolean", boolOps],
+    ["map.is_later", "Is Later", "Map & Canvassing", "boolean", boolOps],
+    ["map.distance_miles", "Distance Miles", "Map & Canvassing", "number", numberOps],
+    ["route.exists", "Route Exists", "Routes", "boolean", boolOps],
+    ["route.status", "Route Status", "Routes", "text", textOps],
+    ["route.stop_count", "Stop Count", "Routes", "number", numberOps],
+    ["route.completed_stop_count", "Completed Stops", "Routes", "number", numberOps],
+    ["route.remaining_stop_count", "Remaining Stops", "Routes", "number", numberOps],
+    ["route.assigned_user_id", "Assigned Rep", "Routes", "user", textOps],
+    ["route.scheduled_date", "Route Date", "Routes", "date", dateOps],
+    ["route.all_stops_completed", "All Stops Completed", "Routes", "boolean", boolOps],
+    ["routeStop.status", "Stop Status", "Routes", "text", textOps],
+    ["routeStop.sort_order", "Stop Order", "Routes", "number", numberOps],
+    ["routeStop.completed", "Stop Completed", "Routes", "boolean", boolOps],
+    ["routeStop.skipped", "Stop Skipped", "Routes", "boolean", boolOps],
+    ["employee.exists", "Employee Exists", "Employees & Team", "boolean", boolOps],
+    ["employee.id", "Employee ID", "Employees & Team", "text", textOps],
+    ["employee.name", "Employee Name", "Employees & Team", "text", textOps],
+    ["employee.email", "Employee Email", "Employees & Team", "text", textOps],
+    ["employee.role", "Employee Role", "Employees & Team", "text", textOps],
+    ["employee.active", "Employee Active", "Employees & Team", "boolean", boolOps],
+    ["employee.is_clocked_in", "Clocked In", "Employees & Team", "boolean", boolOps],
+    ["employee.current_shift_duration", "Current Shift Minutes", "Employees & Team", "number", numberOps],
+    ["employee.jobs_today", "Jobs Today", "Employees & Team", "number", numberOps],
+    ["employee.completed_jobs_today", "Completed Jobs Today", "Employees & Team", "number", numberOps],
+    ["employee.tasks_due_today", "Tasks Due Today", "Employees & Team", "number", numberOps],
+    ["employee.overdue_tasks", "Overdue Tasks", "Employees & Team", "number", numberOps],
+    ["employee.hours_today", "Hours Today", "Employees & Team", "number", numberOps],
+    ["employee.hours_this_week", "Hours This Week", "Employees & Team", "number", numberOps],
+    ["time_clock.employee_clocked_in", "Employee Clocked In", "Time Clock", "boolean", boolOps],
+    ["time_clock.shift_duration_minutes", "Shift Duration Minutes", "Time Clock", "number", numberOps],
+    ["time_clock.shift_duration_hours", "Shift Duration Hours", "Time Clock", "number", numberOps],
+    ["time_clock.clock_in_at", "Clock In", "Time Clock", "date", dateOps],
+    ["time_clock.clock_out_at", "Clock Out", "Time Clock", "date", dateOps],
+    ["time_clock.needs_review", "Needs Review", "Time Clock", "boolean", boolOps],
+    ["time_clock.job_id", "Linked Job", "Time Clock", "text", textOps],
+    ["measurement.exists", "Measurement Exists", "Measurements", "boolean", boolOps],
+    ["measurement.area", "Measurement Area", "Measurements", "number", numberOps],
+    ["measurement.distance", "Measurement Distance", "Measurements", "number", numberOps],
+    ["measurement.type", "Measurement Type", "Measurements", "text", textOps],
+    ["measurement.contact_id", "Measurement Contact", "Measurements", "text", textOps],
+    ["measurement.pin_id", "Measurement Pin", "Measurements", "text", textOps],
     ["time.now", "Current Time", "Time", "date", dateOps],
     ["time.day_of_week", "Day of Week", "Time", "number", numberOps],
     ["time.is_weekday", "Is Weekday", "Time", "boolean", boolOps],
@@ -1028,6 +1352,10 @@ function templateVariableCatalog() {
     "invoice.id", "invoice.status", "invoice.total_cents", "invoice.due_at",
     "payment.id", "payment.status", "payment.amount_cents", "payment.currency",
     "servicePlan.id", "servicePlan.price_cents", "servicePlan.status", "servicePlan.billing_interval", "servicePlan.service_interval", "servicePlan.first_service_date", "servicePlan.last_serviced_at", "servicePlan.next_service_date", "servicePlan.service_count",
+    "map.pin_id", "map.address", "map.status", "map.latitude", "map.longitude", "map.list_name", "map.last_visit_at", "map.last_knock_at",
+    "route.id", "route.name", "route.stop_count", "route.remaining_stop_count", "route.assigned_user_name",
+    "employee.id", "employee.name", "employee.role", "employee.email",
+    "time_clock.clock_in", "time_clock.clock_out", "time_clock.duration_hours", "time_clock.employee_name",
     "sms.body", "sms.from", "sms.to", "sms.external_number", "sms.status",
     "conversation.last_message", "conversation.last_inbound_at", "conversation.last_outbound_at",
     "call.external_number", "call.duration_seconds", "call.status",
@@ -1349,6 +1677,75 @@ export async function syncAutomationSchedulesForServicePlan(companyId, plan) {
   }
 }
 
+export async function syncAutomationSchedulesForMapPin(companyId, pin, basis = "status_changed") {
+  if (!ctx?.pool || !companyId || !pin?.id) return;
+  await cancelScheduledForSubject(companyId, "map_pin", pin.id, ["map.pin_followup_due"]);
+  if (["won", "lost"].includes(String(pin.status || ""))) return;
+  const triggers = (await ctx.pool.query(
+    `SELECT n.id, n.config
+       FROM automation_definitions d
+       JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
+       JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
+      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'map.pin_followup_due'`,
+    [companyId]
+  )).rows;
+  for (const trigger of triggers) {
+    const config = trigger.config || {};
+    const wantedBasis = config.basis || "status_changed";
+    if (wantedBasis !== basis && basis !== "manual") continue;
+    const amount = Number(config.amount || 0);
+    const unit = config.unit || "days";
+    if (amount <= 0) continue;
+    const basisDate = wantedBasis === "last_knock" ? pin.last_knock_at : wantedBasis === "last_visit" ? pin.last_visit_at : pin.updated_at || new Date();
+    const base = new Date(basisDate || Date.now());
+    if (Number.isNaN(base.getTime())) continue;
+    const when = new Date(base.getTime() + durationAmountMs(amount, unit));
+    await enqueueScheduledAutomationEvent({
+      companyId,
+      eventType: "map.pin_followup_due",
+      subjectType: "map_pin",
+      subjectId: pin.id,
+      scheduledFor: when,
+      scheduleKey: `map.pin_followup_due:${trigger.id}:${pin.id}:${wantedBasis}:${base.toISOString()}:${amount}:${unit}`,
+      sourceVersion: `${pin.updated_at || ""}:${pin.status || ""}:${pin.last_knock_at || ""}:${pin.last_visit_at || ""}`,
+      payload: { trigger_node_id: trigger.id, pin_id: pin.id, status: pin.status || null, contact_id: pin.contact_id || null, basis: wantedBasis, amount, unit }
+    });
+  }
+}
+
+export async function syncAutomationSchedulesForTimeEntry(companyId, entry) {
+  if (!ctx?.pool || !companyId || !entry?.id) return;
+  await cancelScheduledForSubject(companyId, "time_entry", entry.id, ["time_clock.shift_duration_reached", "time_clock.overtime_threshold_reached", "time_clock.missed_clock_out"]);
+  if (entry.end_at) return;
+  const triggers = (await ctx.pool.query(
+    `SELECT n.id, n.config
+       FROM automation_definitions d
+       JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
+       JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
+      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = ANY($2::text[])`,
+    [companyId, ["time_clock.shift_duration_reached", "time_clock.overtime_threshold_reached", "time_clock.missed_clock_out"]]
+  )).rows;
+  const start = new Date(entry.start_at);
+  if (Number.isNaN(start.getTime())) return;
+  for (const trigger of triggers) {
+    if (trigger.config?.employee_id && trigger.config.employee_id !== entry.user_id) continue;
+    const amount = Number(trigger.config?.amount || 0);
+    const unit = trigger.config?.unit || "hours";
+    if (amount <= 0) continue;
+    const when = new Date(start.getTime() + durationAmountMs(amount, unit));
+    await enqueueScheduledAutomationEvent({
+      companyId,
+      eventType: trigger.config?.trigger_key,
+      subjectType: "time_entry",
+      subjectId: entry.id,
+      scheduledFor: when,
+      scheduleKey: `${trigger.config?.trigger_key}:${trigger.id}:${entry.id}:${start.toISOString()}:${amount}:${unit}`,
+      sourceVersion: `${entry.updated_at || ""}:${entry.end_at || ""}`,
+      payload: { trigger_node_id: trigger.id, time_entry_id: entry.id, employee_id: entry.user_id, clock_in: start.toISOString(), amount, unit }
+    });
+  }
+}
+
 export async function cancelAutomationSchedulesForSubject(companyId, subjectType, subjectId) {
   if (!ctx?.pool || !companyId || !subjectType || !subjectId) return;
   await ctx.pool.query(
@@ -1644,6 +2041,88 @@ async function bootstrapAutomationSchema() {
       UNIQUE(company_id, normalized_phone, channel)
     );
     CREATE INDEX IF NOT EXISTS phone_opt_outs_company_phone_idx ON phone_opt_outs(company_id, normalized_phone, status);
+
+    ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS list_id UUID;
+    ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
+    ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS last_visit_at TIMESTAMPTZ;
+    ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS last_knock_at TIMESTAMPTZ;
+    ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS visit_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS knock_count INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX IF NOT EXISTS map_pins_status_idx ON map_pins(status);
+    CREATE INDEX IF NOT EXISTS map_pins_list_idx ON map_pins(list_id);
+
+    CREATE TABLE IF NOT EXISTS map_lists (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, name)
+    );
+    CREATE INDEX IF NOT EXISTS map_lists_company_name_idx ON map_lists(company_id, name);
+
+    CREATE TABLE IF NOT EXISTS map_pin_activities (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      pin_id TEXT NOT NULL REFERENCES map_pins(id) ON DELETE CASCADE,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      activity_type TEXT NOT NULL,
+      old_status TEXT,
+      new_status TEXT,
+      note TEXT,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      source TEXT NOT NULL DEFAULT 'automation',
+      automation_run_id UUID REFERENCES automation_runs(id) ON DELETE SET NULL,
+      automation_node_id UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS map_pin_activities_pin_idx ON map_pin_activities(company_id, pin_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS field_routes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      assigned_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      scheduled_date DATE,
+      status TEXT NOT NULL DEFAULT 'draft',
+      created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS field_routes_company_status_idx ON field_routes(company_id, status, scheduled_date);
+    CREATE INDEX IF NOT EXISTS field_routes_assigned_idx ON field_routes(company_id, assigned_user_id, scheduled_date);
+
+    CREATE TABLE IF NOT EXISTS field_route_stops (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      route_id UUID NOT NULL REFERENCES field_routes(id) ON DELETE CASCADE,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      pin_id TEXT,
+      contact_id TEXT,
+      job_id UUID,
+      latitude DOUBLE PRECISION,
+      longitude DOUBLE PRECISION,
+      address TEXT NOT NULL DEFAULT '',
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      arrived_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(route_id, pin_id),
+      UNIQUE(route_id, contact_id),
+      UNIQUE(route_id, job_id)
+    );
+    CREATE INDEX IF NOT EXISTS field_route_stops_route_order_idx ON field_route_stops(route_id, sort_order);
+    CREATE INDEX IF NOT EXISTS field_route_stops_company_status_idx ON field_route_stops(company_id, status);
+
+    ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS needs_review BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS review_reason TEXT;
+    ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS job_id UUID;
+    CREATE INDEX IF NOT EXISTS time_clock_entries_review_idx ON time_clock_entries(company_id, needs_review) WHERE needs_review = true;
 
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'draft';
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
@@ -2109,6 +2588,16 @@ function validateGraphPayload(payload) {
       if (config.action_key === "service_plan.cancel" && config.confirm_cancel !== true) errors.push(`service_plan_cancel_confirmation_required:${nodeKey}`);
       if (["service_plan.set_service_interval", "service_plan.set_billing_interval"].includes(config.action_key) && !(config.service_interval || config.billing_interval)) errors.push(`service_plan_interval_required:${nodeKey}`);
       if (config.action_key === "service_plan.set_next_service_date" && !config.next_service_date) errors.push(`service_plan_next_service_required:${nodeKey}`);
+      if (config.action_key === "map.create_pin" && (config.latitude == null || config.longitude == null) && !config.address) errors.push(`map_pin_location_required:${nodeKey}`);
+      if (config.action_key === "map.delete_pin" && config.confirm_delete !== true) errors.push(`map_delete_confirmation_required:${nodeKey}`);
+      if (config.action_key === "map.set_status" && !mapStatusOptions().includes(String(config.status || ""))) errors.push(`invalid_map_status:${nodeKey}`);
+      if (config.action_key === "map.schedule_followup" && Number(config.amount || 0) <= 0) errors.push(`map_followup_amount_required:${nodeKey}`);
+      if (config.action_key === "route.delete" && config.confirm_delete !== true) errors.push(`route_delete_confirmation_required:${nodeKey}`);
+      if (["route.add_stop", "route.add_contact", "route.add_pin", "route.add_job"].includes(config.action_key) && !config.route_id) warnings.push(`route_context_required_at_runtime:${nodeKey}`);
+      if (config.action_key === "employee.update_role" && config.confirm_sensitive_change !== true) errors.push(`employee_role_confirmation_required:${nodeKey}`);
+      if (config.action_key === "employee.deactivate" && config.confirm_deactivate !== true) errors.push(`employee_deactivate_confirmation_required:${nodeKey}`);
+      if (config.action_key === "time_clock.flag_for_review" && !config.review_reason) warnings.push(`time_review_reason_recommended:${nodeKey}`);
+      if (config.action_key === "measurement.create_record" && (!Array.isArray(config.points) || config.points.length < 2)) warnings.push(`measurement_points_recommended:${nodeKey}`);
     }
     if (nodeType === "trigger" && config.trigger_key === "job.relative_time" && (!config.reference || !config.direction || !config.amount || !config.unit)) errors.push(`relative_time_trigger_incomplete:${nodeKey}`);
     if (nodeType === "trigger" && ["sms.no_reply", "sms.conversation_inactive", "voicemail.unread_for"].includes(config.trigger_key) && Number(config.amount || 0) <= 0) errors.push(`communication_duration_required:${nodeKey}`);
@@ -2116,6 +2605,8 @@ function validateGraphPayload(payload) {
     if (nodeType === "trigger" && ["call.short_call", "call.long_call"].includes(config.trigger_key) && Number(config.threshold_seconds || 0) <= 0) errors.push(`call_duration_threshold_required:${nodeKey}`);
     if (nodeType === "trigger" && config.trigger_key === "quote.followup_due" && Number(config.amount || 0) <= 0) errors.push(`quote_followup_duration_required:${nodeKey}`);
     if (nodeType === "trigger" && ["service_plan.service_upcoming", "service_plan.service_overdue"].includes(config.trigger_key) && Number(config.amount || 0) <= 0) errors.push(`service_plan_offset_required:${nodeKey}`);
+    if (nodeType === "trigger" && config.trigger_key === "map.pin_followup_due" && Number(config.amount || 0) <= 0) errors.push(`map_followup_duration_required:${nodeKey}`);
+    if (nodeType === "trigger" && ["time_clock.shift_duration_reached", "time_clock.overtime_threshold_reached", "time_clock.missed_clock_out"].includes(config.trigger_key) && Number(config.amount || 0) <= 0) errors.push(`time_clock_threshold_required:${nodeKey}`);
   }
   for (const edge of edges) {
     if (!nodeIds.has(edge.source_node_id || edge.sourceNodeId)) errors.push(`edge_source_missing:${edge.id || ""}`);
@@ -2590,6 +3081,26 @@ function triggerMatchesEvent(node, event) {
   if (key.startsWith("service_plan.")) {
     if (Array.isArray(config.statuses) && config.statuses.length && !config.statuses.includes(payload.status || payload.subscription_status)) return false;
   }
+  if (key.startsWith("map.") || key.startsWith("canvass.")) {
+    if (Array.isArray(config.statuses) && config.statuses.length && !config.statuses.includes(payload.status || payload.new_status)) return false;
+    if (config.from_status && config.from_status !== "any" && config.from_status !== payload.old_status) return false;
+    if (config.to_status && config.to_status !== "any" && config.to_status !== (payload.new_status || payload.status)) return false;
+    if (config.list_id && config.list_id !== (payload.list_id || payload.new_list_id)) return false;
+    if (config.known_contact === true && !payload.contact_id) return false;
+    if (config.known_contact === false && payload.contact_id) return false;
+  }
+  if (key.startsWith("route.")) {
+    if (Array.isArray(config.route_statuses) && config.route_statuses.length && !config.route_statuses.includes(payload.status)) return false;
+    if (config.assigned_user_id && config.assigned_user_id !== payload.assigned_user_id) return false;
+  }
+  if (key.startsWith("employee.")) {
+    if (config.employee_id && config.employee_id !== payload.employee_id) return false;
+    if (config.role && config.role !== payload.role) return false;
+    if (config.active != null && Boolean(config.active) !== Boolean(payload.active)) return false;
+  }
+  if (key.startsWith("time_clock.")) {
+    if (config.employee_id && config.employee_id !== payload.employee_id) return false;
+  }
   return true;
 }
 
@@ -2965,6 +3476,15 @@ async function shouldFireScheduledAutomationEvent(row) {
     if (!plan || !["active", "payment_pending", "past_due"].includes(String(plan.status || ""))) return false;
     if (!plan.next_service_date || row.payload?.next_service_date !== new Date(plan.next_service_date).toISOString().slice(0, 10)) return false;
   }
+  if (row.subject_type === "map_pin") {
+    const pin = (await ctx.pool.query(`SELECT status, contact_id, last_knock_at, last_visit_at FROM map_pins p JOIN users u ON u.id = p.user_id WHERE p.id = $1 AND u.company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    if (!pin || ["won", "lost"].includes(String(pin.status || ""))) return false;
+    if (Array.isArray(row.payload?.statuses) && row.payload.statuses.length && !row.payload.statuses.includes(pin.status)) return false;
+  }
+  if (row.subject_type === "time_entry") {
+    const entry = (await ctx.pool.query(`SELECT user_id, end_at FROM time_clock_entries WHERE id = $1 AND company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    if (!entry || entry.end_at) return false;
+  }
   return true;
 }
 
@@ -3034,6 +3554,12 @@ async function loadSubject(companyId, subjectType, subjectId) {
   if (subjectType === "routine") return loadRoutineContext(companyId, subjectId);
   if (subjectType === "customer_reminder") return loadCustomerReminderContext(companyId, subjectId);
   if (subjectType === "payment") return loadPaymentContext(companyId, subjectId);
+  if (subjectType === "map_pin") return loadMapPinContext(companyId, subjectId);
+  if (subjectType === "route") return loadRouteContext(companyId, subjectId);
+  if (subjectType === "route_stop") return loadRouteStopContext(companyId, subjectId);
+  if (subjectType === "employee") return loadEmployeeContext(companyId, subjectId);
+  if (subjectType === "time_entry") return loadTimeEntryContext(companyId, subjectId);
+  if (subjectType === "measurement") return loadMeasurementContext(companyId, subjectId);
   return null;
 }
 
@@ -3063,6 +3589,127 @@ async function loadServicePlanContext(companyId, planId) {
   const next = plan.next_service_date ? new Date(plan.next_service_date) : null;
   const daysUntil = next && !Number.isNaN(next.getTime()) ? Math.ceil((next.getTime() - Date.now()) / 86400000) : null;
   return { ...plan, exists: true, price: plan.price_cents, active: plan.status === "active", paused: plan.status === "paused", canceled: plan.status === "canceled", last_serviced_at: plan.last_service_date, service_count: serviceCount, days_until_next_service: daysUntil, is_due: daysUntil != null && daysUntil <= 0, is_overdue: daysUntil != null && daysUntil < 0, subscription_status: plan.stripe_subscription_status };
+}
+
+async function loadMapPinContext(companyId, pinId) {
+  const pin = (await ctx.pool.query(
+    `SELECT p.*, ml.name AS list_name
+       FROM map_pins p
+       JOIN users u ON u.id = p.user_id
+       LEFT JOIN map_lists ml ON ml.id = p.list_id AND ml.company_id = u.company_id
+      WHERE p.id = $1 AND u.company_id = $2`,
+    [pinId, companyId]
+  )).rows[0];
+  if (!pin) return { exists: false, pin_exists: false };
+  const now = Date.now();
+  const visitAt = pin.last_visit_at ? new Date(pin.last_visit_at) : null;
+  return {
+    ...pin,
+    exists: true,
+    pin_exists: true,
+    pin_id: pin.id,
+    has_contact: !!pin.contact_id,
+    is_lead: pin.status === "lead",
+    is_won: pin.status === "won",
+    is_lost: pin.status === "lost",
+    is_reloop: pin.status === "reloop",
+    is_later: pin.status === "later",
+    days_since_visit: visitAt && !Number.isNaN(visitAt.getTime()) ? Math.floor((now - visitAt.getTime()) / 86400000) : null
+  };
+}
+
+async function loadRouteContext(companyId, routeId) {
+  const route = (await ctx.pool.query(
+    `SELECT r.*, COALESCE(NULLIF(u.display_name, ''), u.email) AS assigned_user_name
+       FROM field_routes r
+       LEFT JOIN users u ON u.id = r.assigned_user_id
+      WHERE r.id::text = $1 AND r.company_id = $2`,
+    [routeId, companyId]
+  )).rows[0];
+  if (!route) return { exists: false };
+  const counts = (await ctx.pool.query(
+    `SELECT COUNT(*)::int AS stop_count,
+            COUNT(*) FILTER (WHERE status = 'completed')::int AS completed_stop_count,
+            COUNT(*) FILTER (WHERE status NOT IN ('completed','skipped'))::int AS remaining_stop_count
+       FROM field_route_stops WHERE route_id = $1 AND company_id = $2`,
+    [route.id, companyId]
+  )).rows[0] || {};
+  return { ...route, exists: true, ...counts, all_stops_completed: Number(counts.stop_count || 0) > 0 && Number(counts.remaining_stop_count || 0) === 0 };
+}
+
+async function loadRouteStopContext(companyId, stopId) {
+  const stop = (await ctx.pool.query(`SELECT * FROM field_route_stops WHERE id::text = $1 AND company_id = $2`, [stopId, companyId])).rows[0];
+  if (!stop) return { exists: false };
+  return { ...stop, exists: true, completed: stop.status === "completed", skipped: stop.status === "skipped" };
+}
+
+async function loadEmployeeContext(companyId, employeeId) {
+  const employee = (await ctx.pool.query(`SELECT id, email, role, display_name, photo_url, created_at, deleted_at FROM users WHERE id::text = $1 AND company_id = $2`, [employeeId, companyId])).rows[0];
+  if (!employee) return { exists: false };
+  const open = (await ctx.pool.query(`SELECT id, start_at FROM time_clock_entries WHERE user_id = $1 AND company_id = $2 AND end_at IS NULL ORDER BY start_at DESC LIMIT 1`, [employee.id, companyId])).rows[0];
+  const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
+  const dayEnd = new Date(dayStart); dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+  const weekStart = new Date(dayStart); weekStart.setUTCDate(weekStart.getUTCDate() - weekStart.getUTCDay());
+  const metrics = (await ctx.pool.query(
+    `SELECT
+       COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(end_at, now()) - start_at)) - COALESCE(break_seconds,0)) FILTER (WHERE start_at >= $3),0) / 3600 AS hours_today,
+       COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(end_at, now()) - start_at)) - COALESCE(break_seconds,0)) FILTER (WHERE start_at >= $4),0) / 3600 AS hours_this_week
+       FROM time_clock_entries WHERE user_id = $1 AND company_id = $2 AND manual_status <> 'disapproved'`,
+    [employee.id, companyId, dayStart.toISOString(), weekStart.toISOString()]
+  )).rows[0] || {};
+  const jobs = (await ctx.pool.query(
+    `SELECT COUNT(*)::int AS jobs_today,
+            COUNT(*) FILTER (WHERE finished_at IS NOT NULL)::int AS completed_jobs_today
+       FROM schedule_events
+      WHERE company_id = $1 AND (worker_user_ids ? $2 OR sales_user_ids ? $2 OR user_id::text = $2)
+        AND start_at >= $3 AND start_at < $4`,
+    [companyId, employee.id, dayStart.toISOString(), dayEnd.toISOString()]
+  )).rows[0] || {};
+  const tasks = (await ctx.pool.query(
+    `SELECT COUNT(*) FILTER (WHERE due_date >= $3 AND due_date < $4)::int AS tasks_due_today,
+            COUNT(*) FILTER (WHERE due_date < now() AND completed = false)::int AS overdue_tasks
+       FROM todo_tasks tt JOIN users u ON u.id = tt.user_id
+      WHERE tt.user_id = $1 AND u.company_id = $2`,
+    [employee.id, companyId, dayStart.toISOString(), dayEnd.toISOString()]
+  )).rows[0] || {};
+  return {
+    ...employee,
+    exists: true,
+    name: employee.display_name || employee.email,
+    active: !employee.deleted_at,
+    is_clocked_in: !!open,
+    current_shift_duration: open ? Math.floor((Date.now() - new Date(open.start_at).getTime()) / 60000) : 0,
+    hours_today: Number(metrics.hours_today || 0),
+    hours_this_week: Number(metrics.hours_this_week || 0),
+    jobs_today: Number(jobs.jobs_today || 0),
+    completed_jobs_today: Number(jobs.completed_jobs_today || 0),
+    tasks_due_today: Number(tasks.tasks_due_today || 0),
+    overdue_tasks: Number(tasks.overdue_tasks || 0)
+  };
+}
+
+async function loadTimeEntryContext(companyId, entryId) {
+  const entry = (await ctx.pool.query(
+    `SELECT e.*, COALESCE(NULLIF(u.display_name, ''), u.email) AS employee_name
+       FROM time_clock_entries e JOIN users u ON u.id = e.user_id
+      WHERE e.id = $1 AND e.company_id = $2`,
+    [entryId, companyId]
+  )).rows[0];
+  if (!entry) return { exists: false };
+  const end = entry.end_at ? new Date(entry.end_at) : new Date();
+  const start = new Date(entry.start_at);
+  const minutes = Number.isNaN(start.getTime()) ? 0 : Math.max(0, Math.floor((end.getTime() - start.getTime()) / 60000) - Math.floor(Number(entry.break_seconds || 0) / 60));
+  return { ...entry, exists: true, employee_clocked_in: !entry.end_at, clock_in_at: entry.start_at, clock_out_at: entry.end_at, clock_in: entry.start_at, clock_out: entry.end_at, shift_duration_minutes: minutes, shift_duration_hours: minutes / 60, duration_hours: minutes / 60 };
+}
+
+async function loadMeasurementContext(companyId, measurementId) {
+  const measurement = (await ctx.pool.query(
+    `SELECT m.* FROM measurements m JOIN users u ON u.id = m.user_id WHERE m.id = $1 AND u.company_id = $2`,
+    [measurementId, companyId]
+  )).rows[0];
+  if (!measurement) return { exists: false };
+  const points = Array.isArray(measurement.points) ? measurement.points : [];
+  return { ...measurement, exists: true, type: points.length >= 3 ? "area" : "distance", area: polygonAreaApprox(points), distance: pathDistance(points), contact_id: Array.isArray(measurement.linked_contact_ids) ? measurement.linked_contact_ids[0] || null : null, pin_id: null };
 }
 
 async function loadTaskContext(companyId, taskId) {
@@ -3210,7 +3857,13 @@ function parseAddressParts(address) {
 }
 
 function subjectContextKey(type) {
-  return type === "sms_conversation" || type === "sms_message" ? "sms" : type === "service_plan" ? "servicePlan" : type === "internal_message" || type === "internal_conversation" ? "internal" : type;
+  if (type === "sms_conversation" || type === "sms_message") return "sms";
+  if (type === "service_plan") return "servicePlan";
+  if (type === "internal_message" || type === "internal_conversation") return "internal";
+  if (type === "map_pin") return "map";
+  if (type === "route_stop") return "routeStop";
+  if (type === "time_entry") return "time_clock";
+  return type;
 }
 
 async function loadSmsMessageContext(companyId, messageId) {
@@ -3573,7 +4226,411 @@ async function executeContactAddToMap(run, node, config) {
      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
     [id, owner, lat, lng, contact.name || "", contact.address || "", resolveTemplate(config.notes || "", context), config.status || "lead", contact.phone || null, contact.email || null, contactId]
   );
+  await emitMapPinEvents(run.company_id, null, rows[0], "automation", null, automationPayload(run, node, { pin_id: id, contact_id: contactId }));
   return { pin_id: rows[0].id, contact_id: contactId };
+}
+
+async function executeMapCreatePin(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:pin_id`);
+  if (existing) {
+    const pin = await loadMapPinContext(run.company_id, existing);
+    if (pin?.exists) return { pin_id: existing, reused: true };
+  }
+  const context = await buildRunContext(run);
+  const fields = resolveConfig(config, context);
+  const contact = fields.contact_id ? await loadContactContext(run.company_id, fields.contact_id) : context.contact;
+  const lat = numOrNull(fields.latitude ?? fields.lat ?? contact?.lat ?? context.map?.latitude);
+  const lng = numOrNull(fields.longitude ?? fields.lng ?? contact?.lng ?? context.map?.longitude);
+  const address = resolveTemplate(fields.address || contact?.address || context.map?.address || "", context);
+  if ((lat == null || lng == null) && !address) throw new Error("map_pin_location_required");
+  if (lat == null || lng == null) throw new Error("backend_geocoding_not_configured_coordinates_required");
+  const owner = await resolveCompanyUser(run.company_id, fields.assigned_user_id || fields.owner_user_id || "");
+  const id = randomUUID();
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO map_pins(id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, list_id, source)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+    [id, owner, lat, lng, resolveTemplate(fields.name || contact?.name || "", context), address, resolveTemplate(fields.notes || "", context), normalizeMapStatus(fields.status), fields.phone || contact?.phone || null, fields.email || contact?.email || null, fields.contact_id || contact?.id || null, fields.list_id || null, "automation"]
+  );
+  await setRunVariable(run.id, `idempotency:${node.id}:pin_id`, id);
+  await emitMapPinEvents(run.company_id, null, rows[0], "automation", null, automationPayload(run, node, { pin_id: id, contact_id: rows[0].contact_id || null }));
+  return { pin_id: id, lat, lng, address, status: rows[0].status, contact_id: rows[0].contact_id || null };
+}
+
+async function executeMapUpdatePin(run, node, config) {
+  const context = await buildRunContext(run);
+  const pin = await resolveMapPin(run.company_id, config.pin_id || run.subject_id, context);
+  const fields = resolveConfig(config, context);
+  const updates = {};
+  for (const key of ["name", "address", "notes", "phone", "email", "contact_id", "list_id"]) if (fields[key] != null) updates[key] = fields[key];
+  if (fields.status != null) updates.status = normalizeMapStatus(fields.status);
+  if (fields.latitude != null || fields.lat != null) updates.latitude = numOrNull(fields.latitude ?? fields.lat);
+  if (fields.longitude != null || fields.lng != null) updates.longitude = numOrNull(fields.longitude ?? fields.lng);
+  if (!Object.keys(updates).length) return { pin_id: pin.id, updated: [] };
+  const before = { ...pin };
+  const sets = Object.keys(updates).map((key, i) => `${key} = $${i + 3}`);
+  const values = Object.values(updates);
+  const { rows } = await ctx.pool.query(`UPDATE map_pins SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [pin.id, run.company_id, ...values]);
+  await emitMapPinEvents(run.company_id, before, rows[0], "automation", null, automationPayload(run, node, { pin_id: pin.id }));
+  return { pin_id: pin.id, updated: Object.keys(updates) };
+}
+
+async function executeMapDeletePin(run, node, config) {
+  if (config.confirm_delete !== true) throw new Error("confirm_delete_required");
+  const context = await buildRunContext(run);
+  const pin = await resolveMapPin(run.company_id, config.pin_id || run.subject_id, context);
+  await ctx.pool.query(`DELETE FROM map_pins WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2)`, [pin.id, run.company_id]);
+  await cancelScheduledForSubject(run.company_id, "map_pin", pin.id, ["map.pin_followup_due"]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "map.pin_deleted", subjectType: "map_pin", subjectId: pin.id, source: "automation", payload: automationPayload(run, node, mapPinPayload(pin)) });
+  return { pin_id: pin.id, deleted: true };
+}
+
+async function executeMapSetStatus(run, node, config) {
+  return executeMapUpdatePin(run, node, { ...config, status: config.status });
+}
+
+async function executeMapAddToList(run, node, config) {
+  const listId = await resolveMapListId(run.company_id, config.list_id, config.list_name, run.manual_started_by_user_id);
+  return executeMapUpdatePin(run, node, { ...config, list_id: listId });
+}
+
+async function executeMapMoveToList(run, node, config) {
+  return executeMapAddToList(run, node, config);
+}
+
+async function executeMapRemoveFromList(run, node, config) {
+  return executeMapUpdatePin(run, node, { ...config, list_id: null });
+}
+
+async function executeMapLinkContact(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  await validateSubject(run.company_id, "contact", contactId);
+  return executeMapUpdatePin(run, node, { ...config, contact_id: contactId });
+}
+
+async function executeMapUnlinkContact(run, node, config) {
+  return executeMapUpdatePin(run, node, { ...config, contact_id: null });
+}
+
+async function executeMapCreateContact(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:map_contact_id`);
+  if (existing) return { contact_id: existing, reused: true };
+  const context = await buildRunContext(run);
+  const pin = await resolveMapPin(run.company_id, config.pin_id || run.subject_id, context);
+  if (pin.contact_id) return { contact_id: pin.contact_id, pin_id: pin.id, reused: true };
+  const contact = await executeContactCreate(run, node, {
+    name: config.name || pin.name || "Door Knock Lead",
+    phone: config.phone || pin.phone || "",
+    email: config.email || pin.email || "",
+    address: pin.address || config.address || "",
+    lat: pin.latitude,
+    lng: pin.longitude,
+    tags: config.tags || ["Door Knock"],
+    job_type: config.job_type || "",
+    value_cents: config.value_cents,
+    source: "map"
+  });
+  await setRunVariable(run.id, `idempotency:${node.id}:map_contact_id`, contact.contact_id);
+  await executeMapUpdatePin(run, node, { pin_id: pin.id, contact_id: contact.contact_id });
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "map.pin_converted_to_contact", subjectType: "map_pin", subjectId: pin.id, source: "automation", payload: automationPayload(run, node, { pin_id: pin.id, contact_id: contact.contact_id }) });
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "contact.converted_from_map_pin", subjectType: "contact", subjectId: contact.contact_id, source: "automation", payload: automationPayload(run, node, { pin_id: pin.id, contact_id: contact.contact_id }) });
+  return { pin_id: pin.id, contact_id: contact.contact_id };
+}
+
+async function executeMapAddNote(run, node, config) {
+  return insertMapActivity(run, node, "note", config);
+}
+
+async function executeMapMarkVisited(run, node, config) {
+  return insertMapActivity(run, node, "visit", config);
+}
+
+async function executeMapRecordKnock(run, node, config) {
+  const result = await insertMapActivity(run, node, "knock", config);
+  if (config.outcome_status) await executeMapUpdatePin(run, node, { pin_id: result.pin_id, status: config.outcome_status });
+  return result;
+}
+
+async function executeMapScheduleFollowup(run, node, config) {
+  const context = await buildRunContext(run);
+  const pin = await resolveMapPin(run.company_id, config.pin_id || run.subject_id, context);
+  const amount = Number(config.amount || 0);
+  const unit = config.unit || "days";
+  if (amount <= 0) throw new Error("followup_amount_required");
+  const when = new Date(Date.now() + durationAmountMs(amount, unit));
+  await enqueueScheduledAutomationEvent({
+    companyId: run.company_id,
+    eventType: "map.pin_followup_due",
+    subjectType: "map_pin",
+    subjectId: pin.id,
+    scheduledFor: when,
+    scheduleKey: `map.pin_followup_due:manual:${run.id}:${node.id}:${pin.id}`,
+    payload: automationPayload(run, node, { pin_id: pin.id, status: pin.status, amount, unit })
+  });
+  return { pin_id: pin.id, followup_at: when.toISOString() };
+}
+
+async function executeMapAddToRoute(run, node, config) {
+  return executeRouteAddPin(run, node, config);
+}
+
+async function resolveMapPin(companyId, pinId, context = {}) {
+  const id = pinId || context.map?.id || context.map?.pin_id;
+  if (!id) throw new Error("map_pin_required");
+  const pin = (await ctx.pool.query(`SELECT p.* FROM map_pins p JOIN users u ON u.id = p.user_id WHERE p.id = $1 AND u.company_id = $2`, [id, companyId])).rows[0];
+  if (!pin) throw new Error("map_pin_not_found");
+  return pin;
+}
+
+async function resolveMapListId(companyId, listId, listName, createdByUserId = null) {
+  if (listId) {
+    const found = await ctx.pool.query(`SELECT id FROM map_lists WHERE id::text = $1 AND company_id = $2`, [listId, companyId]);
+    if (!found.rowCount) throw new Error("map_list_not_found");
+    return found.rows[0].id;
+  }
+  const name = String(listName || "").trim();
+  if (!name) throw new Error("map_list_required");
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO map_lists(company_id, name, created_by_user_id) VALUES($1,$2,$3)
+     ON CONFLICT(company_id, name) DO UPDATE SET updated_at = now()
+     RETURNING id`,
+    [companyId, name, createdByUserId]
+  );
+  return rows[0].id;
+}
+
+function normalizeMapStatus(status) {
+  const s = String(status || "lead").toLowerCase();
+  return mapStatusOptions().includes(s) ? s : "lead";
+}
+
+function mapPinPayload(pin) {
+  return {
+    pin_id: pin.id,
+    status: pin.status || null,
+    list_id: pin.list_id || null,
+    contact_id: pin.contact_id || null,
+    address: pin.address || "",
+    latitude: pin.latitude,
+    longitude: pin.longitude,
+    source: pin.source || "manual",
+    last_visit_at: pin.last_visit_at || null,
+    last_knock_at: pin.last_knock_at || null,
+    knock_count: Number(pin.knock_count || 0),
+    visit_count: Number(pin.visit_count || 0)
+  };
+}
+
+async function emitMapPinEvents(companyId, before, after, source, actorUserId = null, payload = {}) {
+  if (!after?.id) return;
+  const base = { ...mapPinPayload(after), ...payload };
+  if (!before) {
+    await emitAutomationEvent({ companyId, eventType: "map.pin_created", subjectType: "map_pin", subjectId: after.id, actorUserId, source, dedupeKey: `map.pin_created:${after.id}`, payload: base });
+    await syncAutomationSchedulesForMapPin(companyId, after, "status_changed");
+    return;
+  }
+  const changed = diffFields(before, after, ["latitude", "longitude", "name", "address", "notes", "status", "phone", "email", "contact_id", "list_id"]);
+  if (!changed.length) return;
+  await emitAutomationEvent({ companyId, eventType: "map.pin_updated", subjectType: "map_pin", subjectId: after.id, actorUserId, source, payload: { ...base, changed_fields: changed } });
+  const changedNames = new Set(changed.map((c) => c.field));
+  if (changedNames.has("status")) {
+    await emitAutomationEvent({ companyId, eventType: "map.pin_status_changed", subjectType: "map_pin", subjectId: after.id, actorUserId, source, payload: { ...base, changed_fields: changed.filter((c) => c.field === "status"), old_status: before.status, new_status: after.status } });
+    const statusEvents = { lead: ["map.pin_converted_to_lead", "canvass.lead_created"], won: ["map.pin_marked_won", "canvass.sale_recorded"], lost: ["map.pin_marked_lost", "canvass.not_interested"], reloop: ["map.pin_marked_reloop", "canvass.reloop_created"], later: ["map.pin_marked_later", "canvass.no_answer"] };
+    for (const eventType of statusEvents[after.status] || []) await emitAutomationEvent({ companyId, eventType, subjectType: "map_pin", subjectId: after.id, actorUserId, source, payload: base });
+    await syncAutomationSchedulesForMapPin(companyId, after, "status_changed");
+  }
+  if (changedNames.has("list_id")) {
+    await emitAutomationEvent({ companyId, eventType: "map.pin_list_changed", subjectType: "map_pin", subjectId: after.id, actorUserId, source, payload: { ...base, old_list_id: before.list_id || null, new_list_id: after.list_id || null } });
+    if (after.list_id) await emitAutomationEvent({ companyId, eventType: "map.pin_added_to_list", subjectType: "map_pin", subjectId: after.id, actorUserId, source, payload: base });
+    if (before.list_id) await emitAutomationEvent({ companyId, eventType: "map.pin_removed_from_list", subjectType: "map_pin", subjectId: after.id, actorUserId, source, payload: { ...base, removed_list_id: before.list_id } });
+  }
+  if (changedNames.has("contact_id")) {
+    await emitAutomationEvent({ companyId, eventType: after.contact_id ? "map.pin_contact_linked" : "map.pin_contact_unlinked", subjectType: "map_pin", subjectId: after.id, actorUserId, source, payload: base });
+  }
+  if (changedNames.has("address")) await emitAutomationEvent({ companyId, eventType: "map.pin_address_changed", subjectType: "map_pin", subjectId: after.id, actorUserId, source, payload: base });
+  if (changedNames.has("latitude") || changedNames.has("longitude")) await emitAutomationEvent({ companyId, eventType: "map.pin_location_changed", subjectType: "map_pin", subjectId: after.id, actorUserId, source, payload: base });
+}
+
+async function insertMapActivity(run, node, type, config) {
+  const context = await buildRunContext(run);
+  const pin = await resolveMapPin(run.company_id, config.pin_id || run.subject_id, context);
+  const note = resolveTemplate(config.note || config.body || "", context);
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO map_pin_activities(company_id, pin_id, user_id, activity_type, old_status, new_status, note, metadata, source, automation_run_id, automation_node_id)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'automation',$9,$10) RETURNING *`,
+    [run.company_id, pin.id, run.manual_started_by_user_id || null, type, pin.status || null, config.outcome_status || null, note || null, JSON.stringify({}), run.id, node.id]
+  );
+  let updated = pin;
+  if (type === "visit" || type === "knock") {
+    const update = type === "knock"
+      ? `last_knock_at = now(), knock_count = knock_count + 1`
+      : `last_visit_at = now(), visit_count = visit_count + 1`;
+    updated = (await ctx.pool.query(`UPDATE map_pins SET ${update}, updated_at = now() WHERE id = $1 RETURNING *`, [pin.id])).rows[0];
+    await syncAutomationSchedulesForMapPin(run.company_id, updated, type === "knock" ? "last_knock" : "last_visit");
+  }
+  const eventType = type === "knock" ? "map.pin_knocked" : type === "visit" ? "map.pin_visited" : "map.pin_note_added";
+  await emitAutomationEvent({ companyId: run.company_id, eventType, subjectType: "map_pin", subjectId: pin.id, source: "automation", payload: automationPayload(run, node, { ...mapPinPayload(updated), activity_id: rows[0].id, note }) });
+  if (type === "knock") {
+    await emitAutomationEvent({ companyId: run.company_id, eventType: "canvass.knock_recorded", subjectType: "map_pin", subjectId: pin.id, source: "automation", payload: automationPayload(run, node, { ...mapPinPayload(updated), activity_id: rows[0].id, note }) });
+    if (config.outcome_status) await emitAutomationEvent({ companyId: run.company_id, eventType: "canvass.outcome_recorded", subjectType: "map_pin", subjectId: pin.id, source: "automation", payload: automationPayload(run, node, { ...mapPinPayload(updated), outcome_status: config.outcome_status }) });
+  }
+  return { pin_id: pin.id, activity_id: rows[0].id, activity_type: type };
+}
+
+async function resolveRoute(companyId, routeId) {
+  if (!routeId) throw new Error("route_required");
+  const route = (await ctx.pool.query(`SELECT * FROM field_routes WHERE id::text = $1 AND company_id = $2`, [routeId, companyId])).rows[0];
+  if (!route) throw new Error("route_not_found");
+  return route;
+}
+
+async function resolveRouteStop(companyId, stopId) {
+  if (!stopId) throw new Error("route_stop_required");
+  const stop = (await ctx.pool.query(`SELECT * FROM field_route_stops WHERE id::text = $1 AND company_id = $2`, [stopId, companyId])).rows[0];
+  if (!stop) throw new Error("route_stop_not_found");
+  return stop;
+}
+
+async function insertRouteStop(run, node, route, data) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:route_stop_id`);
+  if (existing) return { route_id: route.id, route_stop_id: existing, reused: true };
+  const order = (await ctx.pool.query(`SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM field_route_stops WHERE route_id = $1`, [route.id])).rows[0]?.next_order || 0;
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO field_route_stops(id, route_id, company_id, pin_id, contact_id, job_id, latitude, longitude, address, sort_order)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+     ON CONFLICT DO NOTHING
+     RETURNING *`,
+    [randomUUID(), route.id, run.company_id, data.pin_id || null, data.contact_id || null, data.job_id || null, numOrNull(data.latitude), numOrNull(data.longitude), data.address || "", order]
+  );
+  const stop = rows[0] || (await ctx.pool.query(`SELECT * FROM field_route_stops WHERE route_id = $1 AND (($2::text IS NOT NULL AND pin_id = $2) OR ($3::text IS NOT NULL AND contact_id = $3) OR ($4::uuid IS NOT NULL AND job_id = $4)) LIMIT 1`, [route.id, data.pin_id || null, data.contact_id || null, data.job_id || null])).rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:route_stop_id`, stop.id);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "route.stop_added", subjectType: "route_stop", subjectId: stop.id, source: "automation", payload: automationPayload(run, node, routeStopPayload(stop)) });
+  return { route_id: route.id, route_stop_id: stop.id };
+}
+
+async function updateRouteStopStatus(run, node, stopId, status, notes) {
+  const stop = await resolveRouteStop(run.company_id, stopId);
+  const { rows } = await ctx.pool.query(`UPDATE field_route_stops SET status = $3, notes = COALESCE($4, notes), completed_at = CASE WHEN $3 IN ('completed','skipped') THEN COALESCE(completed_at, now()) ELSE completed_at END, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [stop.id, run.company_id, status, notes || null]);
+  const eventType = status === "completed" ? "route.stop_completed" : "route.stop_skipped";
+  await emitAutomationEvent({ companyId: run.company_id, eventType, subjectType: "route_stop", subjectId: stop.id, source: "automation", payload: automationPayload(run, node, routeStopPayload(rows[0])) });
+  const remaining = await ctx.pool.query(`SELECT 1 FROM field_route_stops WHERE route_id = $1 AND status NOT IN ('completed','skipped') LIMIT 1`, [stop.route_id]);
+  if (!remaining.rowCount) await emitAutomationEvent({ companyId: run.company_id, eventType: "route.all_stops_completed", subjectType: "route", subjectId: stop.route_id, source: "automation", payload: automationPayload(run, node, { route_id: stop.route_id }) });
+  return { route_id: stop.route_id, route_stop_id: stop.id, status };
+}
+
+function routeStopPayload(stop) {
+  return { route_id: stop.route_id, route_stop_id: stop.id, pin_id: stop.pin_id || null, contact_id: stop.contact_id || null, job_id: stop.job_id || null, status: stop.status, sort_order: stop.sort_order, latitude: stop.latitude, longitude: stop.longitude, address: stop.address || "" };
+}
+
+async function emitRouteEvent(run, node, eventType, route, extra = {}) {
+  await emitAutomationEvent({ companyId: run.company_id, eventType, subjectType: "route", subjectId: route.id, source: "automation", payload: automationPayload(run, node, { route_id: route.id, name: route.name, status: route.status, assigned_user_id: route.assigned_user_id || null, scheduled_date: route.scheduled_date || null, ...extra }) });
+}
+
+function optimizeStops(stops) {
+  const usable = stops.filter((s) => Number.isFinite(Number(s.latitude)) && Number.isFinite(Number(s.longitude)));
+  const missing = stops.filter((s) => !usable.includes(s));
+  if (usable.length < 3) return [...usable, ...missing];
+  const remaining = [...usable];
+  const ordered = [remaining.shift()];
+  while (remaining.length) {
+    const last = ordered[ordered.length - 1];
+    let bestIndex = 0;
+    let bestDistance = Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const d = haversineMiles(last.latitude, last.longitude, remaining[i].latitude, remaining[i].longitude);
+      if (d < bestDistance) { bestDistance = d; bestIndex = i; }
+    }
+    ordered.push(remaining.splice(bestIndex, 1)[0]);
+  }
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let i = 1; i < ordered.length - 2; i++) {
+      for (let k = i + 1; k < ordered.length - 1; k++) {
+        const current = segmentDistance(ordered[i - 1], ordered[i]) + segmentDistance(ordered[k], ordered[k + 1]);
+        const swapped = segmentDistance(ordered[i - 1], ordered[k]) + segmentDistance(ordered[i], ordered[k + 1]);
+        if (swapped < current) {
+          ordered.splice(i, k - i + 1, ...ordered.slice(i, k + 1).reverse());
+          improved = true;
+        }
+      }
+    }
+  }
+  return [...ordered, ...missing];
+}
+
+function routeDistanceMiles(stops) {
+  return stops.slice(1).reduce((sum, stop, i) => sum + segmentDistance(stops[i], stop), 0);
+}
+
+function segmentDistance(a, b) {
+  return haversineMiles(a.latitude, a.longitude, b.latitude, b.longitude);
+}
+
+function haversineMiles(lat1, lon1, lat2, lon2) {
+  const toRad = (n) => Number(n) * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 3958.8 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+async function resolveEmployee(companyId, employeeId, options = {}) {
+  if (!employeeId) throw new Error("employee_required");
+  const employee = (await ctx.pool.query(`SELECT id, email, role, display_name, deleted_at FROM users WHERE id::text = $1 AND company_id = $2`, [employeeId, companyId])).rows[0];
+  if (!employee) throw new Error("employee_not_found");
+  if (employee.deleted_at && !options.allowInactive) throw new Error("employee_inactive");
+  return employee;
+}
+
+async function resolveActiveCompanyUser(companyId, userId) {
+  const employee = await resolveEmployee(companyId, userId);
+  return employee.id;
+}
+
+async function assertNotLastEmployer(companyId, employeeId) {
+  const count = (await ctx.pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE company_id = $1 AND role = 'employer' AND deleted_at IS NULL AND id <> $2`, [companyId, employeeId])).rows[0]?.count || 0;
+  if (Number(count) <= 0) throw new Error("cannot_mutate_last_employer");
+}
+
+async function emitEmployeeEvent(run, node, eventType, employee, extra = {}) {
+  await emitAutomationEvent({ companyId: run.company_id, eventType, subjectType: "employee", subjectId: employee.id, source: "automation", payload: automationPayload(run, node, { employee_id: employee.id, role: employee.role, active: !employee.deleted_at, name: employee.display_name || employee.email, ...extra }) });
+}
+
+async function resolveTimeEntry(companyId, entryId) {
+  if (!entryId) throw new Error("time_entry_required");
+  const entry = (await ctx.pool.query(`SELECT * FROM time_clock_entries WHERE id = $1 AND company_id = $2`, [entryId, companyId])).rows[0];
+  if (!entry) throw new Error("time_entry_not_found");
+  return entry;
+}
+
+async function resolveMeasurement(companyId, measurementId) {
+  if (!measurementId) throw new Error("measurement_required");
+  const measurement = (await ctx.pool.query(`SELECT m.* FROM measurements m JOIN users u ON u.id = m.user_id WHERE m.id = $1 AND u.company_id = $2`, [measurementId, companyId])).rows[0];
+  if (!measurement) throw new Error("measurement_not_found");
+  return measurement;
+}
+
+function measurementPayload(m) {
+  const points = Array.isArray(m.points) ? m.points : [];
+  return { measurement_id: m.id, name: m.name, units: m.units, linked_contact_ids: m.linked_contact_ids || [], distance: pathDistance(points), area: polygonAreaApprox(points), type: points.length >= 3 ? "area" : "distance" };
+}
+
+function pathDistance(points) {
+  if (!Array.isArray(points) || points.length < 2) return 0;
+  return points.slice(1).reduce((sum, p, i) => sum + haversineMiles(points[i].lat, points[i].lng, p.lat, p.lng), 0);
+}
+
+function polygonAreaApprox(points) {
+  if (!Array.isArray(points) || points.length < 3) return 0;
+  const meanLat = points.reduce((sum, p) => sum + Number(p.lat || 0), 0) / points.length;
+  const meters = points.map((p) => ({ x: Number(p.lng || 0) * 111320 * Math.cos(meanLat * Math.PI / 180), y: Number(p.lat || 0) * 110540 }));
+  let area = 0;
+  for (let i = 0; i < meters.length; i++) {
+    const j = (i + 1) % meters.length;
+    area += meters[i].x * meters[j].y - meters[j].x * meters[i].y;
+  }
+  return Math.abs(area / 2);
 }
 
 function intOrNull(value) {
@@ -5078,6 +6135,223 @@ function addDaysISO(dateInput, days) {
   const d = new Date(dateInput);
   d.setUTCDate(d.getUTCDate() + Number(days || 0));
   return d.toISOString().slice(0, 10);
+}
+
+async function executeRouteCreate(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:route_id`);
+  if (existing) {
+    const route = await loadRouteContext(run.company_id, existing);
+    if (route?.exists) return { route_id: existing, reused: true };
+  }
+  const context = await buildRunContext(run);
+  const assigned = config.assigned_user_id ? await resolveActiveCompanyUser(run.company_id, resolveTemplate(config.assigned_user_id, context)) : null;
+  const id = randomUUID();
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO field_routes(id, company_id, name, assigned_user_id, scheduled_date, status, created_by_user_id)
+     VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [id, run.company_id, resolveTemplate(config.name || "Automation Route", context), assigned, config.scheduled_date || null, config.scheduled_date ? "scheduled" : "draft", run.manual_started_by_user_id || null]
+  );
+  await setRunVariable(run.id, `idempotency:${node.id}:route_id`, id);
+  await emitRouteEvent(run, node, "route.created", rows[0], {});
+  if (assigned) await emitRouteEvent(run, node, "route.assigned", rows[0], { employee_id: assigned });
+  if (rows[0].scheduled_date) await emitRouteEvent(run, node, "route.scheduled", rows[0], {});
+  return { route_id: id, status: rows[0].status, assigned_user_id: assigned };
+}
+
+async function executeRouteDelete(run, node, config) {
+  if (config.confirm_delete !== true) throw new Error("confirm_delete_required");
+  const route = await resolveRoute(run.company_id, config.route_id || run.subject_id);
+  await ctx.pool.query(`DELETE FROM field_routes WHERE id = $1 AND company_id = $2`, [route.id, run.company_id]);
+  await emitRouteEvent(run, node, "route.deleted", route, {});
+  return { route_id: route.id, deleted: true };
+}
+
+async function executeRouteAddStop(run, node, config) {
+  const context = await buildRunContext(run);
+  const route = await resolveRoute(run.company_id, config.route_id || context.route?.id || run.subject_id);
+  return insertRouteStop(run, node, route, resolveConfig(config, context));
+}
+
+async function executeRouteAddPin(run, node, config) {
+  const context = await buildRunContext(run);
+  const pin = await resolveMapPin(run.company_id, config.pin_id || context.map?.id || run.subject_id, context);
+  const route = await resolveRoute(run.company_id, config.route_id || context.route?.id);
+  return insertRouteStop(run, node, route, { pin_id: pin.id, latitude: pin.latitude, longitude: pin.longitude, address: pin.address, contact_id: pin.contact_id || null });
+}
+
+async function executeRouteAddContact(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const contact = await loadContactContext(run.company_id, contactId);
+  const route = await resolveRoute(run.company_id, config.route_id || context.route?.id);
+  if (contact.lat == null || contact.lng == null) throw new Error("contact_coordinates_required");
+  return insertRouteStop(run, node, route, { contact_id: contactId, latitude: contact.lat, longitude: contact.lng, address: contact.address || "" });
+}
+
+async function executeRouteAddJob(run, node, config) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  const route = await resolveRoute(run.company_id, config.route_id || context.route?.id);
+  if (!job.contact_id) throw new Error("job_contact_required");
+  const contact = await loadContactContext(run.company_id, job.contact_id);
+  if (contact.lat == null || contact.lng == null) throw new Error("job_contact_coordinates_required");
+  return insertRouteStop(run, node, route, { job_id: job.id, contact_id: job.contact_id, latitude: contact.lat, longitude: contact.lng, address: contact.address || "" });
+}
+
+async function executeRouteRemoveStop(run, node, config) {
+  const stop = await resolveRouteStop(run.company_id, config.stop_id || run.subject_id);
+  await ctx.pool.query(`DELETE FROM field_route_stops WHERE id = $1 AND company_id = $2`, [stop.id, run.company_id]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "route.stop_removed", subjectType: "route_stop", subjectId: stop.id, source: "automation", payload: automationPayload(run, node, { route_id: stop.route_id, route_stop_id: stop.id }) });
+  return { route_id: stop.route_id, route_stop_id: stop.id, removed: true };
+}
+
+async function executeRouteAssignUser(run, node, config) {
+  const route = await resolveRoute(run.company_id, config.route_id || run.subject_id);
+  const userId = await resolveActiveCompanyUser(run.company_id, config.assigned_user_id);
+  const { rows } = await ctx.pool.query(`UPDATE field_routes SET assigned_user_id = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [route.id, run.company_id, userId]);
+  await emitRouteEvent(run, node, "route.assigned", rows[0], { previous_assigned_user_id: route.assigned_user_id });
+  return { route_id: route.id, assigned_user_id: userId };
+}
+
+async function executeRouteSetDate(run, node, config) {
+  const route = await resolveRoute(run.company_id, config.route_id || run.subject_id);
+  const { rows } = await ctx.pool.query(`UPDATE field_routes SET scheduled_date = $3::date, status = CASE WHEN status = 'draft' THEN 'scheduled' ELSE status END, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [route.id, run.company_id, config.scheduled_date || null]);
+  await emitRouteEvent(run, node, "route.updated", rows[0], { changed_fields: [{ field: "scheduled_date", old_value: route.scheduled_date, new_value: rows[0].scheduled_date }] });
+  if (rows[0].scheduled_date) await emitRouteEvent(run, node, "route.scheduled", rows[0], {});
+  return { route_id: route.id, scheduled_date: rows[0].scheduled_date };
+}
+
+async function executeRouteOptimize(run, node, config) {
+  const route = await resolveRoute(run.company_id, config.route_id || run.subject_id);
+  const stops = (await ctx.pool.query(`SELECT * FROM field_route_stops WHERE route_id = $1 AND company_id = $2 ORDER BY sort_order ASC, created_at ASC`, [route.id, run.company_id])).rows;
+  const ordered = optimizeStops(stops);
+  if (run.dry_run) return { route_id: route.id, would_order_stop_ids: ordered.map((s) => s.id), estimated_distance_miles: routeDistanceMiles(ordered) };
+  for (let i = 0; i < ordered.length; i++) await ctx.pool.query(`UPDATE field_route_stops SET sort_order = $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [ordered[i].id, run.company_id, i]);
+  await emitRouteEvent(run, node, "route.reordered", route, { ordered_stop_ids: ordered.map((s) => s.id), estimated_distance_miles: routeDistanceMiles(ordered) });
+  return { route_id: route.id, ordered_stop_ids: ordered.map((s) => s.id), estimated_distance_miles: routeDistanceMiles(ordered) };
+}
+
+async function executeRouteMarkStarted(run, node, config) {
+  const route = await resolveRoute(run.company_id, config.route_id || run.subject_id);
+  const { rows } = await ctx.pool.query(`UPDATE field_routes SET status = 'started', started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [route.id, run.company_id]);
+  await emitRouteEvent(run, node, "route.started", rows[0], {});
+  return { route_id: route.id, status: rows[0].status };
+}
+
+async function executeRouteMarkCompleted(run, node, config) {
+  const route = await resolveRoute(run.company_id, config.route_id || run.subject_id);
+  const { rows } = await ctx.pool.query(`UPDATE field_routes SET status = 'completed', completed_at = COALESCE(completed_at, now()), updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [route.id, run.company_id]);
+  await emitRouteEvent(run, node, "route.completed", rows[0], {});
+  return { route_id: route.id, status: rows[0].status };
+}
+
+async function executeRouteCompleteStop(run, node, config) {
+  return updateRouteStopStatus(run, node, config.stop_id || run.subject_id, "completed", config.notes);
+}
+
+async function executeRouteSkipStop(run, node, config) {
+  return updateRouteStopStatus(run, node, config.stop_id || run.subject_id, "skipped", config.notes);
+}
+
+async function executeEmployeeUpdateRole(run, node, config) {
+  if (config.confirm_sensitive_change !== true) throw new Error("confirm_role_change_required");
+  const employee = await resolveEmployee(run.company_id, config.employee_id || run.subject_id);
+  if (!["employee", "employer"].includes(config.role)) throw new Error("invalid_role");
+  if (employee.role === "employer" && config.role !== "employer") await assertNotLastEmployer(run.company_id, employee.id);
+  const { rows } = await ctx.pool.query(`UPDATE users SET role = $3 WHERE id = $1 AND company_id = $2 RETURNING id, email, role, display_name, deleted_at`, [employee.id, run.company_id, config.role]);
+  await emitEmployeeEvent(run, node, "employee.role_changed", rows[0], { old_role: employee.role, new_role: rows[0].role });
+  return { employee_id: employee.id, old_state: { role: employee.role }, new_state: { role: rows[0].role } };
+}
+
+async function executeEmployeeDeactivate(run, node, config) {
+  if (config.confirm_deactivate !== true) throw new Error("confirm_deactivate_required");
+  const employee = await resolveEmployee(run.company_id, config.employee_id || run.subject_id);
+  if (employee.role === "employer") await assertNotLastEmployer(run.company_id, employee.id);
+  const { rows } = await ctx.pool.query(`UPDATE users SET deleted_at = COALESCE(deleted_at, now()), deleted_by = $3 WHERE id = $1 AND company_id = $2 RETURNING id, email, role, display_name, deleted_at`, [employee.id, run.company_id, run.manual_started_by_user_id || null]);
+  await emitEmployeeEvent(run, node, "employee.deactivated", rows[0], {});
+  await emitEmployeeEvent(run, node, "employee.removed", rows[0], {});
+  return { employee_id: employee.id, old_state: { active: !employee.deleted_at }, new_state: { active: false } };
+}
+
+async function executeEmployeeReactivate(run, node, config) {
+  const employee = await resolveEmployee(run.company_id, config.employee_id || run.subject_id, { allowInactive: true });
+  const { rows } = await ctx.pool.query(`UPDATE users SET deleted_at = NULL, deleted_by = NULL WHERE id = $1 AND company_id = $2 RETURNING id, email, role, display_name, deleted_at`, [employee.id, run.company_id]);
+  await emitEmployeeEvent(run, node, "employee.reactivated", rows[0], {});
+  return { employee_id: employee.id, old_state: { active: !employee.deleted_at }, new_state: { active: true } };
+}
+
+async function executeEmployeeSendPush(run, node, config) {
+  const employee = await resolveEmployee(run.company_id, config.employee_id || run.subject_id);
+  return executePushNotification(run, node, { title: config.title || "WolfCRM", body: config.body || "", user_ids: [employee.id] });
+}
+
+async function executeEmployeeSendInternalMessage(run, node, config) {
+  const employee = await resolveEmployee(run.company_id, config.employee_id || run.subject_id);
+  return executeInternalDm(run, node, { ...config, recipient_user_id: employee.id });
+}
+
+async function executeEmployeeCreateTask(run, node, config) {
+  const employee = await resolveEmployee(run.company_id, config.employee_id || run.subject_id);
+  return executeTaskCreate(run, node, { ...config, assigned_user_id: employee.id, title: config.title || "Employee follow-up" });
+}
+
+async function executeTimeClockCreateReviewTask(run, node, config) {
+  const entry = await resolveTimeEntry(run.company_id, config.time_entry_id || run.subject_id);
+  return executeTaskCreate(run, node, { title: config.title || "Review time entry", notes: config.body || entry.review_reason || "", assigned_user_id: await resolveCompanyUser(run.company_id, "") });
+}
+
+async function executeTimeClockSendEmployeeReminder(run, node, config) {
+  const entry = await resolveTimeEntry(run.company_id, config.time_entry_id || run.subject_id);
+  return executeInternalDm(run, node, { recipient_user_id: entry.user_id, body: config.body || "Please review your time clock." });
+}
+
+async function executeTimeClockNotifyManager(run, node, config) {
+  return executePushNotification(run, node, { title: config.title || "Time Clock", body: config.body || "A time entry needs attention." });
+}
+
+async function executeTimeClockFlagForReview(run, node, config) {
+  const entry = await resolveTimeEntry(run.company_id, config.time_entry_id || run.subject_id);
+  const reason = config.review_reason || "Flagged by automation";
+  const { rows } = await ctx.pool.query(`UPDATE time_clock_entries SET needs_review = true, review_reason = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [entry.id, run.company_id, reason]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "time_clock.shift_updated", subjectType: "time_entry", subjectId: entry.id, source: "automation", payload: automationPayload(run, node, { time_entry_id: entry.id, employee_id: entry.user_id, needs_review: true, review_reason: reason }) });
+  return { time_entry_id: entry.id, needs_review: rows[0].needs_review, review_reason: rows[0].review_reason };
+}
+
+async function executeTimeClockClearReviewFlag(run, node, config) {
+  const entry = await resolveTimeEntry(run.company_id, config.time_entry_id || run.subject_id);
+  const { rows } = await ctx.pool.query(`UPDATE time_clock_entries SET needs_review = false, review_reason = NULL, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [entry.id, run.company_id]);
+  return { time_entry_id: entry.id, needs_review: rows[0].needs_review };
+}
+
+async function executeMeasurementCreateRecord(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:measurement_id`);
+  if (existing) return { measurement_id: existing, reused: true };
+  const owner = await resolveCompanyUser(run.company_id, "");
+  const id = randomUUID();
+  const points = Array.isArray(config.points) ? config.points : [];
+  const { rows } = await ctx.pool.query(`INSERT INTO measurements(id, user_id, name, points, linked_contact_ids, units) VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6) RETURNING *`, [id, owner, config.name || "Automation Measurement", JSON.stringify(points), JSON.stringify(config.linked_contact_ids || []), config.units === "meters" ? "meters" : "feet"]);
+  await setRunVariable(run.id, `idempotency:${node.id}:measurement_id`, id);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "measurement.created", subjectType: "measurement", subjectId: id, source: "automation", payload: automationPayload(run, node, measurementPayload(rows[0])) });
+  if (points.length >= 2) await emitAutomationEvent({ companyId: run.company_id, eventType: "measurement.completed", subjectType: "measurement", subjectId: id, source: "automation", payload: automationPayload(run, node, measurementPayload(rows[0])) });
+  return { measurement_id: id, distance: pathDistance(points), area: polygonAreaApprox(points) };
+}
+
+async function executeMeasurementUpdateLabel(run, node, config) {
+  const measurement = await resolveMeasurement(run.company_id, config.measurement_id || run.subject_id);
+  const { rows } = await ctx.pool.query(`UPDATE measurements SET name = $3, updated_at = now() WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [measurement.id, run.company_id, config.name || measurement.name]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "measurement.updated", subjectType: "measurement", subjectId: measurement.id, source: "automation", payload: automationPayload(run, node, measurementPayload(rows[0])) });
+  return { measurement_id: measurement.id, name: rows[0].name };
+}
+
+async function executeMeasurementLinkContact(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const measurement = await resolveMeasurement(run.company_id, config.measurement_id || run.subject_id);
+  const ids = Array.isArray(measurement.linked_contact_ids) ? measurement.linked_contact_ids.map(String) : [];
+  if (!ids.includes(String(contactId))) ids.push(String(contactId));
+  const { rows } = await ctx.pool.query(`UPDATE measurements SET linked_contact_ids = $3::jsonb, updated_at = now() WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [measurement.id, run.company_id, JSON.stringify(ids)]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "measurement.linked_to_contact", subjectType: "measurement", subjectId: measurement.id, source: "automation", payload: automationPayload(run, node, { ...measurementPayload(rows[0]), contact_id: contactId }) });
+  return { measurement_id: measurement.id, contact_id: contactId };
 }
 
 async function executeJobCreate(run, node, config) {

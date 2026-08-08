@@ -23,7 +23,9 @@ import {
   recordPhoneSmsConsent,
   syncAutomationSchedulesForQuote,
   syncAutomationSchedulesForInvoice,
-  syncAutomationSchedulesForServicePlan
+  syncAutomationSchedulesForServicePlan,
+  syncAutomationSchedulesForMapPin,
+  syncAutomationSchedulesForTimeEntry
 } from "./automations.js";
 
 const { Pool } = pkg;
@@ -4107,6 +4109,12 @@ app.delete("/api/company/employees/:id", authRequired, requireEmployer, async (r
     await client.query(`DELETE FROM device_tokens WHERE user_id = $1`, [targetId]).catch(() => {});
     await client.query(`DELETE FROM employee_permissions WHERE user_id = $1`, [targetId]).catch(() => {});
     await client.query("COMMIT");
+    try {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.deactivated", subjectType: "employee", subjectId: targetId, actorUserId: req.userId, source: "ios", payload: { employee_id: targetId, active: false } });
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.removed", subjectType: "employee", subjectId: targetId, actorUserId: req.userId, source: "ios", payload: { employee_id: targetId, active: false } });
+    } catch (automationErr) {
+      console.warn("[automations] employee delete hook failed", automationErr?.message || automationErr);
+    }
     console.log("[employees] removed", { targetId, by: req.userId, company: req.companyId });
     res.json({ success: true });
   } catch (e) {
@@ -4153,6 +4161,11 @@ app.post("/api/company/employees/:id/restore", authRequired, requireEmployer, as
        WHERE id = $1`,
       [targetId]
     );
+    try {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.reactivated", subjectType: "employee", subjectId: targetId, actorUserId: req.userId, source: "ios", payload: { employee_id: targetId, active: true } });
+    } catch (automationErr) {
+      console.warn("[automations] employee restore hook failed", automationErr?.message || automationErr);
+    }
     console.log("[employees] restored", { targetId, by: req.userId, company: req.companyId });
     res.json({ success: true });
   } catch (e) {
@@ -4175,9 +4188,14 @@ app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer,
        ON CONFLICT(user_id) DO UPDATE
          SET can_delete_contacts = EXCLUDED.can_delete_contacts,
              updated_at = now()
-       RETURNING user_id AS id, can_delete_contacts`,
+      RETURNING user_id AS id, can_delete_contacts`,
       [req.params.id, req.companyId, canDelete]
     );
+    try {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.permission_changed", subjectType: "employee", subjectId: req.params.id, actorUserId: req.userId, source: "ios", payload: { employee_id: req.params.id, permission: "can_delete_contacts", new_value: canDelete } });
+    } catch (automationErr) {
+      console.warn("[automations] employee permission hook failed", automationErr?.message || automationErr);
+    }
     res.json(rows[0]);
   } catch (e) {
     console.error(e);
@@ -4737,6 +4755,14 @@ app.post("/api/time-clock/clock-in", authRequired, async (req, res) => {
        RETURNING *`,
       [randomUUID(), req.userId, req.companyId, start.toISOString(), note]
     );
+    try {
+      const entry = rows[0];
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.clocked_in", subjectType: "time_entry", subjectId: entry.id, actorUserId: req.userId, source: "ios", dedupeKey: `time_clock.clocked_in:${entry.id}`, payload: { time_entry_id: entry.id, employee_id: entry.user_id, clock_in: entry.start_at, source: "ios" } });
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.shift_started", subjectType: "time_entry", subjectId: entry.id, actorUserId: req.userId, source: "ios", dedupeKey: `time_clock.shift_started:${entry.id}`, payload: { time_entry_id: entry.id, employee_id: entry.user_id, clock_in: entry.start_at, source: "ios" } });
+      await syncAutomationSchedulesForTimeEntry(req.companyId, entry);
+    } catch (automationErr) {
+      console.warn("[automations] clock-in hook failed", automationErr?.message || automationErr);
+    }
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "clock_in_failed" }); }
 });
@@ -4765,6 +4791,15 @@ app.post("/api/time-clock/clock-out", authRequired, async (req, res) => {
       [req.userId, req.userId, end.toISOString()]
     );
     if (!rows.length) return res.status(404).json({ error: "not_clocked_in" });
+    try {
+      const entry = rows[0];
+      const durationMinutes = Math.max(0, Math.floor((new Date(entry.end_at).getTime() - new Date(entry.start_at).getTime()) / 60000) - Math.floor(Number(entry.break_seconds || 0) / 60));
+      await cancelAutomationSchedulesForSubject(req.companyId, "time_entry", entry.id);
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.clocked_out", subjectType: "time_entry", subjectId: entry.id, actorUserId: req.userId, source: "ios", dedupeKey: `time_clock.clocked_out:${entry.id}`, payload: { time_entry_id: entry.id, employee_id: entry.user_id, clock_in: entry.start_at, clock_out: entry.end_at, duration_minutes: durationMinutes, duration_hours: durationMinutes / 60, source: "ios" } });
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.shift_completed", subjectType: "time_entry", subjectId: entry.id, actorUserId: req.userId, source: "ios", dedupeKey: `time_clock.shift_completed:${entry.id}`, payload: { time_entry_id: entry.id, employee_id: entry.user_id, clock_in: entry.start_at, clock_out: entry.end_at, duration_minutes: durationMinutes, duration_hours: durationMinutes / 60, source: "ios" } });
+    } catch (automationErr) {
+      console.warn("[automations] clock-out hook failed", automationErr?.message || automationErr);
+    }
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "clock_out_failed" }); }
 });
@@ -4785,6 +4820,12 @@ app.post("/api/time-clock/break-start", authRequired, async (req, res) => {
       [req.userId, req.userId]
     );
     if (!rows.length) return res.status(404).json({ error: "not_clocked_in" });
+    try {
+      const entry = rows[0];
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.break_started", subjectType: "time_entry", subjectId: entry.id, actorUserId: req.userId, source: "ios", dedupeKey: `time_clock.break_started:${entry.id}:${entry.break_started_at}`, payload: { time_entry_id: entry.id, employee_id: entry.user_id, break_started_at: entry.break_started_at } });
+    } catch (automationErr) {
+      console.warn("[automations] break-start hook failed", automationErr?.message || automationErr);
+    }
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "break_start_failed" }); }
 });
@@ -4806,6 +4847,12 @@ app.post("/api/time-clock/break-end", authRequired, async (req, res) => {
       [req.userId, req.userId]
     );
     if (!rows.length) return res.status(404).json({ error: "not_on_break" });
+    try {
+      const entry = rows[0];
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.break_ended", subjectType: "time_entry", subjectId: entry.id, actorUserId: req.userId, source: "ios", payload: { time_entry_id: entry.id, employee_id: entry.user_id, break_seconds: entry.break_seconds } });
+    } catch (automationErr) {
+      console.warn("[automations] break-end hook failed", automationErr?.message || automationErr);
+    }
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "break_end_failed" }); }
 });
@@ -4883,6 +4930,13 @@ app.post("/api/time-clock/entries", authRequired, async (req, res) => {
        RETURNING *`,
       [randomUUID(), req.userId, req.companyId, start.toISOString(), end.toISOString(), req.body.note || "Manual employee entry"]
     );
+    try {
+      const entry = rows[0];
+      const durationMinutes = Math.max(0, Math.floor((new Date(entry.end_at).getTime() - new Date(entry.start_at).getTime()) / 60000) - Math.floor(Number(entry.break_seconds || 0) / 60));
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.manual_edit", subjectType: "time_entry", subjectId: entry.id, actorUserId: req.userId, source: "ios", dedupeKey: `time_clock.manual_edit:create:${entry.id}`, payload: { time_entry_id: entry.id, employee_id: entry.user_id, clock_in: entry.start_at, clock_out: entry.end_at, duration_minutes: durationMinutes, source: "ios" } });
+    } catch (automationErr) {
+      console.warn("[automations] manual time create hook failed", automationErr?.message || automationErr);
+    }
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_create_failed" }); }
 });
@@ -4901,6 +4955,7 @@ app.patch("/api/time-clock/entries/:id", authRequired, async (req, res) => {
     const ownerClause = req.role === "employer"
       ? `id = $1 AND company_id = $6`
       : `id = $1 AND user_id = $2`;
+    const before = (await pool.query(`SELECT * FROM time_clock_entries WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
     const { rows } = await pool.query(
       `UPDATE time_clock_entries
           SET start_at = $3,
@@ -4915,6 +4970,17 @@ app.patch("/api/time-clock/entries/:id", authRequired, async (req, res) => {
       [req.params.id, req.userId, start.toISOString(), end ? end.toISOString() : null, req.body.note || null, req.companyId]
     );
     if (!rows.length) return res.status(404).json({ error: "entry_not_found" });
+    try {
+      const entry = rows[0];
+      const changedFields = before ? ["start_at", "end_at", "note"].filter((field) => JSON.stringify(before[field] ?? null) !== JSON.stringify(entry[field] ?? null)).map((field) => ({ field, old_value: before[field] ?? null, new_value: entry[field] ?? null })) : [];
+      if (changedFields.length) {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.shift_updated", subjectType: "time_entry", subjectId: entry.id, actorUserId: req.userId, source: "ios", payload: { time_entry_id: entry.id, employee_id: entry.user_id, changed_fields: changedFields } });
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.manual_edit", subjectType: "time_entry", subjectId: entry.id, actorUserId: req.userId, source: "ios", payload: { time_entry_id: entry.id, employee_id: entry.user_id, changed_fields: changedFields } });
+        if (!entry.end_at) await syncAutomationSchedulesForTimeEntry(req.companyId, entry); else await cancelAutomationSchedulesForSubject(req.companyId, "time_entry", entry.id);
+      }
+    } catch (automationErr) {
+      console.warn("[automations] time update hook failed", automationErr?.message || automationErr);
+    }
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_update_failed" }); }
 });
@@ -4935,6 +5001,12 @@ app.delete("/api/time-clock/entries/:id", authRequired, async (req, res) => {
       [req.params.id, req.role === "employer" ? req.companyId : req.userId]
     );
     if (!rowCount) return res.status(404).json({ error: "entry_not_found" });
+    try {
+      await cancelAutomationSchedulesForSubject(req.companyId, "time_entry", req.params.id);
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.shift_updated", subjectType: "time_entry", subjectId: req.params.id, actorUserId: req.userId, source: "ios", payload: { time_entry_id: req.params.id, deleted: true } });
+    } catch (automationErr) {
+      console.warn("[automations] time delete hook failed", automationErr?.message || automationErr);
+    }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_delete_failed" }); }
 });
@@ -7043,7 +7115,7 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
   }
   try {
     const existing = await pool.query(
-      `SELECT p.user_id, u.company_id
+      `SELECT p.*, u.company_id
          FROM map_pins p
          JOIN users u ON u.id = p.user_id
         WHERE p.id = $1`,
@@ -7057,8 +7129,8 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
       ownerUserId = row.user_id;
     }
     const r = await pool.query(
-      `INSERT INTO map_pins (id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()))
+      `INSERT INTO map_pins (id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at, source)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()), $13)
        ON CONFLICT (id) DO UPDATE
          SET latitude = EXCLUDED.latitude,
              longitude = EXCLUDED.longitude,
@@ -7070,20 +7142,54 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
              email = EXCLUDED.email,
              contact_id = EXCLUDED.contact_id,
              updated_at = now()
-       RETURNING id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at`,
+       RETURNING id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at, updated_at, list_id, source, last_visit_at, last_knock_at, visit_count, knock_count`,
       [
         req.params.id, ownerUserId, latitude, longitude,
         name || '', address || '', notes || '', status || 'lead',
-        phone || null, email || null, contact_id || null, created_at || null
+        phone || null, email || null, contact_id || null, created_at || null, existing.rowCount ? existing.rows[0].source || "manual" : "manual"
       ]
     );
+    const before = existing.rowCount ? existing.rows[0] : null;
+    const after = r.rows[0];
+    const payload = {
+      pin_id: after.id,
+      status: after.status,
+      contact_id: after.contact_id || null,
+      list_id: after.list_id || null,
+      address: after.address || "",
+      latitude: after.latitude,
+      longitude: after.longitude,
+      source: "ios",
+      old_status: before?.status || null,
+      new_status: after.status
+    };
+    const changed = before ? ["latitude", "longitude", "name", "address", "notes", "status", "phone", "email", "contact_id", "list_id"].filter((field) => JSON.stringify(before[field] ?? null) !== JSON.stringify(after[field] ?? null)).map((field) => ({ field, old_value: before[field] ?? null, new_value: after[field] ?? null })) : [];
+    try {
+      if (!before) {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_created", subjectType: "map_pin", subjectId: after.id, actorUserId: req.userId, source: "ios", dedupeKey: `map.pin_created:${after.id}`, payload });
+        await syncAutomationSchedulesForMapPin(req.companyId, after, "status_changed");
+      } else if (changed.length) {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_updated", subjectType: "map_pin", subjectId: after.id, actorUserId: req.userId, source: "ios", payload: { ...payload, changed_fields: changed } });
+        if (changed.some((c) => c.field === "status")) {
+          await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_status_changed", subjectType: "map_pin", subjectId: after.id, actorUserId: req.userId, source: "ios", payload: { ...payload, changed_fields: changed.filter((c) => c.field === "status") } });
+          const statusEvents = { lead: ["map.pin_converted_to_lead", "canvass.lead_created"], won: ["map.pin_marked_won", "canvass.sale_recorded"], lost: ["map.pin_marked_lost", "canvass.not_interested"], reloop: ["map.pin_marked_reloop", "canvass.reloop_created"], later: ["map.pin_marked_later", "canvass.no_answer"] };
+          for (const eventType of statusEvents[after.status] || []) await emitAutomationEvent({ companyId: req.companyId, eventType, subjectType: "map_pin", subjectId: after.id, actorUserId: req.userId, source: "ios", payload });
+          await syncAutomationSchedulesForMapPin(req.companyId, after, "status_changed");
+        }
+        if (changed.some((c) => c.field === "address")) await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_address_changed", subjectType: "map_pin", subjectId: after.id, actorUserId: req.userId, source: "ios", payload });
+        if (changed.some((c) => c.field === "latitude" || c.field === "longitude")) await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_location_changed", subjectType: "map_pin", subjectId: after.id, actorUserId: req.userId, source: "ios", payload });
+        if (changed.some((c) => c.field === "contact_id")) await emitAutomationEvent({ companyId: req.companyId, eventType: after.contact_id ? "map.pin_contact_linked" : "map.pin_contact_unlinked", subjectType: "map_pin", subjectId: after.id, actorUserId: req.userId, source: "ios", payload });
+      }
+    } catch (automationErr) {
+      console.warn("[automations] map pin hook failed", automationErr?.message || automationErr);
+    }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_pin" }); }
 });
 
 app.delete("/api/map-pins/:id", authRequired, async (req, res) => {
   try {
-    await pool.query(
+    const { rows } = await pool.query(
       `DELETE FROM map_pins p
         USING users u
         WHERE p.id = $1
@@ -7091,6 +7197,12 @@ app.delete("/api/map-pins/:id", authRequired, async (req, res) => {
           AND (p.user_id = $2 OR ($3 = 'employer' AND u.company_id = $4))`,
       [req.params.id, req.userId, req.role, req.companyId]
     );
+    try {
+      await cancelAutomationSchedulesForSubject(req.companyId, "map_pin", req.params.id);
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_deleted", subjectType: "map_pin", subjectId: req.params.id, actorUserId: req.userId, source: "ios", payload: { pin_id: req.params.id } });
+    } catch (automationErr) {
+      console.warn("[automations] map pin delete hook failed", automationErr?.message || automationErr);
+    }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_pin" }); }
 });
@@ -7187,6 +7299,7 @@ app.put("/api/measurements/:id", authRequired, async (req, res) => {
   const cleanUnits = units === "meters" ? "meters" : "feet";
   const cleanLinkedContactIDs = Array.isArray(linked_contact_ids) ? linked_contact_ids : [];
   try {
+    const before = (await pool.query(`SELECT * FROM measurements WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId])).rows[0] || null;
     const r = await pool.query(
       `INSERT INTO measurements (id, user_id, name, points, created_at, linked_contact_ids, units)
        VALUES ($1, $2, $3, $4::jsonb, COALESCE($5::timestamptz, now()), $6::jsonb, $7)
@@ -7208,6 +7321,25 @@ app.put("/api/measurements/:id", authRequired, async (req, res) => {
         cleanUnits
       ]
     );
+    try {
+      const after = r.rows[0];
+      const payload = { measurement_id: after.id, name: after.name, units: after.units, point_count: Array.isArray(after.points) ? after.points.length : 0, linked_contact_ids: after.linked_contact_ids || [] };
+      if (!before) {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.created", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: "ios", dedupeKey: `measurement.created:${after.id}`, payload });
+        if (Array.isArray(after.points) && after.points.length >= 2) await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.completed", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: "ios", dedupeKey: `measurement.completed:${after.id}`, payload });
+      } else {
+        const changedFields = ["name", "points", "linked_contact_ids", "units"].filter((field) => JSON.stringify(before[field] ?? null) !== JSON.stringify(after[field] ?? null)).map((field) => ({ field, old_value: before[field] ?? null, new_value: after[field] ?? null }));
+        if (changedFields.length) await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.updated", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: "ios", payload: { ...payload, changed_fields: changedFields } });
+        if (changedFields.some((c) => c.field === "linked_contact_ids")) {
+          const oldIds = Array.isArray(before.linked_contact_ids) ? before.linked_contact_ids.map(String) : [];
+          for (const contactId of cleanLinkedContactIDs.map(String).filter((id) => !oldIds.includes(id))) {
+            await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.linked_to_contact", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: "ios", payload: { ...payload, contact_id: contactId } });
+          }
+        }
+      }
+    } catch (automationErr) {
+      console.warn("[automations] measurement hook failed", automationErr?.message || automationErr);
+    }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_measurement" }); }
 });
@@ -7216,6 +7348,11 @@ app.delete("/api/measurements/:id", authRequired, async (req, res) => {
   try {
     await pool.query(`DELETE FROM measurements WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.userId]);
+    try {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.deleted", subjectType: "measurement", subjectId: req.params.id, actorUserId: req.userId, source: "ios", payload: { measurement_id: req.params.id } });
+    } catch (automationErr) {
+      console.warn("[automations] measurement delete hook failed", automationErr?.message || automationErr);
+    }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_measurement" }); }
 });
