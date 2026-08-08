@@ -984,6 +984,7 @@ async function executeFromNode(runId, nodeId) {
   const graph = await loadGraph(run.automation_version_id, run.company_id);
   const node = graph.nodeById.get(nodeId);
   if (!node) return;
+  if (node.node_type === "note") return;
   if (await shouldStopRun(run)) return stopRun(run, "stop_condition", "Global stop condition matched");
   const previous = await ctx.pool.query(
     `SELECT COUNT(*)::int AS count FROM automation_run_nodes WHERE run_id = $1 AND node_key = $2 AND status = 'completed'`,
