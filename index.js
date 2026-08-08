@@ -2502,6 +2502,198 @@ app.post("/webhooks/twilio/voice/incoming", async (req, res) => {
   }
 });
 
+app.post("/webhooks/twilio/voice/incoming-complete", async (req, res) => {
+  try {
+    const validation = validateTwilioWebhook(req);
+    if (!validation.ok) {
+      console.error("[twilio/voice/incoming-complete] webhook validation failed:", validation.error);
+      if (validation.error === "twilio_auth_token_missing") {
+        return res.status(500).type("text/plain").send("Twilio webhook auth is not configured");
+      }
+      return res.status(403).type("text/plain").send("Forbidden");
+    }
+
+    const voiceResponse = new twilio.twiml.VoiceResponse();
+    const dialStatus = (req.body.DialCallStatus || "").toString().trim().toLowerCase();
+    const callSid = (req.body.CallSid || "").toString().trim();
+    if (dialStatus === "completed" || dialStatus === "answered") {
+      return res.status(200).type("text/xml").send(voiceResponse.toString());
+    }
+
+    const fromNumber = normalizeE164Phone(req.body.From);
+    const toNumber = normalizeE164Phone(req.body.To);
+    let route = null;
+    if (callSid) {
+      const call = await pool.query(
+        `SELECT pc.id AS phone_call_id,
+                pc.company_id,
+                pc.phone_line_id,
+                pc.contact_id,
+                pc.from_number,
+                pc.to_number
+           FROM phone_calls pc
+          WHERE pc.twilio_call_sid = $1
+          LIMIT 1`,
+        [callSid]
+      );
+      route = call.rows[0] || null;
+    }
+    if (!route && isUsableE164(toNumber)) {
+      const line = await pool.query(
+        `SELECT id AS phone_line_id, company_id
+           FROM phone_lines
+          WHERE phone_number = $1
+            AND active = true
+            AND status = 'active'
+          LIMIT 1`,
+        [toNumber]
+      );
+      if (line.rows.length) {
+        const contactID = isUsableE164(fromNumber)
+          ? await findSmsContactID({ companyId: line.rows[0].company_id, externalPhone: fromNumber })
+          : null;
+        route = {
+          company_id: line.rows[0].company_id,
+          phone_line_id: line.rows[0].phone_line_id,
+          contact_id: contactID,
+          from_number: fromNumber,
+          to_number: toNumber
+        };
+      }
+    }
+
+    if (route) {
+      await pool.query(
+        `UPDATE phone_calls
+            SET disposition = COALESCE(disposition, $2),
+                status = COALESCE(status, $3),
+                ended_at = COALESCE(ended_at, now()),
+                updated_at = now()
+          WHERE twilio_call_sid = $1`,
+        [callSid, callDispositionForStatus(dialStatus) || "missed", dialStatus || "no-answer"]
+      ).catch((e) => {
+        console.error("[twilio/voice/incoming-complete] history update failed:", { code: e?.code, message: e?.message });
+      });
+    }
+
+    voiceResponse.say({ voice: "alice" }, "Please leave a message after the tone.");
+    voiceResponse.record({
+      maxLength: 180,
+      playBeep: true,
+      trim: "trim-silence",
+      recordingStatusCallback: twilioPublicUrl("/webhooks/twilio/voice/voicemail-recording"),
+      recordingStatusCallbackMethod: "POST",
+      recordingStatusCallbackEvent: "completed"
+    });
+    res.status(200).type("text/xml").send(voiceResponse.toString());
+  } catch (e) {
+    console.error("[twilio/voice/incoming-complete] failed:", { status: e?.status, code: e?.code, message: e?.message });
+    const voiceResponse = new twilio.twiml.VoiceResponse();
+    res.status(200).type("text/xml").send(voiceResponse.toString());
+  }
+});
+
+app.post("/webhooks/twilio/voice/voicemail-recording", async (req, res) => {
+  try {
+    const validation = validateTwilioWebhook(req);
+    if (!validation.ok) {
+      console.error("[twilio/voice/voicemail-recording] webhook validation failed:", validation.error);
+      if (validation.error === "twilio_auth_token_missing") {
+        return res.status(500).type("text/plain").send("Twilio webhook auth is not configured");
+      }
+      return res.status(403).type("text/plain").send("Forbidden");
+    }
+
+    const callSid = (req.body.CallSid || "").toString().trim();
+    const recordingSid = (req.body.RecordingSid || "").toString().trim();
+    if (!callSid || !recordingSid) return res.status(200).type("text/plain").send("OK");
+    const recordingStatus = (req.body.RecordingStatus || "completed").toString().trim();
+    const duration = req.body.RecordingDuration ? Math.max(0, parseInt(req.body.RecordingDuration, 10) || 0) : null;
+
+    const call = await pool.query(
+      `SELECT pc.id AS phone_call_id,
+              pc.company_id,
+              pc.phone_line_id,
+              pc.contact_id,
+              pc.from_number,
+              pc.to_number
+         FROM phone_calls pc
+        WHERE pc.twilio_call_sid = $1
+        LIMIT 1`,
+      [callSid]
+    );
+    if (!call.rows.length) {
+      console.warn("[twilio/voice/voicemail-recording] call not found", { callSid, recordingSid });
+      return res.status(200).type("text/plain").send("OK");
+    }
+    const row = call.rows[0];
+    const externalPhone = row.from_number;
+    const contactID = row.contact_id || (isUsableE164(externalPhone)
+      ? await findSmsContactID({ companyId: row.company_id, externalPhone })
+      : null);
+
+    const saved = await pool.query(
+      `INSERT INTO voicemails(
+         company_id, phone_line_id, contact_id, phone_call_id, twilio_call_sid,
+         twilio_recording_sid, external_phone_number, recording_status, duration_seconds
+       )
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (twilio_recording_sid)
+       WHERE twilio_recording_sid IS NOT NULL
+       DO UPDATE SET
+         contact_id = COALESCE(voicemails.contact_id, EXCLUDED.contact_id),
+         recording_status = EXCLUDED.recording_status,
+         duration_seconds = COALESCE(EXCLUDED.duration_seconds, voicemails.duration_seconds),
+         deleted_at = NULL,
+         updated_at = now()
+       RETURNING id, contact_id`,
+      [
+        row.company_id,
+        row.phone_line_id,
+        contactID,
+        row.phone_call_id,
+        callSid,
+        recordingSid,
+        externalPhone || null,
+        recordingStatus,
+        duration
+      ]
+    );
+
+    if (recordingStatus.toLowerCase() === "completed") {
+      let title = externalPhone || "Unknown caller";
+      if (saved.rows[0]?.contact_id) {
+        const contact = await pool.query(
+          `SELECT name FROM contacts WHERE id = $1 AND company_id = $2 LIMIT 1`,
+          [saved.rows[0].contact_id, row.company_id]
+        );
+        const name = (contact.rows[0]?.name || "").toString().trim();
+        if (name) title = name;
+      }
+      sendCompanyPhonePush(row.company_id, {
+        title: `New voicemail from ${title}`,
+        body: "Tap to listen.",
+        contactId: saved.rows[0]?.contact_id || undefined,
+        threadId: `voicemail_${saved.rows[0].id}`,
+        payload: {
+          type: "voicemail",
+          voicemail_id: saved.rows[0].id,
+          call_id: row.phone_call_id,
+          external_phone_number: externalPhone || null,
+          contact_id: saved.rows[0]?.contact_id || null
+        }
+      }).catch((e) => {
+        console.error("[twilio/voice/voicemail-recording] APNs failed:", { recordingSid, code: e?.code, message: e?.message });
+      });
+    }
+
+    res.status(200).type("text/plain").send("OK");
+  } catch (e) {
+    console.error("[twilio/voice/voicemail-recording] failed:", { status: e?.status, code: e?.code, message: e?.message });
+    res.status(200).type("text/plain").send("OK");
+  }
+});
+
 app.post("/webhooks/twilio/voice/status", async (req, res) => {
   try {
     const validation = validateTwilioWebhook(req);
