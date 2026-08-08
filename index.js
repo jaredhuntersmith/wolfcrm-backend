@@ -1840,6 +1840,15 @@ app.post("/auth/signup", async (req, res) => {
         [user.id, company.id]
       );
     }
+    try {
+      const payload = { employee_id: user.id, email: user.email, role: user.role, active: true };
+      await emitAutomationEvent({ companyId: company.id, eventType: "employee.created", subjectType: "employee", subjectId: user.id, actorUserId: user.id, source: "ios", dedupeKey: `employee.created:${user.id}`, payload });
+      if (role === "employee") {
+        await emitAutomationEvent({ companyId: company.id, eventType: "employee.joined", subjectType: "employee", subjectId: user.id, actorUserId: user.id, source: "ios", dedupeKey: `employee.joined:${user.id}`, payload });
+      }
+    } catch (automationErr) {
+      console.warn("[automations] employee signup hook failed", automationErr?.message || automationErr);
+    }
 
     const token = randomUUID();
     await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, user.id]);
