@@ -2873,6 +2873,117 @@ app.get("/api/phone/calls", authRequired, async (req, res) => {
   }
 });
 
+app.get("/api/phone/voicemails", authRequired, async (req, res) => {
+  if (!req.companyId) return res.json([]);
+  const limit = Math.min(Math.max(parseInt(req.query.limit || "100", 10) || 100, 1), 200);
+  try {
+    const { rows } = await pool.query(
+      `SELECT vm.id,
+              vm.external_phone_number,
+              COALESCE(vm.contact_id, matched_contacts.id::uuid) AS contact_id,
+              COALESCE(c.name, matched_contacts.name) AS contact_name,
+              vm.created_at,
+              vm.duration_seconds,
+              vm.is_read,
+              vm.recording_status,
+              vm.phone_call_id AS call_id
+         FROM voicemails vm
+         LEFT JOIN contacts c ON c.id = vm.contact_id AND c.company_id = vm.company_id
+         ${contactMatchJoinSQL("vm.external_phone_number", "vm.company_id")}
+        WHERE vm.company_id = $1
+          AND vm.deleted_at IS NULL
+        ORDER BY vm.created_at DESC
+        LIMIT $2`,
+      [req.companyId, limit]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[phone/voicemails] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "phone_voicemails_failed" });
+  }
+});
+
+app.post("/api/phone/voicemails/:id/read", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE voicemails
+          SET is_read = true, updated_at = now()
+        WHERE id = $1
+          AND company_id = $2
+          AND deleted_at IS NULL
+        RETURNING id`,
+      [req.params.id, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "voicemail_not_found" });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[phone/voicemail/read] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "voicemail_read_failed" });
+  }
+});
+
+app.delete("/api/phone/voicemails/:id", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE voicemails
+          SET deleted_at = now(), updated_at = now()
+        WHERE id = $1
+          AND company_id = $2
+          AND deleted_at IS NULL
+        RETURNING twilio_recording_sid`,
+      [req.params.id, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "voicemail_not_found" });
+    const recordingSid = (rows[0].twilio_recording_sid || "").toString().trim();
+    if (recordingSid) {
+      const client = createTwilioClient();
+      if (client) {
+        client.recordings(recordingSid).remove().catch((e) => {
+          console.error("[phone/voicemail/delete] Twilio recording delete failed:", {
+            status: e?.status,
+            code: e?.code,
+            message: e?.message
+          });
+        });
+      }
+    }
+    res.status(204).end();
+  } catch (e) {
+    console.error("[phone/voicemail/delete] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "voicemail_delete_failed" });
+  }
+});
+
+app.get("/api/phone/voicemails/:id/audio", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
+  try {
+    const { rows } = await pool.query(
+      `SELECT twilio_recording_sid
+         FROM voicemails
+        WHERE id = $1
+          AND company_id = $2
+          AND deleted_at IS NULL
+        LIMIT 1`,
+      [req.params.id, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "voicemail_not_found" });
+    const recordingSid = (rows[0].twilio_recording_sid || "").toString().trim();
+    if (!recordingSid) return res.status(404).json({ error: "voicemail_audio_not_ready" });
+    await pool.query(
+      `UPDATE voicemails SET is_read = true, updated_at = now() WHERE id = $1 AND company_id = $2`,
+      [req.params.id, req.companyId]
+    );
+    const upstream = await fetchTwilioResource(buildRecordingAudioUrl(recordingSid));
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    res.type("audio/mpeg").send(buffer);
+  } catch (e) {
+    console.error("[phone/voicemail/audio] failed:", { code: e?.code, status: e?.status, message: e?.message });
+    res.status(e?.status || 500).json({ error: "voicemail_audio_failed" });
+  }
+});
+
 app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
   try {
