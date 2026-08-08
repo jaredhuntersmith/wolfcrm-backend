@@ -252,6 +252,113 @@ function actionConfigFields(key) {
   }
 }
 
+function triggerConfigFields(key) {
+  const sourceOptions = ["manual", "ios", "zapier", "meta", "webhook", "csv", "phone", "map", "schedule", "automation", "system", "other"];
+  const fields = [];
+  if (key.includes("field_changed") || /_(name|phone|email|address|value|job_type|source|u[1-5]|location)_changed$/.test(key)) {
+    fields.push({ key: "field", label: "Field", type: "contact_field" });
+    fields.push({ key: "from", label: "From", type: "text" });
+    fields.push({ key: "to", label: "To", type: "text" });
+  }
+  if (key.includes("tag_") || key.includes("tags_changed")) fields.push({ key: "tags", label: "Tags", type: "tag_list" }, { key: "tag_match", label: "Tag Match", type: "select", options: ["any", "one_of", "all"] });
+  if (key.startsWith("lead.")) fields.push({ key: "sources", label: "Sources", type: "source_list", options: sourceOptions });
+  if (key.includes("stage_") || key.includes("opportunity") || key.includes("pipeline.won") || key.includes("pipeline.lost") || key.includes("pipeline.reopened")) {
+    fields.push({ key: "stage_ids", label: "Stages", type: "stage_list" });
+    fields.push({ key: "from_stage_id", label: "From Stage", type: "stage" });
+    fields.push({ key: "to_stage_id", label: "To Stage", type: "stage" });
+  }
+  fields.push({ key: "allow_automation_origin", label: "Allow events caused by automations", type: "boolean" });
+  return fields;
+}
+
+function triggerIcon(key) {
+  if (key.startsWith("lead.")) return "person.badge.plus";
+  if (key.includes("tag")) return "tag";
+  if (key.startsWith("pipeline.won")) return "trophy";
+  if (key.startsWith("pipeline.lost")) return "xmark.circle";
+  if (key.startsWith("pipeline.")) return "arrow.right";
+  if (key.startsWith("contact.")) return "person.crop.circle";
+  return "bolt";
+}
+
+function actionIcon(key) {
+  if (key.includes("tag")) return "tag";
+  if (key.includes("delete") || key.includes("remove") || key.includes("lost")) return "xmark.circle";
+  if (key.includes("won")) return "trophy";
+  if (key.startsWith("pipeline.")) return "arrow.right";
+  if (key.startsWith("contact.")) return "person.crop.circle.badge.checkmark";
+  if (key.startsWith("sms.")) return "message";
+  if (key.startsWith("notification.")) return "bell";
+  return "bolt";
+}
+
+function conditionFieldCatalog() {
+  const textOps = ["equals", "not_equals", "contains", "not_contains", "starts_with", "ends_with", "exists", "not_exists"];
+  const numberOps = ["equals", "not_equals", "greater_than", "greater_or_equal", "less_than", "less_or_equal", "between", "exists", "not_exists"];
+  const boolOps = ["is_true", "is_false"];
+  const dateOps = ["before", "after", "between", "exists", "not_exists"];
+  return [
+    ["contact.id", "Contact ID", "Contact", "text", textOps],
+    ["contact.exists", "Contact Exists", "Contact", "boolean", boolOps],
+    ["contact.name", "Name", "Contact", "text", textOps],
+    ["contact.phone", "Phone", "Contact", "text", textOps],
+    ["contact.email", "Email", "Contact", "text", textOps],
+    ["contact.address", "Address", "Contact", "text", textOps],
+    ["contact.city", "City", "Contact", "text", textOps],
+    ["contact.state", "State", "Contact", "text", textOps],
+    ["contact.zip", "ZIP", "Contact", "text", textOps],
+    ["contact.value", "Value", "Contact", "number", numberOps],
+    ["contact.value_cents", "Value Cents", "Contact", "number", numberOps],
+    ["contact.job_type", "Job Type", "Contact", "text", textOps],
+    ["contact.source", "Source", "Contact", "text", textOps],
+    ["contact.tags", "Tags", "Contact", "tags", ["contains", "not_contains", "exists", "not_exists"]],
+    ["contact.u1", "Custom Field 1", "Contact", "text", textOps],
+    ["contact.u2", "Custom Field 2", "Contact", "text", textOps],
+    ["contact.u3", "Custom Field 3", "Contact", "text", textOps],
+    ["contact.u4", "Custom Field 4", "Contact", "text", textOps],
+    ["contact.u5", "Custom Field 5", "Contact", "text", textOps],
+    ["contact.created_at", "Created At", "Contact", "date", dateOps],
+    ["contact.updated_at", "Updated At", "Contact", "date", dateOps],
+    ["contact.lat", "Latitude", "Contact", "number", numberOps],
+    ["contact.lng", "Longitude", "Contact", "number", numberOps],
+    ["contact.has_phone", "Has Phone", "Contact", "boolean", boolOps],
+    ["contact.has_email", "Has Email", "Contact", "boolean", boolOps],
+    ["contact.has_address", "Has Address", "Contact", "boolean", boolOps],
+    ["contact.has_future_scheduled_job", "Has Future Job", "Relationships", "boolean", boolOps],
+    ["contact.has_previous_completed_job", "Has Completed Job", "Relationships", "boolean", boolOps],
+    ["contact.has_quote", "Has Quote", "Relationships", "boolean", boolOps],
+    ["contact.has_unpaid_payment", "Has Unpaid Payment", "Relationships", "boolean", boolOps],
+    ["contact.has_active_service_plan", "Has Active Service Plan", "Relationships", "boolean", boolOps],
+    ["contact.exists_on_map", "Exists on Map", "Relationships", "boolean", boolOps],
+    ["lead.source", "Lead Source", "Lead", "text", textOps],
+    ["lead.external_id", "External Lead ID", "Lead", "text", textOps],
+    ["lead.form_id", "Form ID", "Lead", "text", textOps],
+    ["lead.page_id", "Page ID", "Lead", "text", textOps],
+    ["lead.submitted_at", "Submitted At", "Lead", "date", dateOps],
+    ["lead.has_lead_info", "Has Lead Info", "Lead", "boolean", boolOps],
+    ["pipeline.has_opportunity", "Has Opportunity", "Pipeline", "boolean", boolOps],
+    ["pipeline.stage_id", "Stage ID", "Pipeline", "stage", textOps],
+    ["pipeline.stage_name", "Stage Name", "Pipeline", "text", textOps],
+    ["pipeline.is_won", "Is Won", "Pipeline", "boolean", boolOps],
+    ["pipeline.is_lost", "Is Lost", "Pipeline", "boolean", boolOps],
+    ["pipeline.opportunity_value", "Opportunity Value", "Pipeline", "number", numberOps],
+    ["pipeline.salesperson_id", "Salesperson ID", "Pipeline", "user", textOps],
+    ["pipeline.salesperson_name", "Salesperson Name", "Pipeline", "text", textOps],
+    ["pipeline.days_in_stage", "Days in Stage", "Pipeline", "number", numberOps],
+    ["pipeline.reminder_exists", "Reminder Exists", "Pipeline", "boolean", boolOps]
+  ].map(([key, displayName, category, valueType, operators]) => ({ key, display_name: displayName, category, value_type: valueType, operators }));
+}
+
+function templateVariableCatalog() {
+  return [
+    "contact.name", "contact.phone", "contact.email", "contact.address", "contact.value", "contact.job_type", "contact.source",
+    "contact.u1", "contact.u2", "contact.u3", "contact.u4", "contact.u5",
+    "lead.source", "lead.external_id", "lead.form_id", "lead.page_id", "lead.submitted_at",
+    "pipeline.stage_name", "pipeline.opportunity_value", "pipeline.salesperson_name",
+    "company.name", "event.type", "event.payload.form_id", "event.payload.page_id", "variables.some_name"
+  ].map((key) => ({ key, token: `{{${key}}}` }));
+}
+
 export async function installAutomationSystem(options) {
   ctx = options;
   await bootstrapAutomationSchema();
@@ -262,6 +369,10 @@ export async function installAutomationSystem(options) {
 export async function emitAutomationEvent(event) {
   if (!ctx?.pool || !event?.companyId || !event?.eventType) return null;
   const payload = safeJson(event.payload || {});
+  if (Number(payload.automation_event_depth || 0) > AUTOMATION_LIMITS.maxChildDepth) {
+    console.warn("[automations] event skipped at depth limit", { eventType: event.eventType, companyId: event.companyId });
+    return null;
+  }
   try {
     const { rows } = await ctx.pool.query(
       `INSERT INTO automation_events(
@@ -484,6 +595,21 @@ async function bootstrapAutomationSchema() {
     );
     CREATE INDEX IF NOT EXISTS automation_logs_run_date_idx ON automation_logs(run_id, created_at);
     CREATE INDEX IF NOT EXISTS automation_logs_company_date_idx ON automation_logs(company_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS contact_activities (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      contact_id TEXT NOT NULL,
+      created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      activity_type TEXT NOT NULL DEFAULT 'note',
+      body TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'automation',
+      automation_run_id UUID REFERENCES automation_runs(id) ON DELETE SET NULL,
+      automation_node_id UUID,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS contact_activities_company_contact_idx ON contact_activities(company_id, contact_id, created_at DESC);
   `);
 }
 
@@ -494,6 +620,9 @@ function installAutomationRoutes() {
     res.json({
       triggers: triggerCatalog,
       actions: actionCatalog,
+      condition_fields: conditionFieldCatalog(),
+      template_variables: templateVariableCatalog(),
+      sources: ["manual", "ios", "zapier", "meta", "webhook", "csv", "phone", "map", "schedule", "automation", "system", "other"],
       logic_nodes: [
         { key: "condition", display_name: "Condition", category: "Logic", description: "Routes to true or false ports.", outputs: ["true", "false"], config_fields: [{ key: "condition", type: "condition" }] },
         { key: "branch", display_name: "Branch", category: "Logic", description: "Routes by resolved value to named ports.", outputs: ["default"], config_fields: [{ key: "input", type: "template" }, { key: "branches", type: "string_list" }] },
@@ -807,6 +936,14 @@ function validateGraphPayload(payload) {
     const config = node.config || {};
     if (nodeType === "trigger" && !triggerCatalog.find((t) => t.key === config.trigger_key)) errors.push(`invalid_trigger:${nodeKey}`);
     if (nodeType === "action" && !actionExecutors[config.action_key]) errors.push(`invalid_action:${nodeKey}`);
+    if (nodeType === "trigger" && config.trigger_key === "contact.field_changed" && !config.field) errors.push(`field_change_trigger_missing_field:${nodeKey}`);
+    if (nodeType === "action") {
+      if (["contact.add_tag", "contact.remove_tag", "contact.replace_tags"].includes(config.action_key) && !normalizeTags(config.tags || config.tag).length) errors.push(`tags_required:${nodeKey}`);
+      if (config.action_key === "contact.delete" && config.confirm_delete !== true) errors.push(`delete_confirmation_required:${nodeKey}`);
+      if (["pipeline.create_opportunity", "pipeline.move_stage", "pipeline.reopen"].includes(config.action_key) && !config.stage_id) errors.push(`stage_required:${nodeKey}`);
+      if (config.action_key === "pipeline.set_value" && config.value == null && config.value_cents == null) errors.push(`value_required:${nodeKey}`);
+      if (config.action_key === "contact.set_custom_field" && !["u1", "u2", "u3", "u4", "u5"].includes(config.field)) errors.push(`custom_field_required:${nodeKey}`);
+    }
   }
   for (const edge of edges) {
     if (!nodeIds.has(edge.source_node_id || edge.sourceNodeId)) errors.push(`edge_source_missing:${edge.id || ""}`);
@@ -1020,6 +1157,11 @@ async function startRunsForEvent(event) {
     [event.company_id, event.event_type]
   );
   for (const automation of rows) {
+    const triggers = (await ctx.pool.query(
+      `SELECT * FROM automation_nodes WHERE version_id = $1 AND company_id = $2 AND node_type = 'trigger'`,
+      [automation.version_id, event.company_id]
+    )).rows;
+    if (!triggers.some((node) => triggerMatchesEvent(node, event))) continue;
     if (!(await canStartRun(automation, event))) continue;
     const run = await createRun({
       companyId: event.company_id,
@@ -1109,9 +1251,14 @@ async function runAutomation(runId, resumeFromNodeId = null, incomingPort = null
   await ctx.pool.query(`UPDATE automation_runs SET status = 'running', updated_at = now() WHERE id = $1 AND status IN ('queued','waiting','running')`, [runId]);
   run = { ...run, status: "running" };
   const graph = await loadGraph(run.automation_version_id, run.company_id);
-  const startNodes = resumeFromNodeId
-    ? graph.edges.filter((e) => e.source_node_id === resumeFromNodeId && portMatches(e.source_port, incomingPort || "default")).sort(edgeSort).map((e) => graph.nodeById.get(e.target_node_id))
-    : graph.nodes.filter((n) => n.node_type === "trigger" && triggerMatchesRun(n, run));
+  let startNodes = [];
+  if (resumeFromNodeId) {
+    startNodes = graph.edges.filter((e) => e.source_node_id === resumeFromNodeId && portMatches(e.source_port, incomingPort || "default")).sort(edgeSort).map((e) => graph.nodeById.get(e.target_node_id));
+  } else {
+    for (const n of graph.nodes) {
+      if (n.node_type === "trigger" && await triggerMatchesRunAsync(n, run)) startNodes.push(n);
+    }
+  }
   if (!startNodes.length && !resumeFromNodeId) {
     await completeRunIfIdle(run);
     return;
@@ -1172,7 +1319,56 @@ async function loadGraph(versionId, companyId) {
 
 function triggerMatchesRun(node, run) {
   if (!run.trigger_event_id && node.config?.trigger_key === "manual") return true;
+  return false;
+}
+
+async function triggerMatchesRunAsync(node, run) {
+  if (!run.trigger_event_id) return node.config?.trigger_key === "manual";
+  const event = (await ctx.pool.query(`SELECT * FROM automation_events WHERE id = $1`, [run.trigger_event_id])).rows[0];
+  return event ? triggerMatchesEvent(node, event) : false;
+}
+
+function triggerMatchesEvent(node, event) {
+  const config = node.config || {};
+  const key = config.trigger_key;
+  if (!key) return false;
+  const events = Array.isArray(config.event_types) ? config.event_types : [key];
+  if (!events.includes(event.event_type)) return false;
+  const payload = event.payload || {};
+  if (payload.origin_run_id && config.allow_automation_origin !== true) return false;
+  if (Array.isArray(config.sources) && config.sources.length) {
+    const source = String(payload.source || event.source || "").toLowerCase();
+    if (!config.sources.map((s) => String(s).toLowerCase()).includes(source)) return false;
+  }
+  if (config.field) {
+    const fields = changedFields(payload);
+    const wanted = String(config.field);
+    const changed = fields.find((f) => f.field === wanted);
+    if (!changed) return false;
+    if (config.from != null && config.from !== "" && !looseEqual(changed.old_value, config.from)) return false;
+    if (config.to != null && config.to !== "" && !looseEqual(changed.new_value, config.to)) return false;
+  }
+  const triggerTag = config.tag || (Array.isArray(config.tags) && config.tags.length === 1 ? config.tags[0] : null);
+  if (triggerTag || (Array.isArray(config.tags) && config.tags.length)) {
+    const eventTags = normalizeTags(payload.tags || payload.added_tags || payload.removed_tags || payload.tag);
+    const wanted = normalizeTags(config.tags || triggerTag).map((t) => t.toLowerCase());
+    if (!wanted.length) return true;
+    const actual = eventTags.map((t) => t.toLowerCase());
+    const mode = config.tag_match || "one_of";
+    if (mode === "all" && !wanted.every((t) => actual.includes(t))) return false;
+    if (mode !== "all" && !wanted.some((t) => actual.includes(t))) return false;
+  }
+  const stageIds = Array.isArray(config.stage_ids) ? config.stage_ids.filter(Boolean) : [];
+  const eventStageId = payload.stage_id || payload.new_stage_id || payload.to_stage_id;
+  if (stageIds.length && !stageIds.includes(eventStageId)) return false;
+  if (config.from_stage_id && config.from_stage_id !== "any" && config.from_stage_id !== (payload.previous_stage_id || payload.old_stage_id || payload.from_stage_id)) return false;
+  if (config.to_stage_id && config.to_stage_id !== "any" && config.to_stage_id !== eventStageId) return false;
   return true;
+}
+
+function changedFields(payload) {
+  if (!Array.isArray(payload?.changed_fields)) return [];
+  return payload.changed_fields.map((item) => typeof item === "string" ? { field: item } : item).filter((item) => item?.field);
 }
 
 async function beginRunNode(run, node, attempt) {
@@ -1431,13 +1627,19 @@ async function buildRunContext(run, options = {}) {
     const subject = await loadSubject(run.company_id, run.subject_type, run.subject_id);
     if (run.subject_type) context[subjectContextKey(run.subject_type)] = subject || {};
     context.subject.object = subject || {};
+    if (subject?.contact_id && !context.contact) context.contact = await loadContactContext(run.company_id, subject.contact_id);
+    if (context.event?.payload?.contact_id && !context.contact) context.contact = await loadContactContext(run.company_id, context.event.payload.contact_id);
+    if (context.contact?.id) {
+      context.lead = leadContextFromContact(context.contact, context.event?.payload || {});
+      context.pipeline = await loadPipelineContext(run.company_id, context.contact.id);
+    }
   }
   return context;
 }
 
 async function loadSubject(companyId, subjectType, subjectId) {
   if (!subjectType || !subjectId) return null;
-  if (subjectType === "contact") return (await ctx.pool.query(`SELECT id, name, phone, email, address, tags, job_type, u1, u2, u3, u4, u5 FROM contacts WHERE id::text = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
+  if (subjectType === "contact") return loadContactContext(companyId, subjectId);
   if (subjectType === "job") return (await ctx.pool.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
   if (subjectType === "opportunity") return (await ctx.pool.query(`SELECT * FROM opportunities WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
   if (subjectType === "sms_conversation") return (await ctx.pool.query(`SELECT sc.* FROM sms_conversations sc JOIN phone_lines pl ON pl.id = sc.phone_line_id WHERE sc.id = $1 AND pl.company_id = $2`, [subjectId, companyId])).rows[0] || null;
@@ -1447,6 +1649,93 @@ async function loadSubject(companyId, subjectType, subjectId) {
   if (subjectType === "task") return (await ctx.pool.query(`SELECT tt.* FROM todo_tasks tt JOIN users u ON u.id = tt.user_id WHERE tt.id = $1 AND u.company_id = $2`, [subjectId, companyId])).rows[0] || null;
   if (subjectType === "payment") return (await ctx.pool.query(`SELECT * FROM payment_records WHERE id::text = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
   return null;
+}
+
+async function loadContactContext(companyId, contactId) {
+  const contact = (await ctx.pool.query(
+    `SELECT id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5,
+            lead_info, source, external_lead_id, lead_form_id, lead_page_id, lead_submitted_at, created_at, updated_at
+       FROM contacts WHERE id::text = $1 AND company_id = $2`,
+    [contactId, companyId]
+  )).rows[0];
+  if (!contact) return { exists: false };
+  const addressParts = parseAddressParts(contact.address || "");
+  const rel = await loadContactRelationshipFlags(companyId, contact.id);
+  return {
+    ...contact,
+    exists: true,
+    tags: normalizeTags(contact.tags),
+    value: contact.value_cents == null ? null : Number(contact.value_cents) / 100,
+    has_phone: Boolean((contact.phone || "").trim()),
+    has_email: Boolean((contact.email || "").trim()),
+    has_address: Boolean((contact.address || "").trim()),
+    ...addressParts,
+    ...rel
+  };
+}
+
+async function loadContactRelationshipFlags(companyId, contactId) {
+  const [futureJob, completedJob, quote, unpaidPayment, activePlan, mapPin] = await Promise.all([
+    ctx.pool.query(`SELECT 1 FROM schedule_events WHERE company_id = $1 AND contact_id = $2 AND start_at > now() LIMIT 1`, [companyId, contactId]),
+    ctx.pool.query(`SELECT 1 FROM schedule_events WHERE company_id = $1 AND contact_id = $2 AND finished_at IS NOT NULL LIMIT 1`, [companyId, contactId]),
+    ctx.pool.query(`SELECT 1 FROM quotes WHERE company_id = $1 AND contact_id = $2 LIMIT 1`, [companyId, contactId]),
+    ctx.pool.query(`SELECT 1 FROM payment_records WHERE company_id = $1 AND contact_id = $2 AND status NOT IN ('succeeded','paid') LIMIT 1`, [companyId, contactId]).catch(() => ({ rowCount: 0 })),
+    ctx.pool.query(`SELECT 1 FROM service_plans WHERE company_id = $1 AND contact_id = $2 AND status = 'active' LIMIT 1`, [companyId, contactId]).catch(() => ({ rowCount: 0 })),
+    ctx.pool.query(`SELECT 1 FROM map_pins mp JOIN users u ON u.id = mp.user_id WHERE u.company_id = $1 AND mp.contact_id = $2 LIMIT 1`, [companyId, contactId])
+  ]);
+  return {
+    has_future_scheduled_job: futureJob.rowCount > 0,
+    has_previous_completed_job: completedJob.rowCount > 0,
+    has_quote: quote.rowCount > 0,
+    has_unpaid_payment: unpaidPayment.rowCount > 0,
+    has_active_service_plan: activePlan.rowCount > 0,
+    exists_on_map: mapPin.rowCount > 0
+  };
+}
+
+function leadContextFromContact(contact, payload) {
+  const leadInfo = Array.isArray(contact.lead_info) ? contact.lead_info : [];
+  return {
+    source: contact.source || payload.source || null,
+    external_id: contact.external_lead_id || payload.external_lead_id || null,
+    form_id: contact.lead_form_id || payload.form_id || null,
+    page_id: contact.lead_page_id || payload.page_id || null,
+    submitted_at: contact.lead_submitted_at || payload.submitted_at || null,
+    has_lead_info: leadInfo.length > 0,
+    info: leadInfo
+  };
+}
+
+async function loadPipelineContext(companyId, contactId) {
+  const opp = (await ctx.pool.query(
+    `SELECT o.*, s.name AS stage_name
+       FROM opportunities o
+       LEFT JOIN stages s ON s.id = o.stage_id AND (s.company_id = $1 OR s.company_id IS NULL)
+      WHERE o.company_id = $1 AND o.contact_id = $2
+      LIMIT 1`,
+    [companyId, contactId]
+  )).rows[0];
+  const reminder = await ctx.pool.query(`SELECT 1 FROM stage_reminders WHERE contact_id = $1 AND archived = false LIMIT 1`, [contactId]);
+  if (!opp) return { has_opportunity: false, reminder_exists: reminder.rowCount > 0 };
+  const created = opp.updated_at || opp.created_at;
+  return {
+    has_opportunity: true,
+    opportunity_id: opp.id,
+    stage_id: opp.stage_id,
+    stage_name: opp.stage_name,
+    is_won: opp.state === "won",
+    is_lost: opp.state === "lost",
+    opportunity_value: null,
+    salesperson_id: null,
+    salesperson_name: null,
+    days_in_stage: created ? Math.floor((Date.now() - new Date(created).getTime()) / 86400000) : null,
+    reminder_exists: reminder.rowCount > 0
+  };
+}
+
+function parseAddressParts(address) {
+  const zip = (address.match(/\b\d{5}(?:-\d{4})?\b/) || [null])[0];
+  return { city: null, state: null, zip };
 }
 
 function subjectContextKey(type) {
@@ -1519,32 +1808,37 @@ async function executeContactAddTag(run, node, config) {
   const context = await buildRunContext(run);
   const contactId = await resolveContactId(run, context, config);
   const tags = normalizeTags(resolveConfig(config.tags || config.tag || [], context));
-  const updated = await mutateContactTags(run.company_id, contactId, (existing) => [...new Set([...existing, ...tags])]);
-  return { contact_id: contactId, tags: updated };
+  const result = await mutateContactTags(run.company_id, contactId, (existing) => uniqueTags([...existing, ...tags]));
+  await emitContactTagEvents(run, node, contactId, result);
+  return { contact_id: contactId, tags: result.next, added_tags: result.added };
 }
 
 async function executeContactRemoveTag(run, node, config) {
   const context = await buildRunContext(run);
   const contactId = await resolveContactId(run, context, config);
   const tags = normalizeTags(resolveConfig(config.tags || config.tag || [], context)).map((t) => t.toLowerCase());
-  const updated = await mutateContactTags(run.company_id, contactId, (existing) => existing.filter((t) => !tags.includes(t.toLowerCase())));
-  return { contact_id: contactId, tags: updated };
+  const result = await mutateContactTags(run.company_id, contactId, (existing) => existing.filter((t) => !tags.includes(t.toLowerCase())));
+  await emitContactTagEvents(run, node, contactId, result);
+  return { contact_id: contactId, tags: result.next, removed_tags: result.removed };
 }
 
 async function executeContactUpdateFields(run, node, config) {
   const context = await buildRunContext(run);
   const contactId = await resolveContactId(run, context, config);
-  const allowed = ["name", "phone", "email", "address", "job_type", "u1", "u2", "u3", "u4", "u5"];
+  const allowed = ["name", "phone", "email", "address", "job_type", "source", "u1", "u2", "u3", "u4", "u5", "value_cents", "lat", "lng"];
   const updates = {};
   for (const field of allowed) if (config[field] != null) updates[field] = resolveTemplate(config[field], context);
   if (!Object.keys(updates).length) return { contact_id: contactId, updated: [] };
+  const before = (await ctx.pool.query(`SELECT * FROM contacts WHERE id::text = $1 AND company_id = $2`, [contactId, run.company_id])).rows[0];
   const sets = Object.keys(updates).map((key, i) => `${key} = $${i + 3}`);
   const { rows } = await ctx.pool.query(
-    `UPDATE contacts SET ${sets.join(", ")}, updated_at = now() WHERE id::text = $1 AND company_id = $2 RETURNING id`,
+    `UPDATE contacts SET ${sets.join(", ")}, updated_at = now() WHERE id::text = $1 AND company_id = $2 RETURNING *`,
     [contactId, run.company_id, ...Object.values(updates)]
   );
   if (!rows.length) throw new Error("contact_not_found");
-  return { contact_id: contactId, updated: Object.keys(updates) };
+  const changed = contactChangedFields(before, rows[0], Object.keys(updates));
+  await emitContactChangeEvents(run.company_id, contactId, "automation", run.manual_started_by_user_id, changed, automationPayload(run, node, { contact_id: contactId }));
+  return { contact_id: contactId, updated: changed.map((f) => f.field) };
 }
 
 async function resolveContactId(run, context, config) {
@@ -1559,11 +1853,15 @@ async function mutateContactTags(companyId, contactId, mutator) {
   const row = (await ctx.pool.query(`SELECT tags FROM contacts WHERE id::text = $1 AND company_id = $2`, [contactId, companyId])).rows[0];
   if (!row) throw new Error("contact_not_found");
   const current = normalizeTags(row.tags);
-  const next = mutator(current).filter(Boolean);
+  const next = uniqueTags(mutator(current).filter(Boolean));
+  const currentLower = current.map((t) => t.toLowerCase());
+  const nextLower = next.map((t) => t.toLowerCase());
+  const added = next.filter((t) => !currentLower.includes(t.toLowerCase()));
+  const removed = current.filter((t) => !nextLower.includes(t.toLowerCase()));
   const type = (await ctx.pool.query(`SELECT data_type, udt_name FROM information_schema.columns WHERE table_name = 'contacts' AND column_name = 'tags' LIMIT 1`)).rows[0];
   const value = type?.udt_name?.startsWith("_") ? next : next.join(",");
   await ctx.pool.query(`UPDATE contacts SET tags = $3, updated_at = now() WHERE id::text = $1 AND company_id = $2`, [contactId, companyId, value]);
-  return next;
+  return { previous: current, next, added, removed };
 }
 
 function normalizeTags(value) {
@@ -1572,13 +1870,211 @@ function normalizeTags(value) {
   return String(value).split(",").map((t) => t.trim()).filter(Boolean);
 }
 
+function uniqueTags(tags) {
+  const seen = new Set();
+  const out = [];
+  for (const tag of normalizeTags(tags)) {
+    const key = tag.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(tag);
+    }
+  }
+  return out;
+}
+
+async function executeContactCreate(run, node, config) {
+  const existingId = await getRunVariable(run.id, `idempotency:${node.id}:contact_id`);
+  if (existingId) {
+    const existing = await loadContactContext(run.company_id, existingId);
+    if (existing?.exists) return { contact_id: existingId, reused: true };
+  }
+  const context = await buildRunContext(run);
+  const fields = resolveConfig(config, context);
+  const name = (fields.name || "").toString().trim();
+  if (!name) throw new Error("contact_name_required");
+  const owner = await resolveCompanyUser(run.company_id, fields.assigned_user_id || "");
+  const id = randomUUID();
+  const tags = uniqueTags(fields.tags || []);
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO contacts(id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, source)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+     RETURNING *`,
+    [id, owner, run.company_id, name, fields.phone || "", fields.email || "", fields.address || "", intOrNull(fields.value_cents), numOrNull(fields.lat), numOrNull(fields.lng), tags.join(","), fields.job_type || "", fields.u1 || "", fields.u2 || "", fields.u3 || "", fields.u4 || "", fields.u5 || "", fields.source || "automation"]
+  );
+  await setRunVariable(run.id, `idempotency:${node.id}:contact_id`, id);
+  await emitAutomationEvent({
+    companyId: run.company_id,
+    eventType: "contact.created",
+    subjectType: "contact",
+    subjectId: id,
+    source: "automation",
+    dedupeKey: `contact.created:${id}`,
+    payload: automationPayload(run, node, { contact_id: id, name, source: fields.source || "automation" })
+  });
+  return { contact_id: id, name: rows[0].name, phone: rows[0].phone, email: rows[0].email };
+}
+
+async function executeContactDelete(run, node, config) {
+  if (config.confirm_delete !== true) throw new Error("confirm_delete_required");
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const row = (await ctx.pool.query(`SELECT id, name FROM contacts WHERE id::text = $1 AND company_id = $2`, [contactId, run.company_id])).rows[0];
+  if (!row) throw new Error("contact_not_found");
+  await ctx.pool.query(`UPDATE schedule_events SET contact_id = NULL, updated_at = now() WHERE contact_id = $1 AND company_id = $2`, [contactId, run.company_id]);
+  await ctx.pool.query(`DELETE FROM opportunities WHERE contact_id = $1 AND company_id = $2`, [contactId, run.company_id]);
+  await ctx.pool.query(`DELETE FROM contacts WHERE id::text = $1 AND company_id = $2`, [contactId, run.company_id]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "contact.deleted", subjectType: "contact", subjectId: contactId, source: "automation", dedupeKey: `contact.deleted:${contactId}:${run.id}:${node.id}`, payload: automationPayload(run, node, { contact_id: contactId, name: row.name }) });
+  return { contact_id: contactId, deleted: true };
+}
+
+async function executeDeferredAction(_run, _node, config) {
+  throw new Error(config?.deferred_reason || "action_deferred_current_schema_does_not_support_this");
+}
+
+async function executeContactReplaceTags(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const result = await mutateContactTags(run.company_id, contactId, () => uniqueTags(resolveConfig(config.tags || [], context)));
+  await emitContactTagEvents(run, node, contactId, result);
+  return { contact_id: contactId, tags: result.next, added_tags: result.added, removed_tags: result.removed };
+}
+
+async function executeContactClearTags(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const result = await mutateContactTags(run.company_id, contactId, () => []);
+  await emitContactTagEvents(run, node, contactId, result);
+  return { contact_id: contactId, tags: [] };
+}
+
+async function executeContactSetSource(run, node, config) { return executeContactUpdateFields(run, node, { ...config, source: config.source }); }
+async function executeContactSetValue(run, node, config) { return executeContactUpdateFields(run, node, { ...config, value_cents: config.value_cents ?? config.value }); }
+async function executeContactSetJobType(run, node, config) { return executeContactUpdateFields(run, node, { ...config, job_type: config.job_type }); }
+async function executeContactSetLocation(run, node, config) { return executeContactUpdateFields(run, node, { ...config, lat: config.lat, lng: config.lng }); }
+
+async function executeContactSetCustomField(run, node, config) {
+  const field = (config.field || "").toString();
+  if (!["u1", "u2", "u3", "u4", "u5"].includes(field)) throw new Error("invalid_custom_field");
+  return executeContactUpdateFields(run, node, { contact_id: config.contact_id, [field]: config.value });
+}
+
+async function executeContactAddNote(run, node, config) {
+  return insertContactActivity(run, node, { ...config, activity_type: "note" });
+}
+
+async function executeContactAddActivity(run, node, config) {
+  return insertContactActivity(run, node, config);
+}
+
+async function insertContactActivity(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const body = resolveTemplate(config.body || config.note || "", context).trim();
+  if (!body) throw new Error("activity_body_required");
+  const type = ["note", "call", "message", "email"].includes(config.activity_type) ? config.activity_type : "note";
+  const owner = await resolveCompanyUser(run.company_id, "");
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO contact_activities(company_id, contact_id, created_by_user_id, activity_type, body, source, automation_run_id, automation_node_id)
+     VALUES($1,$2,$3,$4,$5,'automation',$6,$7) RETURNING id, contact_id, activity_type, body, created_at`,
+    [run.company_id, contactId, owner, type, body, run.id, node.id]
+  );
+  return rows[0];
+}
+
+async function executeContactAddToMap(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const contact = await loadContactContext(run.company_id, contactId);
+  const lat = numOrNull(config.lat ?? contact.lat);
+  const lng = numOrNull(config.lng ?? contact.lng);
+  if (lat == null || lng == null) throw new Error("contact_coordinates_required");
+  const owner = await resolveCompanyUser(run.company_id, "");
+  const id = randomUUID();
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO map_pins(id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+    [id, owner, lat, lng, contact.name || "", contact.address || "", resolveTemplate(config.notes || "", context), config.status || "lead", contact.phone || null, contact.email || null, contactId]
+  );
+  return { pin_id: rows[0].id, contact_id: contactId };
+}
+
+function intOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n) : null;
+}
+
+function numOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function getRunVariable(runId, name) {
+  return (await ctx.pool.query(`SELECT value FROM automation_variables WHERE run_id = $1 AND name = $2`, [runId, name])).rows[0]?.value || null;
+}
+
+async function setRunVariable(runId, name, value) {
+  await ctx.pool.query(
+    `INSERT INTO automation_variables(run_id, name, value) VALUES($1,$2,$3::jsonb)
+     ON CONFLICT(run_id, name) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [runId, name, JSON.stringify(value)]
+  );
+}
+
+function automationPayload(run, node, extra = {}) {
+  return {
+    ...extra,
+    origin_run_id: run.id,
+    origin_node_id: node?.id || null,
+    root_run_id: run.root_run_id || run.id,
+    automation_event_depth: Number(extra.automation_event_depth || 0) + 1
+  };
+}
+
+function contactChangedFields(before, after, fields) {
+  const changed = [];
+  for (const field of fields) {
+    const oldValue = before?.[field] ?? null;
+    const newValue = after?.[field] ?? null;
+    if (JSON.stringify(oldValue) !== JSON.stringify(newValue)) changed.push({ field, old_value: oldValue, new_value: newValue });
+  }
+  return changed;
+}
+
+async function emitContactChangeEvents(companyId, contactId, source, actorUserId, changedFields, payload = {}) {
+  if (!changedFields.length) return;
+  await emitAutomationEvent({ companyId, eventType: "contact.updated", subjectType: "contact", subjectId: contactId, actorUserId, source, payload: { ...payload, changed_fields: changedFields } });
+  await emitAutomationEvent({ companyId, eventType: "contact.field_changed", subjectType: "contact", subjectId: contactId, actorUserId, source, payload: { ...payload, changed_fields: changedFields } });
+  for (const item of changedFields) {
+    const eventType = contactFieldEventType(item.field);
+    if (eventType) await emitAutomationEvent({ companyId, eventType, subjectType: "contact", subjectId: contactId, actorUserId, source, payload: { ...payload, changed_fields: [item], field: item.field, old_value: item.old_value, new_value: item.new_value } });
+  }
+}
+
+function contactFieldEventType(field) {
+  if (["name", "phone", "email", "address", "job_type", "source"].includes(field)) return `contact.${field}_changed`;
+  if (field === "value_cents") return "contact.value_changed";
+  if (["u1", "u2", "u3", "u4", "u5"].includes(field)) return `contact.${field}_changed`;
+  if (field === "lat" || field === "lng") return "contact.location_changed";
+  return null;
+}
+
+async function emitContactTagEvents(run, node, contactId, result) {
+  const payload = automationPayload(run, node, { contact_id: contactId, tags: result.next, added_tags: result.added, removed_tags: result.removed });
+  if (result.added.length) await emitAutomationEvent({ companyId: run.company_id, eventType: "contact.tag_added", subjectType: "contact", subjectId: contactId, source: "automation", payload });
+  if (result.removed.length) await emitAutomationEvent({ companyId: run.company_id, eventType: "contact.tag_removed", subjectType: "contact", subjectId: contactId, source: "automation", payload });
+  if (result.added.length || result.removed.length) await emitAutomationEvent({ companyId: run.company_id, eventType: "contact.tags_changed", subjectType: "contact", subjectId: contactId, source: "automation", payload });
+}
+
 async function executePipelineMoveStage(run, node, config) {
   const context = await buildRunContext(run);
   const contactId = await resolveContactId(run, context, config);
   const stageId = resolveTemplate(config.stage_id || "", context);
   const stage = await ctx.pool.query(`SELECT id FROM stages WHERE id = $1 AND company_id = $2`, [stageId, run.company_id]);
   if (!stage.rowCount) throw new Error("stage_not_found");
-  const id = config.opportunity_id || randomUUID();
+  const existing = (await ctx.pool.query(`SELECT * FROM opportunities WHERE company_id = $1 AND contact_id = $2 LIMIT 1`, [run.company_id, contactId])).rows[0];
+  if (!existing && (config.if_missing || "fail") !== "create") throw new Error("opportunity_not_found");
+  const id = existing?.id || config.opportunity_id || randomUUID();
   const { rows } = await ctx.pool.query(
     `INSERT INTO opportunities(id, user_id, company_id, contact_id, state, stage_id)
      VALUES($1, (SELECT owner_user_id FROM companies WHERE id = $2), $2, $3, 'stage', $4)
@@ -1586,7 +2082,148 @@ async function executePipelineMoveStage(run, node, config) {
      RETURNING id, stage_id`,
     [id, run.company_id, contactId, stageId]
   );
-  return rows[0];
+  await emitPipelineStageEvents(run.company_id, rows[0].id, contactId, existing, rows[0], "automation", automationPayload(run, node, {}));
+  return { opportunity_id: rows[0].id, previous_stage_id: existing?.stage_id || null, stage_id: rows[0].stage_id };
+}
+
+async function executePipelineCreateOpportunity(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const existing = (await ctx.pool.query(`SELECT * FROM opportunities WHERE company_id = $1 AND contact_id = $2 LIMIT 1`, [run.company_id, contactId])).rows[0];
+  if (existing) {
+    if ((config.if_exists || "reuse") === "fail") throw new Error("opportunity_exists");
+    if (config.if_exists === "move") return executePipelineMoveStage(run, node, { ...config, if_missing: "create" });
+    return { opportunity_id: existing.id, contact_id: contactId, reused: true, stage_id: existing.stage_id };
+  }
+  const stageId = resolveTemplate(config.stage_id || "", context);
+  if (!stageId) throw new Error("stage_id_required");
+  const stage = await ctx.pool.query(`SELECT id FROM stages WHERE id = $1 AND company_id = $2`, [stageId, run.company_id]);
+  if (!stage.rowCount) throw new Error("stage_not_found");
+  const owner = await resolveCompanyUser(run.company_id, "");
+  const id = randomUUID();
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO opportunities(id, user_id, company_id, contact_id, state, stage_id) VALUES($1,$2,$3,$4,'stage',$5) RETURNING *`,
+    [id, owner, run.company_id, contactId, stageId]
+  );
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "pipeline.opportunity_created", subjectType: "opportunity", subjectId: id, source: "automation", dedupeKey: `pipeline.opportunity_created:${id}`, payload: automationPayload(run, node, { opportunity_id: id, contact_id: contactId, stage_id: stageId }) });
+  await emitPipelineStageEvents(run.company_id, id, contactId, null, rows[0], "automation", automationPayload(run, node, {}));
+  return { opportunity_id: id, contact_id: contactId, stage_id: stageId };
+}
+
+async function executePipelineRemoveOpportunity(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const opp = await resolveOpportunity(run.company_id, contactId, config.opportunity_id);
+  await ctx.pool.query(`DELETE FROM opportunities WHERE id = $1 AND company_id = $2`, [opp.id, run.company_id]);
+  const payload = automationPayload(run, node, { opportunity_id: opp.id, contact_id: contactId, stage_id: opp.stage_id, previous_stage_id: opp.stage_id });
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "pipeline.opportunity_removed", subjectType: "opportunity", subjectId: opp.id, source: "automation", payload });
+  if (opp.stage_id) await emitAutomationEvent({ companyId: run.company_id, eventType: "pipeline.stage_exited", subjectType: "opportunity", subjectId: opp.id, source: "automation", payload });
+  return { opportunity_id: opp.id, removed: true };
+}
+
+async function executePipelineMarkWon(run, node, config) {
+  return updateOpportunityState(run, node, config, "won", "pipeline.won");
+}
+
+async function executePipelineMarkLost(run, node, config) {
+  return updateOpportunityState(run, node, config, "lost", "pipeline.lost");
+}
+
+async function executePipelineReopen(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const stageId = resolveTemplate(config.stage_id || "", context);
+  if (!stageId) throw new Error("stage_id_required");
+  const opp = await resolveOpportunity(run.company_id, contactId, config.opportunity_id);
+  const { rows } = await ctx.pool.query(`UPDATE opportunities SET state = 'stage', stage_id = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [opp.id, run.company_id, stageId]);
+  const payload = automationPayload(run, node, { opportunity_id: opp.id, contact_id: contactId, previous_state: opp.state, stage_id: stageId, previous_stage_id: opp.stage_id });
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "pipeline.reopened", subjectType: "opportunity", subjectId: opp.id, source: "automation", payload });
+  await emitPipelineStageEvents(run.company_id, opp.id, contactId, opp, rows[0], "automation", payload);
+  return { opportunity_id: opp.id, stage_id: stageId, previous_state: opp.state };
+}
+
+async function executePipelineSetValue(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const value = intOrNull(resolveTemplate(config.value_cents ?? config.value ?? "", context));
+  if (value == null) throw new Error("value_required");
+  const before = (await ctx.pool.query(`SELECT * FROM contacts WHERE id::text = $1 AND company_id = $2`, [contactId, run.company_id])).rows[0];
+  const { rows } = await ctx.pool.query(`UPDATE contacts SET value_cents = $3, updated_at = now() WHERE id::text = $1 AND company_id = $2 RETURNING *`, [contactId, run.company_id, value]);
+  const changed = contactChangedFields(before, rows[0], ["value_cents"]);
+  await emitContactChangeEvents(run.company_id, contactId, "automation", null, changed, automationPayload(run, node, { contact_id: contactId }));
+  const opp = await resolveOpportunity(run.company_id, contactId, config.opportunity_id).catch(() => null);
+  if (opp) await emitAutomationEvent({ companyId: run.company_id, eventType: "pipeline.value_changed", subjectType: "opportunity", subjectId: opp.id, source: "automation", payload: automationPayload(run, node, { opportunity_id: opp.id, contact_id: contactId, value_cents: value }) });
+  return { contact_id: contactId, value_cents: value };
+}
+
+async function updateOpportunityState(run, node, config, state, eventType) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const opp = await resolveOpportunity(run.company_id, contactId, config.opportunity_id);
+  const { rows } = await ctx.pool.query(`UPDATE opportunities SET state = $3, stage_id = NULL, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [opp.id, run.company_id, state]);
+  const payload = automationPayload(run, node, { opportunity_id: opp.id, contact_id: contactId, previous_state: opp.state, previous_stage_id: opp.stage_id, state, reason: config.reason || null });
+  if (opp.stage_id) await emitAutomationEvent({ companyId: run.company_id, eventType: "pipeline.stage_exited", subjectType: "opportunity", subjectId: opp.id, source: "automation", payload });
+  await emitAutomationEvent({ companyId: run.company_id, eventType, subjectType: "opportunity", subjectId: opp.id, source: "automation", payload });
+  return { opportunity_id: opp.id, state: rows[0].state, previous_stage_id: opp.stage_id };
+}
+
+async function resolveOpportunity(companyId, contactId, opportunityId) {
+  const row = opportunityId
+    ? (await ctx.pool.query(`SELECT * FROM opportunities WHERE id = $1 AND company_id = $2`, [opportunityId, companyId])).rows[0]
+    : (await ctx.pool.query(`SELECT * FROM opportunities WHERE company_id = $1 AND contact_id = $2 LIMIT 1`, [companyId, contactId])).rows[0];
+  if (!row) throw new Error("opportunity_not_found");
+  return row;
+}
+
+async function emitPipelineStageEvents(companyId, opportunityId, contactId, before, after, source, payload = {}) {
+  const oldStage = before?.stage_id || null;
+  const newStage = after?.stage_id || null;
+  if (oldStage && oldStage !== newStage) await emitAutomationEvent({ companyId, eventType: "pipeline.stage_exited", subjectType: "opportunity", subjectId: opportunityId, source, payload: { ...payload, opportunity_id: opportunityId, contact_id: contactId, previous_stage_id: oldStage, stage_id: oldStage, new_stage_id: newStage } });
+  if (newStage && oldStage !== newStage) await emitAutomationEvent({ companyId, eventType: "pipeline.stage_entered", subjectType: "opportunity", subjectId: opportunityId, source, payload: { ...payload, opportunity_id: opportunityId, contact_id: contactId, previous_stage_id: oldStage, stage_id: newStage, new_stage_id: newStage } });
+  if (oldStage !== newStage) {
+    await emitAutomationEvent({ companyId, eventType: "pipeline.stage_changed", subjectType: "opportunity", subjectId: opportunityId, source, payload: { ...payload, opportunity_id: opportunityId, contact_id: contactId, previous_stage_id: oldStage, old_stage_id: oldStage, stage_id: newStage, new_stage_id: newStage } });
+    await emitAutomationEvent({ companyId, eventType: "pipeline.opportunity_moved", subjectType: "opportunity", subjectId: opportunityId, source, payload: { ...payload, opportunity_id: opportunityId, contact_id: contactId, previous_stage_id: oldStage, stage_id: newStage } });
+  }
+}
+
+async function executePipelineCreateReminder(run, node, config) {
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const opp = await resolveOpportunity(run.company_id, contactId, config.opportunity_id).catch(() => null);
+  const owner = await resolveCompanyUser(run.company_id, config.assigned_user_id || "");
+  const remindAt = resolveTemplate(config.remind_at || "", context);
+  if (!remindAt) throw new Error("remind_at_required");
+  const note = resolveTemplate(config.note || config.title || "Automation reminder", context);
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO stage_reminders(user_id, contact_id, opportunity_id, remind_at, note) VALUES($1,$2,$3,$4::timestamptz,$5) RETURNING *`,
+    [owner, contactId, opp?.id || null, remindAt, note]
+  );
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "pipeline.reminder_created", subjectType: opp ? "opportunity" : "contact", subjectId: opp?.id || contactId, source: "automation", payload: automationPayload(run, node, { reminder_id: rows[0].id, contact_id: contactId, opportunity_id: opp?.id || null }) });
+  return { reminder_id: rows[0].id, contact_id: contactId, opportunity_id: opp?.id || null };
+}
+
+async function executePipelineCompleteReminder(run, node, config) {
+  return updateReminderArchived(run, node, config, "pipeline.reminder_completed");
+}
+
+async function executePipelineArchiveReminder(run, node, config) {
+  return updateReminderArchived(run, node, config, "pipeline.reminder_archived");
+}
+
+async function updateReminderArchived(run, node, config, eventType) {
+  const context = await buildRunContext(run);
+  const reminderId = resolveTemplate(config.reminder_id || "", context);
+  if (!reminderId) throw new Error("reminder_id_required");
+  const { rows } = await ctx.pool.query(
+    `UPDATE stage_reminders sr SET archived = true, updated_at = now()
+      FROM users u
+      WHERE sr.id = $1 AND sr.user_id = u.id AND u.company_id = $2
+      RETURNING sr.*`,
+    [reminderId, run.company_id]
+  );
+  if (!rows.length) throw new Error("reminder_not_found");
+  await emitAutomationEvent({ companyId: run.company_id, eventType, subjectType: rows[0].opportunity_id ? "opportunity" : "contact", subjectId: rows[0].opportunity_id || rows[0].contact_id, source: "automation", payload: automationPayload(run, node, { reminder_id: reminderId, contact_id: rows[0].contact_id, opportunity_id: rows[0].opportunity_id }) });
+  return { reminder_id: reminderId, archived: true };
 }
 
 async function executeTaskCreate(run, node, config) {

@@ -4572,6 +4572,49 @@ function companyOrUserContactWhere(req, alias = "") {
     : { sql: `${p}user_id = $1`, values: [req.userId] };
 }
 
+function contactTagsArray(value) {
+  if (Array.isArray(value)) return value.flatMap(contactTagsArray);
+  if (value == null) return [];
+  return String(value).split(",").map((t) => t.trim()).filter(Boolean);
+}
+
+function contactChangedFields(before, after, fields) {
+  return fields
+    .map((field) => ({ field, old_value: before?.[field] ?? null, new_value: after?.[field] ?? null }))
+    .filter((item) => JSON.stringify(item.old_value) !== JSON.stringify(item.new_value));
+}
+
+function contactFieldEventType(field) {
+  if (["name", "phone", "email", "address", "job_type", "source"].includes(field)) return `contact.${field}_changed`;
+  if (field === "value_cents") return "contact.value_changed";
+  if (["u1", "u2", "u3", "u4", "u5"].includes(field)) return `contact.${field}_changed`;
+  if (field === "lat" || field === "lng") return "contact.location_changed";
+  return null;
+}
+
+async function emitContactUpdateEvents({ companyId, contactId, actorUserId, source, changedFields, extra = {} }) {
+  if (!companyId || !changedFields.length) return;
+  const base = { contact_id: contactId, changed_fields: changedFields, ...extra };
+  await emitAutomationEvent({ companyId, eventType: "contact.updated", subjectType: "contact", subjectId: contactId, actorUserId, source, payload: base });
+  await emitAutomationEvent({ companyId, eventType: "contact.field_changed", subjectType: "contact", subjectId: contactId, actorUserId, source, payload: base });
+  for (const change of changedFields) {
+    const eventType = contactFieldEventType(change.field);
+    if (eventType) await emitAutomationEvent({ companyId, eventType, subjectType: "contact", subjectId: contactId, actorUserId, source, payload: { ...base, changed_fields: [change], field: change.field, old_value: change.old_value, new_value: change.new_value } });
+  }
+}
+
+async function emitContactTagEvents({ companyId, contactId, actorUserId, source, previousTags, nextTags, extra = {} }) {
+  if (!companyId) return;
+  const prevLower = previousTags.map((t) => t.toLowerCase());
+  const nextLower = nextTags.map((t) => t.toLowerCase());
+  const added = nextTags.filter((t) => !prevLower.includes(t.toLowerCase()));
+  const removed = previousTags.filter((t) => !nextLower.includes(t.toLowerCase()));
+  const payload = { contact_id: contactId, tags: nextTags, added_tags: added, removed_tags: removed, ...extra };
+  if (added.length) await emitAutomationEvent({ companyId, eventType: "contact.tag_added", subjectType: "contact", subjectId: contactId, actorUserId, source, payload });
+  if (removed.length) await emitAutomationEvent({ companyId, eventType: "contact.tag_removed", subjectType: "contact", subjectId: contactId, actorUserId, source, payload });
+  if (added.length || removed.length) await emitAutomationEvent({ companyId, eventType: "contact.tags_changed", subjectType: "contact", subjectId: contactId, actorUserId, source, payload });
+}
+
 // ---------- contacts (AUTH REQUIRED + COMPANY-SCOPED) ----------
 app.get("/api/contacts", authRequired, async (req, res) => {
   const q = (req.query.q || "").toString().trim();
@@ -4628,7 +4671,7 @@ app.post("/api/contacts", authRequired, async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
-    u1, u2, u3, u4, u5, lead_info
+    u1, u2, u3, u4, u5, lead_info, source
   } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
 
@@ -4637,9 +4680,9 @@ app.post("/api/contacts", authRequired, async (req, res) => {
     const r = await pool.query(
       `
       INSERT INTO contacts (
-        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info
+        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info, source
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
       ) RETURNING *;
       `,
       [
@@ -4647,10 +4690,12 @@ app.post("/api/contacts", authRequired, async (req, res) => {
         Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
         lat ?? null, lng ?? null, tags || "", job_type || "",
         u1 || "", u2 || "", u3 || "", u4 || "", u5 || "",
-        Array.isArray(lead_info) ? JSON.stringify(lead_info) : null
+        Array.isArray(lead_info) ? JSON.stringify(lead_info) : null,
+        source || "manual"
       ]
     );
     if (req.companyId) {
+      const origin = source || "manual";
       await emitAutomationEvent({
         companyId: req.companyId,
         eventType: "contact.created",
@@ -4659,7 +4704,22 @@ app.post("/api/contacts", authRequired, async (req, res) => {
         actorUserId: req.userId,
         source: "contacts.api",
         dedupeKey: `contact.created:${r.rows[0].id}`,
-        payload: { contact_id: r.rows[0].id, name: r.rows[0].name }
+        payload: { contact_id: r.rows[0].id, name: r.rows[0].name, source: origin }
+      });
+      const sourceEvent = origin === "csv" ? "contact.imported_csv"
+        : origin === "phone" ? "contact.imported_phone"
+          : origin === "map" ? "contact.converted_from_map_pin"
+            : origin === "schedule" ? "contact.created_from_schedule"
+              : "contact.created_manually";
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: sourceEvent,
+        subjectType: "contact",
+        subjectId: r.rows[0].id,
+        actorUserId: req.userId,
+        source: `contacts.${origin}`,
+        dedupeKey: `${sourceEvent}:${r.rows[0].id}`,
+        payload: { contact_id: r.rows[0].id, name: r.rows[0].name, source: origin }
       });
     }
     res.status(201).json(r.rows[0]);
@@ -4673,10 +4733,14 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
-    u1, u2, u3, u4, u5, lead_info
+    u1, u2, u3, u4, u5, lead_info, source
   } = req.body || {};
   try {
     const scope = companyOrUserContactWhere(req);
+    const before = (await pool.query(
+      `SELECT * FROM contacts WHERE id = $1 AND ${scope.sql.replace("$1", "$2")}`,
+      [req.params.id, ...scope.values]
+    )).rows[0];
     // lead_info: null means "leave as-is"; explicit array (even empty) overwrites.
     const leadInfoParam = Array.isArray(lead_info) ? JSON.stringify(lead_info) : null;
     const r = await pool.query(
@@ -4696,8 +4760,9 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
         u3 = COALESCE($13,u3),
         u4 = COALESCE($14,u4),
         u5 = COALESCE($15,u5),
-        lead_info = COALESCE($16::jsonb, lead_info)
-      WHERE id = $1 AND ${scope.sql.replace("$1", "$17")}
+        lead_info = COALESCE($16::jsonb, lead_info),
+        source = COALESCE($17, source)
+      WHERE id = $1 AND ${scope.sql.replace("$1", "$18")}
       RETURNING *;
       `,
       [
@@ -4705,20 +4770,18 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
         Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
         lat ?? null, lng ?? null, tags, job_type, u1, u2, u3, u4, u5,
         leadInfoParam,
+        source,
         ...scope.values
       ]
     );
     if (!r.rowCount) return res.status(404).json({ error: "not_found" });
     if (req.companyId) {
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "contact.updated",
-        subjectType: "contact",
-        subjectId: r.rows[0].id,
-        actorUserId: req.userId,
-        source: "contacts.api",
-        payload: { contact_id: r.rows[0].id, changed_fields: Object.keys(req.body || {}) }
-      });
+      const fields = ["name", "phone", "email", "address", "value_cents", "lat", "lng", "job_type", "u1", "u2", "u3", "u4", "u5", "source"].filter((key) => Object.prototype.hasOwnProperty.call(req.body || {}, key));
+      const changed = contactChangedFields(before, r.rows[0], fields);
+      await emitContactUpdateEvents({ companyId: req.companyId, contactId: r.rows[0].id, actorUserId: req.userId, source: "contacts.api", changedFields: changed });
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, "tags")) {
+        await emitContactTagEvents({ companyId: req.companyId, contactId: r.rows[0].id, actorUserId: req.userId, source: "contacts.api", previousTags: contactTagsArray(before?.tags), nextTags: contactTagsArray(r.rows[0].tags) });
+      }
     }
     res.json(r.rows[0]);
   } catch (e) {
@@ -4733,6 +4796,10 @@ app.delete("/api/contacts/:id", authRequired, async (req, res) => {
       return res.status(403).json({ error: "permission_denied" });
     }
     const scope = companyOrUserContactWhere(req);
+    const before = (await pool.query(
+      `SELECT id, name, tags FROM contacts WHERE id = $1 AND ${scope.sql.replace("$1", "$2")}`,
+      [req.params.id, ...scope.values]
+    )).rows[0];
     await pool.query(
       `UPDATE schedule_events
        SET contact_id = NULL, updated_at = now()
@@ -4747,6 +4814,18 @@ app.delete("/api/contacts/:id", authRequired, async (req, res) => {
       `DELETE FROM contacts WHERE id = $1 AND ${scope.sql.replace("$1", "$2")}`,
       [req.params.id, ...scope.values]
     );
+    if (r.rowCount && req.companyId) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "contact.deleted",
+        subjectType: "contact",
+        subjectId: req.params.id,
+        actorUserId: req.userId,
+        source: "contacts.api",
+        dedupeKey: `contact.deleted:${req.params.id}`,
+        payload: { contact_id: req.params.id, name: before?.name || null, tags: contactTagsArray(before?.tags) }
+      });
+    }
     res.status(204).end();
   } catch (e) {
     console.error(e);
@@ -5194,6 +5273,18 @@ app.post("/api/stage-reminders", authRequired, async (req, res) => {
        RETURNING id, contact_id, opportunity_id, remind_at, note, archived`,
       [req.userId, contact_id, opportunity_id || null, remind_at, note || null]
     );
+    if (req.companyId) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "pipeline.reminder_created",
+        subjectType: opportunity_id ? "opportunity" : "contact",
+        subjectId: opportunity_id || contact_id,
+        actorUserId: req.userId,
+        source: "stage_reminders.api",
+        dedupeKey: `pipeline.reminder_created:${rows[0].id}`,
+        payload: { reminder_id: rows[0].id, contact_id, opportunity_id: opportunity_id || null, remind_at }
+      });
+    }
     res.status(201).json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_create_reminder" }); }
 });
@@ -5212,6 +5303,17 @@ app.put("/api/stage-reminders/:id", authRequired, async (req, res) => {
       [req.params.id, remind_at || null, note ?? null, typeof archived === "boolean" ? archived : null, req.userId]
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
+    if (req.companyId && archived === true) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "pipeline.reminder_archived",
+        subjectType: rows[0].opportunity_id ? "opportunity" : "contact",
+        subjectId: rows[0].opportunity_id || rows[0].contact_id,
+        actorUserId: req.userId,
+        source: "stage_reminders.api",
+        payload: { reminder_id: rows[0].id, contact_id: rows[0].contact_id, opportunity_id: rows[0].opportunity_id }
+      });
+    }
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_update_reminder" }); }
 });
@@ -5815,6 +5917,16 @@ app.post("/webhooks/leads/:token", async (req, res) => {
         stageResult.stage_id = autoStageId;
         await emitAutomationEvent({
           companyId,
+          eventType: "pipeline.opportunity_created",
+          subjectType: "opportunity",
+          subjectId: oppId,
+          actorUserId: userId,
+          source: "lead_intake",
+          dedupeKey: externalLeadId ? `pipeline.opportunity_created:${source}:${externalLeadId}` : `pipeline.opportunity_created:${oppId}`,
+          payload: { opportunity_id: oppId, contact_id: contactId, stage_id: autoStageId, source }
+        });
+        await emitAutomationEvent({
+          companyId,
           eventType: "pipeline.stage_entered",
           subjectType: "opportunity",
           subjectId: oppId,
@@ -5866,6 +5978,29 @@ app.post("/webhooks/leads/:token", async (req, res) => {
       fallback_used: fallbackUsed
     }
   });
+  const leadEvents = ["lead.received_external", "lead.received_webhook", "lead.received_zapier"];
+  if (source && /facebook|meta|instagram/i.test(source)) leadEvents.push("lead.received_meta", "lead.external_form_received");
+  if (source && /website|site/i.test(source)) leadEvents.push("lead.received_website");
+  for (const eventType of leadEvents) {
+    await emitAutomationEvent({
+      companyId,
+      eventType,
+      subjectType: "contact",
+      subjectId: contactRow.id,
+      actorUserId: userId,
+      source: "lead_intake",
+      dedupeKey: externalLeadId ? `${eventType}:${source}:${externalLeadId}` : `${eventType}:${contactRow.id}`,
+      payload: {
+        contact_id: contactRow.id,
+        source,
+        external_lead_id: externalLeadId,
+        form_id: formId,
+        page_id: pageId,
+        submitted_at: submittedAtSafe,
+        lead_info: leadInfo
+      }
+    });
+  }
   return res.status(201).json(responseBody);
 });
 
@@ -6123,9 +6258,10 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
   if (!contact_id || !state) return res.status(400).json({ error: "missing_params" });
   try {
     const previous = await pool.query(
-      `SELECT stage_id FROM opportunities WHERE id = $1 AND (user_id = $2 OR company_id = $3) LIMIT 1`,
+      `SELECT * FROM opportunities WHERE id = $1 AND (user_id = $2 OR company_id = $3) LIMIT 1`,
       [req.params.id, req.userId, req.companyId || null]
     );
+    const before = previous.rows[0] || null;
     const r = await pool.query(
       `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
@@ -6137,17 +6273,33 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
        RETURNING id, contact_id, state, stage_id, created_at`,
       [req.params.id, req.userId, req.companyId || null, contact_id, state, stage_id || null, created_at || null]
     );
-    const oldStageId = previous.rows[0]?.stage_id || null;
-    if (req.companyId && stage_id && oldStageId !== stage_id) {
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "pipeline.stage_entered",
-        subjectType: "opportunity",
-        subjectId: r.rows[0].id,
-        actorUserId: req.userId,
-        source: "opportunities.api",
-        payload: { opportunity_id: r.rows[0].id, contact_id, stage_id, previous_stage_id: oldStageId }
-      });
+    if (req.companyId) {
+      const after = r.rows[0];
+      const base = { opportunity_id: after.id, contact_id, state: after.state, stage_id: after.stage_id, previous_state: before?.state || null, previous_stage_id: before?.stage_id || null };
+      if (!before) {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.opportunity_created", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", dedupeKey: `pipeline.opportunity_created:${after.id}`, payload: base });
+      } else {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.opportunity_updated", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", payload: base });
+      }
+      if (before?.stage_id && before.stage_id !== after.stage_id) {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.stage_exited", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", payload: { ...base, stage_id: before.stage_id, new_stage_id: after.stage_id } });
+      }
+      if (after.stage_id && before?.stage_id !== after.stage_id) {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.stage_entered", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", payload: { ...base, stage_id: after.stage_id, new_stage_id: after.stage_id } });
+      }
+      if (before && before.stage_id !== after.stage_id) {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.stage_changed", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", payload: { ...base, old_stage_id: before.stage_id, new_stage_id: after.stage_id } });
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.opportunity_moved", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", payload: base });
+      }
+      if (before?.state !== "won" && after.state === "won") {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.won", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", payload: base });
+      }
+      if (before?.state !== "lost" && after.state === "lost") {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.lost", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", payload: base });
+      }
+      if (["won", "lost"].includes(before?.state) && after.state === "stage") {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.reopened", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", payload: base });
+      }
     }
     res.json(r.rows[0]);
   } catch (e) { console.error("[opportunities] upsert failed:", e); res.status(500).json({ error: "failed_upsert_opportunity" }); }
@@ -6155,11 +6307,17 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
 
 app.delete("/api/opportunities/:id", authRequired, async (req, res) => {
   try {
-    await pool.query(
+    const before = (await pool.query(
       `DELETE FROM opportunities
        WHERE id = $1
-         AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))`,
-      [req.params.id, req.userId, req.companyId || null]);
+         AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))
+       RETURNING *`,
+      [req.params.id, req.userId, req.companyId || null])).rows?.[0];
+    if (before && req.companyId) {
+      const payload = { opportunity_id: before.id, contact_id: before.contact_id, stage_id: before.stage_id, previous_stage_id: before.stage_id, state: before.state };
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.opportunity_removed", subjectType: "opportunity", subjectId: before.id, actorUserId: req.userId, source: "opportunities.api", payload });
+      if (before.stage_id) await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.stage_exited", subjectType: "opportunity", subjectId: before.id, actorUserId: req.userId, source: "opportunities.api", payload });
+    }
     res.status(204).end();
   } catch (e) { console.error("[opportunities] delete failed:", e); res.status(500).json({ error: "failed_delete_opportunity" }); }
 });
