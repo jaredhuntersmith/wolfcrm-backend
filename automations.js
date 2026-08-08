@@ -100,10 +100,36 @@ const triggerCatalog = [
 }));
 
 const actionCatalog = [
+  ["contact.create", "Create Contact", "Contacts", "Creates a company contact.", ["generic"], ["default"]],
+  ["contact.delete", "Delete Contact", "Contacts", "Deletes a contact after explicit node confirmation.", ["contact"], ["default"]],
+  ["contact.restore", "Restore Contact", "Contacts", "Reserved for future soft-delete restore support.", ["contact"], ["default"]],
   ["contact.add_tag", "Add Contact Tag", "Contacts", "Adds one or more tags without removing existing tags.", ["contact"], ["default"]],
   ["contact.remove_tag", "Remove Contact Tag", "Contacts", "Removes selected tags from a contact.", ["contact"], ["default"]],
+  ["contact.replace_tags", "Replace Contact Tags", "Contacts", "Replaces all contact tags with a new list.", ["contact"], ["default"]],
+  ["contact.clear_tags", "Clear Contact Tags", "Contacts", "Removes all tags from a contact.", ["contact"], ["default"]],
   ["contact.update_fields", "Update Contact Fields", "Contacts", "Updates whitelisted contact fields.", ["contact"], ["default"]],
+  ["contact.assign_user", "Assign Contact User", "Contacts", "Deferred because contacts do not currently have an assignment column.", ["contact"], ["default"]],
+  ["contact.unassign_user", "Unassign Contact User", "Contacts", "Deferred because contacts do not currently have an assignment column.", ["contact"], ["default"]],
+  ["contact.set_source", "Set Contact Source", "Contacts", "Sets the contact source field.", ["contact"], ["default"]],
+  ["contact.set_value", "Set Contact Value", "Contacts", "Sets the contact value.", ["contact"], ["default"]],
+  ["contact.set_job_type", "Set Job Type", "Contacts", "Sets the contact job type.", ["contact"], ["default"]],
+  ["contact.set_custom_field", "Set Custom Field", "Contacts", "Sets one of the five contact custom fields.", ["contact"], ["default"]],
+  ["contact.set_location", "Set Contact Location", "Contacts", "Sets contact latitude/longitude.", ["contact"], ["default"]],
+  ["contact.add_note", "Add Contact Note", "Contacts", "Adds a server-synced contact note/activity.", ["contact"], ["default"]],
+  ["contact.add_activity", "Add Contact Activity", "Contacts", "Adds a server-synced contact activity entry.", ["contact"], ["default"]],
+  ["contact.add_to_map", "Add Contact to Map", "Contacts", "Creates a map pin linked to the contact.", ["contact"], ["default"]],
+  ["pipeline.create_opportunity", "Create Opportunity", "Pipeline", "Creates an active opportunity for a contact.", ["contact"], ["default"]],
   ["pipeline.move_stage", "Move Pipeline Stage", "Pipeline", "Moves an existing contact opportunity to a stage.", ["contact", "opportunity"], ["default"]],
+  ["pipeline.remove_opportunity", "Remove Opportunity", "Pipeline", "Removes a contact from the active pipeline.", ["contact", "opportunity"], ["default"]],
+  ["pipeline.mark_won", "Mark Opportunity Won", "Pipeline", "Marks an opportunity sold/won.", ["contact", "opportunity"], ["default"]],
+  ["pipeline.mark_lost", "Mark Opportunity Lost", "Pipeline", "Marks an opportunity lost.", ["contact", "opportunity"], ["default"]],
+  ["pipeline.reopen", "Reopen Opportunity", "Pipeline", "Reopens a won/lost opportunity into a selected stage.", ["contact", "opportunity"], ["default"]],
+  ["pipeline.set_value", "Set Opportunity Value", "Pipeline", "Sets the contact value used by the opportunity.", ["contact", "opportunity"], ["default"]],
+  ["pipeline.assign_salesperson", "Assign Salesperson", "Pipeline", "Deferred: current opportunity model has no salesperson column.", ["opportunity"], ["default"]],
+  ["pipeline.remove_salesperson", "Remove Salesperson", "Pipeline", "Deferred: current opportunity model has no salesperson column.", ["opportunity"], ["default"]],
+  ["pipeline.create_reminder", "Create Pipeline Reminder", "Pipeline", "Creates a server-synced follow-up reminder.", ["contact", "opportunity"], ["default"]],
+  ["pipeline.complete_reminder", "Complete Pipeline Reminder", "Pipeline", "Archives a follow-up reminder as completed.", ["contact", "opportunity"], ["default"]],
+  ["pipeline.archive_reminder", "Archive Pipeline Reminder", "Pipeline", "Archives a follow-up reminder.", ["contact", "opportunity"], ["default"]],
   ["task.create", "Create Task", "Tasks", "Creates a todo task.", ["generic"], ["default"]],
   ["notification.send_push", "Send Push Notification", "Notifications", "Sends APNs push notifications to scoped company users.", ["generic"], ["default"]],
   ["sms.send", "Send SMS", "Phone", "Sends SMS through the configured company phone line.", ["contact", "sms_conversation"], ["default"]],
@@ -118,14 +144,41 @@ const actionCatalog = [
   description,
   supported_subject_types: subjectTypes,
   outputs,
+  icon: actionIcon(key),
   config_fields: actionConfigFields(key)
 }));
 
 const actionExecutors = {
+  "contact.create": executeContactCreate,
+  "contact.delete": executeContactDelete,
+  "contact.restore": executeDeferredAction,
   "contact.add_tag": executeContactAddTag,
   "contact.remove_tag": executeContactRemoveTag,
+  "contact.replace_tags": executeContactReplaceTags,
+  "contact.clear_tags": executeContactClearTags,
   "contact.update_fields": executeContactUpdateFields,
+  "contact.assign_user": executeDeferredAction,
+  "contact.unassign_user": executeDeferredAction,
+  "contact.set_source": executeContactSetSource,
+  "contact.set_value": executeContactSetValue,
+  "contact.set_job_type": executeContactSetJobType,
+  "contact.set_custom_field": executeContactSetCustomField,
+  "contact.set_location": executeContactSetLocation,
+  "contact.add_note": executeContactAddNote,
+  "contact.add_activity": executeContactAddActivity,
+  "contact.add_to_map": executeContactAddToMap,
+  "pipeline.create_opportunity": executePipelineCreateOpportunity,
   "pipeline.move_stage": executePipelineMoveStage,
+  "pipeline.remove_opportunity": executePipelineRemoveOpportunity,
+  "pipeline.mark_won": executePipelineMarkWon,
+  "pipeline.mark_lost": executePipelineMarkLost,
+  "pipeline.reopen": executePipelineReopen,
+  "pipeline.set_value": executePipelineSetValue,
+  "pipeline.assign_salesperson": executeDeferredAction,
+  "pipeline.remove_salesperson": executeDeferredAction,
+  "pipeline.create_reminder": executePipelineCreateReminder,
+  "pipeline.complete_reminder": executePipelineCompleteReminder,
+  "pipeline.archive_reminder": executePipelineArchiveReminder,
   "task.create": executeTaskCreate,
   "notification.send_push": executePushNotification,
   "sms.send": executeSmsSend,
@@ -138,13 +191,48 @@ const actionExecutors = {
 function actionConfigFields(key) {
   const commonText = (name, label) => ({ key: name, label, type: "text" });
   switch (key) {
+    case "contact.create":
+      return ["name", "phone", "email", "address", "job_type", "source", "u1", "u2", "u3", "u4", "u5"].map((field) => commonText(field, field))
+        .concat([{ key: "value_cents", label: "Value", type: "money" }, { key: "tags", label: "Tags", type: "tag_list" }, { key: "lat", label: "Latitude", type: "number" }, { key: "lng", label: "Longitude", type: "number" }]);
     case "contact.add_tag":
     case "contact.remove_tag":
-      return [{ key: "tags", label: "Tags", type: "string_list" }];
+    case "contact.replace_tags":
+      return [{ key: "tags", label: "Tags", type: "tag_list" }];
+    case "contact.clear_tags":
+      return [];
     case "contact.update_fields":
-      return ["name", "phone", "email", "address", "job_type", "u1", "u2", "u3", "u4", "u5"].map((field) => commonText(field, field));
+      return ["name", "phone", "email", "address", "job_type", "source", "u1", "u2", "u3", "u4", "u5"].map((field) => commonText(field, field))
+        .concat([{ key: "value_cents", label: "Value", type: "money" }, { key: "lat", label: "Latitude", type: "number" }, { key: "lng", label: "Longitude", type: "number" }]);
+    case "contact.set_source":
+      return [commonText("source", "Source")];
+    case "contact.set_value":
+    case "pipeline.set_value":
+      return [{ key: "value_cents", label: "Value", type: "money" }];
+    case "contact.set_job_type":
+      return [commonText("job_type", "Job Type")];
+    case "contact.set_custom_field":
+      return [{ key: "field", label: "Custom Field", type: "select", options: ["u1", "u2", "u3", "u4", "u5"] }, commonText("value", "Value")];
+    case "contact.set_location":
+      return [{ key: "lat", label: "Latitude", type: "number" }, { key: "lng", label: "Longitude", type: "number" }];
+    case "contact.delete":
+      return [{ key: "confirm_delete", label: "Confirm Delete", type: "boolean" }];
+    case "contact.add_note":
+    case "contact.add_activity":
+      return [commonText("body", "Note"), { key: "activity_type", label: "Activity Type", type: "select", options: ["note", "call", "message", "email"] }];
+    case "contact.add_to_map":
+      return [{ key: "status", label: "Status", type: "select", options: ["lead", "won", "reloop", "later", "lost"] }, commonText("notes", "Notes")];
+    case "pipeline.create_opportunity":
+      return [{ key: "stage_id", label: "Stage ID", type: "stage" }, { key: "if_exists", label: "If Exists", type: "select", options: ["reuse", "fail", "move"] }];
     case "pipeline.move_stage":
-      return [{ key: "stage_id", label: "Stage ID", type: "stage" }];
+    case "pipeline.reopen":
+      return [{ key: "stage_id", label: "Stage ID", type: "stage" }, { key: "if_missing", label: "If Missing", type: "select", options: ["fail", "create"] }];
+    case "pipeline.mark_lost":
+      return [commonText("reason", "Reason")];
+    case "pipeline.create_reminder":
+      return [commonText("note", "Message"), { key: "remind_at", label: "Remind At", type: "datetime" }];
+    case "pipeline.complete_reminder":
+    case "pipeline.archive_reminder":
+      return [commonText("reminder_id", "Reminder ID")];
     case "task.create":
       return [commonText("title", "Title"), commonText("notes", "Notes"), { key: "due_date", label: "Due Date", type: "datetime" }, { key: "assigned_user_id", label: "Assignee", type: "user" }];
     case "notification.send_push":
