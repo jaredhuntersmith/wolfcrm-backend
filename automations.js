@@ -355,7 +355,8 @@ function installAutomationRoutes() {
         { key: "branch", display_name: "Branch", category: "Logic", description: "Routes by resolved value to named ports.", outputs: ["default"], config_fields: [{ key: "input", type: "template" }, { key: "branches", type: "string_list" }] },
         { key: "wait", display_name: "Wait", category: "Timing", description: "Persists a duration, date, or event wait.", outputs: ["default", "event", "timeout"], config_fields: [{ key: "mode", type: "select", options: ["duration", "until_datetime", "event_wait"] }] },
         { key: "variable.set", display_name: "Set Variable", category: "Utility", description: "Stores a run variable.", outputs: ["default"], config_fields: [{ key: "name", type: "text" }, { key: "value", type: "template" }] },
-        { key: "automation.start", display_name: "Start Automation", category: "Utility", description: "Starts another published automation.", outputs: ["default"], config_fields: [{ key: "automation_id", type: "automation" }] }
+        { key: "automation.start", display_name: "Start Automation", category: "Utility", description: "Starts another published automation.", outputs: ["default"], config_fields: [{ key: "automation_id", type: "automation" }] },
+        { key: "note", display_name: "Note", category: "Notes", description: "Editor-only annotation. Does not execute.", outputs: [], config_fields: [{ key: "title", type: "text" }, { key: "body", type: "multiline" }] }
       ]
     });
   });
@@ -648,7 +649,7 @@ function validateGraphPayload(payload) {
   const warnings = [];
   const nodeIds = new Set();
   const nodeKeys = new Set();
-  const validTypes = new Set(["trigger", "action", "condition", "wait", "branch", "sub_automation", "utility"]);
+  const validTypes = new Set(["trigger", "action", "condition", "wait", "branch", "sub_automation", "utility", "note"]);
   for (const node of nodes) {
     if (!node.id) errors.push("node_missing_id");
     if (!node.node_key && !node.nodeKey) errors.push("node_missing_key");
