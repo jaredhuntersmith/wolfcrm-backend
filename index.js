@@ -1982,6 +1982,55 @@ app.get("/api/voice/token", authRequired, async (req, res) => {
   }
 });
 
+app.get("/api/voice/diagnostics", authRequired, async (req, res) => {
+  const { configured, twimlAppSid, pushCredentialSid } = twilioVoiceConfig();
+  const voiceIdentity = voiceIdentityForUserID(req.userId);
+  try {
+    const activeLine = req.companyId
+      ? await pool.query(
+          `SELECT id, phone_number
+             FROM phone_lines
+            WHERE company_id = $1
+              AND active = true
+              AND status = 'active'
+              AND phone_number ~ '^\\+[1-9][0-9]{6,14}$'
+            ORDER BY created_at ASC
+            LIMIT 1`,
+          [req.companyId]
+        )
+      : { rows: [] };
+    const employer = req.companyId
+      ? await pool.query(
+          `SELECT u.id
+             FROM users u
+             LEFT JOIN companies c ON c.id = u.company_id
+            WHERE u.company_id = $1
+              AND u.deleted_at IS NULL
+              AND u.role = 'employer'
+            ORDER BY (u.id = c.owner_user_id) DESC, u.created_at ASC, u.id ASC
+            LIMIT 1`,
+          [req.companyId]
+        )
+      : { rows: [] };
+    const incomingTargetIdentity = employer.rows[0]?.id ? voiceIdentityForUserID(employer.rows[0].id) : null;
+    res.json({
+      ok: true,
+      user_id: req.userId,
+      company_id: req.companyId,
+      role: req.role,
+      voice_identity: voiceIdentity,
+      active_phone_line: activeLine.rows[0]?.phone_number || null,
+      twiml_app_configured: Boolean(twimlAppSid && configured),
+      push_credential_configured: Boolean(pushCredentialSid),
+      incoming_target_identity: incomingTargetIdentity,
+      identity_matches: Boolean(voiceIdentity && incomingTargetIdentity && voiceIdentity === incomingTargetIdentity)
+    });
+  } catch (e) {
+    console.error("[voice/diagnostics] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "voice_diagnostics_failed" });
+  }
+});
+
 app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
   try {
     const validation = validateTwilioWebhook(req);
@@ -1997,13 +2046,20 @@ app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
     const identity = req.body.ClientIdentity || req.body.From || req.body.Caller || "";
     const userID = uuidFromVoiceIdentity(identity);
     const toNumber = normalizeE164Phone(req.body.to || req.body.To);
+    console.info("[voice outgoing]", {
+      rawIdentity: identity || null,
+      requestedDestination: toNumber || null,
+      parsedUserID: userID || null,
+      hasToParam: Boolean(req.body.to),
+      hasToField: Boolean(req.body.To)
+    });
 
     if (!userID) {
-      console.warn("[twilio/voice/outgoing] invalid identity");
+      console.warn("[voice outgoing] rejected", { reason: "invalid_identity", rawIdentity: identity || null });
       return res.status(200).type("text/xml").send(voiceResponse.toString());
     }
     if (!isUsableE164(toNumber)) {
-      console.warn("[twilio/voice/outgoing] invalid destination", { userID });
+      console.warn("[voice outgoing] rejected", { reason: "invalid_destination", userID, requestedDestination: toNumber || null });
       return res.status(200).type("text/xml").send(voiceResponse.toString());
     }
 
@@ -2025,40 +2081,57 @@ app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
       [userID]
     );
     if (!rows.length) {
-      console.warn("[twilio/voice/outgoing] no active phone line", { userID });
+      console.warn("[voice outgoing] rejected", {
+        reason: "user_or_phone_line_not_found",
+        userID,
+        userFound: false,
+        phoneLineFound: false
+      });
       return res.status(200).type("text/xml").send(voiceResponse.toString());
     }
 
     const callerId = normalizeE164Phone(rows[0].phone_number);
     if (!isUsableE164(callerId)) {
-      console.warn("[twilio/voice/outgoing] invalid caller ID", { userID, companyID: rows[0].company_id });
+      console.warn("[voice outgoing] rejected", {
+        reason: "invalid_caller_id",
+        userID,
+        companyID: rows[0].company_id,
+        phoneLineFound: true
+      });
       return res.status(200).type("text/xml").send(voiceResponse.toString());
     }
 
-    const contactID = await findSmsContactID({
-      companyId: rows[0].company_id,
-      externalPhone: toNumber
-    });
-    await pool.query(
-      `INSERT INTO phone_calls(
-         company_id, phone_line_id, contact_id, twilio_call_sid, direction,
-         from_number, to_number, status, started_at
-       )
-       VALUES($1, $2, $3, $4, 'outbound', $5, $6, $7, now())
-       ON CONFLICT(twilio_call_sid)
-       DO UPDATE SET
-         status = EXCLUDED.status,
-         updated_at = now()`,
-      [
-        rows[0].company_id,
-        rows[0].phone_line_id || null,
-        contactID,
-        (req.body.CallSid || "").toString().trim() || null,
-        callerId,
-        toNumber,
-        (req.body.CallStatus || "initiated").toString()
-      ]
-    );
+    try {
+      const contactID = await findSmsContactID({
+        companyId: rows[0].company_id,
+        externalPhone: toNumber
+      });
+      await pool.query(
+        `INSERT INTO phone_calls(
+           company_id, phone_line_id, contact_id, twilio_call_sid, direction,
+           from_number, to_number, status, started_at
+         )
+         VALUES($1, $2, $3, $4, 'outbound', $5, $6, $7, now())
+         ON CONFLICT(twilio_call_sid)
+         DO UPDATE SET
+           status = EXCLUDED.status,
+           updated_at = now()`,
+        [
+          rows[0].company_id,
+          rows[0].phone_line_id || null,
+          contactID,
+          (req.body.CallSid || "").toString().trim() || null,
+          callerId,
+          toNumber,
+          (req.body.CallStatus || "initiated").toString()
+        ]
+      );
+    } catch (historyError) {
+      console.error("[voice outgoing] call history failed; continuing call routing:", {
+        code: historyError?.code,
+        message: historyError?.message
+      });
+    }
 
     const dial = voiceResponse.dial({
       callerId,
@@ -2066,6 +2139,14 @@ app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
       statusCallbackEvent: "initiated ringing answered completed"
     });
     dial.number(toNumber);
+    console.info("[voice outgoing] routing", {
+      decision: "dial_number",
+      userID,
+      companyID: rows[0].company_id,
+      phoneLineFound: true,
+      selectedCallerID: callerId,
+      destination: toNumber
+    });
     res.status(200).type("text/xml").send(voiceResponse.toString());
   } catch (e) {
     console.error("[twilio/voice/outgoing] failed:", {
@@ -2092,62 +2173,98 @@ app.post("/webhooks/twilio/voice/incoming", async (req, res) => {
     const voiceResponse = new twilio.twiml.VoiceResponse();
     const fromNumber = normalizeE164Phone(req.body.From);
     const toNumber = normalizeE164Phone(req.body.To);
+    console.info("[voice incoming]", {
+      externalFrom: fromNumber || null,
+      calledTo: toNumber || null
+    });
     if (!isUsableE164(toNumber)) {
-      console.warn("[twilio/voice/incoming] invalid destination");
+      console.warn("[voice incoming] rejected", { reason: "invalid_called_number", calledTo: toNumber || null });
       return res.status(200).type("text/xml").send(voiceResponse.toString());
     }
 
     const { rows } = await pool.query(
-      `SELECT pl.id AS phone_line_id,
+      `WITH matched_line AS (
+         SELECT id, company_id
+           FROM phone_lines
+          WHERE phone_number = $1
+            AND active = true
+            AND status = 'active'
+          LIMIT 1
+       ),
+       eligible_employers AS (
+         SELECT u.id, u.created_at, c.owner_user_id
+           FROM matched_line pl
+           JOIN users u ON u.company_id = pl.company_id
+           LEFT JOIN companies c ON c.id = pl.company_id
+          WHERE u.deleted_at IS NULL
+            AND u.role = 'employer'
+       )
+       SELECT pl.id AS phone_line_id,
               pl.company_id,
-              u.id AS owner_user_id
-         FROM phone_lines pl
-         JOIN users u ON u.company_id = pl.company_id
-         LEFT JOIN companies c ON c.id = pl.company_id
-        WHERE pl.phone_number = $1
-          AND pl.active = true
-          AND pl.status = 'active'
-          AND u.deleted_at IS NULL
-          AND u.role = 'employer'
-        ORDER BY (u.id = c.owner_user_id) DESC, u.created_at ASC, u.id ASC
+              ee.id AS owner_user_id,
+              (SELECT COUNT(*) FROM eligible_employers) AS eligible_employer_count
+         FROM matched_line pl
+         LEFT JOIN eligible_employers ee ON true
+        ORDER BY (ee.id = ee.owner_user_id) DESC, ee.created_at ASC, ee.id ASC
         LIMIT 1`,
       [toNumber]
     );
     if (!rows.length) {
-      console.warn("[twilio/voice/incoming] no route for phone line", { toNumber });
+      console.warn("[voice incoming] rejected", { reason: "phone_line_not_found", calledTo: toNumber });
       return res.status(200).type("text/xml").send(voiceResponse.toString());
     }
 
     const route = rows[0];
+    console.info("[voice incoming] route lookup", {
+      phoneLineFound: true,
+      companyID: route.company_id,
+      eligibleEmployerCount: Number(route.eligible_employer_count || 0),
+      selectedUserID: route.owner_user_id || null
+    });
+    if (!route.owner_user_id) {
+      console.warn("[voice incoming] rejected", {
+        reason: "eligible_employer_not_found",
+        companyID: route.company_id,
+        eligibleEmployerCount: Number(route.eligible_employer_count || 0)
+      });
+      return res.status(200).type("text/xml").send(voiceResponse.toString());
+    }
     const identity = voiceIdentityForUserID(route.owner_user_id);
     if (!identity) {
-      console.warn("[twilio/voice/incoming] invalid owner identity", { userID: route.owner_user_id });
+      console.warn("[voice incoming] rejected", { reason: "invalid_owner_identity", userID: route.owner_user_id });
       return res.status(200).type("text/xml").send(voiceResponse.toString());
     }
 
-    const contactID = isUsableE164(fromNumber)
-      ? await findSmsContactID({ companyId: route.company_id, externalPhone: fromNumber })
-      : null;
-    await pool.query(
-      `INSERT INTO phone_calls(
-         company_id, phone_line_id, contact_id, twilio_call_sid, direction,
-         from_number, to_number, status, started_at
-       )
-       VALUES($1, $2, $3, $4, 'inbound', $5, $6, $7, now())
-       ON CONFLICT(twilio_call_sid)
-       DO UPDATE SET
-         status = EXCLUDED.status,
-         updated_at = now()`,
-      [
-        route.company_id,
-        route.phone_line_id,
-        contactID,
-        (req.body.CallSid || "").toString().trim() || null,
-        fromNumber || null,
-        toNumber,
-        (req.body.CallStatus || "ringing").toString()
-      ]
-    );
+    try {
+      const contactID = isUsableE164(fromNumber)
+        ? await findSmsContactID({ companyId: route.company_id, externalPhone: fromNumber })
+        : null;
+      await pool.query(
+        `INSERT INTO phone_calls(
+           company_id, phone_line_id, contact_id, twilio_call_sid, direction,
+           from_number, to_number, status, started_at
+         )
+         VALUES($1, $2, $3, $4, 'inbound', $5, $6, $7, now())
+         ON CONFLICT(twilio_call_sid)
+         DO UPDATE SET
+           status = EXCLUDED.status,
+           updated_at = now()`,
+        [
+          route.company_id,
+          route.phone_line_id,
+          contactID,
+          (req.body.CallSid || "").toString().trim() || null,
+          fromNumber || null,
+          toNumber,
+          (req.body.CallStatus || "ringing").toString()
+        ]
+      );
+    } catch (historyError) {
+      console.error("[voice incoming] call history failed; continuing call routing:", {
+        code: historyError?.code,
+        message: historyError?.message
+      });
+    }
 
     const dial = voiceResponse.dial({
       callerId: fromNumber || undefined,
@@ -2156,6 +2273,12 @@ app.post("/webhooks/twilio/voice/incoming", async (req, res) => {
     });
     const client = dial.client();
     client.identity(identity);
+    console.info("[voice incoming] routing", {
+      decision: "dial_client",
+      companyID: route.company_id,
+      selectedUserID: route.owner_user_id,
+      generatedClientIdentity: identity
+    });
     res.status(200).type("text/xml").send(voiceResponse.toString());
   } catch (e) {
     console.error("[twilio/voice/incoming] failed:", { status: e?.status, code: e?.code, message: e?.message });
@@ -6524,6 +6647,9 @@ app.post("/stripe/webhook", async (req, res) => {
     res.status(500).json({ error: "webhook_handler_failed" });
   }
 });
+
+app.get("/", (_req, res) => res.send("WolfCRM backend up"));
+app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
