@@ -112,8 +112,63 @@ const triggerCatalog = [
   ["job.created_by_automation", "Job Created by Automation", "Schedule & Jobs", "A job was created by an automation action.", ["job"], ["job.created_by_automation"]],
   ["sms.received", "SMS Received", "Phone", "An inbound SMS/MMS was received.", ["sms_conversation", "contact"], ["sms.received"]],
   ["sms.sent", "SMS Sent", "Phone", "An SMS/MMS was sent.", ["sms_conversation", "contact"], ["sms.sent"]],
+  ["sms.delivered", "SMS Delivered", "Cellular Messaging", "Twilio reported an outbound message delivered.", ["sms_message", "sms_conversation", "contact"], ["sms.delivered"]],
+  ["sms.failed", "SMS Failed", "Cellular Messaging", "Twilio reported an outbound message failed.", ["sms_message", "sms_conversation", "contact"], ["sms.failed"]],
+  ["sms.undelivered", "SMS Undelivered", "Cellular Messaging", "Twilio reported an outbound message undelivered.", ["sms_message", "sms_conversation", "contact"], ["sms.undelivered"]],
+  ["sms.queued", "SMS Queued", "Cellular Messaging", "Twilio reported a message queued.", ["sms_message", "sms_conversation", "contact"], ["sms.queued"]],
+  ["sms.sending", "SMS Sending", "Cellular Messaging", "Twilio reported a message sending.", ["sms_message", "sms_conversation", "contact"], ["sms.sending"]],
+  ["sms.conversation_created", "SMS Conversation Created", "Cellular Messaging", "A customer SMS conversation was created.", ["sms_conversation"], ["sms.conversation_created"]],
+  ["sms.conversation_read", "SMS Conversation Read", "Cellular Messaging", "A conversation was marked read.", ["sms_conversation"], ["sms.conversation_read"]],
+  ["sms.conversation_unread", "SMS Conversation Unread", "Cellular Messaging", "A conversation became unread from inbound activity.", ["sms_conversation"], ["sms.conversation_unread"]],
+  ["sms.reply_received", "Customer Reply Received", "Cellular Messaging", "An inbound message arrived after a prior outbound message.", ["sms_conversation", "contact"], ["sms.reply_received"]],
+  ["sms.first_inbound", "First Inbound SMS", "Cellular Messaging", "The first inbound message in a conversation was received.", ["sms_conversation", "contact"], ["sms.first_inbound"]],
+  ["sms.first_outbound", "First Outbound SMS", "Cellular Messaging", "The first outbound message in a conversation was sent.", ["sms_conversation", "contact"], ["sms.first_outbound"]],
+  ["sms.first_message_from_number", "First Message From Number", "Cellular Messaging", "The first message from a phone number was received.", ["sms_conversation"], ["sms.first_message_from_number"]],
+  ["sms.message_received_from_unknown_number", "SMS From Unknown Number", "Cellular Messaging", "An inbound SMS could not be matched to a contact.", ["sms_conversation"], ["sms.message_received_from_unknown_number"]],
+  ["sms.message_received_from_contact", "SMS From Contact", "Cellular Messaging", "An inbound SMS matched a contact.", ["sms_conversation", "contact"], ["sms.message_received_from_contact"]],
+  ["sms.keyword_received", "SMS Keyword Received", "Cellular Messaging", "An inbound SMS matched configured words or phrases.", ["sms_conversation", "contact"], ["sms.keyword_received"]],
+  ["sms.attachment_received", "SMS Attachment Received", "Cellular Messaging", "An inbound SMS/MMS had media.", ["sms_conversation", "contact"], ["sms.attachment_received"]],
+  ["sms.mms_received", "MMS Received", "Cellular Messaging", "An inbound MMS was received.", ["sms_conversation", "contact"], ["sms.mms_received"]],
+  ["sms.mms_sent", "MMS Sent", "Cellular Messaging", "An outbound MMS was sent.", ["sms_message", "sms_conversation", "contact"], ["sms.mms_sent"]],
+  ["sms.no_reply", "No Customer Reply", "Cellular Messaging", "A customer did not reply within a configured duration.", ["sms_conversation", "contact"], ["sms.no_reply"]],
+  ["sms.conversation_inactive", "SMS Conversation Inactive", "Cellular Messaging", "A conversation had no new messages for a configured duration.", ["sms_conversation", "contact"], ["sms.conversation_inactive"]],
   ["call.missed", "Missed Call", "Phone", "An inbound call was missed.", ["call"], ["call.missed"]],
+  ["call.incoming", "Incoming Call", "Calls", "An inbound call was received.", ["call"], ["call.incoming"]],
+  ["call.outgoing", "Outgoing Call", "Calls", "An outbound call was started.", ["call"], ["call.outgoing"]],
+  ["call.started", "Call Started", "Calls", "A call record was started.", ["call"], ["call.started"]],
+  ["call.ringing", "Call Ringing", "Calls", "Twilio reported ringing.", ["call"], ["call.ringing"]],
+  ["call.answered", "Call Answered", "Calls", "A call was answered.", ["call"], ["call.answered"]],
+  ["call.connected", "Call Connected", "Calls", "A call connected/in-progress.", ["call"], ["call.connected"]],
+  ["call.completed", "Call Completed", "Calls", "A logical call completed.", ["call"], ["call.completed"]],
+  ["call.declined", "Call Declined", "Calls", "CallKit/Twilio reported a declined/canceled inbound call where distinguishable.", ["call"], ["call.declined"]],
+  ["call.busy", "Call Busy", "Calls", "Twilio reported busy.", ["call"], ["call.busy"]],
+  ["call.no_answer", "Call No Answer", "Calls", "Twilio reported no answer.", ["call"], ["call.no_answer"]],
+  ["call.failed", "Call Failed", "Calls", "Twilio reported call failure.", ["call"], ["call.failed"]],
+  ["call.short_call", "Short Call", "Calls", "A completed call duration was below threshold.", ["call"], ["call.short_call"]],
+  ["call.long_call", "Long Call", "Calls", "A completed call duration exceeded threshold.", ["call"], ["call.long_call"]],
+  ["call.first_call_with_contact", "First Call With Contact", "Calls", "The first logical call with a contact/number occurred.", ["call"], ["call.first_call_with_contact"]],
+  ["call.after_hours", "After-Hours Call", "Calls", "An inbound call arrived outside business hours.", ["call"], ["call.after_hours"]],
   ["voicemail.received", "Voicemail Received", "Phone", "A voicemail recording was received.", ["voicemail"], ["voicemail.received"]],
+  ["voicemail.recording_ready", "Voicemail Recording Ready", "Voicemail", "A voicemail recording is available.", ["voicemail"], ["voicemail.recording_ready"]],
+  ["voicemail.read", "Voicemail Read", "Voicemail", "A voicemail was marked read.", ["voicemail"], ["voicemail.read"]],
+  ["voicemail.unread", "Voicemail Unread", "Voicemail", "A voicemail was marked unread.", ["voicemail"], ["voicemail.unread"]],
+  ["voicemail.deleted", "Voicemail Deleted", "Voicemail", "A WolfCRM voicemail record was deleted.", ["voicemail"], ["voicemail.deleted"]],
+  ["voicemail.unread_for", "Voicemail Unread For", "Voicemail", "A voicemail remained unread for a configured duration.", ["voicemail"], ["voicemail.unread_for"]],
+  ["voicemail.from_contact", "Voicemail From Contact", "Voicemail", "A voicemail matched a contact.", ["voicemail", "contact"], ["voicemail.from_contact"]],
+  ["voicemail.from_unknown_number", "Voicemail From Unknown Number", "Voicemail", "A voicemail could not be matched to a contact.", ["voicemail"], ["voicemail.from_unknown_number"]],
+  ["internal.message_received", "Internal Message Received", "Company Comms", "A company internal message was received.", ["internal_message"], ["internal.message_received"]],
+  ["internal.message_sent", "Internal Message Sent", "Company Comms", "A company internal message was sent.", ["internal_message"], ["internal.message_sent"]],
+  ["internal.dm_received", "DM Received", "Company Comms", "A direct internal message was received.", ["internal_message"], ["internal.dm_received"]],
+  ["internal.group_message_received", "Group Message Received", "Company Comms", "A group conversation message was received.", ["internal_message"], ["internal.group_message_received"]],
+  ["internal.channel_message_received", "Channel Message Received", "Company Comms", "A channel message was posted.", ["internal_message", "channel"], ["internal.channel_message_received"]],
+  ["internal.attachment_received", "Internal Attachment Received", "Company Comms", "An internal message included attachments.", ["internal_message"], ["internal.attachment_received"]],
+  ["internal.conversation_created", "Conversation Created", "Company Comms", "An internal conversation was created.", ["internal_conversation"], ["internal.conversation_created"]],
+  ["internal.group_created", "Group Created", "Company Comms", "An internal group conversation was created.", ["internal_conversation"], ["internal.group_created"]],
+  ["internal.channel_created", "Channel Created", "Company Comms", "A channel was created.", ["channel"], ["internal.channel_created"]],
+  ["internal.channel_deleted", "Channel Deleted", "Company Comms", "A channel was archived/deleted.", ["channel"], ["internal.channel_deleted"]],
+  ["internal.message_deleted", "Internal Message Deleted", "Company Comms", "An internal message was deleted.", ["internal_message"], ["internal.message_deleted"]],
+  ["internal.conversation_read", "Internal Conversation Read", "Company Comms", "An internal conversation was marked read.", ["internal_conversation"], ["internal.conversation_read"]],
+  ["internal.conversation_unread", "Internal Conversation Unread", "Company Comms", "An internal conversation became unread.", ["internal_conversation"], ["internal.conversation_unread"]],
   ["payment.succeeded", "Payment Succeeded", "Payments", "A Stripe payment succeeded.", ["payment", "contact"], ["payment.succeeded"]],
   ["payment.failed", "Payment Failed", "Payments", "A Stripe payment failed.", ["payment", "contact"], ["payment.failed"]],
   ["service_plan.created", "Service Plan Created", "Service Plans", "A service plan was created.", ["service_plan"], ["service_plan.created"]],
@@ -160,7 +215,7 @@ const triggerCatalog = [
   config_fields: triggerConfigFields(key),
   outputs: ["default"],
   icon: triggerIcon(key),
-  wired: !["contact.restored", "contact.assigned", "contact.reassigned", "contact.unassigned", "lead.assigned", "lead.reassigned", "pipeline.salesperson_assigned", "pipeline.salesperson_changed", "pipeline.salesperson_removed", "job.updated", "sms.sent"].includes(key)
+  wired: !["contact.restored", "contact.assigned", "contact.reassigned", "contact.unassigned", "lead.assigned", "lead.reassigned", "pipeline.salesperson_assigned", "pipeline.salesperson_changed", "pipeline.salesperson_removed", "job.restored", "job.canceled", "job.started", "call.declined", "internal.mention_received"].includes(key)
 }));
 
 const actionCatalog = [
@@ -197,7 +252,28 @@ const actionCatalog = [
   ["task.create", "Create Task", "Tasks", "Creates a todo task.", ["generic"], ["default"]],
   ["notification.send_push", "Send Push Notification", "Notifications", "Sends APNs push notifications to scoped company users.", ["generic"], ["default"]],
   ["sms.send", "Send SMS", "Phone", "Sends SMS through the configured company phone line.", ["contact", "sms_conversation"], ["default"]],
+  ["sms.send_mms", "Send MMS", "Cellular Messaging", "Sends MMS through the configured company phone line.", ["contact", "sms_conversation"], ["default"]],
+  ["sms.mark_conversation_read", "Mark SMS Conversation Read", "Cellular Messaging", "Marks a cellular conversation read.", ["sms_conversation"], ["default"]],
+  ["sms.mark_conversation_unread", "Mark SMS Conversation Unread", "Cellular Messaging", "Marks a cellular conversation unread.", ["sms_conversation"], ["default"]],
+  ["sms.delete_local_message", "Delete Local SMS Message", "Cellular Messaging", "Deletes WolfCRM's local message copy.", ["sms_message"], ["default"]],
+  ["sms.delete_local_conversation", "Delete Local SMS Conversation", "Cellular Messaging", "Deletes WolfCRM's local conversation copy.", ["sms_conversation"], ["default"]],
+  ["phone.create_contact_from_number", "Create Contact from Phone Number", "Cellular Messaging", "Creates a contact from a communication phone number.", ["sms_conversation", "call", "voicemail"], ["default"]],
   ["internal.send_message", "Send Internal Message", "Company Comms", "Sends a message to a conversation or channel.", ["generic"], ["default"]],
+  ["internal.send_dm", "Send DM", "Company Comms", "Sends a direct message as the company owner/system sender.", ["generic"], ["default"]],
+  ["internal.send_group_message", "Send Group Message", "Company Comms", "Sends to an existing group conversation.", ["generic"], ["default"]],
+  ["internal.send_channel_message", "Send Channel Message", "Company Comms", "Sends to an existing channel.", ["generic"], ["default"]],
+  ["internal.create_group", "Create Group", "Company Comms", "Creates an internal group conversation.", ["generic"], ["default"]],
+  ["internal.create_channel", "Create Channel", "Company Comms", "Creates a company channel.", ["generic"], ["default"]],
+  ["internal.mark_conversation_read", "Mark Internal Conversation Read", "Company Comms", "Marks an internal conversation read for the automation sender.", ["internal_conversation"], ["default"]],
+  ["call.set_disposition", "Set Call Disposition", "Calls", "Sets CRM disposition without changing Twilio status.", ["call"], ["default"]],
+  ["call.create_callback_task", "Create Callback Task", "Calls", "Creates a callback task from a call.", ["call"], ["default"]],
+  ["call.send_followup_sms", "Send Call Follow-Up SMS", "Calls", "Sends follow-up SMS using the shared SMS safety path.", ["call"], ["default"]],
+  ["call.add_contact_note", "Add Call Contact Note", "Calls", "Adds a contact note related to the call.", ["call", "contact"], ["default"]],
+  ["voicemail.mark_read", "Mark Voicemail Read", "Voicemail", "Marks a voicemail read.", ["voicemail"], ["default"]],
+  ["voicemail.mark_unread", "Mark Voicemail Unread", "Voicemail", "Marks a voicemail unread.", ["voicemail"], ["default"]],
+  ["voicemail.delete", "Delete Voicemail", "Voicemail", "Deletes the WolfCRM voicemail record.", ["voicemail"], ["default"]],
+  ["voicemail.create_callback_task", "Create Voicemail Callback Task", "Voicemail", "Creates a callback task from voicemail.", ["voicemail"], ["default"]],
+  ["voicemail.send_followup_sms", "Send Voicemail Follow-Up SMS", "Voicemail", "Sends follow-up SMS using the shared SMS safety path.", ["voicemail"], ["default"]],
   ["job.create", "Create Job", "Schedule", "Creates a scheduled job.", ["contact"], ["default"]],
   ["job.update", "Update Job", "Schedule & Jobs", "Updates whitelisted job fields.", ["job"], ["default"]],
   ["job.reschedule", "Reschedule Job", "Schedule & Jobs", "Changes a job start/end time.", ["job"], ["default"]],
@@ -289,7 +365,28 @@ const actionExecutors = {
   "task.create": executeTaskCreate,
   "notification.send_push": executePushNotification,
   "sms.send": executeSmsSend,
+  "sms.send_mms": executeMmsSend,
+  "sms.mark_conversation_read": executeSmsConversationRead,
+  "sms.mark_conversation_unread": executeSmsConversationUnread,
+  "sms.delete_local_message": executeSmsDeleteLocalMessage,
+  "sms.delete_local_conversation": executeSmsDeleteLocalConversation,
+  "phone.create_contact_from_number": executeCreateContactFromNumber,
   "internal.send_message": executeInternalMessage,
+  "internal.send_dm": executeInternalDm,
+  "internal.send_group_message": executeInternalGroupMessage,
+  "internal.send_channel_message": executeInternalChannelMessage,
+  "internal.create_group": executeInternalCreateGroup,
+  "internal.create_channel": executeInternalCreateChannel,
+  "internal.mark_conversation_read": executeInternalMarkConversationRead,
+  "call.set_disposition": executeCallSetDisposition,
+  "call.create_callback_task": executeCallCreateCallbackTask,
+  "call.send_followup_sms": executeCallFollowupSms,
+  "call.add_contact_note": executeCallAddContactNote,
+  "voicemail.mark_read": executeVoicemailMarkRead,
+  "voicemail.mark_unread": executeVoicemailMarkUnread,
+  "voicemail.delete": executeVoicemailDelete,
+  "voicemail.create_callback_task": executeVoicemailCreateCallbackTask,
+  "voicemail.send_followup_sms": executeVoicemailFollowupSms,
   "job.create": executeJobCreate,
   "job.update": executeJobUpdate,
   "job.reschedule": executeJobReschedule,
@@ -388,9 +485,34 @@ function actionConfigFields(key) {
     case "notification.send_push":
       return [commonText("title", "Title"), commonText("body", "Body"), { key: "user_ids", label: "Recipients", type: "user_list" }];
     case "sms.send":
-      return [commonText("body", "Message")];
+    case "sms.send_mms":
+    case "call.send_followup_sms":
+    case "voicemail.send_followup_sms":
+      return [commonText("body", "Message"), commonText("phone", "Phone/Template"), commonText("contact_id", "Contact ID"), commonText("conversation_id", "Conversation ID"), { key: "business_hours_policy", label: "Business Hours Policy", type: "select", options: ["send_immediately", "defer_until_business_hours", "skip_if_outside_business_hours"] }, { key: "media", label: "Media", type: "json" }];
+    case "sms.mark_conversation_read":
+    case "sms.mark_conversation_unread":
+    case "sms.delete_local_conversation":
+      return [commonText("conversation_id", "Conversation ID")];
+    case "sms.delete_local_message":
+      return [commonText("message_id", "Message ID")];
+    case "phone.create_contact_from_number":
+      return [commonText("name", "Name"), commonText("phone", "Phone")];
     case "internal.send_message":
-      return [commonText("body", "Message"), commonText("conversation_id", "Conversation ID"), commonText("channel_id", "Channel ID"), { key: "recipient_user_ids", label: "Recipients", type: "user_list" }];
+    case "internal.send_dm":
+    case "internal.send_group_message":
+    case "internal.send_channel_message":
+      return [commonText("body", "Message"), commonText("conversation_id", "Conversation ID"), commonText("channel_id", "Channel ID"), commonText("recipient_user_id", "Recipient"), { key: "recipient_user_ids", label: "Recipients", type: "user_list" }];
+    case "internal.create_group":
+      return [commonText("title", "Title"), { key: "recipient_user_ids", label: "Members", type: "user_list" }];
+    case "internal.create_channel":
+      return [commonText("name", "Name"), commonText("description", "Description")];
+    case "call.set_disposition":
+      return [commonText("disposition", "Disposition")];
+    case "call.create_callback_task":
+    case "voicemail.create_callback_task":
+      return [commonText("title", "Title"), commonText("notes", "Notes"), { key: "due_date", label: "Due Date", type: "datetime_expression" }, { key: "assigned_user_id", label: "Assignee", type: "user" }];
+    case "call.add_contact_note":
+      return [commonText("body", "Note")];
     case "job.create":
     case "job.update":
       return [commonText("title", "Title"), { key: "start_at", label: "Start", type: "datetime_expression" }, { key: "end_at", label: "End", type: "datetime_expression" }, commonText("notes", "Notes"), commonText("contact_id", "Contact ID"), { key: "price_cents", label: "Price", type: "money" }, { key: "material_cost_cents", label: "Material Cost", type: "money" }, commonText("color", "Color"), { key: "service_items", label: "Services", type: "json" }, { key: "worker_user_ids", label: "Workers", type: "user_list" }, { key: "sales_user_ids", label: "Salespeople", type: "user_list" }];
@@ -597,7 +719,44 @@ function conditionFieldCatalog() {
     ["time.day_of_week", "Day of Week", "Time", "number", numberOps],
     ["time.is_weekday", "Is Weekday", "Time", "boolean", boolOps],
     ["time.is_weekend", "Is Weekend", "Time", "boolean", boolOps],
-    ["company.timezone", "Company Timezone", "Time", "text", textOps]
+    ["company.timezone", "Company Timezone", "Time", "text", textOps],
+    ["sms.body", "SMS Body", "Cellular Messaging", "text", textOps],
+    ["sms.direction", "SMS Direction", "Cellular Messaging", "text", textOps],
+    ["sms.status", "SMS Status", "Cellular Messaging", "text", textOps],
+    ["sms.external_number", "External Number", "Cellular Messaging", "text", textOps],
+    ["sms.contact_exists", "SMS Contact Exists", "Cellular Messaging", "boolean", boolOps],
+    ["sms.has_media", "SMS Has Media", "Cellular Messaging", "boolean", boolOps],
+    ["sms.media_count", "SMS Media Count", "Cellular Messaging", "number", numberOps],
+    ["sms.is_reply", "Is Reply", "Cellular Messaging", "boolean", boolOps],
+    ["sms.reply_latency_seconds", "Reply Latency", "Cellular Messaging", "number", numberOps],
+    ["sms.sms_opted_out", "SMS Opted Out", "Cellular Messaging", "boolean", boolOps],
+    ["conversation.exists", "Conversation Exists", "Conversations", "boolean", boolOps],
+    ["conversation.unread", "Conversation Unread", "Conversations", "boolean", boolOps],
+    ["conversation.message_count", "Message Count", "Conversations", "number", numberOps],
+    ["conversation.last_message_at", "Last Message At", "Conversations", "date", dateOps],
+    ["conversation.last_direction", "Last Direction", "Conversations", "text", textOps],
+    ["call.exists", "Call Exists", "Calls", "boolean", boolOps],
+    ["call.direction", "Call Direction", "Calls", "text", textOps],
+    ["call.status", "Call Status", "Calls", "text", textOps],
+    ["call.disposition", "Call Disposition", "Calls", "text", textOps],
+    ["call.duration_seconds", "Call Duration", "Calls", "number", numberOps],
+    ["call.is_missed", "Call Missed", "Calls", "boolean", boolOps],
+    ["call.is_after_hours", "Call After Hours", "Calls", "boolean", boolOps],
+    ["call.contact_exists", "Call Contact Exists", "Calls", "boolean", boolOps],
+    ["call.answered", "Call Answered", "Calls", "boolean", boolOps],
+    ["call.failed", "Call Failed", "Calls", "boolean", boolOps],
+    ["voicemail.exists", "Voicemail Exists", "Voicemail", "boolean", boolOps],
+    ["voicemail.read", "Voicemail Read", "Voicemail", "boolean", boolOps],
+    ["voicemail.duration", "Voicemail Duration", "Voicemail", "number", numberOps],
+    ["voicemail.contact_exists", "Voicemail Contact Exists", "Voicemail", "boolean", boolOps],
+    ["voicemail.external_number", "Voicemail External Number", "Voicemail", "text", textOps],
+    ["voicemail.recording_status", "Recording Status", "Voicemail", "text", textOps],
+    ["internal.message.body", "Internal Message Body", "Company Comms", "text", textOps],
+    ["internal.message.has_attachment", "Internal Has Attachment", "Company Comms", "boolean", boolOps],
+    ["internal.sender_id", "Internal Sender", "Company Comms", "user", textOps],
+    ["internal.sender_name", "Internal Sender Name", "Company Comms", "text", textOps],
+    ["internal.conversation_type", "Conversation Type", "Company Comms", "text", textOps],
+    ["internal.channel_id", "Channel ID", "Company Comms", "text", textOps]
   ].map(([key, displayName, category, valueType, operators]) => ({ key, display_name: displayName, category, value_type: valueType, operators }));
 }
 
@@ -611,6 +770,11 @@ function templateVariableCatalog() {
     "task.id", "task.title", "task.due_at",
     "routine.id", "routine.title",
     "customer_reminder.id", "customer_reminder.title", "customer_reminder.due_at",
+    "sms.body", "sms.from", "sms.to", "sms.external_number", "sms.status",
+    "conversation.last_message", "conversation.last_inbound_at", "conversation.last_outbound_at",
+    "call.external_number", "call.duration_seconds", "call.status",
+    "voicemail.external_number", "voicemail.duration",
+    "internal.sender_name", "internal.message_body", "internal.channel_name",
     "company.name", "event.type", "event.payload.form_id", "event.payload.page_id", "variables.some_name"
   ].map((key) => ({ key, token: `{{${key}}}` }));
 }
@@ -740,6 +904,93 @@ export async function syncAutomationSchedulesForRoutine(companyId, routine) {
     await enqueueScheduledAutomationEvent({ companyId, eventType: "routine.weekday_reached", subjectType: "routine", subjectId: routine.id, scheduledFor: date, scheduleKey: `routine.weekday_reached:${routine.id}:${dayKey}`, payload });
     await enqueueScheduledAutomationEvent({ companyId, eventType: "routine.due", subjectType: "routine", subjectId: routine.id, scheduledFor: date, scheduleKey: `routine.due:${routine.id}:${dayKey}`, payload });
     await enqueueScheduledAutomationEvent({ companyId, eventType: "routine.missed", subjectType: "routine", subjectId: routine.id, scheduledFor: new Date(date.getTime() + 24 * 3600000), scheduleKey: `routine.missed:${routine.id}:${dayKey}`, payload });
+  }
+}
+
+export async function syncAutomationSchedulesForSmsOutbound(companyId, message) {
+  if (!ctx?.pool || !companyId || !message?.id || !message.conversation_id) return;
+  const triggers = (await ctx.pool.query(
+    `SELECT n.id, n.config
+       FROM automation_definitions d
+       JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
+       JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
+      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'sms.no_reply'`,
+    [companyId]
+  )).rows;
+  for (const trigger of triggers) {
+    const amount = Number(trigger.config?.amount || trigger.config?.after_amount || 0);
+    const unit = trigger.config?.unit || trigger.config?.after_unit || "hours";
+    if (amount <= 0) continue;
+    const when = new Date(new Date(message.created_at || Date.now()).getTime() + durationAmountMs(amount, unit));
+    await enqueueScheduledAutomationEvent({
+      companyId,
+      eventType: "sms.no_reply",
+      subjectType: "sms_conversation",
+      subjectId: message.conversation_id,
+      scheduledFor: when,
+      scheduleKey: `sms.no_reply:${trigger.id}:${message.conversation_id}:${message.id}:${amount}:${unit}`,
+      payload: { trigger_node_id: trigger.id, conversation_id: message.conversation_id, message_id: message.id, contact_id: message.contact_id || null, external_number: message.external_phone_number || message.to_number || null, amount, unit }
+    });
+  }
+}
+
+export async function syncAutomationSchedulesForSmsConversationActivity(companyId, conversationId, lastMessage) {
+  if (!ctx?.pool || !companyId || !conversationId) return;
+  await cancelScheduledForSubject(companyId, "sms_conversation", conversationId, ["sms.conversation_inactive"]);
+  const triggers = (await ctx.pool.query(
+    `SELECT n.id, n.config
+       FROM automation_definitions d
+       JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
+       JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
+      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'sms.conversation_inactive'`,
+    [companyId]
+  )).rows;
+  for (const trigger of triggers) {
+    const amount = Number(trigger.config?.amount || 0);
+    const unit = trigger.config?.unit || "hours";
+    if (amount <= 0) continue;
+    const when = new Date(new Date(lastMessage?.created_at || Date.now()).getTime() + durationAmountMs(amount, unit));
+    await enqueueScheduledAutomationEvent({
+      companyId,
+      eventType: "sms.conversation_inactive",
+      subjectType: "sms_conversation",
+      subjectId: conversationId,
+      scheduledFor: when,
+      scheduleKey: `sms.conversation_inactive:${trigger.id}:${conversationId}:${lastMessage?.id || Date.now()}:${amount}:${unit}`,
+      payload: { trigger_node_id: trigger.id, conversation_id: conversationId, last_message_id: lastMessage?.id || null, amount, unit }
+    });
+  }
+}
+
+export async function cancelNoReplySchedulesForConversation(companyId, conversationId) {
+  await cancelScheduledForSubject(companyId, "sms_conversation", conversationId, ["sms.no_reply"]);
+}
+
+export async function syncAutomationSchedulesForVoicemail(companyId, voicemail) {
+  if (!ctx?.pool || !companyId || !voicemail?.id) return;
+  await cancelScheduledForSubject(companyId, "voicemail", voicemail.id, ["voicemail.unread_for"]);
+  if (voicemail.is_read || voicemail.deleted_at) return;
+  const triggers = (await ctx.pool.query(
+    `SELECT n.id, n.config
+       FROM automation_definitions d
+       JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
+       JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
+      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'voicemail.unread_for'`,
+    [companyId]
+  )).rows;
+  for (const trigger of triggers) {
+    const amount = Number(trigger.config?.amount || 0);
+    const unit = trigger.config?.unit || "hours";
+    if (amount <= 0) continue;
+    await enqueueScheduledAutomationEvent({
+      companyId,
+      eventType: "voicemail.unread_for",
+      subjectType: "voicemail",
+      subjectId: voicemail.id,
+      scheduledFor: new Date(new Date(voicemail.created_at || Date.now()).getTime() + durationAmountMs(amount, unit)),
+      scheduleKey: `voicemail.unread_for:${trigger.id}:${voicemail.id}:${amount}:${unit}`,
+      payload: { trigger_node_id: trigger.id, voicemail_id: voicemail.id, contact_id: voicemail.contact_id || null, amount, unit }
+    });
   }
 }
 
@@ -1007,6 +1258,24 @@ async function bootstrapAutomationSchema() {
     );
     CREATE INDEX IF NOT EXISTS automation_scheduled_events_due_idx ON automation_scheduled_events(status, scheduled_for);
     CREATE INDEX IF NOT EXISTS automation_scheduled_events_subject_idx ON automation_scheduled_events(company_id, subject_type, subject_id, status);
+
+    CREATE TABLE IF NOT EXISTS phone_opt_outs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      normalized_phone TEXT NOT NULL,
+      channel TEXT NOT NULL DEFAULT 'sms',
+      status TEXT NOT NULL DEFAULT 'opted_out',
+      source TEXT NOT NULL DEFAULT 'twilio',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, normalized_phone, channel)
+    );
+    CREATE INDEX IF NOT EXISTS phone_opt_outs_company_phone_idx ON phone_opt_outs(company_id, normalized_phone, status);
+
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS automated_customer_messages_enabled BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_sms_default_business_hours_policy TEXT NOT NULL DEFAULT 'send_immediately';
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_sms_max_per_contact_hour INTEGER NOT NULL DEFAULT 6;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_sms_max_per_contact_day INTEGER NOT NULL DEFAULT 20;
   `);
 }
 
@@ -2108,6 +2377,21 @@ async function shouldFireScheduledAutomationEvent(row) {
     const done = await ctx.pool.query(`SELECT 1 FROM todo_routine_done rd JOIN users u ON u.id = rd.user_id WHERE rd.routine_id = $1 AND rd.day_key = $2 AND u.company_id = $3 LIMIT 1`, [row.subject_id, dayKey, row.company_id]);
     if (done.rowCount) return false;
   }
+  if (row.event_type === "sms.no_reply") {
+    const inbound = await ctx.pool.query(
+      `SELECT 1 FROM sms_messages WHERE conversation_id = $1 AND direction = 'inbound' AND created_at > (SELECT created_at FROM sms_messages WHERE id = $2) AND deleted_at IS NULL LIMIT 1`,
+      [row.subject_id, row.payload?.message_id]
+    );
+    if (inbound.rowCount) return false;
+  }
+  if (row.event_type === "sms.conversation_inactive") {
+    const latest = await ctx.pool.query(`SELECT id FROM sms_messages WHERE conversation_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`, [row.subject_id]);
+    if (latest.rows[0]?.id && row.payload?.last_message_id && latest.rows[0].id !== row.payload.last_message_id) return false;
+  }
+  if (row.event_type === "voicemail.unread_for") {
+    const vm = (await ctx.pool.query(`SELECT is_read, deleted_at FROM voicemails WHERE id = $1 AND company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    if (!vm || vm.is_read || vm.deleted_at) return false;
+  }
   return true;
 }
 
@@ -2163,9 +2447,13 @@ async function loadSubject(companyId, subjectType, subjectId) {
   if (subjectType === "contact") return loadContactContext(companyId, subjectId);
   if (subjectType === "job") return loadJobContext(companyId, subjectId);
   if (subjectType === "opportunity") return (await ctx.pool.query(`SELECT * FROM opportunities WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
-  if (subjectType === "sms_conversation") return (await ctx.pool.query(`SELECT sc.* FROM sms_conversations sc JOIN phone_lines pl ON pl.id = sc.phone_line_id WHERE sc.id = $1 AND pl.company_id = $2`, [subjectId, companyId])).rows[0] || null;
-  if (subjectType === "call") return (await ctx.pool.query(`SELECT * FROM phone_calls WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
-  if (subjectType === "voicemail") return (await ctx.pool.query(`SELECT * FROM voicemails WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
+  if (subjectType === "sms_message") return loadSmsMessageContext(companyId, subjectId);
+  if (subjectType === "sms_conversation") return loadSmsConversationContext(companyId, subjectId);
+  if (subjectType === "call") return loadCallContext(companyId, subjectId);
+  if (subjectType === "voicemail") return loadVoicemailContext(companyId, subjectId);
+  if (subjectType === "internal_message") return loadInternalMessageContext(companyId, subjectId);
+  if (subjectType === "internal_conversation") return loadInternalConversationContext(companyId, subjectId);
+  if (subjectType === "channel") return loadChannelContext(companyId, subjectId);
   if (subjectType === "service_plan") return (await ctx.pool.query(`SELECT * FROM service_plans WHERE id::text = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
   if (subjectType === "task") return loadTaskContext(companyId, subjectId);
   if (subjectType === "routine") return loadRoutineContext(companyId, subjectId);
@@ -2319,7 +2607,113 @@ function parseAddressParts(address) {
 }
 
 function subjectContextKey(type) {
-  return type === "sms_conversation" ? "sms" : type === "service_plan" ? "servicePlan" : type;
+  return type === "sms_conversation" || type === "sms_message" ? "sms" : type === "service_plan" ? "servicePlan" : type === "internal_message" || type === "internal_conversation" ? "internal" : type;
+}
+
+async function loadSmsMessageContext(companyId, messageId) {
+  const row = (await ctx.pool.query(
+    `SELECT sm.*, sc.external_phone_number, sc.contact_id, sc.last_read_at, pl.phone_number AS business_phone
+       FROM sms_messages sm
+       JOIN sms_conversations sc ON sc.id = sm.conversation_id
+       JOIN phone_lines pl ON pl.id = sc.phone_line_id
+      WHERE sm.id = $1 AND pl.company_id = $2`,
+    [messageId, companyId]
+  )).rows[0];
+  if (!row) return { exists: false };
+  return smsContextFromRow(companyId, row);
+}
+
+async function loadSmsConversationContext(companyId, conversationId) {
+  const last = (await ctx.pool.query(
+    `SELECT sm.*, sc.external_phone_number, sc.contact_id, sc.last_read_at, pl.phone_number AS business_phone
+       FROM sms_conversations sc
+       JOIN phone_lines pl ON pl.id = sc.phone_line_id
+       LEFT JOIN LATERAL (
+         SELECT * FROM sms_messages m WHERE m.conversation_id = sc.id AND m.deleted_at IS NULL ORDER BY m.created_at DESC LIMIT 1
+       ) sm ON true
+      WHERE sc.id = $1 AND pl.company_id = $2`,
+    [conversationId, companyId]
+  )).rows[0];
+  if (!last) return { exists: false };
+  return smsContextFromRow(companyId, last);
+}
+
+async function smsContextFromRow(companyId, row) {
+  const counts = (await ctx.pool.query(
+    `SELECT COUNT(*)::int AS message_count,
+            COUNT(*) FILTER (WHERE direction = 'inbound')::int AS inbound_count,
+            COUNT(*) FILTER (WHERE direction = 'outbound')::int AS outbound_count,
+            MAX(created_at) FILTER (WHERE direction = 'inbound') AS last_inbound_at,
+            MAX(created_at) FILTER (WHERE direction = 'outbound') AS last_outbound_at
+       FROM sms_messages WHERE conversation_id = $1 AND deleted_at IS NULL`,
+    [row.conversation_id]
+  )).rows[0] || {};
+  const optedOut = await isPhoneOptedOut(companyId, row.external_phone_number || row.from_number || row.to_number);
+  return {
+    exists: true,
+    id: row.id,
+    message_id: row.id,
+    conversation_id: row.conversation_id,
+    body: row.body || "",
+    from: row.from_number,
+    to: row.to_number,
+    external_number: row.external_phone_number,
+    business_phone: row.business_phone,
+    direction: row.direction,
+    status: row.message_status,
+    contact_id: row.contact_id,
+    contact_exists: !!row.contact_id,
+    has_media: Number(row.media_count || 0) > 0,
+    media_count: Number(row.media_count || 0),
+    is_reply: row.direction === "inbound" && !!counts.last_outbound_at,
+    reply_latency_seconds: row.direction === "inbound" && counts.last_outbound_at ? Math.max(0, Math.round((new Date(row.created_at).getTime() - new Date(counts.last_outbound_at).getTime()) / 1000)) : null,
+    messages_count: Number(counts.message_count || 0),
+    inbound_count: Number(counts.inbound_count || 0),
+    outbound_count: Number(counts.outbound_count || 0),
+    last_inbound_at: counts.last_inbound_at,
+    last_outbound_at: counts.last_outbound_at,
+    sms_opted_out: optedOut,
+    is_business_hours: true,
+    is_after_hours: false
+  };
+}
+
+async function loadCallContext(companyId, callId) {
+  const call = (await ctx.pool.query(`SELECT * FROM phone_calls WHERE id = $1 AND company_id = $2`, [callId, companyId])).rows[0];
+  if (!call) return { exists: false };
+  const external = call.direction === "inbound" ? call.from_number : call.to_number;
+  return { ...call, exists: true, external_number: external, contact_exists: !!call.contact_id, is_missed: call.direction === "inbound" && ["missed", "busy", "failed", "no-answer", "canceled"].includes(String(call.disposition || call.status || "").toLowerCase()), is_after_hours: false, answered: !!call.answered_at, failed: ["failed", "busy", "no-answer"].includes(String(call.disposition || call.status || "").toLowerCase()) };
+}
+
+async function loadVoicemailContext(companyId, voicemailId) {
+  const vm = (await ctx.pool.query(`SELECT * FROM voicemails WHERE id = $1 AND company_id = $2`, [voicemailId, companyId])).rows[0];
+  if (!vm) return { exists: false };
+  return { ...vm, exists: true, read: !!vm.is_read, duration: vm.duration_seconds, contact_exists: !!vm.contact_id, external_number: vm.external_phone_number, received_at: vm.created_at, age: Math.max(0, Math.round((Date.now() - new Date(vm.created_at).getTime()) / 1000)) };
+}
+
+async function loadInternalMessageContext(companyId, messageId) {
+  const msg = (await ctx.pool.query(
+    `SELECT m.*, u.display_name AS sender_name, ch.name AS channel_name, c.is_group,
+            (SELECT COUNT(*)::int FROM message_attachments a WHERE a.message_id = m.id) AS attachment_count
+       FROM messages m
+       JOIN users u ON u.id = m.sender_id
+       LEFT JOIN channels ch ON ch.id = m.channel_id
+       LEFT JOIN conversations c ON c.id = m.conversation_id
+      WHERE m.id = $1 AND u.company_id = $2`,
+    [messageId, companyId]
+  )).rows[0];
+  if (!msg) return { exists: false };
+  return { message: { body: msg.body, has_attachment: Number(msg.attachment_count || 0) > 0 }, message_body: msg.body, sender_id: msg.sender_id, sender_name: msg.sender_name, channel_id: msg.channel_id, channel_name: msg.channel_name, conversation_id: msg.conversation_id, conversation_type: msg.channel_id ? "channel" : msg.is_group ? "group" : "dm", is_dm: !msg.channel_id && !msg.is_group, is_group: !!msg.is_group, is_channel: !!msg.channel_id };
+}
+
+async function loadInternalConversationContext(companyId, conversationId) {
+  const conv = (await ctx.pool.query(`SELECT * FROM conversations WHERE id = $1 AND company_id = $2`, [conversationId, companyId])).rows[0];
+  return conv ? { ...conv, exists: true, is_dm: !conv.is_group, is_group: !!conv.is_group } : { exists: false };
+}
+
+async function loadChannelContext(companyId, channelId) {
+  const channel = (await ctx.pool.query(`SELECT * FROM channels WHERE id = $1 AND company_id = $2`, [channelId, companyId])).rows[0];
+  return channel ? { ...channel, exists: true } : { exists: false };
 }
 
 function resolveTemplate(value, context) {
