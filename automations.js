@@ -18,6 +18,12 @@ const AUTOMATION_LIMITS = {
 
 let ctx = null;
 
+const SIDE_EFFECT_FREE_ACTIONS = new Set([
+  "contacts.search", "jobs.search", "tasks.search", "map.search_pins", "route.get_stops", "quotes.search", "payments.search", "service_plans.search", "employees.search",
+  "collection.filter", "collection.map", "collection.sort", "collection.limit", "collection.first", "collection.last", "collection.count", "collection.unique", "collection.concat", "collection.flatten", "collection.contains",
+  "object.get", "object.build", "coalesce", "math", "text", "date"
+]);
+
 const triggerCatalog = [
   ["manual", "Manual", "Manual", "Starts when an employer manually runs the automation.", ["generic"], ["manual"]],
   ["contact.created", "Contact Created", "Contacts", "A contact was created.", ["contact"], ["contact.created"]],
@@ -2356,7 +2362,7 @@ function installAutomationRoutes() {
         { key: "foreach", display_name: "For Each", category: "Collections", description: "Runs the ITEM path once for each item, then DONE once.", outputs: ["item", "done"], config_fields: [{ key: "collection", type: "template" }, { key: "execution_mode", type: "select", options: ["sequential", "parallel"] }, { key: "parallelism", type: "number" }, { key: "failure_policy", type: "select", options: ["stop_all", "continue", "collect_errors"] }, { key: "max_items", type: "number" }] },
         { key: "random_split", display_name: "Random Split", category: "Logic", description: "Chooses one weighted path and persists the choice.", outputs: ["path_a", "path_b"], dynamic_ports: true, config_fields: [{ key: "mode", type: "select", options: ["per_run", "sticky_subject"] }, { key: "paths", type: "weighted_ports" }] },
         { key: "event_wait_multi", display_name: "Wait for Any Event", category: "Wait & Events", description: "Waits for the first matching event from several subscriptions.", outputs: ["timeout"], dynamic_ports: true, config_fields: [{ key: "events", type: "event_list" }, { key: "timeout", type: "duration" }] },
-        { key: "wait", display_name: "Wait", category: "Timing", description: "Persists a duration, date, or event wait.", outputs: ["default", "event", "timeout"], config_fields: [{ key: "mode", type: "select", options: ["duration", "until_datetime", "event_wait"] }] },
+        { key: "wait", display_name: "Wait", category: "Timing", description: "Persists a duration, date, business-day, random, or event wait.", outputs: ["default", "event", "timeout"], config_fields: [{ key: "mode", type: "select", options: ["duration", "until_datetime", "event_wait", "business_days", "next_business_open", "random_duration"] }] },
         { key: "variable.set", display_name: "Set Variable", category: "Utility", description: "Stores a run variable.", outputs: ["default"], config_fields: [{ key: "name", type: "text" }, { key: "value", type: "template" }] },
         { key: "goal", display_name: "Goal Reached", category: "Flow Control", description: "Records a workflow goal and continues.", outputs: ["default"], config_fields: [{ key: "goal_key", type: "text" }, { key: "metadata", type: "json" }] },
         { key: "stop", display_name: "Stop Automation", category: "Flow Control", description: "Stops the entire run.", outputs: [], config_fields: [{ key: "reason", type: "text" }] },
@@ -2722,7 +2728,7 @@ function validateGraphPayload(payload) {
   const warnings = [];
   const nodeIds = new Set();
   const nodeKeys = new Set();
-  const validTypes = new Set(["trigger", "action", "condition", "wait", "branch", "sub_automation", "utility", "note"]);
+  const validTypes = new Set(["trigger", "action", "condition", "wait", "branch", "sub_automation", "utility", "note", "foreach", "merge", "parallel", "switch", "random_split", "event_wait_multi", "goal", "stop", "end", "fail"]);
   for (const node of nodes) {
     if (!node.id) errors.push("node_missing_id");
     if (!node.node_key && !node.nodeKey) errors.push("node_missing_key");
@@ -2781,6 +2787,32 @@ function validateGraphPayload(payload) {
       if (config.action_key === "employee.deactivate" && config.confirm_deactivate !== true) errors.push(`employee_deactivate_confirmation_required:${nodeKey}`);
       if (config.action_key === "time_clock.flag_for_review" && !config.review_reason) warnings.push(`time_review_reason_recommended:${nodeKey}`);
       if (config.action_key === "measurement.create_record" && (!Array.isArray(config.points) || config.points.length < 2)) warnings.push(`measurement_points_recommended:${nodeKey}`);
+      if (config.action_key?.startsWith("collection.") && !config.collection && config.action_key !== "collection.concat") errors.push(`collection_input_required:${nodeKey}`);
+      if (config.action_key === "collection.limit" && Number(config.limit || 0) <= 0) errors.push(`collection_limit_required:${nodeKey}`);
+      if (config.action_key === "math" && config.operation === "divide" && Number(config.b || 0) === 0) warnings.push(`math_divide_by_zero_if_literal:${nodeKey}`);
+      if (config.action_key === "object.get" && !isSafeObjectPath(config.path || "")) errors.push(`unsafe_object_path:${nodeKey}`);
+    }
+    if (nodeType === "foreach") {
+      if (!config.collection) errors.push(`foreach_collection_required:${nodeKey}`);
+      if (Number(config.max_items || 1) <= 0) errors.push(`foreach_max_items_required:${nodeKey}`);
+      if (Number(config.max_items || 1) > AUTOMATION_LIMITS.foreachHardMaxItems) errors.push(`foreach_max_items_too_large:${nodeKey}`);
+      if (config.execution_mode === "parallel" && (Number(config.parallelism || 0) <= 0 || Number(config.parallelism || 0) > AUTOMATION_LIMITS.foreachMaxParallelism)) errors.push(`foreach_parallelism_invalid:${nodeKey}`);
+    }
+    if (nodeType === "merge") {
+      const incomingCount = edges.filter((edge) => (edge.target_node_id || edge.targetNodeId) === node.id).length;
+      if (!incomingCount) errors.push(`merge_incoming_required:${nodeKey}`);
+      if ((config.mode || "any") === "all" && incomingCount === 1) warnings.push(`merge_all_single_incoming:${nodeKey}`);
+    }
+    if (nodeType === "random_split") {
+      const paths = normalizeDynamicPorts(config, []);
+      const total = paths.reduce((sum, path) => sum + Number(path.weight || 0), 0);
+      if (paths.length < 2) errors.push(`random_split_two_paths_required:${nodeKey}`);
+      if (Math.round(total) !== 100) errors.push(`random_split_weights_must_total_100:${nodeKey}`);
+      if (new Set(paths.map((path) => path.id)).size !== paths.length) errors.push(`random_split_duplicate_ports:${nodeKey}`);
+    }
+    if (nodeType === "event_wait_multi") {
+      if (!Array.isArray(config.events) || !config.events.length) errors.push(`multi_wait_events_required:${nodeKey}`);
+      if (config.timeout && parseDurationMs(config.timeout) <= 0) errors.push(`multi_wait_timeout_invalid:${nodeKey}`);
     }
     if (nodeType === "trigger" && config.trigger_key === "job.relative_time" && (!config.reference || !config.direction || !config.amount || !config.unit)) errors.push(`relative_time_trigger_incomplete:${nodeKey}`);
     if (nodeType === "trigger" && ["sms.no_reply", "sms.conversation_inactive", "voicemail.unread_for"].includes(config.trigger_key) && Number(config.amount || 0) <= 0) errors.push(`communication_duration_required:${nodeKey}`);
@@ -3112,7 +3144,7 @@ async function runAutomation(runId, resumeFromNodeId = null, incomingPort = null
   for (const node of startNodes.filter(Boolean)) {
     await executeFromNode(run.id, node.id, scopeKey);
   }
-  await completeRunIfIdle((await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [runId])).rows[0]);
+  if (scopeKey === "root") await completeRunIfIdle((await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [runId])).rows[0]);
 }
 
 async function executeFromNode(runId, nodeId, scopeKey = "root", arrival = null) {
@@ -3167,6 +3199,7 @@ async function executeFromNode(runId, nodeId, scopeKey = "root", arrival = null)
     }
     await failRun(run, "node_failed", e?.message || "Node failed");
   }
+  if (scopeKey !== "root") await completeIterationScopeIfIdle(run.id, scopeKey);
 }
 
 async function loadGraph(versionId, companyId) {
@@ -3409,7 +3442,7 @@ async function executeNode(run, node, runNode, scopeKey = "root", arrival = null
     const actionKey = node.config?.action_key;
     const executor = actionExecutors[actionKey];
     if (!executor) throw new Error(`unknown_action:${actionKey}`);
-    if (run.dry_run) {
+    if (run.dry_run && !SIDE_EFFECT_FREE_ACTIONS.has(actionKey)) {
       const context = await buildRunContext(run, { scopeKey });
       const resolved = resolveConfig(node.config || {}, context);
       await logRun(run, node, "info", "action.dry_run", `Would execute ${actionKey}`, { resolved_config: redact(resolved) });
@@ -3433,6 +3466,207 @@ async function traverse(run, graph, node, port, scopeKey = "root") {
   for (const edge of edges) {
     await executeFromNode(run.id, edge.target_node_id, scopeKey, { source_node_id: node.id, source_port: port, edge_id: edge.id });
   }
+}
+
+async function executeForeachNode(run, node, scopeKey) {
+  const graph = await loadGraph(run.automation_version_id, run.company_id);
+  const context = await buildRunContext(run, { scopeKey });
+  const maxItems = Math.min(Math.max(0, Number(node.config?.max_items || AUTOMATION_LIMITS.foreachDefaultMaxItems)), AUTOMATION_LIMITS.foreachHardMaxItems);
+  const items = resolveCollection(node.config?.collection, context, { maxItems });
+  if (items.length > maxItems) throw new Error("foreach_item_limit_exceeded");
+  const mode = node.config?.execution_mode || "sequential";
+  const failurePolicy = node.config?.failure_policy || "stop_all";
+  const iterationRows = [];
+  for (let index = 0; index < items.length; index++) {
+    const iterationKey = String(index);
+    const childScope = `${scopeKey}/foreach:${node.id}:item:${index}`;
+    if (childScope.split("/").length - 1 > AUTOMATION_LIMITS.maxScopeDepth) throw new Error("foreach_scope_depth_exceeded");
+    const row = (await ctx.pool.query(
+      `INSERT INTO automation_run_iterations(run_id, foreach_node_id, foreach_node_key, parent_scope_key, scope_key, iteration_key, item_index, item_count, item_data, status)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'queued')
+       ON CONFLICT(run_id, foreach_node_id, parent_scope_key, iteration_key)
+       DO UPDATE SET item_count = EXCLUDED.item_count, item_data = EXCLUDED.item_data, updated_at = now()
+       RETURNING *`,
+      [run.id, node.id, node.node_key, scopeKey, childScope, iterationKey, index, items.length, JSON.stringify(items[index])]
+    )).rows[0];
+    iterationRows.push(row);
+  }
+  const queued = iterationRows.filter((row) => !["completed", "failed"].includes(row.status));
+  const runOne = async (iteration) => {
+    await ctx.pool.query(`UPDATE automation_run_iterations SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = $1 AND status IN ('queued','running')`, [iteration.id]);
+    try {
+      await traverse(run, graph, node, "item", iteration.scope_key);
+      const activeWait = await ctx.pool.query(`SELECT 1 FROM automation_waits WHERE run_id = $1 AND scope_key = $2 AND status = 'waiting' LIMIT 1`, [run.id, iteration.scope_key]);
+      if (activeWait.rowCount) {
+        await ctx.pool.query(`UPDATE automation_run_iterations SET status = 'waiting', updated_at = now() WHERE id = $1`, [iteration.id]);
+        return;
+      }
+      await ctx.pool.query(`UPDATE automation_run_iterations SET status = 'completed', completed_at = COALESCE(completed_at, now()), updated_at = now() WHERE id = $1`, [iteration.id]);
+    } catch (e) {
+      await ctx.pool.query(`UPDATE automation_run_iterations SET status = 'failed', error = $2, failed_at = now(), updated_at = now() WHERE id = $1`, [iteration.id, (e?.message || "iteration_failed").slice(0, 1000)]);
+      if (failurePolicy === "stop_all") throw e;
+    }
+  };
+  if (mode === "parallel") {
+    const parallelism = Math.min(Math.max(1, Number(node.config?.parallelism || 3)), AUTOMATION_LIMITS.foreachMaxParallelism);
+    for (let i = 0; i < queued.length; i += parallelism) await Promise.all(queued.slice(i, i + parallelism).map(runOne));
+  } else {
+    for (const iteration of queued) await runOne(iteration);
+  }
+  const summary = await foreachSummary(run.id, node.id, scopeKey);
+  if (summary.waiting_count > 0) {
+    await ctx.pool.query(`UPDATE automation_runs SET status = 'waiting', updated_at = now() WHERE id = $1`, [run.id]);
+    return { waiting: true, output: summary };
+  }
+  if (summary.failed_count > 0 && failurePolicy === "stop_all") throw new Error("foreach_iteration_failed");
+  await traverse(run, graph, node, "done", scopeKey);
+  return { stoppedPath: true, output: summary };
+}
+
+async function foreachSummary(runId, nodeId, parentScopeKey) {
+  const rows = (await ctx.pool.query(
+    `SELECT status, item_index, item_data, error FROM automation_run_iterations WHERE run_id = $1 AND foreach_node_id = $2 AND parent_scope_key = $3 ORDER BY item_index ASC`,
+    [runId, nodeId, parentScopeKey]
+  )).rows;
+  const successful = rows.filter((r) => r.status === "completed");
+  const failed = rows.filter((r) => r.status === "failed");
+  const waiting = rows.filter((r) => r.status === "waiting" || r.status === "running");
+  return {
+    total_count: rows.length,
+    successful_count: successful.length,
+    failed_count: failed.length,
+    waiting_count: waiting.length,
+    items: capCollection(rows.map((r) => ({ index: r.item_index, status: r.status, item: r.item_data, error: r.error })), 100),
+    successful_items: capCollection(successful.map((r) => r.item_data), 100),
+    failed_items: capCollection(failed.map((r) => ({ item: r.item_data, error: r.error })), 100)
+  };
+}
+
+async function completeIterationScopeIfIdle(runId, scopeKey) {
+  const waiting = await ctx.pool.query(`SELECT 1 FROM automation_waits WHERE run_id = $1 AND scope_key = $2 AND status = 'waiting' LIMIT 1`, [runId, scopeKey]);
+  if (waiting.rowCount) return;
+  const iteration = (await ctx.pool.query(`UPDATE automation_run_iterations SET status = 'completed', completed_at = COALESCE(completed_at, now()), updated_at = now() WHERE run_id = $1 AND scope_key = $2 AND status IN ('queued','running','waiting') RETURNING *`, [runId, scopeKey])).rows[0];
+  if (!iteration) return;
+  const remaining = await ctx.pool.query(
+    `SELECT 1 FROM automation_run_iterations
+      WHERE run_id = $1 AND foreach_node_id = $2 AND parent_scope_key = $3 AND status NOT IN ('completed','failed')
+      LIMIT 1`,
+    [runId, iteration.foreach_node_id, iteration.parent_scope_key]
+  );
+  if (remaining.rowCount) return;
+  const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [runId])).rows[0];
+  if (!run || ["completed", "failed", "canceled", "stopped"].includes(run.status)) return;
+  const node = (await ctx.pool.query(`SELECT * FROM automation_nodes WHERE id = $1`, [iteration.foreach_node_id])).rows[0];
+  if (!node) return;
+  const failurePolicy = node.config?.failure_policy || "stop_all";
+  const summary = await foreachSummary(runId, iteration.foreach_node_id, iteration.parent_scope_key);
+  if (summary.failed_count > 0 && failurePolicy === "stop_all") return failRun(run, "foreach_iteration_failed", "A foreach iteration failed");
+  const graph = await loadGraph(run.automation_version_id, run.company_id);
+  await traverse(run, graph, node, "done", iteration.parent_scope_key);
+  if (iteration.parent_scope_key === "root") await completeRunIfIdle(run);
+}
+
+async function executeMergeNode(run, node, scopeKey, arrival) {
+  const arrivalKey = arrival?.edge_id || `${arrival?.source_node_id || "unknown"}:${arrival?.source_port || "default"}`;
+  await ctx.pool.query(
+    `INSERT INTO automation_merge_arrivals(run_id, merge_node_id, scope_key, arrival_key, source_node_id, source_port)
+     VALUES($1,$2,$3,$4,$5,$6)
+     ON CONFLICT(run_id, merge_node_id, scope_key, arrival_key) DO NOTHING`,
+    [run.id, node.id, scopeKey, arrivalKey, arrival?.source_node_id || null, arrival?.source_port || null]
+  );
+  const mode = String(node.config?.mode || "any").toLowerCase();
+  const graph = await loadGraph(run.automation_version_id, run.company_id);
+  const inbound = graph.edges.filter((e) => e.target_node_id === node.id);
+  const arrived = (await ctx.pool.query(`SELECT COUNT(*)::int AS count FROM automation_merge_arrivals WHERE run_id = $1 AND merge_node_id = $2 AND scope_key = $3`, [run.id, node.id, scopeKey])).rows[0].count;
+  const alreadyReleased = await ctx.pool.query(`SELECT 1 FROM automation_merge_arrivals WHERE run_id = $1 AND merge_node_id = $2 AND scope_key = $3 AND released_at IS NOT NULL LIMIT 1`, [run.id, node.id, scopeKey]);
+  if (alreadyReleased.rowCount) return { stoppedPath: true, output: { mode, arrived, released: false } };
+  const shouldRelease = mode === "all" ? Number(arrived) >= inbound.length : true;
+  if (!shouldRelease) return { waiting: true, output: { mode, arrived, required: inbound.length } };
+  const released = await ctx.pool.query(
+    `UPDATE automation_merge_arrivals SET released_at = now()
+      WHERE id = (
+        SELECT id FROM automation_merge_arrivals WHERE run_id = $1 AND merge_node_id = $2 AND scope_key = $3 AND released_at IS NULL ORDER BY arrived_at ASC LIMIT 1
+      )
+      RETURNING id`,
+    [run.id, node.id, scopeKey]
+  );
+  if (!released.rowCount) return { stoppedPath: true, output: { mode, arrived, released: false } };
+  return { port: "default", output: { mode, arrived, required: inbound.length, released: true } };
+}
+
+function executeParallelNode(_run, node) {
+  const ports = normalizeDynamicPorts(node.config).map((p) => p.id);
+  return { ports, output: { ports } };
+}
+
+async function executeSwitchNode(run, node, scopeKey) {
+  const context = await buildRunContext(run, { scopeKey });
+  const input = resolveRawValue(node.config?.input, context);
+  const cases = Array.isArray(node.config?.cases) ? node.config.cases : [];
+  for (const item of cases) {
+    const operator = item.operator || "equals";
+    const condition = { operator, left: String(input ?? ""), value: item.value };
+    if (evaluateCondition(condition, { value: input })) {
+      const port = stablePortId(item.port || item.id || item.label || item.value);
+      return { port, output: { input, port, matched: item.label || item.value } };
+    }
+  }
+  return { port: "default", output: { input, port: "default" } };
+}
+
+async function executeRandomSplitNode(run, node, scopeKey) {
+  const name = `random_split:${node.id}:${scopeKey}`;
+  const existing = (await ctx.pool.query(`SELECT value FROM automation_variables WHERE run_id = $1 AND name = $2`, [run.id, name])).rows[0]?.value;
+  if (existing?.port) return { port: existing.port, output: existing };
+  const paths = normalizeDynamicPorts(node.config).filter((p) => p.weight > 0);
+  const total = paths.reduce((sum, p) => sum + p.weight, 0);
+  if (paths.length < 2 || Math.round(total) !== 100) throw new Error("random_split_weights_invalid");
+  const seed = node.config?.mode === "sticky_subject" ? `${run.automation_version_id}:${run.subject_type}:${run.subject_id}:${node.id}` : `${run.id}:${node.id}:${scopeKey}`;
+  const roll = hashNumber(seed) * 100;
+  let cursor = 0;
+  let selected = paths[paths.length - 1];
+  for (const path of paths) {
+    cursor += path.weight;
+    if (roll <= cursor) { selected = path; break; }
+  }
+  const output = { port: selected.id, label: selected.label, weight: selected.weight, mode: node.config?.mode || "per_run" };
+  await ctx.pool.query(
+    `INSERT INTO automation_variables(run_id, name, value) VALUES($1,$2,$3::jsonb)
+     ON CONFLICT(run_id, name) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [run.id, name, JSON.stringify(output)]
+  );
+  return { port: selected.id, output };
+}
+
+async function createMultiEventWait(run, node, scopeKey) {
+  const context = await buildRunContext(run, { scopeKey });
+  const events = (Array.isArray(node.config?.events) ? node.config.events : []).map((event, index) => ({
+    event_type: event.event_type || event.type || event.key,
+    port: stablePortId(event.port || event.label || event.event_type || `event_${index + 1}`),
+    filter: event.filter || event.match || {}
+  })).filter((event) => event.event_type);
+  if (!events.length) throw new Error("multi_wait_events_required");
+  const timeoutMs = node.config?.timeout ? parseDurationMs(resolveTemplate(node.config.timeout, context)) : null;
+  return createWait(run, node, "event", {
+    event_type: "*",
+    event_filter: { events },
+    timeout_at: timeoutMs ? new Date(Date.now() + timeoutMs).toISOString() : null,
+    scope_key: scopeKey
+  });
+}
+
+async function executeGoalNode(run, node, scopeKey) {
+  const context = await buildRunContext(run, { scopeKey });
+  const goalKey = stablePortId(resolveTemplate(node.config?.goal_key || node.title || node.node_key, context));
+  const metadata = resolveConfig(node.config?.metadata || {}, context);
+  await ctx.pool.query(
+    `INSERT INTO automation_run_goals(run_id, node_id, goal_key, metadata, scope_key)
+     VALUES($1,$2,$3,$4::jsonb,$5)
+     ON CONFLICT(run_id, node_id, scope_key, goal_key) DO NOTHING`,
+    [run.id, node.id, goalKey, JSON.stringify(safeJsonLimited(metadata)), scopeKey]
+  );
+  await logRun(run, node, "info", "goal.reached", `Goal reached: ${goalKey}`, { goal_key: goalKey, scope_key: scopeKey });
+  return { port: "default", output: { goal_key: goalKey, metadata } };
 }
 
 function portMatches(edgePort, resultPort) {
@@ -3487,6 +3721,29 @@ async function createWaitForNode(run, node, scopeKey = "root") {
   if (mode === "duration") {
     const resumeAt = new Date(Date.now() + parseDurationMs(resolveTemplate(node.config?.duration || node.config?.value || "1 minute", context)));
     return createWait(run, node, "duration", { resume_at: resumeAt.toISOString(), scope_key: scopeKey });
+  }
+  if (mode === "business_days") {
+    const days = Math.max(1, Number(resolveTemplate(node.config?.amount || node.config?.days || 1, context)) || 1);
+    const resumeAt = addBusinessDays(new Date(), days, context.company || {});
+    return createWait(run, node, "duration", { resume_at: resumeAt.toISOString(), scope_key: scopeKey });
+  }
+  if (mode === "next_business_open") {
+    return createWait(run, node, "duration", { resume_at: nextBusinessOpen(new Date(), context.company || {}).toISOString(), scope_key: scopeKey });
+  }
+  if (mode === "random_duration") {
+    const minMs = parseDurationMs(resolveTemplate(node.config?.min_duration || "1 minute", context));
+    const maxMs = Math.max(minMs, parseDurationMs(resolveTemplate(node.config?.max_duration || "5 minutes", context)));
+    const key = `wait_random:${node.id}:${scopeKey}`;
+    const existing = (await ctx.pool.query(`SELECT value FROM automation_variables WHERE run_id = $1 AND name = $2`, [run.id, key])).rows[0]?.value;
+    const chosenMs = Number(existing?.chosen_ms || 0) || Math.round(minMs + hashNumber(`${run.id}:${node.id}:${scopeKey}`) * (maxMs - minMs));
+    if (!existing) {
+      await ctx.pool.query(
+        `INSERT INTO automation_variables(run_id, name, value) VALUES($1,$2,$3::jsonb)
+         ON CONFLICT(run_id, name) DO NOTHING`,
+        [run.id, key, JSON.stringify({ chosen_ms: chosenMs })]
+      );
+    }
+    return createWait(run, node, "duration", { resume_at: new Date(Date.now() + chosenMs).toISOString(), scope_key: scopeKey });
   }
   if (mode === "until_datetime") {
     let date = null;
@@ -3810,6 +4067,36 @@ function isWithinBusinessHours(date, company) {
   if (!days.includes(day)) return false;
   const hhmm = `${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}`;
   return hhmm >= (company.business_open_time || "09:00") && hhmm <= (company.business_close_time || "17:00");
+}
+
+function addBusinessDays(date, count, company) {
+  const days = Array.isArray(company.business_days) ? company.business_days.map(Number) : [1, 2, 3, 4, 5];
+  const result = new Date(date);
+  let remaining = Math.max(0, Number(count) || 0);
+  while (remaining > 0) {
+    result.setUTCDate(result.getUTCDate() + 1);
+    const day = result.getUTCDay() || 7;
+    if (days.includes(day)) remaining -= 1;
+  }
+  return nextBusinessOpen(result, company);
+}
+
+function nextBusinessOpen(date, company) {
+  const days = Array.isArray(company.business_days) ? company.business_days.map(Number) : [1, 2, 3, 4, 5];
+  const [openHour, openMinute] = String(company.business_open_time || "09:00").split(":").map(Number);
+  const [closeHour, closeMinute] = String(company.business_close_time || "17:00").split(":").map(Number);
+  const result = new Date(date);
+  for (let i = 0; i < 14; i++) {
+    const day = result.getUTCDay() || 7;
+    const open = new Date(result);
+    open.setUTCHours(openHour || 9, openMinute || 0, 0, 0);
+    const close = new Date(result);
+    close.setUTCHours(closeHour || 17, closeMinute || 0, 0, 0);
+    if (days.includes(day) && result <= close) return result <= open ? open : result;
+    result.setUTCDate(result.getUTCDate() + 1);
+    result.setUTCHours(openHour || 9, openMinute || 0, 0, 0);
+  }
+  return result;
 }
 
 async function loadSubject(companyId, subjectType, subjectId) {
@@ -4267,7 +4554,71 @@ function resolveConfig(config, context) {
 }
 
 function getPath(root, path) {
-  return path.split(".").reduce((acc, key) => (acc == null ? undefined : acc[key]), root);
+  if (!isSafeObjectPath(path)) return undefined;
+  return String(path || "").split(".").reduce((acc, key) => (acc == null ? undefined : acc[key]), root);
+}
+
+function isSafeObjectPath(path) {
+  return String(path || "").split(".").every((part) => part && !["__proto__", "constructor", "prototype"].includes(part));
+}
+
+function resolveRawValue(value, context) {
+  if (typeof value !== "string") return value;
+  const match = value.trim().match(/^\{\{\s*([^}]+?)\s*\}\}$/);
+  if (match) return getPath(context, match[1].trim());
+  return resolveTemplate(value, context);
+}
+
+function resolveCollection(value, context, options = {}) {
+  const raw = resolveRawValue(value, context);
+  let items = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed && options.nullAsEmpty !== false) return [];
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      try { items = JSON.parse(trimmed); } catch { items = raw; }
+    }
+  }
+  if (items == null && options.nullAsEmpty !== false) return [];
+  if (!Array.isArray(items)) throw new Error("collection_required");
+  return capCollection(items, options.maxItems || AUTOMATION_LIMITS.maxCollectionOutputItems);
+}
+
+function capCollection(items, maxItems = AUTOMATION_LIMITS.maxCollectionOutputItems) {
+  const capped = items.slice(0, Math.max(0, Math.min(maxItems, AUTOMATION_LIMITS.maxCollectionOutputItems)));
+  return capped.map((item) => safeJsonLimited(item));
+}
+
+function safeJsonLimited(value) {
+  const safe = safeJson(value);
+  const serialized = JSON.stringify(safe);
+  if (serialized.length <= AUTOMATION_LIMITS.maxJsonBytes) return safe;
+  if (Array.isArray(safe)) return safe.slice(0, 25);
+  if (safe && typeof safe === "object") return { truncated: true, keys: Object.keys(safe).slice(0, 50) };
+  return String(safe).slice(0, 1000);
+}
+
+function stablePortId(value) {
+  const cleaned = String(value || "default").trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
+  return cleaned || "default";
+}
+
+function normalizeDynamicPorts(config, fallback = ["path_a", "path_b"]) {
+  const raw = Array.isArray(config?.paths) ? config.paths : fallback.map((id) => ({ id, label: id, weight: 50 }));
+  return raw.map((path, index) => {
+    if (typeof path === "string") return { id: stablePortId(path), label: path, weight: index === 0 ? 50 : 50 };
+    const label = path.label || path.name || path.id || `Path ${index + 1}`;
+    return { ...path, id: stablePortId(path.id || label), label, weight: Number(path.weight ?? path.percentage ?? 0) };
+  }).filter((path) => path.id);
+}
+
+function hashNumber(input) {
+  let h = 2166136261;
+  for (const ch of String(input)) {
+    h ^= ch.charCodeAt(0);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 4294967296;
 }
 
 function evaluateCondition(config, context) {
@@ -6801,6 +7152,353 @@ async function executeFindAvailableSlots(run, _node, config) {
   return { slots };
 }
 
+function boundedLimit(config, fallback = 25) {
+  return Math.min(Math.max(0, Number(config.limit || fallback) || fallback), AUTOMATION_LIMITS.maxCollectionOutputItems);
+}
+
+async function executeContactsSearch(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const clauses = ["company_id = $1", "deleted_at IS NULL"];
+  const params = [run.company_id];
+  const tags = normalizeTags(resolveRawValue(config.tags || [], context));
+  if (tags.length) {
+    params.push(tags);
+    clauses.push(`tags ?| $${params.length}::text[]`);
+  }
+  if (config.source) {
+    params.push(resolveTemplate(config.source, context));
+    clauses.push(`source = $${params.length}`);
+  }
+  if (config.min_value_cents != null) {
+    params.push(Number(resolveTemplate(config.min_value_cents, context)) || 0);
+    clauses.push(`COALESCE(value,0) >= $${params.length}`);
+  }
+  params.push(boundedLimit(config));
+  const rows = (await ctx.pool.query(
+    `SELECT id, name, phone, email, address, tags, source, job_type, value, created_at, updated_at
+       FROM contacts WHERE ${clauses.join(" AND ")}
+      ORDER BY updated_at DESC LIMIT $${params.length}`,
+    params
+  )).rows;
+  return { contacts: rows, items: rows, count: rows.length };
+}
+
+async function executeJobsSearch(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const clauses = ["company_id = $1"];
+  const params = [run.company_id];
+  if (config.contact_id) { params.push(resolveTemplate(config.contact_id, context)); clauses.push(`contact_id::text = $${params.length}`); }
+  if (config.start_after) { params.push(resolveDateExpression(config.start_after, context)?.toISOString()); clauses.push(`start_at >= $${params.length}::timestamptz`); }
+  if (config.start_before) { params.push(resolveDateExpression(config.start_before, context)?.toISOString()); clauses.push(`start_at <= $${params.length}::timestamptz`); }
+  if (config.completed != null) clauses.push(config.completed ? "finished_at IS NOT NULL" : "finished_at IS NULL");
+  params.push(boundedLimit(config));
+  const rows = (await ctx.pool.query(
+    `SELECT id, contact_id, title, start_at, end_at, finished_at, price_cents, worker_user_ids, sales_user_ids, service_items
+       FROM schedule_events WHERE ${clauses.join(" AND ")}
+      ORDER BY start_at DESC LIMIT $${params.length}`,
+    params
+  )).rows;
+  return { jobs: rows, items: rows, count: rows.length };
+}
+
+async function executeTasksSearch(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const clauses = ["u.company_id = $1"];
+  const params = [run.company_id];
+  if (config.contact_id) { params.push(resolveTemplate(config.contact_id, context)); clauses.push(`tt.contact_id::text = $${params.length}`); }
+  if (config.completed != null) { params.push(!!config.completed); clauses.push(`tt.completed = $${params.length}`); }
+  if (config.overdue === true) clauses.push(`tt.completed = false AND tt.due_date IS NOT NULL AND tt.due_date < now()`);
+  params.push(boundedLimit(config));
+  const rows = (await ctx.pool.query(
+    `SELECT tt.id, tt.user_id, tt.contact_id, tt.title, tt.notes, tt.due_date, tt.completed, tt.created_at, tt.updated_at
+       FROM todo_tasks tt JOIN users u ON u.id = tt.user_id
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY tt.updated_at DESC LIMIT $${params.length}`,
+    params
+  )).rows;
+  return { tasks: rows, items: rows, count: rows.length };
+}
+
+async function executeMapSearchPins(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const clauses = ["u.company_id = $1"];
+  const params = [run.company_id];
+  if (config.status) { params.push(resolveTemplate(config.status, context)); clauses.push(`p.status = $${params.length}`); }
+  if (config.list_id) { params.push(resolveTemplate(config.list_id, context)); clauses.push(`p.list_id::text = $${params.length}`); }
+  if (config.has_contact != null) clauses.push(config.has_contact ? "p.contact_id IS NOT NULL" : "p.contact_id IS NULL");
+  params.push(boundedLimit(config));
+  const rows = (await ctx.pool.query(
+    `SELECT p.id, p.contact_id, p.address, p.lat, p.lng, p.status, p.list_id, p.source, p.last_visit_at, p.last_knock_at, p.created_at, p.updated_at
+       FROM map_pins p JOIN users u ON u.id = p.user_id
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY p.updated_at DESC LIMIT $${params.length}`,
+    params
+  )).rows;
+  return { pins: rows, items: rows, count: rows.length };
+}
+
+async function executeRouteGetStops(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const routeId = resolveTemplate(config.route_id || context.route?.id || context.event?.payload?.route_id || run.subject_id || "", context);
+  if (!routeId) throw new Error("route_required");
+  const clauses = ["route_id::text = $1", "company_id = $2"];
+  const params = [routeId, run.company_id];
+  const filter = config.filter || "all";
+  if (filter === "completed") clauses.push("status = 'completed'");
+  if (filter === "skipped") clauses.push("status = 'skipped'");
+  if (filter === "remaining") clauses.push("status NOT IN ('completed','skipped')");
+  const rows = (await ctx.pool.query(
+    `SELECT id, route_id, pin_id, contact_id, job_id, latitude, longitude, address, sort_order, status, arrived_at, completed_at, notes
+       FROM field_route_stops WHERE ${clauses.join(" AND ")} ORDER BY sort_order ASC, created_at ASC`,
+    params
+  )).rows;
+  return { stops: capCollection(rows), items: capCollection(rows), count: rows.length };
+}
+
+async function executeQuotesSearch(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const clauses = ["company_id = $1"];
+  const params = [run.company_id];
+  if (config.status) { params.push(resolveTemplate(config.status, context)); clauses.push(`status = $${params.length}`); }
+  if (config.contact_id) { params.push(resolveTemplate(config.contact_id, context)); clauses.push(`contact_id::text = $${params.length}`); }
+  if (config.min_total_cents != null) { params.push(Number(resolveTemplate(config.min_total_cents, context)) || 0); clauses.push(`total_cents >= $${params.length}`); }
+  params.push(boundedLimit(config));
+  const rows = (await ctx.pool.query(`SELECT id, contact_id, title, status, subtotal_cents, total_cents, expires_at, created_at, updated_at FROM quotes WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC LIMIT $${params.length}`, params)).rows;
+  return { quotes: rows, items: rows, count: rows.length };
+}
+
+async function executePaymentsSearch(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const clauses = ["company_id = $1"];
+  const params = [run.company_id];
+  if (config.status) { params.push(resolveTemplate(config.status, context)); clauses.push(`status = $${params.length}`); }
+  if (config.contact_id) { params.push(resolveTemplate(config.contact_id, context)); clauses.push(`contact_id::text = $${params.length}`); }
+  if (config.service_plan_id) { params.push(resolveTemplate(config.service_plan_id, context)); clauses.push(`service_plan_id::text = $${params.length}`); }
+  params.push(boundedLimit(config));
+  const rows = (await ctx.pool.query(`SELECT id, contact_id, service_plan_id, amount_cents, currency, status, created_at, updated_at FROM payment_records WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC LIMIT $${params.length}`, params)).rows;
+  return { payments: rows, items: rows, count: rows.length };
+}
+
+async function executeServicePlansSearch(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const clauses = ["company_id = $1"];
+  const params = [run.company_id];
+  if (config.status) { params.push(resolveTemplate(config.status, context)); clauses.push(`status = $${params.length}`); }
+  if (config.contact_id) { params.push(resolveTemplate(config.contact_id, context)); clauses.push(`contact_id::text = $${params.length}`); }
+  params.push(boundedLimit(config));
+  const rows = (await ctx.pool.query(`SELECT id, contact_id, plan_name, status, price_cents, billing_interval, service_interval, first_service_date, last_serviced_at, next_service_date, service_count FROM service_plans WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC LIMIT $${params.length}`, params)).rows;
+  return { service_plans: rows, items: rows, count: rows.length };
+}
+
+async function executeEmployeesSearch(run, _node, config) {
+  const clauses = ["company_id = $1"];
+  const params = [run.company_id];
+  if (config.role && config.role !== "any") { params.push(config.role); clauses.push(`role = $${params.length}`); }
+  if (config.active != null) { params.push(!!config.active); clauses.push(`active = $${params.length}`); }
+  params.push(boundedLimit(config));
+  const rows = (await ctx.pool.query(`SELECT id, name, email, role, active, created_at, updated_at FROM users WHERE ${clauses.join(" AND ")} ORDER BY name ASC LIMIT $${params.length}`, params)).rows;
+  return { employees: rows, items: rows, count: rows.length };
+}
+
+async function executeCollectionFilter(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const items = resolveCollection(config.collection, context);
+  const out = items.filter((item, index) => evaluateCondition(config.condition || {}, { ...context, item, item_index: index, iteration: { ...(context.iteration || {}), item, index } }));
+  return { items: capCollection(out), count: out.length };
+}
+
+async function executeCollectionMap(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const items = resolveCollection(config.collection, context);
+  const mappings = config.mappings || {};
+  const out = items.map((item, index) => resolveConfig(mappings, { ...context, item, item_index: index, iteration: { ...(context.iteration || {}), item, index } }));
+  return { items: capCollection(out), count: out.length };
+}
+
+async function executeCollectionSort(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const dir = config.direction === "desc" ? -1 : 1;
+  const type = config.value_type || "string";
+  const items = resolveCollection(config.collection, context).map((item, index) => ({ item, index }));
+  items.sort((a, b) => {
+    const av = getPath(a.item, config.field || "id");
+    const bv = getPath(b.item, config.field || "id");
+    const left = type === "number" ? Number(av || 0) : type === "date" ? new Date(av || 0).getTime() : String(av ?? "");
+    const right = type === "number" ? Number(bv || 0) : type === "date" ? new Date(bv || 0).getTime() : String(bv ?? "");
+    if (left === right) return a.index - b.index;
+    return left > right ? dir : -dir;
+  });
+  const out = items.map((entry) => entry.item);
+  return { items: out, count: out.length };
+}
+
+async function executeCollectionLimit(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const items = resolveCollection(config.collection, context, { maxItems: boundedLimit(config) });
+  return { items, count: items.length };
+}
+
+async function executeCollectionFirst(run, _node, config, scopeKey = "root") {
+  const items = resolveCollection(config.collection, await buildRunContext(run, { scopeKey }));
+  return { item: items[0] || null, exists: items.length > 0 };
+}
+
+async function executeCollectionLast(run, _node, config, scopeKey = "root") {
+  const items = resolveCollection(config.collection, await buildRunContext(run, { scopeKey }));
+  return { item: items[items.length - 1] || null, exists: items.length > 0 };
+}
+
+async function executeCollectionCount(run, _node, config, scopeKey = "root") {
+  const items = resolveCollection(config.collection, await buildRunContext(run, { scopeKey }));
+  return { count: items.length };
+}
+
+async function executeCollectionUnique(run, _node, config, scopeKey = "root") {
+  const items = resolveCollection(config.collection, await buildRunContext(run, { scopeKey }));
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const key = config.identity_field ? getPath(item, config.identity_field) : item;
+    const stable = JSON.stringify(key);
+    if (seen.has(stable)) continue;
+    seen.add(stable);
+    out.push(item);
+  }
+  return { items: out, count: out.length };
+}
+
+async function executeCollectionConcat(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const collections = Array.isArray(config.collections) ? config.collections : [config.collection_a, config.collection_b].filter(Boolean);
+  const out = collections.flatMap((entry) => resolveCollection(entry, context));
+  return { items: capCollection(out), count: Math.min(out.length, AUTOMATION_LIMITS.maxCollectionOutputItems), truncated: out.length > AUTOMATION_LIMITS.maxCollectionOutputItems };
+}
+
+async function executeCollectionFlatten(run, _node, config, scopeKey = "root") {
+  const items = resolveCollection(config.collection, await buildRunContext(run, { scopeKey }));
+  const out = items.flatMap((item) => Array.isArray(item) ? item : [item]);
+  return { items: capCollection(out), count: out.length };
+}
+
+async function executeCollectionContains(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const items = resolveCollection(config.collection, context);
+  const value = resolveRawValue(config.value, context);
+  const found = items.some((item) => looseEqual(config.field ? getPath(item, config.field) : item, value));
+  return { result: found };
+}
+
+async function executeVariableIncrement(run, _node, config) {
+  const name = String(config.name || "").trim();
+  if (!name) throw new Error("variable_name_required");
+  const amount = Number(config.amount ?? 1) || 0;
+  const row = (await ctx.pool.query(
+    `INSERT INTO automation_variables(run_id, name, value) VALUES($1,$2,$3::jsonb)
+     ON CONFLICT(run_id, name) DO UPDATE
+       SET value = to_jsonb(COALESCE((automation_variables.value #>> '{}')::numeric, 0) + $4::numeric), updated_at = now()
+     RETURNING value`,
+    [run.id, name, JSON.stringify(amount), amount]
+  )).rows[0];
+  return { name, value: row.value };
+}
+
+async function executeVariableAppend(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const name = String(config.name || "").trim();
+  if (!name) throw new Error("variable_name_required");
+  const value = safeJsonLimited(resolveRawValue(config.value, context));
+  const existing = (await ctx.pool.query(`SELECT value FROM automation_variables WHERE run_id = $1 AND name = $2 FOR UPDATE`, [run.id, name])).rows[0]?.value;
+  const list = Array.isArray(existing) ? existing : [];
+  const next = config.dedupe && list.some((item) => looseEqual(item, value)) ? list : capCollection([...list, value]);
+  await ctx.pool.query(
+    `INSERT INTO automation_variables(run_id, name, value) VALUES($1,$2,$3::jsonb)
+     ON CONFLICT(run_id, name) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [run.id, name, JSON.stringify(next)]
+  );
+  return { name, value: next, count: next.length };
+}
+
+async function executeObjectGet(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const object = resolveRawValue(config.object, context);
+  const path = String(config.path || "");
+  if (!isSafeObjectPath(path)) throw new Error("unsafe_object_path");
+  return { value: getPath(object || {}, path), exists: getPath(object || {}, path) != null };
+}
+
+async function executeObjectBuild(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  return { object: safeJsonLimited(resolveConfig(config.mappings || {}, context)) };
+}
+
+async function executeCoalesce(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  for (const value of (Array.isArray(config.values) ? config.values : [])) {
+    const resolved = resolveRawValue(value, context);
+    if (resolved != null && resolved !== "") return { value: resolved };
+  }
+  return { value: null };
+}
+
+async function executeMath(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const a = Number(resolveRawValue(config.a, context) || 0);
+  const b = Number(resolveRawValue(config.b, context) || 0);
+  const op = config.operation || "add";
+  let value = a + b;
+  if (op === "subtract") value = a - b;
+  if (op === "multiply") value = a * b;
+  if (op === "divide") {
+    if (b === 0) throw new Error("divide_by_zero");
+    value = a / b;
+  }
+  if (op === "percentage") value = Math.round(a * b / 100);
+  if (op === "min") value = Math.min(a, b);
+  if (op === "max") value = Math.max(a, b);
+  if (op === "round") value = Math.round(a);
+  if (op === "floor") value = Math.floor(a);
+  if (op === "ceil") value = Math.ceil(a);
+  if (op === "absolute") value = Math.abs(a);
+  return { value, operation: op };
+}
+
+async function executeText(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const op = config.operation || "concat";
+  const value = resolveRawValue(config.value, context);
+  const text = Array.isArray(value) ? value.map(String) : String(value ?? "");
+  if (op === "join") return { value: (Array.isArray(value) ? value : [value]).map((v) => String(v ?? "")).join(config.delimiter ?? ", ") };
+  if (op === "uppercase") return { value: String(text).toUpperCase() };
+  if (op === "lowercase") return { value: String(text).toLowerCase() };
+  if (op === "trim") return { value: String(text).trim() };
+  if (op === "replace") return { value: String(text).split(config.find || "").join(config.replace || "") };
+  if (op === "substring") return { value: String(text).slice(Number(config.start || 0), config.end == null ? undefined : Number(config.end)) };
+  if (op === "split") return { items: String(text).split(config.delimiter ?? ","), count: String(text).split(config.delimiter ?? ",").length };
+  if (op === "length") return { value: String(text).length };
+  return { value: Array.isArray(value) ? value.join(config.delimiter ?? "") : String(text) + String(resolveRawValue(config.b || "", context) ?? "") };
+}
+
+async function executeDateTransform(run, _node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
+  const base = new Date(resolveRawValue(config.value, context) || Date.now());
+  if (Number.isNaN(base.getTime())) throw new Error("invalid_date");
+  const op = config.operation || "add";
+  let value = base;
+  if (op === "add") value = addCalendarDuration(base, Number(config.amount || 0), config.unit || "days");
+  if (op === "subtract") value = addCalendarDuration(base, -Number(config.amount || 0), config.unit || "days");
+  if (op === "start_of_day") value = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), 0, 0, 0));
+  if (op === "end_of_day") value = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), 23, 59, 59, 999));
+  if (op === "next_weekday") {
+    value = new Date(base);
+    do { value = addCalendarDuration(value, 1, "days"); } while ([0, 6].includes(value.getUTCDay()));
+  }
+  if (op === "difference") {
+    const other = new Date(resolveRawValue(config.other, context) || Date.now());
+    return { value: Math.round((other.getTime() - base.getTime()) / 60000), unit: "minutes" };
+  }
+  return { value: value.toISOString(), timezone: context.company?.timezone || "UTC" };
+}
+
 async function resolveJob(companyId, subjectId, explicitId, context) {
   const jobId = resolveTemplate(explicitId || context.job?.id || subjectId || "", context);
   if (!jobId) throw new Error("job_id_required");
@@ -7035,7 +7733,10 @@ async function loadRunDetail(runId, companyId) {
   const nodes = (await ctx.pool.query(`SELECT * FROM automation_run_nodes WHERE run_id = $1 ORDER BY created_at ASC`, [runId])).rows;
   const logs = (await ctx.pool.query(`SELECT * FROM automation_logs WHERE run_id = $1 ORDER BY created_at ASC`, [runId])).rows;
   const waits = (await ctx.pool.query(`SELECT * FROM automation_waits WHERE run_id = $1 ORDER BY created_at ASC`, [runId])).rows;
-  return { run, nodes, logs, waits };
+  const iterations = (await ctx.pool.query(`SELECT * FROM automation_run_iterations WHERE run_id = $1 ORDER BY created_at ASC, item_index ASC`, [runId])).rows;
+  const merges = (await ctx.pool.query(`SELECT * FROM automation_merge_arrivals WHERE run_id = $1 ORDER BY arrived_at ASC`, [runId])).rows;
+  const goals = (await ctx.pool.query(`SELECT * FROM automation_run_goals WHERE run_id = $1 ORDER BY reached_at ASC`, [runId])).rows;
+  return { run, nodes, logs, waits, iterations, merges, goals };
 }
 
 function safeJson(value) {
