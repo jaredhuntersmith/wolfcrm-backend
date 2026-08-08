@@ -1116,10 +1116,6 @@ async function bootstrap() {
 
   console.log(`[bootstrap] DB ready @ ${nowIso()}`);
 }
-bootstrap().catch((err) => {
-  console.error("DB bootstrap failed:", err);
-  process.exit(1);
-});
 
 // ---------- auth middleware ----------
 async function authRequired(req, res, next) {
@@ -6649,7 +6645,19 @@ app.post("/stripe/webhook", async (req, res) => {
 });
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
-app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 
-app.get("/", (_req, res) => res.send("WolfCRM backend up"));
-app.listen(PORT, () => console.log(`API listening on ${PORT}`));
+let serverStarted = false;
+async function startServer() {
+  if (serverStarted) {
+    console.warn("[startup] startServer called after listener already started; ignoring duplicate call");
+    return;
+  }
+  serverStarted = true;
+  await bootstrap();
+  app.listen(PORT, () => console.log(`API listening on ${PORT}`));
+}
+
+startServer().catch((err) => {
+  console.error("Server startup failed:", err);
+  process.exit(1);
+});
