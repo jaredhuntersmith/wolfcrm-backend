@@ -29,10 +29,14 @@ const pool = new Pool({
 //   APNS_KEY_ID         Key ID from developer.apple.com
 //   APNS_TEAM_ID        Your Apple Developer team ID
 //   APNS_BUNDLE_ID      Your app's bundle ID (topic)
-//   APNS_PRODUCTION     "true" to use the production APNs environment; else sandbox
-let apnProviderInstance = null;
-function getApnProvider() {
-  if (apnProviderInstance) return apnProviderInstance;
+//   APNS_PRODUCTION     fallback environment for old tokens without stored environment
+const apnProviderInstances = new Map();
+function getApnProvider(environment = null) {
+  const production = environment
+    ? environment === "production"
+    : process.env.APNS_PRODUCTION === "true";
+  const cacheKey = production ? "production" : "sandbox";
+  if (apnProviderInstances.has(cacheKey)) return apnProviderInstances.get(cacheKey);
   let keyPem = process.env.APNS_KEY_P8 || "";
   const keyId = process.env.APNS_KEY_ID || "";
   const teamId = process.env.APNS_TEAM_ID || "";
@@ -42,21 +46,21 @@ function getApnProvider() {
     try { keyPem = Buffer.from(keyPem, "base64").toString("utf8"); } catch (_) {}
   }
   try {
-    apnProviderInstance = new apn.Provider({
+    const provider = new apn.Provider({
       token: { key: keyPem, keyId, teamId },
-      production: process.env.APNS_PRODUCTION === "true"
+      production
     });
+    apnProviderInstances.set(cacheKey, provider);
   } catch (e) {
     console.error("[apns] provider init failed:", e && e.message ? e.message : e);
     return null;
   }
-  return apnProviderInstance;
+  return apnProviderInstances.get(cacheKey);
 }
 
 async function sendApnsPush(deviceTokens, { title, body, contactId, payload = {}, badge = null, threadId = null }) {
-  const provider = getApnProvider();
   const bundleId = process.env.APNS_BUNDLE_ID;
-  if (!provider || !bundleId) {
+  if (!bundleId) {
     return { sent: 0, failed: 0, skipped: true, reason: "not_configured" };
   }
   if (!Array.isArray(deviceTokens) || deviceTokens.length === 0) {
@@ -72,17 +76,55 @@ async function sendApnsPush(deviceTokens, { title, body, contactId, payload = {}
   note.payload = { ...payload };
   if (contactId) note.payload.contact_id = contactId;
   try {
-    const result = await provider.send(note, deviceTokens);
+    const tokenRows = deviceTokens.map((entry) => {
+      if (typeof entry === "string") {
+        return {
+          token: entry,
+          environment: process.env.APNS_PRODUCTION === "true" ? "production" : "sandbox"
+        };
+      }
+      return {
+        token: entry.token,
+        environment: entry.environment === "production" ? "production" : "sandbox"
+      };
+    }).filter((entry) => entry.token);
+    const groups = tokenRows.reduce((acc, entry) => {
+      acc[entry.environment] = acc[entry.environment] || [];
+      acc[entry.environment].push(entry.token);
+      return acc;
+    }, {});
+    let sent = 0;
+    let failed = 0;
+    const badTokens = [];
+    for (const [environment, tokens] of Object.entries(groups)) {
+      const provider = getApnProvider(environment);
+      if (!provider) {
+        console.error("[apns] provider missing for environment", { environment });
+        failed += tokens.length;
+        continue;
+      }
+      console.log("[apns] sending", { environment, tokenCount: tokens.length, payloadType: note.payload?.type || null });
+      const result = await provider.send(note, tokens);
+      sent += (result.sent || []).length;
+      failed += (result.failed || []).length;
+      for (const failure of (result.failed || [])) {
+        console.error("[apns] failed", {
+          environment,
+          status: failure.status,
+          reason: failure.response?.reason || failure.error?.message || "unknown"
+        });
+      }
+      badTokens.push(...(result.failed || [])
+        .filter(f => f.status === "410" || (f.response && f.response.reason === "Unregistered"))
+        .map(f => f.device));
+    }
     // Prune tokens Apple flagged as unregistered so we stop sending to dead devices.
-    const badTokens = (result.failed || [])
-      .filter(f => f.status === "410" || (f.response && f.response.reason === "Unregistered"))
-      .map(f => f.device);
     if (badTokens.length) {
       try {
         await pool.query(`DELETE FROM device_tokens WHERE token = ANY($1::text[])`, [badTokens]);
       } catch (_) {}
     }
-    return { sent: (result.sent || []).length, failed: (result.failed || []).length };
+    return { sent, failed };
   } catch (e) {
     console.error("[apns] send failed:", e && e.message ? e.message : e);
     return { sent: 0, failed: deviceTokens.length, error: "send_failed" };
@@ -92,15 +134,15 @@ async function sendApnsPush(deviceTokens, { title, body, contactId, payload = {}
 async function deviceTokensForCompany(companyId) {
   if (!companyId) return [];
   const { rows } = await pool.query(
-    `SELECT DISTINCT dt.token
+    `SELECT DISTINCT dt.token, COALESCE(dt.environment, CASE WHEN $2::boolean THEN 'production' ELSE 'sandbox' END) AS environment
        FROM device_tokens dt
        JOIN users u ON u.id = dt.user_id
       WHERE u.company_id = $1
         AND u.deleted_at IS NULL
         AND u.role = 'employer'`,
-    [companyId]
+    [companyId, process.env.APNS_PRODUCTION === "true"]
   );
-  return rows.map((row) => row.token).filter(Boolean);
+  return rows.map((row) => ({ token: row.token, environment: row.environment })).filter((row) => row.token);
 }
 
 async function phoneUnreadBadgeCount(companyId) {
@@ -134,6 +176,7 @@ async function phoneUnreadBadgeCount(companyId) {
 async function sendCompanyPhonePush(companyId, options) {
   try {
     const tokens = await deviceTokensForCompany(companyId);
+    console.log("[apns] company users/device tokens resolved", { companyId, tokenCount: tokens.length });
     if (!tokens.length) return { skipped: true, reason: "no_device_tokens" };
     const badge = await phoneUnreadBadgeCount(companyId).catch(() => null);
     return await sendApnsPush(tokens, { ...options, badge });
@@ -629,7 +672,10 @@ async function bootstrap() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE device_tokens ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'sandbox';
+    ALTER TABLE device_tokens ADD COLUMN IF NOT EXISTS last_registration_error TEXT;
     CREATE INDEX IF NOT EXISTS device_tokens_user_idx ON device_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS device_tokens_user_environment_idx ON device_tokens(user_id, environment);
 
     -- Contact provenance for webhook-imported leads
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS source TEXT;
@@ -1996,6 +2042,12 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
       const preview = body.trim()
         ? body.trim().slice(0, 140)
         : (mediaCount > 0 ? "Sent an attachment" : "New message");
+      console.log("[apns] inbound SMS push requested", {
+        companyId: phoneLine.company_id,
+        conversationID: storedConversationID,
+        hasContact: Boolean(contactID),
+        mediaCount
+      });
       sendCompanyPhonePush(phoneLine.company_id, {
         title: pushTitle,
         body: preview,
@@ -2917,6 +2969,16 @@ app.get("/api/phone/calls", authRequired, async (req, res) => {
   } catch (e) {
     console.error("[phone/calls] failed:", { code: e?.code, message: e?.message });
     res.status(500).json({ error: "phone_calls_failed" });
+  }
+});
+
+app.get("/api/phone/unread-count", authRequired, async (req, res) => {
+  if (!req.companyId) return res.json({ count: 0 });
+  try {
+    res.json({ count: await phoneUnreadBadgeCount(req.companyId) });
+  } catch (e) {
+    console.error("[phone/unread-count] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "phone_unread_count_failed" });
   }
 });
 
@@ -4687,22 +4749,72 @@ app.put("/api/integrations/zapier/notifications", authRequired, async (req, res)
 app.post("/api/integrations/device-token", authRequired, async (req, res) => {
   const raw = (req.body && req.body.token) || "";
   const token = typeof raw === "string" ? raw.trim() : "";
+  const rawEnvironment = (req.body && req.body.environment) || "";
+  const environment = rawEnvironment === "production" ? "production" : "sandbox";
   if (!token || token.length < 32 || token.length > 200) {
     return res.status(400).json({ error: "bad_token", message: "Missing or malformed device token." });
   }
   try {
     await pool.query(
-      `INSERT INTO device_tokens (token, user_id, platform)
-       VALUES ($1, $2, 'ios')
+      `INSERT INTO device_tokens (token, user_id, platform, environment, last_registration_error)
+       VALUES ($1, $2, 'ios', $3, NULL)
        ON CONFLICT (token) DO UPDATE
          SET user_id = EXCLUDED.user_id,
+             environment = EXCLUDED.environment,
+             last_registration_error = NULL,
              updated_at = now()`,
-      [token, req.userId]
+      [token, req.userId, environment]
     );
+    console.log("[device-token] registered", { userId: req.userId, environment });
     res.json({ ok: true });
   } catch (e) {
     console.error("[device-token] upsert failed:", e && e.message ? e.message : e);
     res.status(500).json({ error: "failed_upsert" });
+  }
+});
+
+app.get("/api/integrations/push/diagnostics", authRequired, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT environment, updated_at, last_registration_error
+         FROM device_tokens
+        WHERE user_id = $1
+        ORDER BY updated_at DESC
+        LIMIT 5`,
+      [req.userId]
+    );
+    res.json({
+      ok: true,
+      apns_configured: Boolean(process.env.APNS_KEY_P8 && process.env.APNS_KEY_ID && process.env.APNS_TEAM_ID && process.env.APNS_BUNDLE_ID),
+      bundle_id_configured: Boolean(process.env.APNS_BUNDLE_ID),
+      registered_token_count: rows.length,
+      environments: rows.map((row) => row.environment),
+      last_registration_error: rows.find((row) => row.last_registration_error)?.last_registration_error || null
+    });
+  } catch (e) {
+    console.error("[push/diagnostics] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "push_diagnostics_failed" });
+  }
+});
+
+app.post("/api/integrations/push/test", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT token, COALESCE(environment, CASE WHEN $2::boolean THEN 'production' ELSE 'sandbox' END) AS environment
+         FROM device_tokens
+        WHERE user_id = $1`,
+      [req.userId, process.env.APNS_PRODUCTION === "true"]
+    );
+    const result = await sendApnsPush(rows, {
+      title: "WolfCRM test notification",
+      body: "Normal push notifications are registered.",
+      payload: { type: "push_test" },
+      threadId: "push_test"
+    });
+    res.json({ ok: true, sent: result.sent || 0, failed: result.failed || 0, skipped: result.skipped || false, reason: result.reason || null });
+  } catch (e) {
+    console.error("[push/test] failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "push_test_failed" });
   }
 });
 
