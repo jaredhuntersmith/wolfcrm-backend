@@ -126,6 +126,15 @@ app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: false, limit: "2mb" }));
 
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    phone_calls_route: true,
+    incoming_voice_route: true,
+    sms_route: true
+  });
+});
+
 const mediaBucketConfig = () => {
   const endpoint = process.env.MEDIA_ENDPOINT || process.env.AWS_ENDPOINT_URL;
   const bucket = process.env.MEDIA_BUCKET || process.env.AWS_S3_BUCKET_NAME;
