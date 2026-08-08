@@ -703,6 +703,31 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS phone_calls_phone_line_idx ON phone_calls(phone_line_id);
     CREATE INDEX IF NOT EXISTS phone_calls_parent_sid_idx ON phone_calls(twilio_parent_call_sid);
 
+    CREATE TABLE IF NOT EXISTS voicemails (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      phone_line_id UUID REFERENCES phone_lines(id) ON DELETE SET NULL,
+      contact_id UUID REFERENCES contacts(id) ON DELETE SET NULL,
+      phone_call_id UUID REFERENCES phone_calls(id) ON DELETE SET NULL,
+      twilio_call_sid TEXT,
+      twilio_recording_sid TEXT,
+      external_phone_number TEXT,
+      recording_status TEXT,
+      duration_seconds INTEGER,
+      is_read BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      deleted_at TIMESTAMPTZ
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS voicemails_recording_sid_uidx
+      ON voicemails(twilio_recording_sid)
+      WHERE twilio_recording_sid IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS voicemails_company_created_idx ON voicemails(company_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS voicemails_contact_idx ON voicemails(contact_id);
+    CREATE INDEX IF NOT EXISTS voicemails_phone_line_idx ON voicemails(phone_line_id);
+    CREATE INDEX IF NOT EXISTS voicemails_call_sid_idx ON voicemails(twilio_call_sid);
+    CREATE INDEX IF NOT EXISTS voicemails_unread_idx ON voicemails(company_id, is_read) WHERE deleted_at IS NULL;
+
     DO $$
     BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'phone_lines_touch_updated_at') THEN
@@ -723,6 +748,11 @@ async function bootstrap() {
       IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'phone_calls_touch_updated_at') THEN
         CREATE TRIGGER phone_calls_touch_updated_at
         BEFORE UPDATE ON phone_calls
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'voicemails_touch_updated_at') THEN
+        CREATE TRIGGER voicemails_touch_updated_at
+        BEFORE UPDATE ON voicemails
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
       END IF;
     END $$;
