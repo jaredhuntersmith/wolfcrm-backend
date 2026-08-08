@@ -20,7 +20,10 @@ import {
   syncAutomationSchedulesForSmsConversationActivity,
   cancelNoReplySchedulesForConversation,
   syncAutomationSchedulesForVoicemail,
-  recordPhoneSmsConsent
+  recordPhoneSmsConsent,
+  syncAutomationSchedulesForQuote,
+  syncAutomationSchedulesForInvoice,
+  syncAutomationSchedulesForServicePlan
 } from "./automations.js";
 
 const { Pool } = pkg;
@@ -6497,7 +6500,7 @@ app.get("/api/quotes", authRequired, async (req, res) => {
     let rows;
     if (contactID) {
       rows = (await pool.query(
-        `SELECT id, contact_id, title, line_items, total_cents, notes, created_at, updated_at
+        `SELECT id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
          FROM quotes q
          WHERE ${scope.sql} AND contact_id = $${scope.values.length + 1}
          ORDER BY updated_at DESC`,
@@ -6505,7 +6508,7 @@ app.get("/api/quotes", authRequired, async (req, res) => {
       )).rows;
     } else {
       rows = (await pool.query(
-        `SELECT id, contact_id, title, line_items, total_cents, notes, created_at, updated_at
+        `SELECT id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
          FROM quotes q
          WHERE ${scope.sql}
          ORDER BY updated_at DESC
@@ -6538,17 +6541,30 @@ app.get("/api/quotes/totals", authRequired, async (req, res) => {
 });
 
 app.post("/api/quotes", authRequired, async (req, res) => {
-  const { contact_id, title, line_items, notes } = req.body || {};
+  const { contact_id, title, line_items, notes, status, expires_at } = req.body || {};
   if (!contact_id) return res.status(400).json({ error: "contact_id_required" });
   const items = Array.isArray(line_items) ? line_items : [];
   const total = computeQuoteTotalCents(items);
   try {
     const { rows } = await pool.query(
-      `INSERT INTO quotes (user_id, company_id, contact_id, title, line_items, total_cents, notes)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
-       RETURNING id, contact_id, title, line_items, total_cents, notes, created_at, updated_at`,
-      [req.userId, req.companyId || null, contact_id, title || null, JSON.stringify(items), total, notes || null]
+      `INSERT INTO quotes (user_id, company_id, contact_id, title, line_items, total_cents, notes, status, expires_at)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
+       RETURNING id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
+      [req.userId, req.companyId || null, contact_id, title || null, JSON.stringify(items), total, notes || null, ["draft","sent","accepted","declined","expired","converted"].includes(status) ? status : "draft", expires_at || null]
     );
+    if (req.companyId) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "quote.created",
+        subjectType: "quote",
+        subjectId: rows[0].id,
+        actorUserId: req.userId,
+        source: "quotes.api",
+        dedupeKey: `quote.created:${rows[0].id}`,
+        payload: { quote_id: rows[0].id, contact_id, status: rows[0].status, total_cents: rows[0].total_cents, line_item_count: items.length, expires_at: rows[0].expires_at }
+      });
+      await syncAutomationSchedulesForQuote(req.companyId, rows[0]);
+    }
     res.status(201).json(rows[0]);
   } catch (e) {
     console.error("[quotes] create failed:", e && e.message ? e.message : e);
@@ -6557,7 +6573,7 @@ app.post("/api/quotes", authRequired, async (req, res) => {
 });
 
 app.put("/api/quotes/:id", authRequired, async (req, res) => {
-  const { title, line_items, notes } = req.body || {};
+  const { title, line_items, notes, status, expires_at } = req.body || {};
   const items = Array.isArray(line_items) ? line_items : null;
   const total = items ? computeQuoteTotalCents(items) : null;
   try {
@@ -6569,7 +6585,9 @@ app.put("/api/quotes/:id", authRequired, async (req, res) => {
       title || null,
       items ? JSON.stringify(items) : null,
       total,
-      notes || null
+      notes || null,
+      ["draft","sent","accepted","declined","expired","converted"].includes(status) ? status : null,
+      expires_at || null
     ];
     let whereScope;
     if (req.companyId) {
@@ -6579,18 +6597,41 @@ app.put("/api/quotes/:id", authRequired, async (req, res) => {
       params.push(req.userId);
       whereScope = `q.user_id = $${params.length}`;
     }
+    const before = await pool.query(`SELECT * FROM quotes q WHERE id = $1 AND ${whereScope}`, params);
     const { rows } = await pool.query(
       `UPDATE quotes q SET
          title = COALESCE($2, title),
          line_items = COALESCE($3::jsonb, line_items),
          total_cents = COALESCE($4, total_cents),
          notes = COALESCE($5, notes),
+         status = COALESCE($6, status),
+         expires_at = COALESCE($7::timestamptz, expires_at),
+         sent_at = CASE WHEN $6 = 'sent' THEN COALESCE(sent_at, now()) ELSE sent_at END,
+         accepted_at = CASE WHEN $6 = 'accepted' THEN COALESCE(accepted_at, now()) ELSE accepted_at END,
+         declined_at = CASE WHEN $6 = 'declined' THEN COALESCE(declined_at, now()) ELSE declined_at END,
          updated_at = now()
        WHERE id = $1 AND ${whereScope}
-       RETURNING id, contact_id, title, line_items, total_cents, notes, created_at, updated_at`,
+       RETURNING id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
       params
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
+    if (req.companyId) {
+      const prev = before.rows[0] || {};
+      const changed = ["title", "notes", "status", "total_cents", "expires_at"].filter((field) => JSON.stringify(prev[field] ?? null) !== JSON.stringify(rows[0][field] ?? null)).map((field) => ({ field, old_value: prev[field] ?? null, new_value: rows[0][field] ?? null }));
+      if (JSON.stringify(prev.line_items || []) !== JSON.stringify(rows[0].line_items || [])) changed.push({ field: "line_items", old_value: prev.line_items || [], new_value: rows[0].line_items || [] });
+      if (changed.length) {
+        const payload = { quote_id: rows[0].id, contact_id: rows[0].contact_id, status: rows[0].status, total_cents: rows[0].total_cents, line_item_count: Array.isArray(rows[0].line_items) ? rows[0].line_items.length : 0, changed_fields: changed };
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "quote.updated", subjectType: "quote", subjectId: rows[0].id, actorUserId: req.userId, source: "quotes.api", dedupeKey: `quote.updated:${rows[0].id}:${rows[0].updated_at?.toISOString?.() || Date.now()}`, payload });
+        if (prev.status !== rows[0].status) {
+          await emitAutomationEvent({ companyId: req.companyId, eventType: "quote.status_changed", subjectType: "quote", subjectId: rows[0].id, actorUserId: req.userId, source: "quotes.api", dedupeKey: `quote.status_changed:${rows[0].id}:${rows[0].status}:${rows[0].updated_at?.toISOString?.() || Date.now()}`, payload });
+          const eventType = { sent: "quote.sent", accepted: "quote.accepted", declined: "quote.declined", expired: "quote.expired" }[rows[0].status];
+          if (eventType) await emitAutomationEvent({ companyId: req.companyId, eventType, subjectType: "quote", subjectId: rows[0].id, actorUserId: req.userId, source: "quotes.api", dedupeKey: `${eventType}:${rows[0].id}`, payload });
+        }
+        if (prev.total_cents !== rows[0].total_cents) await emitAutomationEvent({ companyId: req.companyId, eventType: "quote.total_changed", subjectType: "quote", subjectId: rows[0].id, actorUserId: req.userId, source: "quotes.api", dedupeKey: `quote.total_changed:${rows[0].id}:${rows[0].updated_at?.toISOString?.() || Date.now()}`, payload });
+        if (JSON.stringify(prev.line_items || []) !== JSON.stringify(rows[0].line_items || [])) await emitAutomationEvent({ companyId: req.companyId, eventType: "quote.line_items_changed", subjectType: "quote", subjectId: rows[0].id, actorUserId: req.userId, source: "quotes.api", dedupeKey: `quote.line_items_changed:${rows[0].id}:${rows[0].updated_at?.toISOString?.() || Date.now()}`, payload });
+      }
+      await syncAutomationSchedulesForQuote(req.companyId, rows[0]);
+    }
     res.json(rows[0]);
   } catch (e) {
     console.error("[quotes] update failed:", e && e.message ? e.message : e);
@@ -6611,11 +6652,25 @@ app.delete("/api/quotes/:id", authRequired, async (req, res) => {
       whereScope = `q.user_id = $2`;
     }
     const result = await pool.query(
-      `DELETE FROM quotes q WHERE id = $1 AND ${whereScope}`,
+      `DELETE FROM quotes q WHERE id = $1 AND ${whereScope}
+       RETURNING id, company_id, contact_id, status, total_cents`,
       params
     );
     console.log("[quotes] delete", { id: req.params.id, deleted: result.rowCount });
     if (!result.rowCount) return res.status(404).json({ error: "not_found" });
+    if (req.companyId) {
+      await cancelAutomationSchedulesForSubject(req.companyId, "quote", req.params.id);
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "quote.deleted",
+        subjectType: "quote",
+        subjectId: req.params.id,
+        actorUserId: req.userId,
+        source: "quotes.api",
+        dedupeKey: `quote.deleted:${req.params.id}`,
+        payload: { quote_id: req.params.id, contact_id: result.rows[0].contact_id || null, status: result.rows[0].status, total_cents: result.rows[0].total_cents || 0 }
+      });
+    }
     res.status(204).end();
   } catch (e) {
     console.error("[quotes] delete failed:", e && e.message ? e.message : e);
@@ -7855,6 +7910,7 @@ app.post("/api/service-plans", authRequired, async (req, res) => {
         dedupeKey: `service_plan.created:${inserted.rows[0].id}`,
         payload: { service_plan_id: inserted.rows[0].id, contact_id: contactId, plan_name }
       });
+      await syncAutomationSchedulesForServicePlan(req.companyId, inserted.rows[0]);
     }
     // Join contact info for the response so the client shows the customer.
     const joined = await pool.query(
@@ -7881,6 +7937,7 @@ app.put("/api/service-plans/:id", authRequired, requireEmployer, async (req, res
       [req.params.id, employerId]
     );
     if (!owned.rows.length) return res.status(404).json({ error: "not_found" });
+    const before = await pool.query(`SELECT * FROM service_plans WHERE id = $1 AND user_id = $2`, [req.params.id, employerId]);
     const { rows } = await pool.query(
       `UPDATE service_plans
           SET plan_name = COALESCE($2, plan_name),
@@ -7910,6 +7967,20 @@ app.put("/api/service-plans/:id", authRequired, requireEmployer, async (req, res
         b.notes || null
       ]
     );
+    if (req.companyId) {
+      const prev = before.rows[0] || {};
+      const changed = ["plan_name", "price_cents", "billing_interval", "billing_interval_count", "service_interval", "service_interval_count", "first_service_date", "next_service_date"].filter((field) => JSON.stringify(prev[field] ?? null) !== JSON.stringify(rows[0][field] ?? null)).map((field) => ({ field, old_value: prev[field] ?? null, new_value: rows[0][field] ?? null }));
+      if (changed.length) {
+        const payload = { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, status: rows[0].status, price_cents: rows[0].price_cents, next_service_date: rows[0].next_service_date, changed_fields: changed };
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "service_plan.updated", subjectType: "service_plan", subjectId: rows[0].id, actorUserId: req.userId, source: "service_plans.api", dedupeKey: `service_plan.updated:${rows[0].id}:${rows[0].updated_at?.toISOString?.() || Date.now()}`, payload });
+        const eventMap = { price_cents: "service_plan.price_changed", billing_interval: "service_plan.billing_interval_changed", billing_interval_count: "service_plan.billing_interval_changed", service_interval: "service_plan.service_interval_changed", service_interval_count: "service_plan.service_interval_changed", first_service_date: "service_plan.first_service_date_changed", next_service_date: "service_plan.next_service_changed" };
+        for (const item of changed) {
+          const eventType = eventMap[item.field];
+          if (eventType) await emitAutomationEvent({ companyId: req.companyId, eventType, subjectType: "service_plan", subjectId: rows[0].id, actorUserId: req.userId, source: "service_plans.api", dedupeKey: `${eventType}:${rows[0].id}:${rows[0].updated_at?.toISOString?.() || Date.now()}:${item.field}`, payload: { ...payload, changed_fields: [item] } });
+        }
+      }
+      await syncAutomationSchedulesForServicePlan(req.companyId, rows[0]);
+    }
     res.json(sanitizeServicePlan(rows[0]));
   } catch (e) {
     console.error(e);
@@ -8083,6 +8154,29 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
       [employerId, req.companyId || null, req.userId, plan.id, plan.contact_id,
        `Started by ${req.userEmail || req.userId}`]
     );
+    if (req.companyId) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "payment.started",
+        subjectType: "payment",
+        subjectId: paymentRecord.rows[0].id,
+        actorUserId: req.userId,
+        source: "stripe.api",
+        dedupeKey: `payment.started:${paymentRecord.rows[0].id}`,
+        payload: { payment_id: paymentRecord.rows[0].id, contact_id: plan.contact_id, service_plan_id: plan.id, amount_cents: plan.price_cents, currency: (plan.currency || "usd").toLowerCase(), status: "pending", stripe_payment_intent_id: pi.id, stripe_subscription_id: subscription.id }
+      });
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "service_plan.subscription_created",
+        subjectType: "service_plan",
+        subjectId: plan.id,
+        actorUserId: req.userId,
+        source: "stripe.api",
+        dedupeKey: `service_plan.subscription_created:${subscription.id}`,
+        payload: { service_plan_id: plan.id, contact_id: plan.contact_id, subscription_status: subscription.status, stripe_subscription_id: subscription.id }
+      });
+      await syncAutomationSchedulesForServicePlan(req.companyId, { ...plan, status: "payment_pending", stripe_subscription_id: subscription.id, stripe_subscription_status: subscription.status });
+    }
 
     res.json({
       publishable_key: publishableKey,
@@ -8140,6 +8234,7 @@ app.post("/api/service-plans/:id/mark-serviced", authRequired, requireEmployer, 
         dedupeKey: `service_plan.serviced:${plan.id}:${completed}`,
         payload: { service_plan_id: plan.id, contact_id: plan.contact_id, completed_date: completed, next_service_date: next }
       });
+      await syncAutomationSchedulesForServicePlan(req.companyId, updated.rows[0]);
     }
     res.json(sanitizeServicePlan(updated.rows[0]));
   } catch (e) {
@@ -8168,6 +8263,19 @@ app.post("/api/service-plans/:id/pause", authRequired, requireEmployer, async (r
     // TODO: also pause the Stripe subscription (`pause_collection`) when a
     // clear resume UX exists — leaving local-only for now so we never
     // accidentally break Stripe billing state.
+    if (req.companyId) {
+      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", rows[0].id);
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "service_plan.paused",
+        subjectType: "service_plan",
+        subjectId: rows[0].id,
+        actorUserId: req.userId,
+        source: "service_plans.api",
+        dedupeKey: `service_plan.paused:${rows[0].id}:${rows[0].updated_at?.toISOString?.() || Date.now()}`,
+        payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, status: rows[0].status }
+      });
+    }
     res.json(sanitizeServicePlan(rows[0]));
   } catch (e) {
     console.error(e);
@@ -8206,6 +8314,19 @@ app.post("/api/service-plans/:id/cancel", authRequired, requireEmployer, async (
       [employerId, req.companyId || null, req.userId, plan.id, plan.contact_id,
        `Canceled by ${req.userEmail || req.userId}`]
     );
+    if (req.companyId) {
+      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", updated.rows[0].id);
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "service_plan.canceled",
+        subjectType: "service_plan",
+        subjectId: updated.rows[0].id,
+        actorUserId: req.userId,
+        source: "service_plans.api",
+        dedupeKey: `service_plan.canceled:${updated.rows[0].id}`,
+        payload: { service_plan_id: updated.rows[0].id, contact_id: updated.rows[0].contact_id, status: updated.rows[0].status, stripe_subscription_id: plan.stripe_subscription_id || null }
+      });
+    }
     res.json(sanitizeServicePlan(updated.rows[0]));
   } catch (e) {
     console.error(e);
@@ -8288,6 +8409,28 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
         connectedAccountId, customer.id, intent.id
       ]
     );
+    if (req.companyId) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "payment.created",
+        subjectType: "payment",
+        subjectId: record.rows[0].id,
+        actorUserId: req.userId,
+        source: "stripe.api",
+        dedupeKey: `payment.created:${record.rows[0].id}`,
+        payload: { payment_id: record.rows[0].id, contact_id: contact.id, amount_cents: amountInt, currency, status: "pending", stripe_payment_intent_id: intent.id }
+      });
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "payment.started",
+        subjectType: "payment",
+        subjectId: record.rows[0].id,
+        actorUserId: req.userId,
+        source: "stripe.api",
+        dedupeKey: `payment.started:${record.rows[0].id}`,
+        payload: { payment_id: record.rows[0].id, contact_id: contact.id, amount_cents: amountInt, currency, status: "pending", stripe_payment_intent_id: intent.id }
+      });
+    }
     res.json({
       publishable_key: publishableKey,
       connected_account_id: connectedAccountId,
@@ -8427,12 +8570,29 @@ app.post("/stripe/webhook", async (req, res) => {
                   updated_at = now()
             WHERE stripe_subscription_id = $1
               AND (stripe_connected_account_id = $4 OR $4 IS NULL)
-            RETURNING id, user_id, company_id, contact_id`,
+            RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
           [sub.id, sub.status, localStatus, connectedAccountId]
         );
         if (rows.length) {
           await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
             `stripe_${event.type}`, `Subscription is ${sub.status}`);
+          const mappedEvent = event.type === "customer.subscription.created"
+            ? "service_plan.subscription_created"
+            : event.type === "customer.subscription.deleted"
+              ? "service_plan.subscription_canceled"
+              : ({ active: "service_plan.subscription_active", past_due: "service_plan.subscription_past_due", unpaid: "service_plan.subscription_unpaid", paused: "service_plan.subscription_paused" }[sub.status] || "service_plan.updated");
+          if (rows[0].company_id) {
+            await emitAutomationEvent({
+              companyId: rows[0].company_id,
+              eventType: mappedEvent,
+              subjectType: "service_plan",
+              subjectId: rows[0].id,
+              source: "stripe.webhook",
+              dedupeKey: `${mappedEvent}:${event.id}:${rows[0].id}`,
+              payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, stripe_event_id: event.id, stripe_subscription_id: sub.id, subscription_status: sub.status, status: rows[0].status }
+            });
+            await syncAutomationSchedulesForServicePlan(rows[0].company_id, rows[0]);
+          }
         }
         break;
       }
@@ -8468,12 +8628,22 @@ app.post("/stripe/webhook", async (req, res) => {
                     updated_at = now()
               WHERE stripe_subscription_id = $1
                 AND (stripe_connected_account_id = $2 OR $2 IS NULL)
-              RETURNING id, user_id, company_id, contact_id`,
+              RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
             [invoice.subscription, connectedAccountId]
           );
           if (rows.length) {
             await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
               "invoice_paid", `Invoice ${invoice.id} paid`);
+            await emitAutomationEvent({
+              companyId: rows[0].company_id,
+              eventType: "service_plan.subscription_payment_succeeded",
+              subjectType: "service_plan",
+              subjectId: rows[0].id,
+              source: "stripe.webhook",
+              dedupeKey: `service_plan.subscription_payment_succeeded:${event.id}:${rows[0].id}`,
+              payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, stripe_event_id: event.id, stripe_invoice_id: invoice.id, stripe_subscription_id: invoice.subscription, subscription_status: "active" }
+            });
+            await syncAutomationSchedulesForServicePlan(rows[0].company_id, rows[0]);
           }
         }
         break;
@@ -8485,8 +8655,9 @@ app.post("/stripe/webhook", async (req, res) => {
           `UPDATE payment_records
               SET status = 'failed', updated_at = now()
             WHERE stripe_invoice_id = $1
+               OR stripe_subscription_id = $2
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [invoice.id]
+          [invoice.id, invoice.subscription || null]
         );
         for (const rec of failedRecords.rows) {
           await emitAutomationEvent({
@@ -8504,12 +8675,21 @@ app.post("/stripe/webhook", async (req, res) => {
             `UPDATE service_plans
                 SET status = 'past_due', updated_at = now()
               WHERE stripe_subscription_id = $1
-              RETURNING id, user_id, company_id, contact_id`,
+              RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
             [invoice.subscription]
           );
           if (rows.length) {
             await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
               "invoice_failed", `Invoice ${invoice.id} failed`);
+            await emitAutomationEvent({
+              companyId: rows[0].company_id,
+              eventType: "service_plan.subscription_payment_failed",
+              subjectType: "service_plan",
+              subjectId: rows[0].id,
+              source: "stripe.webhook",
+              dedupeKey: `service_plan.subscription_payment_failed:${event.id}:${rows[0].id}`,
+              payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, stripe_event_id: event.id, stripe_invoice_id: invoice.id, stripe_subscription_id: invoice.subscription, subscription_status: "past_due" }
+            });
           }
         }
         break;
@@ -8564,12 +8744,75 @@ app.post("/stripe/webhook", async (req, res) => {
       case "charge.refunded": {
         const charge = event.data.object;
         if (charge.payment_intent) {
-          await pool.query(
+          const refunded = await pool.query(
             `UPDATE payment_records
                 SET status = 'refunded', updated_at = now()
-              WHERE stripe_payment_intent_id = $1`,
+              WHERE stripe_payment_intent_id = $1
+              RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
             [charge.payment_intent]
           );
+          for (const rec of refunded.rows) {
+            await emitAutomationEvent({
+              companyId: rec.company_id,
+              eventType: charge.amount_refunded && charge.amount_refunded < charge.amount ? "payment.partially_refunded" : "payment.refunded",
+              subjectType: "payment",
+              subjectId: rec.id,
+              source: "stripe.webhook",
+              dedupeKey: `payment.refunded:${event.id}:${rec.id}`,
+              payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: charge.payment_intent }
+            });
+          }
+        }
+        break;
+      }
+
+      case "payment_intent.canceled":
+      case "payment_intent.requires_action":
+      case "payment_intent.requires_payment_method": {
+        const pi = event.data.object;
+        const statusMap = { "payment_intent.canceled": "canceled", "payment_intent.requires_action": "action_required", "payment_intent.requires_payment_method": "payment_method_required" };
+        const eventMap = { "payment_intent.canceled": "payment.canceled", "payment_intent.requires_action": "payment.action_required", "payment_intent.requires_payment_method": "payment.payment_method_required" };
+        const records = await pool.query(
+          `UPDATE payment_records SET status = $2, updated_at = now()
+            WHERE stripe_payment_intent_id = $1
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
+          [pi.id, statusMap[event.type]]
+        );
+        for (const rec of records.rows) {
+          await emitAutomationEvent({
+            companyId: rec.company_id,
+            eventType: eventMap[event.type],
+            subjectType: "payment",
+            subjectId: rec.id,
+            source: "stripe.webhook",
+            dedupeKey: `${eventMap[event.type]}:${event.id}:${rec.id}`,
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
+          });
+        }
+        break;
+      }
+
+      case "charge.dispute.created":
+      case "charge.dispute.updated":
+      case "charge.dispute.closed": {
+        const dispute = event.data.object;
+        const eventType = event.type === "charge.dispute.created" ? "payment.dispute_created" : event.type === "charge.dispute.closed" ? "payment.dispute_closed" : "payment.dispute_updated";
+        const records = await pool.query(
+          `SELECT id, company_id, contact_id, service_plan_id, amount_cents, currency
+             FROM payment_records
+            WHERE stripe_payment_intent_id = $1 OR stripe_invoice_id = $2`,
+          [dispute.payment_intent || null, dispute.invoice || null]
+        );
+        for (const rec of records.rows) {
+          await emitAutomationEvent({
+            companyId: rec.company_id,
+            eventType,
+            subjectType: "payment",
+            subjectId: rec.id,
+            source: "stripe.webhook",
+            dedupeKey: `${eventType}:${event.id}:${rec.id}`,
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, dispute_id: dispute.id, dispute_status: dispute.status }
+          });
         }
         break;
       }
@@ -8603,7 +8846,8 @@ async function startServer() {
     requireEmployer,
     sendPushToUsers,
     createTwilioClient,
-    twilioPublicUrl
+    twilioPublicUrl,
+    getStripe
   });
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }

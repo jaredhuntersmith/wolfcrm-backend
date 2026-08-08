@@ -169,10 +169,68 @@ const triggerCatalog = [
   ["internal.message_deleted", "Internal Message Deleted", "Company Comms", "An internal message was deleted.", ["internal_message"], ["internal.message_deleted"]],
   ["internal.conversation_read", "Internal Conversation Read", "Company Comms", "An internal conversation was marked read.", ["internal_conversation"], ["internal.conversation_read"]],
   ["internal.conversation_unread", "Internal Conversation Unread", "Company Comms", "An internal conversation became unread.", ["internal_conversation"], ["internal.conversation_unread"]],
+  ["quote.created", "Quote Created", "Quotes", "A quote was created.", ["quote", "contact"], ["quote.created"]],
+  ["quote.updated", "Quote Updated", "Quotes", "A quote was updated.", ["quote", "contact"], ["quote.updated"]],
+  ["quote.deleted", "Quote Deleted", "Quotes", "A quote was deleted.", ["quote", "contact"], ["quote.deleted"]],
+  ["quote.line_item_added", "Quote Line Item Added", "Quotes", "A quote line item was added.", ["quote"], ["quote.line_item_added"]],
+  ["quote.line_item_removed", "Quote Line Item Removed", "Quotes", "A quote line item was removed.", ["quote"], ["quote.line_item_removed"]],
+  ["quote.line_items_changed", "Quote Line Items Changed", "Quotes", "Quote line items changed.", ["quote"], ["quote.line_items_changed"]],
+  ["quote.total_changed", "Quote Total Changed", "Quotes", "A quote total changed.", ["quote"], ["quote.total_changed"]],
+  ["quote.contact_changed", "Quote Contact Changed", "Quotes", "A quote contact changed.", ["quote", "contact"], ["quote.contact_changed"]],
+  ["quote.status_changed", "Quote Status Changed", "Quotes", "A quote lifecycle status changed.", ["quote"], ["quote.status_changed"]],
+  ["quote.sent", "Quote Sent", "Quotes", "A quote was marked sent.", ["quote"], ["quote.sent"]],
+  ["quote.accepted", "Quote Accepted", "Quotes", "A quote was marked accepted.", ["quote"], ["quote.accepted"]],
+  ["quote.declined", "Quote Declined", "Quotes", "A quote was marked declined.", ["quote"], ["quote.declined"]],
+  ["quote.expired", "Quote Expired", "Quotes", "A quote expiration date was reached.", ["quote"], ["quote.expired"]],
+  ["quote.converted_to_job", "Quote Converted to Job", "Quotes", "A quote was converted into a scheduled job.", ["quote", "job"], ["quote.converted_to_job"]],
+  ["quote.scheduled", "Quote Scheduled", "Quotes", "A quote produced a scheduled job.", ["quote", "job"], ["quote.scheduled"]],
+  ["quote.followup_due", "Quote Follow-Up Due", "Quotes", "A quote follow-up timer became due.", ["quote"], ["quote.followup_due"]],
+  ["invoice.created", "Invoice Created", "Invoices", "A durable invoice record was created.", ["invoice", "contact"], ["invoice.created"]],
+  ["invoice.issued", "Invoice Issued", "Invoices", "An invoice was issued.", ["invoice"], ["invoice.issued"]],
+  ["invoice.updated", "Invoice Updated", "Invoices", "An invoice was updated.", ["invoice"], ["invoice.updated"]],
+  ["invoice.due", "Invoice Due", "Invoices", "An invoice due date arrived.", ["invoice"], ["invoice.due"]],
+  ["invoice.overdue", "Invoice Overdue", "Invoices", "An unpaid invoice became overdue.", ["invoice"], ["invoice.overdue"]],
+  ["invoice.paid", "Invoice Paid", "Invoices", "An invoice was paid.", ["invoice", "payment"], ["invoice.paid"]],
+  ["invoice.voided", "Invoice Voided", "Invoices", "An invoice was voided.", ["invoice"], ["invoice.voided"]],
+  ["invoice.deleted", "Invoice Deleted", "Invoices", "An invoice record was deleted.", ["invoice"], ["invoice.deleted"]],
+  ["invoice.total_changed", "Invoice Total Changed", "Invoices", "An invoice total changed.", ["invoice"], ["invoice.total_changed"]],
+  ["payment.created", "Payment Created", "Payments", "A payment record was created.", ["payment", "contact"], ["payment.created"]],
+  ["payment.started", "Payment Started", "Payments", "A payment collection flow started.", ["payment", "contact"], ["payment.started"]],
+  ["payment.pending", "Payment Pending", "Payments", "A payment is pending.", ["payment", "contact"], ["payment.pending"]],
   ["payment.succeeded", "Payment Succeeded", "Payments", "A Stripe payment succeeded.", ["payment", "contact"], ["payment.succeeded"]],
   ["payment.failed", "Payment Failed", "Payments", "A Stripe payment failed.", ["payment", "contact"], ["payment.failed"]],
+  ["payment.canceled", "Payment Canceled", "Payments", "A payment was canceled.", ["payment"], ["payment.canceled"]],
+  ["payment.refunded", "Payment Refunded", "Payments", "A payment was refunded.", ["payment"], ["payment.refunded"]],
+  ["payment.partially_refunded", "Payment Partially Refunded", "Payments", "A payment was partially refunded.", ["payment"], ["payment.partially_refunded"]],
+  ["payment.payment_method_required", "Payment Method Required", "Payments", "Stripe requires a payment method.", ["payment"], ["payment.payment_method_required"]],
+  ["payment.action_required", "Payment Action Required", "Payments", "Stripe requires customer action.", ["payment"], ["payment.action_required"]],
+  ["payment.dispute_created", "Payment Dispute Created", "Payments", "A Stripe dispute was created.", ["payment"], ["payment.dispute_created"]],
+  ["payment.dispute_updated", "Payment Dispute Updated", "Payments", "A Stripe dispute changed.", ["payment"], ["payment.dispute_updated"]],
+  ["payment.dispute_closed", "Payment Dispute Closed", "Payments", "A Stripe dispute closed.", ["payment"], ["payment.dispute_closed"]],
   ["service_plan.created", "Service Plan Created", "Service Plans", "A service plan was created.", ["service_plan"], ["service_plan.created"]],
+  ["service_plan.updated", "Service Plan Updated", "Service Plans", "A service plan was updated.", ["service_plan"], ["service_plan.updated"]],
+  ["service_plan.activated", "Service Plan Activated", "Service Plans", "A service plan became active.", ["service_plan"], ["service_plan.activated"]],
+  ["service_plan.paused", "Service Plan Paused", "Service Plans", "A service plan was paused.", ["service_plan"], ["service_plan.paused"]],
+  ["service_plan.resumed", "Service Plan Resumed", "Service Plans", "A service plan resumed.", ["service_plan"], ["service_plan.resumed"]],
+  ["service_plan.canceled", "Service Plan Canceled", "Service Plans", "A service plan was canceled.", ["service_plan"], ["service_plan.canceled"]],
   ["service_plan.serviced", "Service Plan Serviced", "Service Plans", "A service plan was marked serviced.", ["service_plan"], ["service_plan.serviced"]],
+  ["service_plan.service_due", "Service Due", "Service Plans", "A service plan service date arrived.", ["service_plan"], ["service_plan.service_due"]],
+  ["service_plan.service_upcoming", "Service Upcoming", "Service Plans", "A service plan service date is approaching.", ["service_plan"], ["service_plan.service_upcoming"]],
+  ["service_plan.service_overdue", "Service Overdue", "Service Plans", "A service plan service became overdue.", ["service_plan"], ["service_plan.service_overdue"]],
+  ["service_plan.next_service_changed", "Next Service Changed", "Service Plans", "The next service date changed.", ["service_plan"], ["service_plan.next_service_changed"]],
+  ["service_plan.price_changed", "Service Plan Price Changed", "Service Plans", "A service plan price changed.", ["service_plan"], ["service_plan.price_changed"]],
+  ["service_plan.billing_interval_changed", "Billing Interval Changed", "Service Plans", "A billing interval changed.", ["service_plan"], ["service_plan.billing_interval_changed"]],
+  ["service_plan.service_interval_changed", "Service Interval Changed", "Service Plans", "A service interval changed.", ["service_plan"], ["service_plan.service_interval_changed"]],
+  ["service_plan.first_service_date_changed", "First Service Date Changed", "Service Plans", "A first service date changed.", ["service_plan"], ["service_plan.first_service_date_changed"]],
+  ["service_plan.subscription_created", "Subscription Created", "Subscriptions", "A Stripe subscription was created.", ["service_plan"], ["service_plan.subscription_created"]],
+  ["service_plan.subscription_active", "Subscription Active", "Subscriptions", "A subscription became active.", ["service_plan"], ["service_plan.subscription_active"]],
+  ["service_plan.subscription_paused", "Subscription Paused", "Subscriptions", "A subscription paused where supported by Stripe.", ["service_plan"], ["service_plan.subscription_paused"]],
+  ["service_plan.subscription_canceled", "Subscription Canceled", "Subscriptions", "A subscription was canceled.", ["service_plan"], ["service_plan.subscription_canceled"]],
+  ["service_plan.subscription_payment_succeeded", "Subscription Payment Succeeded", "Subscriptions", "A service-plan subscription payment succeeded.", ["service_plan", "payment"], ["service_plan.subscription_payment_succeeded"]],
+  ["service_plan.subscription_payment_failed", "Subscription Payment Failed", "Subscriptions", "A service-plan subscription payment failed.", ["service_plan", "payment"], ["service_plan.subscription_payment_failed"]],
+  ["service_plan.subscription_past_due", "Subscription Past Due", "Subscriptions", "A subscription became past due.", ["service_plan"], ["service_plan.subscription_past_due"]],
+  ["service_plan.subscription_unpaid", "Subscription Unpaid", "Subscriptions", "A subscription became unpaid.", ["service_plan"], ["service_plan.subscription_unpaid"]],
+  ["service_plan.subscription_trial_ending", "Subscription Trial Ending", "Subscriptions", "Stripe reported a subscription trial ending.", ["service_plan"], ["service_plan.subscription_trial_ending"]],
   ["task.created", "Task Created", "Tasks", "A task was created.", ["task"], ["task.created"]],
   ["task.updated", "Task Updated", "Tasks", "A task was updated.", ["task"], ["task.updated"]],
   ["task.assigned", "Task Assigned", "Tasks", "A task was assigned to a user.", ["task"], ["task.assigned"]],
@@ -274,6 +332,49 @@ const actionCatalog = [
   ["voicemail.delete", "Delete Voicemail", "Voicemail", "Deletes the WolfCRM voicemail record.", ["voicemail"], ["default"]],
   ["voicemail.create_callback_task", "Create Voicemail Callback Task", "Voicemail", "Creates a callback task from voicemail.", ["voicemail"], ["default"]],
   ["voicemail.send_followup_sms", "Send Voicemail Follow-Up SMS", "Voicemail", "Sends follow-up SMS using the shared SMS safety path.", ["voicemail"], ["default"]],
+  ["quote.create", "Create Quote", "Quotes", "Creates a contact quote with line items.", ["contact"], ["default"]],
+  ["quote.update", "Update Quote", "Quotes", "Updates quote fields and line items.", ["quote"], ["default"]],
+  ["quote.delete", "Delete Quote", "Quotes", "Deletes a quote after explicit confirmation.", ["quote"], ["default"]],
+  ["quote.add_line_item", "Add Quote Line Item", "Quotes", "Adds a line item to a quote.", ["quote"], ["default"]],
+  ["quote.remove_line_item", "Remove Quote Line Item", "Quotes", "Removes matching quote line items.", ["quote"], ["default"]],
+  ["quote.replace_line_items", "Replace Quote Line Items", "Quotes", "Replaces all quote line items.", ["quote"], ["default"]],
+  ["quote.set_status", "Set Quote Status", "Quotes", "Sets quote lifecycle status.", ["quote"], ["default"]],
+  ["quote.mark_sent", "Mark Quote Sent", "Quotes", "Marks a quote sent.", ["quote"], ["default"]],
+  ["quote.mark_accepted", "Mark Quote Accepted", "Quotes", "Marks a quote accepted.", ["quote"], ["default"]],
+  ["quote.mark_declined", "Mark Quote Declined", "Quotes", "Marks a quote declined.", ["quote"], ["default"]],
+  ["quote.set_expiration", "Set Quote Expiration", "Quotes", "Sets quote expiration.", ["quote"], ["default"]],
+  ["quote.convert_to_job", "Convert Quote to Job", "Quotes", "Creates a scheduled job from a quote.", ["quote"], ["default"]],
+  ["quote.create_followup_task", "Create Quote Follow-Up Task", "Quotes", "Creates a quote follow-up task.", ["quote"], ["default"]],
+  ["quote.create_invoice", "Create Invoice from Quote", "Invoices", "Creates a lightweight invoice record from a quote.", ["quote"], ["default"]],
+  ["invoice.create", "Create Invoice", "Invoices", "Creates a durable invoice record.", ["contact"], ["default"]],
+  ["invoice.issue", "Issue Invoice", "Invoices", "Marks an invoice issued.", ["invoice"], ["default"]],
+  ["invoice.set_due_date", "Set Invoice Due Date", "Invoices", "Sets an invoice due date.", ["invoice"], ["default"]],
+  ["invoice.void", "Void Invoice", "Invoices", "Voids an invoice.", ["invoice"], ["default"]],
+  ["invoice.create_payment_request", "Create Invoice Payment Request", "Invoices", "Creates a Stripe payment request for an invoice.", ["invoice"], ["default"]],
+  ["invoice.generate_pdf", "Generate Invoice PDF", "Invoices", "Deferred because PDF generation is currently iOS-side.", ["invoice"], ["default"]],
+  ["invoice.send_payment_link", "Send Invoice Payment Link", "Invoices", "Creates a payment request and sends it by SMS.", ["invoice"], ["default"]],
+  ["invoice.create_followup_task", "Create Invoice Follow-Up Task", "Invoices", "Creates an invoice follow-up task.", ["invoice"], ["default"]],
+  ["payment.create_request", "Create Payment Request", "Payments", "Creates a Stripe PaymentIntent using the connected account.", ["contact"], ["default"]],
+  ["payment.create_payment_link", "Create Payment Link", "Payments", "Creates a payment request/link reference where supported.", ["contact"], ["default"]],
+  ["payment.create_followup_task", "Create Payment Follow-Up Task", "Payments", "Creates a payment follow-up task.", ["payment"], ["default"]],
+  ["payment.send_payment_sms", "Send Payment SMS", "Payments", "Sends a payment follow-up SMS through the shared SMS safety path.", ["payment", "contact"], ["default"]],
+  ["payment.send_payment_push", "Send Payment Push", "Payments", "Sends a payment-related push notification.", ["payment"], ["default"]],
+  ["payment.record_manual_payment", "Record Manual Payment", "Payments", "Creates a manual paid payment record.", ["contact"], ["default"]],
+  ["service_plan.create", "Create Service Plan", "Service Plans", "Creates a service plan.", ["contact"], ["default"]],
+  ["service_plan.update", "Update Service Plan", "Service Plans", "Updates service-plan fields.", ["service_plan"], ["default"]],
+  ["service_plan.activate", "Activate Service Plan", "Service Plans", "Marks a plan active locally.", ["service_plan"], ["default"]],
+  ["service_plan.pause", "Pause Service Plan", "Service Plans", "Pauses local service scheduling.", ["service_plan"], ["default"]],
+  ["service_plan.resume", "Resume Service Plan", "Service Plans", "Resumes local service scheduling.", ["service_plan"], ["default"]],
+  ["service_plan.cancel", "Cancel Service Plan", "Service Plans", "Cancels a plan using existing local/Stripe semantics.", ["service_plan"], ["default"]],
+  ["service_plan.mark_serviced", "Mark Service Plan Serviced", "Service Plans", "Marks service completed and rolls next service date.", ["service_plan"], ["default"]],
+  ["service_plan.set_price", "Set Service Plan Price", "Service Plans", "Sets service-plan price.", ["service_plan"], ["default"]],
+  ["service_plan.set_service_interval", "Set Service Interval", "Service Plans", "Sets the service interval.", ["service_plan"], ["default"]],
+  ["service_plan.set_billing_interval", "Set Billing Interval", "Service Plans", "Sets the billing interval.", ["service_plan"], ["default"]],
+  ["service_plan.set_next_service_date", "Set Next Service Date", "Service Plans", "Sets the next service date.", ["service_plan"], ["default"]],
+  ["service_plan.create_next_job", "Create Next Service Job", "Service Plans", "Creates a job for the next service.", ["service_plan"], ["default"]],
+  ["service_plan.create_service_task", "Create Service Task", "Service Plans", "Creates a service scheduling task.", ["service_plan"], ["default"]],
+  ["service_plan.send_scheduling_sms", "Send Service Scheduling SMS", "Service Plans", "Sends scheduling SMS through the shared SMS safety path.", ["service_plan"], ["default"]],
+  ["service_plan.create_payment_followup", "Create Service Payment Follow-Up", "Service Plans", "Creates a payment follow-up task.", ["service_plan"], ["default"]],
   ["job.create", "Create Job", "Schedule", "Creates a scheduled job.", ["contact"], ["default"]],
   ["job.update", "Update Job", "Schedule & Jobs", "Updates whitelisted job fields.", ["job"], ["default"]],
   ["job.reschedule", "Reschedule Job", "Schedule & Jobs", "Changes a job start/end time.", ["job"], ["default"]],
@@ -387,6 +488,49 @@ const actionExecutors = {
   "voicemail.delete": executeVoicemailDelete,
   "voicemail.create_callback_task": executeVoicemailCreateCallbackTask,
   "voicemail.send_followup_sms": executeVoicemailFollowupSms,
+  "quote.create": executeQuoteCreate,
+  "quote.update": executeQuoteUpdate,
+  "quote.delete": executeQuoteDelete,
+  "quote.add_line_item": executeQuoteAddLineItem,
+  "quote.remove_line_item": executeQuoteRemoveLineItem,
+  "quote.replace_line_items": executeQuoteReplaceLineItems,
+  "quote.set_status": executeQuoteSetStatus,
+  "quote.mark_sent": executeQuoteMarkSent,
+  "quote.mark_accepted": executeQuoteMarkAccepted,
+  "quote.mark_declined": executeQuoteMarkDeclined,
+  "quote.set_expiration": executeQuoteSetExpiration,
+  "quote.convert_to_job": executeQuoteConvertToJob,
+  "quote.create_followup_task": executeQuoteFollowupTask,
+  "quote.create_invoice": executeQuoteCreateInvoice,
+  "invoice.create": executeInvoiceCreate,
+  "invoice.issue": executeInvoiceIssue,
+  "invoice.set_due_date": executeInvoiceSetDueDate,
+  "invoice.void": executeInvoiceVoid,
+  "invoice.create_payment_request": executeInvoiceCreatePaymentRequest,
+  "invoice.generate_pdf": executeDeferredAction,
+  "invoice.send_payment_link": executeInvoiceSendPaymentLink,
+  "invoice.create_followup_task": executeInvoiceFollowupTask,
+  "payment.create_request": executePaymentCreateRequest,
+  "payment.create_payment_link": executePaymentCreateRequest,
+  "payment.create_followup_task": executePaymentFollowupTask,
+  "payment.send_payment_sms": executePaymentSendSms,
+  "payment.send_payment_push": executePaymentSendPush,
+  "payment.record_manual_payment": executePaymentRecordManual,
+  "service_plan.create": executeServicePlanCreate,
+  "service_plan.update": executeServicePlanUpdate,
+  "service_plan.activate": executeServicePlanActivate,
+  "service_plan.pause": executeServicePlanPause,
+  "service_plan.resume": executeServicePlanResume,
+  "service_plan.cancel": executeServicePlanCancel,
+  "service_plan.mark_serviced": executeServicePlanMarkServiced,
+  "service_plan.set_price": executeServicePlanSetPrice,
+  "service_plan.set_service_interval": executeServicePlanSetServiceInterval,
+  "service_plan.set_billing_interval": executeServicePlanSetBillingInterval,
+  "service_plan.set_next_service_date": executeServicePlanSetNextServiceDate,
+  "service_plan.create_next_job": executeServicePlanCreateNextJob,
+  "service_plan.create_service_task": executeServicePlanCreateTask,
+  "service_plan.send_scheduling_sms": executeServicePlanSendSchedulingSms,
+  "service_plan.create_payment_followup": executeServicePlanPaymentFollowup,
   "job.create": executeJobCreate,
   "job.update": executeJobUpdate,
   "job.reschedule": executeJobReschedule,
@@ -567,6 +711,57 @@ function actionConfigFields(key) {
     case "customer_reminder.create":
     case "customer_reminder.reschedule":
       return [commonText("title", "Title"), commonText("contact_id", "Contact ID"), commonText("contact_name", "Contact Name"), { key: "due_date", label: "Due Date", type: "datetime_expression" }];
+    case "quote.create":
+    case "quote.update":
+      return [commonText("contact_id", "Contact ID"), commonText("title", "Title"), { key: "line_items", label: "Line Items", type: "line_items" }, commonText("notes", "Notes"), { key: "expires_at", label: "Expires At", type: "datetime_expression" }];
+    case "quote.add_line_item":
+      return [commonText("description", "Description"), { key: "qty", label: "Quantity", type: "number" }, { key: "price_cents", label: "Unit Price", type: "money" }];
+    case "quote.remove_line_item":
+      return [commonText("description", "Description")];
+    case "quote.replace_line_items":
+      return [{ key: "line_items", label: "Line Items", type: "line_items" }];
+    case "quote.set_status":
+      return [{ key: "status", label: "Status", type: "select", options: ["draft", "sent", "accepted", "declined", "expired", "converted"] }];
+    case "quote.delete":
+      return [{ key: "confirm_delete", label: "Confirm Delete", type: "boolean" }];
+    case "quote.set_expiration":
+      return [{ key: "expires_at", label: "Expires At", type: "datetime_expression" }];
+    case "quote.convert_to_job":
+      return [{ key: "start_at", label: "Job Start", type: "datetime_expression" }, { key: "end_at", label: "Job End", type: "datetime_expression" }, { key: "copy_total_to_price", label: "Copy Quote Total", type: "boolean" }, { key: "worker_user_ids", label: "Workers", type: "user_list" }, { key: "sales_user_ids", label: "Salespeople", type: "user_list" }];
+    case "invoice.create":
+      return [commonText("contact_id", "Contact ID"), commonText("quote_id", "Quote ID"), commonText("job_id", "Job ID"), { key: "line_items", label: "Line Items", type: "line_items" }, { key: "total_cents", label: "Total", type: "money" }, { key: "due_at", label: "Due At", type: "datetime_expression" }];
+    case "invoice.issue":
+    case "invoice.set_due_date":
+      return [{ key: "due_at", label: "Due At", type: "datetime_expression" }];
+    case "invoice.void":
+      return [{ key: "confirm_void", label: "Confirm Void", type: "boolean" }];
+    case "payment.create_request":
+    case "payment.create_payment_link":
+    case "invoice.create_payment_request":
+      return [commonText("contact_id", "Contact ID"), { key: "amount_cents", label: "Amount", type: "money" }, commonText("description", "Description")];
+    case "payment.record_manual_payment":
+      return [commonText("contact_id", "Contact ID"), { key: "amount_cents", label: "Amount", type: "money" }, commonText("description", "Description")];
+    case "service_plan.create":
+    case "service_plan.update":
+      return [commonText("contact_id", "Contact ID"), commonText("plan_name", "Plan Name"), { key: "price_cents", label: "Price", type: "money" }, { key: "billing_interval", label: "Billing Interval", type: "select", options: ["day", "week", "month", "year"] }, { key: "billing_interval_count", label: "Billing Count", type: "number" }, { key: "service_interval", label: "Service Interval", type: "select", options: ["day", "week", "month", "year"] }, { key: "service_interval_count", label: "Service Count", type: "number" }, { key: "first_service_date", label: "First Service Date", type: "date" }, { key: "next_service_date", label: "Next Service Date", type: "date" }];
+    case "service_plan.cancel":
+      return [{ key: "confirm_cancel", label: "Confirm Cancel", type: "boolean" }];
+    case "service_plan.set_price":
+      return [{ key: "price_cents", label: "Price", type: "money" }];
+    case "service_plan.set_next_service_date":
+      return [{ key: "next_service_date", label: "Next Service Date", type: "date" }];
+    case "service_plan.set_service_interval":
+      return [{ key: "service_interval", label: "Service Interval", type: "select", options: ["day", "week", "month", "year"] }, { key: "service_interval_count", label: "Count", type: "number" }];
+    case "service_plan.set_billing_interval":
+      return [{ key: "billing_interval", label: "Billing Interval", type: "select", options: ["day", "week", "month", "year"] }, { key: "billing_interval_count", label: "Count", type: "number" }];
+    case "service_plan.create_next_job":
+      return [{ key: "start_at", label: "Start", type: "datetime_expression" }, { key: "duration_minutes", label: "Duration", type: "number" }, { key: "worker_user_ids", label: "Workers", type: "user_list" }];
+    case "service_plan.create_service_task":
+    case "service_plan.create_payment_followup":
+      return [commonText("title", "Title"), { key: "due_date", label: "Due Date", type: "datetime_expression" }];
+    case "service_plan.send_scheduling_sms":
+    case "payment.send_payment_sms":
+      return [commonText("body", "Message"), { key: "business_hours_policy", label: "Business Hours", type: "select", options: ["send_immediately", "defer_until_business_hours", "skip_if_outside_business_hours"] }];
     case "webhook.send":
       return [commonText("url", "URL"), { key: "method", label: "Method", type: "select", options: ["GET", "POST", "PUT", "PATCH", "DELETE"] }, { key: "headers", label: "Headers", type: "json" }, { key: "body", label: "JSON Body", type: "json" }];
     case "automation.start":
@@ -590,6 +785,18 @@ function triggerConfigFields(key) {
     fields.push({ key: "amount", label: "Amount", type: "number" });
     fields.push({ key: "unit", label: "Unit", type: "select", options: ["minutes", "hours", "days", "weeks"] });
   }
+  if (key === "quote.followup_due") {
+    fields.push({ key: "basis", label: "After", type: "select", options: ["created", "sent"] });
+    fields.push({ key: "amount", label: "Amount", type: "number" });
+    fields.push({ key: "unit", label: "Unit", type: "select", options: ["minutes", "hours", "days", "weeks"] });
+  }
+  if (key === "service_plan.service_upcoming" || key === "service_plan.service_overdue") {
+    fields.push({ key: "amount", label: "Amount", type: "number" });
+    fields.push({ key: "unit", label: "Unit", type: "select", options: ["days", "weeks"] });
+  }
+  if (key.startsWith("quote.")) fields.push({ key: "statuses", label: "Statuses", type: "string_list" });
+  if (key.startsWith("payment.")) fields.push({ key: "status", label: "Status", type: "text" }, { key: "min_amount_cents", label: "Minimum Amount", type: "money" }, { key: "max_amount_cents", label: "Maximum Amount", type: "money" });
+  if (key.startsWith("service_plan.") || key.startsWith("subscription.")) fields.push({ key: "statuses", label: "Statuses", type: "string_list" });
   if (key.startsWith("job.")) fields.push({ key: "worker_user_ids", label: "Workers", type: "user_list" }, { key: "sales_user_ids", label: "Salespeople", type: "user_list" }, { key: "services", label: "Services", type: "string_list" });
   if (key.includes("tag_") || key.includes("tags_changed")) fields.push({ key: "tags", label: "Tags", type: "tag_list" }, { key: "tag_match", label: "Tag Match", type: "select", options: ["any", "one_of", "all"] });
   if (key.startsWith("lead.")) fields.push({ key: "sources", label: "Sources", type: "source_list", options: sourceOptions });
@@ -715,6 +922,53 @@ function conditionFieldCatalog() {
     ["customer_reminder.completed", "Reminder Completed", "Customer Reminders", "boolean", boolOps],
     ["customer_reminder.overdue", "Reminder Overdue", "Customer Reminders", "boolean", boolOps],
     ["customer_reminder.title", "Reminder Title", "Customer Reminders", "text", textOps],
+    ["quote.exists", "Quote Exists", "Quotes", "boolean", boolOps],
+    ["quote.id", "Quote ID", "Quotes", "text", textOps],
+    ["quote.contact_id", "Quote Contact", "Quotes", "text", textOps],
+    ["quote.status", "Quote Status", "Quotes", "text", textOps],
+    ["quote.subtotal_cents", "Quote Subtotal", "Quotes", "number", numberOps],
+    ["quote.total_cents", "Quote Total", "Quotes", "number", numberOps],
+    ["quote.line_item_count", "Quote Line Items", "Quotes", "number", numberOps],
+    ["quote.created_at", "Quote Created At", "Quotes", "date", dateOps],
+    ["quote.updated_at", "Quote Updated At", "Quotes", "date", dateOps],
+    ["quote.expires_at", "Quote Expires At", "Quotes", "date", dateOps],
+    ["quote.is_expired", "Quote Is Expired", "Quotes", "boolean", boolOps],
+    ["quote.is_accepted", "Quote Is Accepted", "Quotes", "boolean", boolOps],
+    ["quote.is_declined", "Quote Is Declined", "Quotes", "boolean", boolOps],
+    ["quote.is_converted", "Quote Is Converted", "Quotes", "boolean", boolOps],
+    ["invoice.exists", "Invoice Exists", "Invoices", "boolean", boolOps],
+    ["invoice.status", "Invoice Status", "Invoices", "text", textOps],
+    ["invoice.total_cents", "Invoice Total", "Invoices", "number", numberOps],
+    ["invoice.due_at", "Invoice Due At", "Invoices", "date", dateOps],
+    ["invoice.is_paid", "Invoice Paid", "Invoices", "boolean", boolOps],
+    ["invoice.is_overdue", "Invoice Overdue", "Invoices", "boolean", boolOps],
+    ["payment.exists", "Payment Exists", "Payments", "boolean", boolOps],
+    ["payment.status", "Payment Status", "Payments", "text", textOps],
+    ["payment.amount_cents", "Payment Amount", "Payments", "number", numberOps],
+    ["payment.currency", "Payment Currency", "Payments", "text", textOps],
+    ["payment.is_paid", "Payment Paid", "Payments", "boolean", boolOps],
+    ["payment.is_failed", "Payment Failed", "Payments", "boolean", boolOps],
+    ["payment.is_refunded", "Payment Refunded", "Payments", "boolean", boolOps],
+    ["payment.contact_id", "Payment Contact", "Payments", "text", textOps],
+    ["payment.service_plan_id", "Payment Service Plan", "Payments", "text", textOps],
+    ["servicePlan.exists", "Service Plan Exists", "Service Plans", "boolean", boolOps],
+    ["servicePlan.id", "Service Plan ID", "Service Plans", "text", textOps],
+    ["servicePlan.contact_id", "Service Plan Contact", "Service Plans", "text", textOps],
+    ["servicePlan.status", "Service Plan Status", "Service Plans", "text", textOps],
+    ["servicePlan.active", "Service Plan Active", "Service Plans", "boolean", boolOps],
+    ["servicePlan.paused", "Service Plan Paused", "Service Plans", "boolean", boolOps],
+    ["servicePlan.canceled", "Service Plan Canceled", "Service Plans", "boolean", boolOps],
+    ["servicePlan.price_cents", "Service Plan Price", "Service Plans", "number", numberOps],
+    ["servicePlan.billing_interval", "Billing Interval", "Service Plans", "text", textOps],
+    ["servicePlan.service_interval", "Service Interval", "Service Plans", "text", textOps],
+    ["servicePlan.first_service_date", "First Service Date", "Service Plans", "date", dateOps],
+    ["servicePlan.last_serviced_at", "Last Serviced At", "Service Plans", "date", dateOps],
+    ["servicePlan.next_service_date", "Next Service Date", "Service Plans", "date", dateOps],
+    ["servicePlan.service_count", "Service Count", "Service Plans", "number", numberOps],
+    ["servicePlan.days_until_next_service", "Days Until Next Service", "Service Plans", "number", numberOps],
+    ["servicePlan.is_due", "Service Plan Is Due", "Service Plans", "boolean", boolOps],
+    ["servicePlan.is_overdue", "Service Plan Is Overdue", "Service Plans", "boolean", boolOps],
+    ["servicePlan.subscription_status", "Subscription Status", "Subscriptions", "text", textOps],
     ["time.now", "Current Time", "Time", "date", dateOps],
     ["time.day_of_week", "Day of Week", "Time", "number", numberOps],
     ["time.is_weekday", "Is Weekday", "Time", "boolean", boolOps],
@@ -770,6 +1024,10 @@ function templateVariableCatalog() {
     "task.id", "task.title", "task.due_at",
     "routine.id", "routine.title",
     "customer_reminder.id", "customer_reminder.title", "customer_reminder.due_at",
+    "quote.id", "quote.status", "quote.subtotal_cents", "quote.total_cents", "quote.expires_at",
+    "invoice.id", "invoice.status", "invoice.total_cents", "invoice.due_at",
+    "payment.id", "payment.status", "payment.amount_cents", "payment.currency",
+    "servicePlan.id", "servicePlan.price_cents", "servicePlan.status", "servicePlan.billing_interval", "servicePlan.service_interval", "servicePlan.first_service_date", "servicePlan.last_serviced_at", "servicePlan.next_service_date", "servicePlan.service_count",
     "sms.body", "sms.from", "sms.to", "sms.external_number", "sms.status",
     "conversation.last_message", "conversation.last_inbound_at", "conversation.last_outbound_at",
     "call.external_number", "call.duration_seconds", "call.status",
@@ -990,6 +1248,102 @@ export async function syncAutomationSchedulesForVoicemail(companyId, voicemail) 
       scheduledFor: new Date(new Date(voicemail.created_at || Date.now()).getTime() + durationAmountMs(amount, unit)),
       scheduleKey: `voicemail.unread_for:${trigger.id}:${voicemail.id}:${amount}:${unit}`,
       payload: { trigger_node_id: trigger.id, voicemail_id: voicemail.id, contact_id: voicemail.contact_id || null, amount, unit }
+    });
+  }
+}
+
+export async function syncAutomationSchedulesForQuote(companyId, quote) {
+  if (!ctx?.pool || !companyId || !quote?.id) return;
+  await cancelScheduledForSubject(companyId, "quote", quote.id, ["quote.expired", "quote.followup_due"]);
+  const status = String(quote.status || "draft");
+  if (["accepted", "declined", "converted", "deleted"].includes(status)) return;
+  const expiresAt = quote.expires_at ? new Date(quote.expires_at) : null;
+  if (expiresAt && !Number.isNaN(expiresAt.getTime())) {
+    await enqueueScheduledAutomationEvent({
+      companyId,
+      eventType: "quote.expired",
+      subjectType: "quote",
+      subjectId: quote.id,
+      scheduledFor: expiresAt,
+      scheduleKey: `quote.expired:${quote.id}:${expiresAt.toISOString()}`,
+      sourceVersion: `${quote.updated_at || ""}:${status}:${expiresAt.toISOString()}`,
+      payload: { quote_id: quote.id, contact_id: quote.contact_id || null, status, total_cents: quote.total_cents || 0, expires_at: expiresAt.toISOString() }
+    });
+  }
+  const triggers = (await ctx.pool.query(
+    `SELECT n.id, n.config
+       FROM automation_definitions d
+       JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
+       JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
+      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'quote.followup_due'`,
+    [companyId]
+  )).rows;
+  for (const trigger of triggers) {
+    const basisName = trigger.config?.basis || trigger.config?.after || "created";
+    const basisValue = basisName === "sent" ? quote.sent_at : quote.created_at;
+    const basis = basisValue ? new Date(basisValue) : null;
+    const amount = Number(trigger.config?.amount || 0);
+    const unit = trigger.config?.unit || "days";
+    if (!basis || Number.isNaN(basis.getTime()) || amount <= 0) continue;
+    const when = new Date(basis.getTime() + durationAmountMs(amount, unit));
+    await enqueueScheduledAutomationEvent({
+      companyId,
+      eventType: "quote.followup_due",
+      subjectType: "quote",
+      subjectId: quote.id,
+      scheduledFor: when,
+      scheduleKey: `quote.followup_due:${trigger.id}:${quote.id}:${basisName}:${basis.toISOString()}:${amount}:${unit}`,
+      sourceVersion: `${quote.updated_at || ""}:${status}`,
+      payload: { trigger_node_id: trigger.id, quote_id: quote.id, contact_id: quote.contact_id || null, status, total_cents: quote.total_cents || 0, basis: basisName, amount, unit }
+    });
+  }
+}
+
+export async function syncAutomationSchedulesForInvoice(companyId, invoice) {
+  if (!ctx?.pool || !companyId || !invoice?.id) return;
+  await cancelScheduledForSubject(companyId, "invoice", invoice.id, ["invoice.due", "invoice.overdue"]);
+  if (!invoice.due_at || ["paid", "void", "deleted"].includes(String(invoice.status || ""))) return;
+  const due = new Date(invoice.due_at);
+  if (Number.isNaN(due.getTime())) return;
+  const payload = { invoice_id: invoice.id, contact_id: invoice.contact_id || null, quote_id: invoice.quote_id || null, job_id: invoice.job_id || null, total_cents: invoice.total_cents || 0, status: invoice.status, due_at: due.toISOString() };
+  await enqueueScheduledAutomationEvent({ companyId, eventType: "invoice.due", subjectType: "invoice", subjectId: invoice.id, scheduledFor: due, scheduleKey: `invoice.due:${invoice.id}:${due.toISOString()}`, sourceVersion: `${invoice.updated_at || ""}:${invoice.status}`, payload });
+  await enqueueScheduledAutomationEvent({ companyId, eventType: "invoice.overdue", subjectType: "invoice", subjectId: invoice.id, scheduledFor: due, scheduleKey: `invoice.overdue:${invoice.id}:${due.toISOString()}`, sourceVersion: `${invoice.updated_at || ""}:${invoice.status}`, payload });
+}
+
+export async function syncAutomationSchedulesForServicePlan(companyId, plan) {
+  if (!ctx?.pool || !companyId || !plan?.id) return;
+  await cancelScheduledForSubject(companyId, "service_plan", plan.id, ["service_plan.service_upcoming", "service_plan.service_due", "service_plan.service_overdue"]);
+  const status = String(plan.status || "");
+  if (!["active", "payment_pending", "past_due"].includes(status) || !plan.next_service_date) return;
+  const due = new Date(plan.next_service_date);
+  if (Number.isNaN(due.getTime())) return;
+  const cycleKey = due.toISOString().slice(0, 10);
+  const basePayload = { service_plan_id: plan.id, contact_id: plan.contact_id || null, status, next_service_date: cycleKey, price_cents: plan.price_cents || 0 };
+  await enqueueScheduledAutomationEvent({ companyId, eventType: "service_plan.service_due", subjectType: "service_plan", subjectId: plan.id, scheduledFor: due, scheduleKey: `service_plan.service_due:${plan.id}:${cycleKey}`, sourceVersion: `${plan.updated_at || ""}:${status}:${cycleKey}`, payload: basePayload });
+  const triggers = (await ctx.pool.query(
+    `SELECT n.id, n.config
+       FROM automation_definitions d
+       JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
+       JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
+      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = ANY($2::text[])`,
+    [companyId, ["service_plan.service_upcoming", "service_plan.service_overdue"]]
+  )).rows;
+  for (const trigger of triggers) {
+    const key = trigger.config?.trigger_key;
+    const amount = Number(trigger.config?.amount || (key === "service_plan.service_upcoming" ? 7 : 1));
+    const unit = trigger.config?.unit || "days";
+    if (amount <= 0) continue;
+    const offset = durationAmountMs(amount, unit);
+    const when = new Date(due.getTime() + (key === "service_plan.service_upcoming" ? -offset : offset));
+    await enqueueScheduledAutomationEvent({
+      companyId,
+      eventType: key,
+      subjectType: "service_plan",
+      subjectId: plan.id,
+      scheduledFor: when,
+      scheduleKey: `${key}:${trigger.id}:${plan.id}:${cycleKey}:${amount}:${unit}`,
+      sourceVersion: `${plan.updated_at || ""}:${status}:${cycleKey}`,
+      payload: { ...basePayload, trigger_node_id: trigger.id, amount, unit }
     });
   }
 }
@@ -1271,6 +1625,39 @@ async function bootstrapAutomationSchema() {
       UNIQUE(company_id, normalized_phone, channel)
     );
     CREATE INDEX IF NOT EXISTS phone_opt_outs_company_phone_idx ON phone_opt_outs(company_id, normalized_phone, status);
+
+    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'draft';
+    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
+    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;
+    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS declined_at TIMESTAMPTZ;
+    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS converted_job_id UUID;
+    CREATE INDEX IF NOT EXISTS quotes_company_status_idx ON quotes(company_id, status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS quotes_expires_idx ON quotes(company_id, expires_at) WHERE expires_at IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS invoices (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      contact_id UUID,
+      job_id UUID,
+      quote_id UUID,
+      status TEXT NOT NULL DEFAULT 'draft',
+      line_items JSONB NOT NULL DEFAULT '[]'::jsonb,
+      subtotal_cents INTEGER NOT NULL DEFAULT 0,
+      total_cents INTEGER NOT NULL DEFAULT 0,
+      currency TEXT NOT NULL DEFAULT 'usd',
+      due_at TIMESTAMPTZ,
+      issued_at TIMESTAMPTZ,
+      paid_at TIMESTAMPTZ,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS invoices_company_status_idx ON invoices(company_id, status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS invoices_contact_idx ON invoices(company_id, contact_id);
+    CREATE INDEX IF NOT EXISTS invoices_due_idx ON invoices(company_id, due_at) WHERE due_at IS NOT NULL;
 
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS automated_customer_messages_enabled BOOLEAN NOT NULL DEFAULT true;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_sms_default_business_hours_policy TEXT NOT NULL DEFAULT 'send_immediately';
@@ -1693,11 +2080,23 @@ function validateGraphPayload(payload) {
       if (config.action_key === "internal.send_channel_message" && !config.channel_id) errors.push(`internal_channel_required:${nodeKey}`);
       if (config.action_key === "internal.create_channel" && !config.name) errors.push(`internal_channel_name_required:${nodeKey}`);
       if (["call.set_disposition"].includes(config.action_key) && !config.disposition) errors.push(`call_disposition_required:${nodeKey}`);
+      if (config.action_key === "quote.create" && !(Array.isArray(config.line_items) && config.line_items.length)) errors.push(`quote_line_items_required:${nodeKey}`);
+      if (config.action_key === "quote.delete" && config.confirm_delete !== true) errors.push(`quote_delete_confirmation_required:${nodeKey}`);
+      if (config.action_key === "quote.set_status" && !["draft", "sent", "accepted", "declined", "expired", "converted"].includes(config.status)) errors.push(`quote_status_invalid:${nodeKey}`);
+      if (config.action_key === "quote.set_expiration" && !config.expires_at) errors.push(`quote_expiration_required:${nodeKey}`);
+      if (["invoice.create", "payment.create_request", "payment.create_payment_link", "invoice.create_payment_request", "payment.record_manual_payment"].includes(config.action_key) && Number(config.amount_cents || config.total_cents || 0) <= 0 && !config.line_items) errors.push(`financial_amount_required:${nodeKey}`);
+      if (config.action_key === "invoice.void" && config.confirm_void !== true) errors.push(`invoice_void_confirmation_required:${nodeKey}`);
+      if (config.action_key === "service_plan.create" && (!config.plan_name || Number(config.price_cents || 0) <= 0)) errors.push(`service_plan_create_incomplete:${nodeKey}`);
+      if (config.action_key === "service_plan.cancel" && config.confirm_cancel !== true) errors.push(`service_plan_cancel_confirmation_required:${nodeKey}`);
+      if (["service_plan.set_service_interval", "service_plan.set_billing_interval"].includes(config.action_key) && !(config.service_interval || config.billing_interval)) errors.push(`service_plan_interval_required:${nodeKey}`);
+      if (config.action_key === "service_plan.set_next_service_date" && !config.next_service_date) errors.push(`service_plan_next_service_required:${nodeKey}`);
     }
     if (nodeType === "trigger" && config.trigger_key === "job.relative_time" && (!config.reference || !config.direction || !config.amount || !config.unit)) errors.push(`relative_time_trigger_incomplete:${nodeKey}`);
     if (nodeType === "trigger" && ["sms.no_reply", "sms.conversation_inactive", "voicemail.unread_for"].includes(config.trigger_key) && Number(config.amount || 0) <= 0) errors.push(`communication_duration_required:${nodeKey}`);
     if (nodeType === "trigger" && config.trigger_key === "sms.keyword_received" && !(Array.isArray(config.keywords) && config.keywords.length)) errors.push(`sms_keywords_required:${nodeKey}`);
     if (nodeType === "trigger" && ["call.short_call", "call.long_call"].includes(config.trigger_key) && Number(config.threshold_seconds || 0) <= 0) errors.push(`call_duration_threshold_required:${nodeKey}`);
+    if (nodeType === "trigger" && config.trigger_key === "quote.followup_due" && Number(config.amount || 0) <= 0) errors.push(`quote_followup_duration_required:${nodeKey}`);
+    if (nodeType === "trigger" && ["service_plan.service_upcoming", "service_plan.service_overdue"].includes(config.trigger_key) && Number(config.amount || 0) <= 0) errors.push(`service_plan_offset_required:${nodeKey}`);
   }
   for (const edge of edges) {
     if (!nodeIds.has(edge.source_node_id || edge.sourceNodeId)) errors.push(`edge_source_missing:${edge.id || ""}`);
@@ -2159,6 +2558,19 @@ function triggerMatchesEvent(node, event) {
       if (!matchesTextKeywords(payload.body || payload.message_body || "", config)) return false;
     }
   }
+  if (key.startsWith("quote.")) {
+    if (Array.isArray(config.statuses) && config.statuses.length && !config.statuses.includes(payload.status)) return false;
+    if (config.min_total_cents != null && Number(payload.total_cents || 0) < Number(config.min_total_cents)) return false;
+    if (config.max_total_cents != null && Number(payload.total_cents || 0) > Number(config.max_total_cents)) return false;
+  }
+  if (key.startsWith("payment.")) {
+    if (config.status && config.status !== payload.status) return false;
+    if (config.min_amount_cents != null && Number(payload.amount_cents || 0) < Number(config.min_amount_cents)) return false;
+    if (config.max_amount_cents != null && Number(payload.amount_cents || 0) > Number(config.max_amount_cents)) return false;
+  }
+  if (key.startsWith("service_plan.")) {
+    if (Array.isArray(config.statuses) && config.statuses.length && !config.statuses.includes(payload.status || payload.subscription_status)) return false;
+  }
   return true;
 }
 
@@ -2519,6 +2931,21 @@ async function shouldFireScheduledAutomationEvent(row) {
     const vm = (await ctx.pool.query(`SELECT is_read, deleted_at FROM voicemails WHERE id = $1 AND company_id = $2`, [row.subject_id, row.company_id])).rows[0];
     if (!vm || vm.is_read || vm.deleted_at) return false;
   }
+  if (row.subject_type === "quote") {
+    const quote = (await ctx.pool.query(`SELECT status, expires_at, sent_at, updated_at FROM quotes WHERE id::text = $1 AND company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    if (!quote || ["accepted", "declined", "converted", "deleted"].includes(String(quote.status || ""))) return false;
+    if (row.event_type === "quote.expired" && (!quote.expires_at || new Date(quote.expires_at) > new Date())) return false;
+  }
+  if (row.subject_type === "invoice") {
+    const invoice = (await ctx.pool.query(`SELECT status, due_at, total_cents FROM invoices WHERE id::text = $1 AND company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    if (!invoice || ["paid", "void", "deleted"].includes(String(invoice.status || ""))) return false;
+    if (row.event_type === "invoice.overdue" && (!invoice.due_at || new Date(invoice.due_at) > new Date())) return false;
+  }
+  if (row.subject_type === "service_plan") {
+    const plan = (await ctx.pool.query(`SELECT status, next_service_date FROM service_plans WHERE id::text = $1 AND company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    if (!plan || !["active", "payment_pending", "past_due"].includes(String(plan.status || ""))) return false;
+    if (!plan.next_service_date || row.payload?.next_service_date !== new Date(plan.next_service_date).toISOString().slice(0, 10)) return false;
+  }
   return true;
 }
 
@@ -2581,12 +3008,42 @@ async function loadSubject(companyId, subjectType, subjectId) {
   if (subjectType === "internal_message") return loadInternalMessageContext(companyId, subjectId);
   if (subjectType === "internal_conversation") return loadInternalConversationContext(companyId, subjectId);
   if (subjectType === "channel") return loadChannelContext(companyId, subjectId);
-  if (subjectType === "service_plan") return (await ctx.pool.query(`SELECT * FROM service_plans WHERE id::text = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
+  if (subjectType === "quote") return loadQuoteContext(companyId, subjectId);
+  if (subjectType === "invoice") return loadInvoiceContext(companyId, subjectId);
+  if (subjectType === "service_plan") return loadServicePlanContext(companyId, subjectId);
   if (subjectType === "task") return loadTaskContext(companyId, subjectId);
   if (subjectType === "routine") return loadRoutineContext(companyId, subjectId);
   if (subjectType === "customer_reminder") return loadCustomerReminderContext(companyId, subjectId);
-  if (subjectType === "payment") return (await ctx.pool.query(`SELECT * FROM payment_records WHERE id::text = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
+  if (subjectType === "payment") return loadPaymentContext(companyId, subjectId);
   return null;
+}
+
+async function loadQuoteContext(companyId, quoteId) {
+  const quote = (await ctx.pool.query(`SELECT * FROM quotes WHERE id::text = $1 AND company_id = $2`, [quoteId, companyId])).rows[0];
+  if (!quote) return { exists: false };
+  const items = Array.isArray(quote.line_items) ? quote.line_items : [];
+  return { ...quote, exists: true, subtotal: quote.total_cents, total: quote.total_cents, subtotal_cents: quote.total_cents, line_item_count: items.length, is_expired: quote.expires_at ? new Date(quote.expires_at) <= new Date() : false, is_accepted: quote.status === "accepted", is_declined: quote.status === "declined", is_converted: quote.status === "converted" };
+}
+
+async function loadInvoiceContext(companyId, invoiceId) {
+  const invoice = (await ctx.pool.query(`SELECT * FROM invoices WHERE id::text = $1 AND company_id = $2`, [invoiceId, companyId])).rows[0];
+  if (!invoice) return { exists: false };
+  return { ...invoice, exists: true, is_paid: invoice.status === "paid", is_overdue: invoice.due_at ? new Date(invoice.due_at) < new Date() && !["paid", "void", "deleted"].includes(invoice.status) : false };
+}
+
+async function loadPaymentContext(companyId, paymentId) {
+  const payment = (await ctx.pool.query(`SELECT * FROM payment_records WHERE id::text = $1 AND company_id = $2`, [paymentId, companyId])).rows[0];
+  if (!payment) return { exists: false };
+  return { ...payment, exists: true, amount: payment.amount_cents, is_paid: ["succeeded", "paid"].includes(payment.status), is_failed: payment.status === "failed", is_refunded: String(payment.status || "").includes("refunded") };
+}
+
+async function loadServicePlanContext(companyId, planId) {
+  const plan = (await ctx.pool.query(`SELECT * FROM service_plans WHERE id::text = $1 AND company_id = $2`, [planId, companyId])).rows[0];
+  if (!plan) return { exists: false };
+  const serviceCount = (await ctx.pool.query(`SELECT COUNT(*)::int AS count FROM service_plan_events WHERE service_plan_id = $1 AND event_type = 'serviced'`, [plan.id])).rows[0]?.count || 0;
+  const next = plan.next_service_date ? new Date(plan.next_service_date) : null;
+  const daysUntil = next && !Number.isNaN(next.getTime()) ? Math.ceil((next.getTime() - Date.now()) / 86400000) : null;
+  return { ...plan, exists: true, price: plan.price_cents, active: plan.status === "active", paused: plan.status === "paused", canceled: plan.status === "canceled", last_serviced_at: plan.last_service_date, service_count: serviceCount, days_until_next_service: daysUntil, is_due: daysUntil != null && daysUntil <= 0, is_overdue: daysUntil != null && daysUntil < 0, subscription_status: plan.stripe_subscription_status };
 }
 
 async function loadTaskContext(companyId, taskId) {
@@ -4079,6 +4536,529 @@ async function executeVoicemailCreateCallbackTask(run, node, config) {
 async function executeVoicemailFollowupSms(run, node, config) {
   const context = await buildRunContext(run);
   return executeSmsSendShared(run, node, { ...config, phone: config.phone || context.voicemail?.external_number, contact_id: config.contact_id || context.voicemail?.contact_id }, { mms: false });
+}
+
+async function executeQuoteCreate(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:quote_id`);
+  if (existing) return { quote_id: existing, reused: true };
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const items = normalizeQuoteLineItems(resolveConfig(config.line_items || config.items || [], context));
+  if (!items.length) throw new Error("quote_line_items_required");
+  const total = computeQuoteTotalCents(items);
+  const owner = await resolveCompanyUser(run.company_id, config.user_id);
+  const expiresAt = resolveDateExpression(config.expires_at || "", context);
+  const row = (await ctx.pool.query(
+    `INSERT INTO quotes(user_id, company_id, contact_id, title, line_items, total_cents, notes, status, expires_at)
+     VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,'draft',$8)
+     RETURNING *`,
+    [owner, run.company_id, contactId, resolveTemplate(config.title || "Automation Quote", context), JSON.stringify(items), total, resolveTemplate(config.notes || "", context) || null, expiresAt ? expiresAt.toISOString() : null]
+  )).rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:quote_id`, row.id);
+  await emitFinancialEvent(run, node, "quote.created", "quote", row.id, quotePayload(row));
+  await syncAutomationSchedulesForQuote(run.company_id, row);
+  return { quote_id: row.id, contact_id: row.contact_id, subtotal_cents: total, total_cents: total, status: row.status };
+}
+
+async function executeQuoteUpdate(run, node, config) {
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  const items = config.line_items || config.items ? normalizeQuoteLineItems(resolveConfig(config.line_items || config.items || [], context)) : null;
+  const total = items ? computeQuoteTotalCents(items) : null;
+  const expiresAt = config.expires_at ? resolveDateExpression(config.expires_at, context) : null;
+  const row = (await ctx.pool.query(
+    `UPDATE quotes
+        SET title = COALESCE($3, title),
+            line_items = COALESCE($4::jsonb, line_items),
+            total_cents = COALESCE($5, total_cents),
+            notes = COALESCE($6, notes),
+            expires_at = COALESCE($7::timestamptz, expires_at),
+            updated_at = now()
+      WHERE id::text = $1 AND company_id = $2
+      RETURNING *`,
+    [quote.id, run.company_id, config.title ? resolveTemplate(config.title, context) : null, items ? JSON.stringify(items) : null, total, config.notes ? resolveTemplate(config.notes, context) : null, expiresAt ? expiresAt.toISOString() : null]
+  )).rows[0];
+  await emitQuoteChangeEvents(run, node, quote, row);
+  await syncAutomationSchedulesForQuote(run.company_id, row);
+  return { quote_id: row.id, total_cents: row.total_cents, status: row.status };
+}
+
+async function executeQuoteDelete(run, node, config) {
+  if (config.confirm_delete !== true) throw new Error("delete_confirmation_required");
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  await ctx.pool.query(`DELETE FROM quotes WHERE id = $1 AND company_id = $2`, [quote.id, run.company_id]);
+  await cancelScheduledForSubject(run.company_id, "quote", quote.id, ["quote.expired", "quote.followup_due"]);
+  await emitFinancialEvent(run, node, "quote.deleted", "quote", quote.id, quotePayload(quote));
+  return { quote_id: quote.id, deleted: true };
+}
+
+async function executeQuoteAddLineItem(run, node, config) {
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  const item = normalizeQuoteLineItems([resolveConfig({ description: config.description || config.service || "Service", qty: config.qty || 1, price_cents: config.price_cents || 0 }, context)])[0];
+  if (!item) throw new Error("quote_line_item_required");
+  const items = [...(Array.isArray(quote.line_items) ? quote.line_items : []), item];
+  return updateQuoteItems(run, node, quote, items);
+}
+
+async function executeQuoteRemoveLineItem(run, node, config) {
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  const needle = resolveTemplate(config.description || config.service || "", context).toLowerCase();
+  const items = (Array.isArray(quote.line_items) ? quote.line_items : []).filter((item) => !needle || !String(item.description || item.name || "").toLowerCase().includes(needle));
+  return updateQuoteItems(run, node, quote, items);
+}
+
+async function executeQuoteReplaceLineItems(run, node, config) {
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  const items = normalizeQuoteLineItems(resolveConfig(config.line_items || config.items || [], context));
+  return updateQuoteItems(run, node, quote, items);
+}
+
+async function updateQuoteItems(run, node, quote, items) {
+  const total = computeQuoteTotalCents(items);
+  const row = (await ctx.pool.query(`UPDATE quotes SET line_items = $3::jsonb, total_cents = $4, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [quote.id, run.company_id, JSON.stringify(items), total])).rows[0];
+  await emitQuoteChangeEvents(run, node, quote, row);
+  await syncAutomationSchedulesForQuote(run.company_id, row);
+  return { quote_id: row.id, total_cents: row.total_cents, line_item_count: items.length };
+}
+
+async function executeQuoteSetStatus(run, node, config) {
+  return setQuoteStatus(run, node, config.status || "draft", config);
+}
+async function executeQuoteMarkSent(run, node, config) { return setQuoteStatus(run, node, "sent", config); }
+async function executeQuoteMarkAccepted(run, node, config) { return setQuoteStatus(run, node, "accepted", config); }
+async function executeQuoteMarkDeclined(run, node, config) { return setQuoteStatus(run, node, "declined", config); }
+
+async function setQuoteStatus(run, node, status, config) {
+  if (!["draft", "sent", "accepted", "declined", "expired", "converted"].includes(status)) throw new Error("invalid_quote_status");
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  const row = (await ctx.pool.query(
+    `UPDATE quotes
+        SET status = $3,
+            sent_at = CASE WHEN $3 = 'sent' THEN COALESCE(sent_at, now()) ELSE sent_at END,
+            accepted_at = CASE WHEN $3 = 'accepted' THEN COALESCE(accepted_at, now()) ELSE accepted_at END,
+            declined_at = CASE WHEN $3 = 'declined' THEN COALESCE(declined_at, now()) ELSE declined_at END,
+            updated_at = now()
+      WHERE id = $1 AND company_id = $2
+      RETURNING *`,
+    [quote.id, run.company_id, status]
+  )).rows[0];
+  await emitQuoteChangeEvents(run, node, quote, row);
+  await syncAutomationSchedulesForQuote(run.company_id, row);
+  return { quote_id: row.id, status: row.status };
+}
+
+async function executeQuoteSetExpiration(run, node, config) {
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  const expiresAt = resolveDateExpression(config.expires_at || config.until || "", context);
+  if (!expiresAt) throw new Error("quote_expiration_required");
+  const row = (await ctx.pool.query(`UPDATE quotes SET expires_at = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [quote.id, run.company_id, expiresAt.toISOString()])).rows[0];
+  await emitQuoteChangeEvents(run, node, quote, row);
+  await syncAutomationSchedulesForQuote(run.company_id, row);
+  return { quote_id: row.id, expires_at: row.expires_at };
+}
+
+async function executeQuoteConvertToJob(run, node, config) {
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  const job = await executeJobCreate(run, node, {
+    ...config,
+    contact_id: quote.contact_id,
+    title: config.title || quote.title || "Quoted job",
+    service_items: quote.line_items || [],
+    price_cents: config.copy_total_to_price === false ? config.price_cents : quote.total_cents
+  });
+  await ctx.pool.query(`UPDATE quotes SET status = 'converted', converted_job_id = $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [quote.id, run.company_id, job.job_id]);
+  await cancelScheduledForSubject(run.company_id, "quote", quote.id, ["quote.expired", "quote.followup_due"]);
+  await emitFinancialEvent(run, node, "quote.converted_to_job", "quote", quote.id, { ...quotePayload(quote), job_id: job.job_id });
+  await emitFinancialEvent(run, node, "quote.scheduled", "quote", quote.id, { ...quotePayload(quote), job_id: job.job_id });
+  return { quote_id: quote.id, job_id: job.job_id };
+}
+
+async function executeQuoteFollowupTask(run, node, config) {
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  return executeTaskCreate(run, node, { ...config, title: config.title || `Follow up on quote ${quote.title || quote.id}`, contact_id: quote.contact_id });
+}
+
+async function executeQuoteCreateInvoice(run, node, config) {
+  const context = await buildRunContext(run);
+  const quote = await resolveQuote(run, context, config);
+  return executeInvoiceCreate(run, node, { ...config, quote_id: quote.id, contact_id: quote.contact_id, line_items: quote.line_items, total_cents: quote.total_cents });
+}
+
+async function executeInvoiceCreate(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:invoice_id`);
+  if (existing) return { invoice_id: existing, reused: true };
+  const context = await buildRunContext(run);
+  const owner = await resolveCompanyUser(run.company_id, config.user_id);
+  const contactId = config.contact_id ? resolveTemplate(config.contact_id, context) : (context.quote?.contact_id || context.job?.contact_id || context.contact?.id);
+  if (contactId) await validateSubject(run.company_id, "contact", contactId);
+  const items = normalizeQuoteLineItems(resolveConfig(config.line_items || [], context));
+  const total = intOrNull(config.total_cents) ?? computeQuoteTotalCents(items);
+  const due = resolveDateExpression(config.due_at || "", context);
+  const row = (await ctx.pool.query(
+    `INSERT INTO invoices(company_id, user_id, created_by_user_id, contact_id, quote_id, job_id, status, line_items, subtotal_cents, total_cents, currency, due_at, metadata)
+     VALUES($1,$2,$2,$3,$4,$5,'draft',$6::jsonb,$7,$7,$8,$9,$10::jsonb)
+     RETURNING *`,
+    [run.company_id, owner, contactId || null, config.quote_id || null, config.job_id || null, JSON.stringify(items), total, (config.currency || "usd").toLowerCase(), due ? due.toISOString() : null, JSON.stringify({ source: "automation" })]
+  )).rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:invoice_id`, row.id);
+  await emitFinancialEvent(run, node, "invoice.created", "invoice", row.id, invoicePayload(row));
+  await syncAutomationSchedulesForInvoice(run.company_id, row);
+  return { invoice_id: row.id, contact_id: row.contact_id, total_cents: row.total_cents, status: row.status, due_at: row.due_at };
+}
+
+async function executeInvoiceIssue(run, node, config) {
+  const invoice = await resolveInvoice(run, await buildRunContext(run), config);
+  const row = (await ctx.pool.query(`UPDATE invoices SET status = 'issued', issued_at = COALESCE(issued_at, now()), due_at = COALESCE($3::timestamptz, due_at), updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [invoice.id, run.company_id, config.due_at || null])).rows[0];
+  await emitFinancialEvent(run, node, "invoice.issued", "invoice", row.id, invoicePayload(row));
+  await syncAutomationSchedulesForInvoice(run.company_id, row);
+  return { invoice_id: row.id, status: row.status, due_at: row.due_at };
+}
+
+async function executeInvoiceSetDueDate(run, node, config) {
+  const context = await buildRunContext(run);
+  const invoice = await resolveInvoice(run, context, config);
+  const due = resolveDateExpression(config.due_at || "", context);
+  if (!due) throw new Error("invoice_due_required");
+  const row = (await ctx.pool.query(`UPDATE invoices SET due_at = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [invoice.id, run.company_id, due.toISOString()])).rows[0];
+  await emitFinancialEvent(run, node, "invoice.updated", "invoice", row.id, invoicePayload(row));
+  await syncAutomationSchedulesForInvoice(run.company_id, row);
+  return { invoice_id: row.id, due_at: row.due_at };
+}
+
+async function executeInvoiceVoid(run, node, config) {
+  if (config.confirm_void !== true) throw new Error("invoice_void_confirmation_required");
+  const invoice = await resolveInvoice(run, await buildRunContext(run), config);
+  const row = (await ctx.pool.query(`UPDATE invoices SET status = 'void', updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [invoice.id, run.company_id])).rows[0];
+  await cancelScheduledForSubject(run.company_id, "invoice", row.id, ["invoice.due", "invoice.overdue"]);
+  await emitFinancialEvent(run, node, "invoice.voided", "invoice", row.id, invoicePayload(row));
+  return { invoice_id: row.id, status: row.status };
+}
+
+async function executeInvoiceCreatePaymentRequest(run, node, config) {
+  const context = await buildRunContext(run);
+  const invoice = await resolveInvoice(run, context, config);
+  return executePaymentCreateRequest(run, node, { ...config, contact_id: invoice.contact_id, amount_cents: invoice.total_cents, description: config.description || `Invoice ${invoice.id}`, invoice_id: invoice.id });
+}
+
+async function executeInvoiceSendPaymentLink(run, node, config) {
+  const payment = await executeInvoiceCreatePaymentRequest(run, node, config);
+  const context = await buildRunContext(run);
+  return executeSmsSendShared(run, node, { ...config, contact_id: context.invoice?.contact_id || config.contact_id, body: config.body || `Your payment request is ready: ${payment.payment_url || payment.payment_record_id}` }, { mms: false });
+}
+
+async function executeInvoiceFollowupTask(run, node, config) {
+  const invoice = await resolveInvoice(run, await buildRunContext(run), config);
+  return executeTaskCreate(run, node, { ...config, title: config.title || "Invoice follow-up", contact_id: invoice.contact_id });
+}
+
+async function executePaymentCreateRequest(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:payment_record_id`);
+  if (existing) return { payment_record_id: existing, reused: true };
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const amount = intOrNull(resolveTemplate(config.amount_cents || config.amount || "", context));
+  if (!amount || amount < 50) throw new Error("payment_amount_required");
+  const owner = await resolveCompanyUser(run.company_id, config.user_id);
+  const settings = (await ctx.pool.query(`SELECT stripe_account_id, stripe_default_currency FROM business_settings WHERE user_id = $1`, [owner])).rows[0];
+  if (!settings?.stripe_account_id) throw new Error("stripe_not_connected");
+  const stripe = ctx.getStripe ? ctx.getStripe() : null;
+  if (!stripe) throw new Error("stripe_not_configured");
+  const contact = (await ctx.pool.query(`SELECT name, email, phone, address FROM contacts WHERE id::text = $1 AND company_id = $2`, [contactId, run.company_id])).rows[0];
+  const currency = (config.currency || settings.stripe_default_currency || "usd").toLowerCase();
+  const customer = await stripe.customers.create({ name: contact?.name || undefined, email: contact?.email || undefined, phone: contact?.phone || undefined, metadata: { wolfcrm_contact_id: contactId } }, { stripeAccount: settings.stripe_account_id, idempotencyKey: `auto_${run.id}_${node.id}_customer` });
+  const intent = await stripe.paymentIntents.create({
+    amount,
+    currency,
+    customer: customer.id,
+    description: resolveTemplate(config.description || "WolfCRM payment request", context),
+    automatic_payment_methods: { enabled: true },
+    metadata: { wolfcrm_contact_id: contactId, wolfcrm_run_id: run.id, wolfcrm_node_id: node.id, wolfcrm_invoice_id: config.invoice_id || "" }
+  }, { stripeAccount: settings.stripe_account_id, idempotencyKey: `auto_${run.id}_${node.id}_payment_intent` });
+  const row = (await ctx.pool.query(
+    `INSERT INTO payment_records(user_id, company_id, created_by_user_id, contact_id, payment_type, status, amount_cents, currency, description, stripe_connected_account_id, stripe_customer_id, stripe_payment_intent_id, stripe_invoice_id)
+     VALUES($1,$2,$1,$3,'automation_request','pending',$4,$5,$6,$7,$8,$9,$10)
+     RETURNING *`,
+    [owner, run.company_id, contactId, amount, currency, resolveTemplate(config.description || "Automation payment request", context), settings.stripe_account_id, customer.id, intent.id, config.invoice_id || null]
+  )).rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:payment_record_id`, row.id);
+  await emitFinancialEvent(run, node, "payment.created", "payment", row.id, paymentPayload(row));
+  await emitFinancialEvent(run, node, "payment.started", "payment", row.id, paymentPayload(row));
+  return { payment_record_id: row.id, payment_intent_id: intent.id, amount_cents: amount, currency, payment_url: null };
+}
+
+async function executePaymentFollowupTask(run, node, config) {
+  const payment = await resolvePayment(run, await buildRunContext(run), config);
+  return executeTaskCreate(run, node, { ...config, title: config.title || "Payment follow-up", contact_id: payment.contact_id });
+}
+
+async function executePaymentSendSms(run, node, config) {
+  const payment = await resolvePayment(run, await buildRunContext(run), config);
+  return executeSmsSendShared(run, node, { ...config, contact_id: payment.contact_id, body: config.body || "Your payment needs attention." }, { mms: false });
+}
+
+async function executePaymentSendPush(run, node, config) {
+  return executePushNotification(run, node, { ...config, title: config.title || "Payment update", body: config.body || "{{event.type}}" });
+}
+
+async function executePaymentRecordManual(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:payment_record_id`);
+  if (existing) return { payment_record_id: existing, reused: true };
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const amount = intOrNull(resolveTemplate(config.amount_cents || "", context));
+  if (!amount || amount < 1) throw new Error("payment_amount_required");
+  const owner = await resolveCompanyUser(run.company_id, config.user_id);
+  const row = (await ctx.pool.query(`INSERT INTO payment_records(user_id, company_id, created_by_user_id, contact_id, payment_type, status, amount_cents, currency, description) VALUES($1,$2,$1,$3,'manual','succeeded',$4,$5,$6) RETURNING *`, [owner, run.company_id, contactId, amount, (config.currency || "usd").toLowerCase(), resolveTemplate(config.description || "Manual payment", context)])).rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:payment_record_id`, row.id);
+  await emitFinancialEvent(run, node, "payment.succeeded", "payment", row.id, paymentPayload(row));
+  return { payment_record_id: row.id, amount_cents: amount, status: row.status };
+}
+
+async function executeServicePlanCreate(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:service_plan_id`);
+  if (existing) return { service_plan_id: existing, reused: true };
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config);
+  const owner = await resolveCompanyUser(run.company_id, config.user_id);
+  const firstDate = resolveDateExpression(config.first_service_date || config.next_service_date || "", context);
+  const price = intOrNull(resolveTemplate(config.price_cents || "", context));
+  if (!price || price < 1) throw new Error("service_plan_price_required");
+  const row = (await ctx.pool.query(
+    `INSERT INTO service_plans(user_id, company_id, created_by_user_id, contact_id, plan_name, status, price_cents, currency, billing_interval, billing_interval_count, service_interval, service_interval_count, first_service_date, next_service_date, included_services, notes)
+     VALUES($1,$2,$1,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::date,$12::date,$13,$14)
+     RETURNING *`,
+    [owner, run.company_id, contactId, resolveTemplate(config.plan_name || "Automation Service Plan", context), config.status || "draft", price, (config.currency || "usd").toLowerCase(), config.billing_interval || "month", Math.max(1, Number(config.billing_interval_count || 1)), config.service_interval || "month", Math.max(1, Number(config.service_interval_count || 1)), firstDate ? firstDate.toISOString().slice(0, 10) : null, resolveTemplate(config.included_services || "", context) || null, resolveTemplate(config.notes || "", context) || null]
+  )).rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:service_plan_id`, row.id);
+  await emitFinancialEvent(run, node, "service_plan.created", "service_plan", row.id, servicePlanPayload(row));
+  await syncAutomationSchedulesForServicePlan(run.company_id, row);
+  return { service_plan_id: row.id, contact_id: row.contact_id, status: row.status, next_service_date: row.next_service_date };
+}
+
+async function executeServicePlanUpdate(run, node, config) {
+  const context = await buildRunContext(run);
+  const plan = await resolveServicePlan(run, context, config);
+  const row = (await ctx.pool.query(
+    `UPDATE service_plans
+        SET plan_name = COALESCE($3, plan_name),
+            price_cents = COALESCE($4, price_cents),
+            billing_interval = COALESCE($5, billing_interval),
+            billing_interval_count = COALESCE($6, billing_interval_count),
+            service_interval = COALESCE($7, service_interval),
+            service_interval_count = COALESCE($8, service_interval_count),
+            first_service_date = COALESCE($9::date, first_service_date),
+            next_service_date = COALESCE($10::date, next_service_date),
+            included_services = COALESCE($11, included_services),
+            notes = COALESCE($12, notes),
+            updated_at = now()
+      WHERE id = $1 AND company_id = $2
+      RETURNING *`,
+    [plan.id, run.company_id, config.plan_name || null, intOrNull(config.price_cents), config.billing_interval || null, intOrNull(config.billing_interval_count), config.service_interval || null, intOrNull(config.service_interval_count), config.first_service_date || null, config.next_service_date || null, config.included_services || null, config.notes || null]
+  )).rows[0];
+  await emitServicePlanChangeEvents(run, node, plan, row);
+  await syncAutomationSchedulesForServicePlan(run.company_id, row);
+  return { service_plan_id: row.id, status: row.status, next_service_date: row.next_service_date };
+}
+
+async function executeServicePlanActivate(run, node, config) { return setServicePlanStatus(run, node, config, "active"); }
+async function executeServicePlanPause(run, node, config) { return setServicePlanStatus(run, node, config, "paused"); }
+async function executeServicePlanResume(run, node, config) { return setServicePlanStatus(run, node, config, "active", "service_plan.resumed"); }
+
+async function setServicePlanStatus(run, node, config, status, eventOverride = null) {
+  const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+  const row = (await ctx.pool.query(`UPDATE service_plans SET status = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [plan.id, run.company_id, status])).rows[0];
+  const eventType = eventOverride || (status === "active" ? "service_plan.activated" : status === "paused" ? "service_plan.paused" : "service_plan.updated");
+  await emitFinancialEvent(run, node, eventType, "service_plan", row.id, servicePlanPayload(row));
+  await syncAutomationSchedulesForServicePlan(run.company_id, row);
+  return { service_plan_id: row.id, status: row.status };
+}
+
+async function executeServicePlanCancel(run, node, config) {
+  if (config.confirm_cancel !== true) throw new Error("service_plan_cancel_confirmation_required");
+  const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+  const stripe = ctx.getStripe ? ctx.getStripe() : null;
+  if (stripe && plan.stripe_subscription_id && plan.stripe_connected_account_id) {
+    await stripe.subscriptions.cancel(plan.stripe_subscription_id, { stripeAccount: plan.stripe_connected_account_id, idempotencyKey: `auto_${run.id}_${node.id}_cancel_subscription` }).catch((e) => { throw new Error(`stripe_cancel_failed:${e?.message || "unknown"}`); });
+  }
+  const row = (await ctx.pool.query(`UPDATE service_plans SET status = 'canceled', updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [plan.id, run.company_id])).rows[0];
+  await cancelScheduledForSubject(run.company_id, "service_plan", row.id, ["service_plan.service_upcoming", "service_plan.service_due", "service_plan.service_overdue"]);
+  await emitFinancialEvent(run, node, "service_plan.canceled", "service_plan", row.id, servicePlanPayload(row));
+  return { service_plan_id: row.id, status: row.status };
+}
+
+async function executeServicePlanMarkServiced(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:service_event_id`);
+  if (existing) return { service_event_id: existing, reused: true };
+  const context = await buildRunContext(run);
+  const plan = await resolveServicePlan(run, context, config);
+  const completedDate = (resolveDateExpression(config.completed_date || "", context) || new Date()).toISOString().slice(0, 10);
+  const next = addDaysISO(completedDate, serviceIntervalDays(plan.service_interval, plan.service_interval_count));
+  const row = (await ctx.pool.query(`UPDATE service_plans SET last_service_date = $3::date, next_service_date = $4::date, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [plan.id, run.company_id, completedDate, next])).rows[0];
+  const owner = await resolveCompanyUser(run.company_id, plan.user_id);
+  const event = (await ctx.pool.query(`INSERT INTO service_plan_events(user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, completed_date, notes) VALUES($1,$2,$1,$3,$4,'serviced',$5,$6) RETURNING id`, [owner, run.company_id, row.id, row.contact_id, completedDate, "Marked serviced by automation"])).rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:service_event_id`, event.id);
+  await emitFinancialEvent(run, node, "service_plan.serviced", "service_plan", row.id, { ...servicePlanPayload(row), completed_date: completedDate });
+  await syncAutomationSchedulesForServicePlan(run.company_id, row);
+  return { service_plan_id: row.id, service_event_id: event.id, completed_date: completedDate, next_service_date: next };
+}
+
+async function executeServicePlanSetPrice(run, node, config) { return executeServicePlanUpdate(run, node, { ...config, price_cents: config.price_cents }); }
+async function executeServicePlanSetServiceInterval(run, node, config) { return executeServicePlanUpdate(run, node, { ...config, service_interval: config.service_interval, service_interval_count: config.service_interval_count }); }
+async function executeServicePlanSetBillingInterval(run, node, config) { return executeServicePlanUpdate(run, node, { ...config, billing_interval: config.billing_interval, billing_interval_count: config.billing_interval_count }); }
+async function executeServicePlanSetNextServiceDate(run, node, config) { return executeServicePlanUpdate(run, node, { ...config, next_service_date: config.next_service_date }); }
+
+async function executeServicePlanCreateNextJob(run, node, config) {
+  const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+  return executeJobCreate(run, node, { ...config, contact_id: plan.contact_id, title: config.title || plan.plan_name || "Service plan job", start_at: config.start_at || plan.next_service_date, price_cents: config.price_cents || plan.price_cents });
+}
+
+async function executeServicePlanCreateTask(run, node, config) {
+  const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+  return executeTaskCreate(run, node, { ...config, title: config.title || `Schedule next service for {{contact.name}}`, contact_id: plan.contact_id, due_date: config.due_date || plan.next_service_date });
+}
+
+async function executeServicePlanSendSchedulingSms(run, node, config) {
+  const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+  return executeSmsSendShared(run, node, { ...config, contact_id: plan.contact_id, body: config.body || "It is time to schedule your next service." }, { mms: false });
+}
+
+async function executeServicePlanPaymentFollowup(run, node, config) {
+  const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+  return executeTaskCreate(run, node, { ...config, title: config.title || "Service plan payment follow-up", contact_id: plan.contact_id });
+}
+
+function normalizeQuoteLineItems(items) {
+  const array = Array.isArray(items) ? items : [];
+  return array.map((item) => ({
+    description: String(item.description || item.name || item.service || "Service").trim(),
+    qty: Math.max(0, Number(item.qty ?? item.quantity ?? 1) || 0),
+    price_cents: Math.max(0, Math.round(Number(item.price_cents ?? item.unit_price_cents ?? item.price ?? 0) || 0))
+  })).filter((item) => item.description && item.qty > 0);
+}
+
+function computeQuoteTotalCents(items) {
+  return normalizeQuoteLineItems(items).reduce((sum, item) => sum + Math.round(item.qty * item.price_cents), 0);
+}
+
+async function resolveQuote(run, context, config) {
+  const id = resolveTemplate(config.quote_id || context.quote?.id || (run.subject_type === "quote" ? run.subject_id : ""), context);
+  if (!id) throw new Error("quote_required");
+  const row = (await ctx.pool.query(`SELECT * FROM quotes WHERE id::text = $1 AND company_id = $2`, [id, run.company_id])).rows[0];
+  if (!row) throw new Error("quote_not_found");
+  return row;
+}
+
+async function resolveInvoice(run, context, config) {
+  const id = resolveTemplate(config.invoice_id || context.invoice?.id || (run.subject_type === "invoice" ? run.subject_id : ""), context);
+  if (!id) throw new Error("invoice_required");
+  const row = (await ctx.pool.query(`SELECT * FROM invoices WHERE id::text = $1 AND company_id = $2`, [id, run.company_id])).rows[0];
+  if (!row) throw new Error("invoice_not_found");
+  return row;
+}
+
+async function resolvePayment(run, context, config) {
+  const id = resolveTemplate(config.payment_id || context.payment?.id || (run.subject_type === "payment" ? run.subject_id : ""), context);
+  if (!id) throw new Error("payment_required");
+  const row = (await ctx.pool.query(`SELECT * FROM payment_records WHERE id::text = $1 AND company_id = $2`, [id, run.company_id])).rows[0];
+  if (!row) throw new Error("payment_not_found");
+  return row;
+}
+
+async function resolveServicePlan(run, context, config) {
+  const id = resolveTemplate(config.service_plan_id || context.servicePlan?.id || (run.subject_type === "service_plan" ? run.subject_id : ""), context);
+  if (!id) throw new Error("service_plan_required");
+  const row = (await ctx.pool.query(`SELECT * FROM service_plans WHERE id::text = $1 AND company_id = $2`, [id, run.company_id])).rows[0];
+  if (!row) throw new Error("service_plan_not_found");
+  return row;
+}
+
+function quotePayload(row) {
+  return { quote_id: row.id, contact_id: row.contact_id, status: row.status || "draft", total_cents: row.total_cents || 0, subtotal_cents: row.total_cents || 0, line_item_count: Array.isArray(row.line_items) ? row.line_items.length : 0, expires_at: row.expires_at || null };
+}
+
+function invoicePayload(row) {
+  return { invoice_id: row.id, contact_id: row.contact_id || null, quote_id: row.quote_id || null, job_id: row.job_id || null, status: row.status, total_cents: row.total_cents || 0, currency: row.currency || "usd", due_at: row.due_at || null };
+}
+
+function paymentPayload(row) {
+  return { payment_id: row.id, contact_id: row.contact_id || null, service_plan_id: row.service_plan_id || null, amount_cents: row.amount_cents || 0, currency: row.currency || "usd", status: row.status, stripe_payment_intent_id: row.stripe_payment_intent_id || null, stripe_invoice_id: row.stripe_invoice_id || null, stripe_subscription_id: row.stripe_subscription_id || null };
+}
+
+function servicePlanPayload(row) {
+  return { service_plan_id: row.id, contact_id: row.contact_id || null, status: row.status, price_cents: row.price_cents || 0, currency: row.currency || "usd", billing_interval: row.billing_interval, billing_interval_count: row.billing_interval_count, service_interval: row.service_interval, service_interval_count: row.service_interval_count, first_service_date: row.first_service_date || null, last_serviced_at: row.last_service_date || null, next_service_date: row.next_service_date || null, stripe_subscription_id: row.stripe_subscription_id || null, subscription_status: row.stripe_subscription_status || null };
+}
+
+async function emitFinancialEvent(run, node, eventType, subjectType, subjectId, payload) {
+  await emitAutomationEvent({
+    companyId: run.company_id,
+    eventType,
+    subjectType,
+    subjectId,
+    source: "automation",
+    dedupeKey: `${eventType}:${subjectId}:${run.id}:${node.id}`,
+    payload: automationPayload(run, node, payload)
+  });
+}
+
+async function emitQuoteChangeEvents(run, node, before, after) {
+  const changed = diffFields(before, after, ["title", "notes", "status", "total_cents", "contact_id", "expires_at"]);
+  if (!changed.length && JSON.stringify(before.line_items || []) === JSON.stringify(after.line_items || [])) return;
+  await emitFinancialEvent(run, node, "quote.updated", "quote", after.id, { ...quotePayload(after), changed_fields: changed });
+  if (before.status !== after.status) {
+    await emitFinancialEvent(run, node, "quote.status_changed", "quote", after.id, { ...quotePayload(after), old_status: before.status, new_status: after.status });
+    const statusEvent = { sent: "quote.sent", accepted: "quote.accepted", declined: "quote.declined", expired: "quote.expired" }[after.status];
+    if (statusEvent) await emitFinancialEvent(run, node, statusEvent, "quote", after.id, quotePayload(after));
+  }
+  if (before.total_cents !== after.total_cents) await emitFinancialEvent(run, node, "quote.total_changed", "quote", after.id, { ...quotePayload(after), old_total_cents: before.total_cents, new_total_cents: after.total_cents });
+  if (before.contact_id !== after.contact_id) await emitFinancialEvent(run, node, "quote.contact_changed", "quote", after.id, { ...quotePayload(after), old_contact_id: before.contact_id, new_contact_id: after.contact_id });
+  const beforeItems = JSON.stringify(before.line_items || []);
+  const afterItems = JSON.stringify(after.line_items || []);
+  if (beforeItems !== afterItems) {
+    await emitFinancialEvent(run, node, "quote.line_items_changed", "quote", after.id, quotePayload(after));
+    const beforeCount = Array.isArray(before.line_items) ? before.line_items.length : 0;
+    const afterCount = Array.isArray(after.line_items) ? after.line_items.length : 0;
+    if (afterCount > beforeCount) await emitFinancialEvent(run, node, "quote.line_item_added", "quote", after.id, quotePayload(after));
+    if (afterCount < beforeCount) await emitFinancialEvent(run, node, "quote.line_item_removed", "quote", after.id, quotePayload(after));
+  }
+}
+
+async function emitServicePlanChangeEvents(run, node, before, after) {
+  const changed = diffFields(before, after, ["status", "price_cents", "billing_interval", "billing_interval_count", "service_interval", "service_interval_count", "first_service_date", "next_service_date"]);
+  if (!changed.length) return;
+  await emitFinancialEvent(run, node, "service_plan.updated", "service_plan", after.id, { ...servicePlanPayload(after), changed_fields: changed });
+  const eventMap = { price_cents: "service_plan.price_changed", billing_interval: "service_plan.billing_interval_changed", billing_interval_count: "service_plan.billing_interval_changed", service_interval: "service_plan.service_interval_changed", service_interval_count: "service_plan.service_interval_changed", first_service_date: "service_plan.first_service_date_changed", next_service_date: "service_plan.next_service_changed" };
+  for (const changedField of changed) {
+    const eventType = eventMap[changedField.field];
+    if (eventType) await emitFinancialEvent(run, node, eventType, "service_plan", after.id, { ...servicePlanPayload(after), changed_fields: [changedField] });
+  }
+}
+
+function diffFields(before, after, fields) {
+  return fields.filter((field) => JSON.stringify(before?.[field] ?? null) !== JSON.stringify(after?.[field] ?? null))
+    .map((field) => ({ field, old_value: before?.[field] ?? null, new_value: after?.[field] ?? null }));
+}
+
+function serviceIntervalDays(interval, count) {
+  const n = Math.max(1, Number(count || 1));
+  const key = String(interval || "month").toLowerCase();
+  if (key.startsWith("day")) return n;
+  if (key.startsWith("week")) return n * 7;
+  if (key.startsWith("year")) return n * 365;
+  return n * 30;
+}
+
+function addDaysISO(dateInput, days) {
+  const d = new Date(dateInput);
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
 }
 
 async function executeJobCreate(run, node, config) {
