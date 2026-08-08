@@ -1856,6 +1856,8 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
     const messageStatus = (req.body.SmsStatus || req.body.MessageStatus || "received").toString();
     const body = (req.body.Body || "").toString();
     const client = await pool.connect();
+    let storedConversationID = null;
+    let pushTitle = fromNumber;
 
     try {
       await client.query("BEGIN");
@@ -1872,6 +1874,7 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
         [phoneLine.id, fromNumber, contactID]
       );
       const conversationID = conversationRows[0].id;
+      storedConversationID = conversationID;
 
       try {
         await client.query(
@@ -1915,6 +1918,38 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
       throw e;
     } finally {
       client.release();
+    }
+
+    try {
+      if (contactID) {
+        const contact = await pool.query(
+          `SELECT name FROM contacts WHERE id = $1 AND company_id = $2 LIMIT 1`,
+          [contactID, phoneLine.company_id]
+        );
+        const name = (contact.rows[0]?.name || "").toString().trim();
+        if (name) pushTitle = name;
+      }
+      const preview = body.trim()
+        ? body.trim().slice(0, 140)
+        : (mediaCount > 0 ? "Sent an attachment" : "New message");
+      sendCompanyPhonePush(phoneLine.company_id, {
+        title: pushTitle,
+        body: preview,
+        contactId: contactID || undefined,
+        threadId: storedConversationID ? `cellular_sms_${storedConversationID}` : "cellular_sms",
+        payload: {
+          type: "cellular_sms",
+          conversation_id: storedConversationID,
+          external_phone_number: fromNumber,
+          contact_id: contactID || null
+        }
+      }).then((result) => {
+        console.log("[twilio/sms] APNs result", { messageSid, conversationID: storedConversationID, ...result });
+      }).catch((e) => {
+        console.error("[twilio/sms] APNs failed:", { messageSid, code: e?.code, message: e?.message });
+      });
+    } catch (e) {
+      console.error("[twilio/sms] APNs scheduling failed:", { messageSid, code: e?.code, message: e?.message });
     }
 
     res.status(200).type("text/xml").send(emptyMessagingResponse());
