@@ -2810,11 +2810,21 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
         ]
       );
       if (parentUpdate.rowCount) {
+        if (direction === "inbound" && ["busy", "failed", "canceled"].includes(disposition || "")) {
+          sendMissedCallPush({
+            companyId: line.company_id,
+            callId: parentUpdate.rows[0].id,
+            externalPhone: externalNumber,
+            contactId: contactID
+          }).catch((e) => {
+            console.error("[twilio/voice/status] missed-call APNs failed:", { callSid: parentCallSid, code: e?.code, message: e?.message });
+          });
+        }
         return res.status(200).type("text/plain").send("OK");
       }
     }
 
-    await pool.query(
+    const savedCall = await pool.query(
       `INSERT INTO phone_calls(
          company_id, phone_line_id, contact_id, twilio_call_sid, twilio_parent_call_sid,
          direction, from_number, to_number, status, started_at, answered_at,
@@ -2831,7 +2841,8 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
          ended_at = COALESCE(phone_calls.ended_at, EXCLUDED.ended_at),
          duration_seconds = COALESCE(EXCLUDED.duration_seconds, phone_calls.duration_seconds),
          disposition = COALESCE(EXCLUDED.disposition, phone_calls.disposition),
-         updated_at = now()`,
+         updated_at = now()
+       RETURNING id`,
       [
         line.company_id,
         line.id || null,
@@ -2847,6 +2858,17 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
         disposition
       ]
     );
+
+    if (direction === "inbound" && ["busy", "failed", "canceled"].includes(disposition || "")) {
+      sendMissedCallPush({
+        companyId: line.company_id,
+        callId: savedCall.rows[0]?.id,
+        externalPhone: externalNumber,
+        contactId: contactID
+      }).catch((e) => {
+        console.error("[twilio/voice/status] missed-call APNs failed:", { callSid, code: e?.code, message: e?.message });
+      });
+    }
 
     res.status(200).type("text/plain").send("OK");
   } catch (e) {
