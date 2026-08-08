@@ -143,6 +143,31 @@ async function sendCompanyPhonePush(companyId, options) {
   }
 }
 
+async function sendMissedCallPush({ companyId, callId, externalPhone, contactId }) {
+  if (!companyId || !externalPhone) return;
+  let caller = externalPhone;
+  if (contactId) {
+    const contact = await pool.query(
+      `SELECT name FROM contacts WHERE id = $1 AND company_id = $2 LIMIT 1`,
+      [contactId, companyId]
+    );
+    const name = (contact.rows[0]?.name || "").toString().trim();
+    if (name) caller = name;
+  }
+  await sendCompanyPhonePush(companyId, {
+    title: `Missed call from ${caller}`,
+    body: "Tap to call or text back.",
+    contactId: contactId || undefined,
+    threadId: callId ? `missed_call_${callId}` : "missed_call",
+    payload: {
+      type: "missed_call",
+      call_id: callId || null,
+      external_phone_number: externalPhone,
+      contact_id: contactId || null
+    }
+  });
+}
+
 // ---------- Stripe client (lazy) ----------
 // Only initialised when a route actually needs it, so missing keys never
 // crash the process. Every Stripe route below calls `requireStripe(res)`
