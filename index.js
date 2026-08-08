@@ -2726,11 +2726,12 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
   if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
 
   const rawBody = req.body?.body;
-  if (typeof rawBody !== "string") {
+  if (rawBody !== undefined && typeof rawBody !== "string") {
     return res.status(400).json({ error: "message_body_required" });
   }
-  const body = rawBody.trim();
-  if (!body) return res.status(400).json({ error: "message_body_required" });
+  const body = (rawBody || "").trim();
+  const requestedMedia = Array.isArray(req.body?.media) ? req.body.media.slice(0, 5) : [];
+  if (!body && requestedMedia.length === 0) return res.status(400).json({ error: "message_body_required" });
   if (body.length > MAX_SMS_BODY_LENGTH) {
     return res.status(400).json({ error: "message_too_long", max_length: MAX_SMS_BODY_LENGTH });
   }
@@ -2763,14 +2764,42 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
     const client = createTwilioClient();
     if (!client) return res.status(503).json({ error: "twilio_not_configured" });
 
+    const outboundMedia = [];
+    const mediaUrls = [];
+    if (requestedMedia.length) {
+      const cfg = mediaBucketConfig();
+      const s3 = getMediaS3Client();
+      if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured" });
+      const allowedPrefix = `companies/${req.companyId}/messages/`;
+      for (const item of requestedMedia) {
+        const objectKey = (item?.object_key || "").toString();
+        if (!objectKey.startsWith(allowedPrefix)) {
+          return res.status(403).json({ error: "media_forbidden" });
+        }
+        const mimeType = (item?.mime_type || item?.contentType || "application/octet-stream").toString().slice(0, 120);
+        const fileName = (item?.file_name || "attachment").toString().slice(0, 160);
+        const command = new GetObjectCommand({ Bucket: cfg.bucket, Key: objectKey });
+        const signedUrl = await getSignedUrl(s3, command, { expiresIn: 3600 });
+        mediaUrls.push(signedUrl);
+        outboundMedia.push({
+          index: outboundMedia.length,
+          objectKey,
+          contentType: mimeType,
+          fileName
+        });
+      }
+    }
+
     let sent;
     try {
-      sent = await client.messages.create({
+      const sendPayload = {
         from: fromNumber,
         to: toNumber,
-        body,
         statusCallback: twilioPublicUrl("/webhooks/twilio/message-status")
-      });
+      };
+      if (body) sendPayload.body = body;
+      if (mediaUrls.length) sendPayload.mediaUrl = mediaUrls;
+      sent = await client.messages.create(sendPayload);
     } catch (e) {
       console.error("[phone/messages] Twilio send failed:", {
         status: e?.status,
@@ -2788,7 +2817,7 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
            conversation_id, twilio_message_sid, direction, from_number, to_number,
            body, message_status, media_count, media
          )
-         VALUES($1,$2,'outbound',$3,$4,$5,$6,0,'[]'::jsonb)
+         VALUES($1,$2,'outbound',$3,$4,$5,$6,$7,$8::jsonb)
          RETURNING id,
                    conversation_id,
                    twilio_message_sid,
@@ -2808,8 +2837,10 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
           sent.sid || null,
           fromNumber,
           toNumber,
-          body,
-          sent.status || "queued"
+          body || null,
+          sent.status || "queued",
+          outboundMedia.length,
+          JSON.stringify(outboundMedia)
         ]
       );
       await db.query(
