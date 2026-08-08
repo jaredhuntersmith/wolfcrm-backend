@@ -76,7 +76,40 @@ const triggerCatalog = [
   ["pipeline.reminder_archived", "Pipeline Reminder Archived", "Pipeline", "A follow-up reminder was archived.", ["opportunity", "contact"], ["pipeline.reminder_archived"]],
   ["job.created", "Job Created", "Schedule", "A scheduled job was created.", ["job"], ["job.created"]],
   ["job.updated", "Job Updated", "Schedule", "A scheduled job was updated.", ["job"], ["job.updated"]],
+  ["job.deleted", "Job Deleted", "Schedule & Jobs", "A job was deleted.", ["job"], ["job.deleted"]],
+  ["job.restored", "Job Restored", "Schedule & Jobs", "Reserved for future server-side deleted job restore support.", ["job"], ["job.restored"]],
+  ["job.scheduled", "Job Scheduled", "Schedule & Jobs", "A job received its initial scheduled start/end.", ["job"], ["job.scheduled"]],
+  ["job.rescheduled", "Job Rescheduled", "Schedule & Jobs", "A job start or end time changed.", ["job"], ["job.rescheduled"]],
+  ["job.canceled", "Job Canceled", "Schedule & Jobs", "Reserved for future server-side cancellation status.", ["job"], ["job.canceled"]],
+  ["job.started", "Job Started", "Schedule & Jobs", "Reserved for future explicit job start status.", ["job"], ["job.started"]],
+  ["job.start_time_reached", "Job Start Time Reached", "Schedule & Jobs", "The scheduled job start time was reached.", ["job"], ["job.start_time_reached"]],
   ["job.completed", "Job Completed", "Schedule", "A scheduled job was marked complete.", ["job"], ["job.completed"]],
+  ["job.reopened", "Job Reopened", "Schedule & Jobs", "A completed job was reopened.", ["job"], ["job.reopened"]],
+  ["job.overdue", "Job Overdue", "Schedule & Jobs", "A job end time passed without completion.", ["job"], ["job.overdue"]],
+  ["job.relative_time", "Relative Job Time", "Schedule & Jobs", "Fires before or after a job start/end time.", ["job"], ["job.relative_time"]],
+  ["job.field_changed", "Job Field Changed", "Schedule & Jobs", "A selected job field changed.", ["job"], ["job.field_changed"]],
+  ["job.start_changed", "Job Start Changed", "Schedule & Jobs", "A job start time changed.", ["job"], ["job.start_changed"]],
+  ["job.end_changed", "Job End Changed", "Schedule & Jobs", "A job end time changed.", ["job"], ["job.end_changed"]],
+  ["job.date_changed", "Job Date Changed", "Schedule & Jobs", "A job date changed.", ["job"], ["job.date_changed"]],
+  ["job.price_changed", "Job Price Changed", "Schedule & Jobs", "A job price changed.", ["job"], ["job.price_changed"]],
+  ["job.material_cost_changed", "Material Cost Changed", "Schedule & Jobs", "A job material cost changed.", ["job"], ["job.material_cost_changed"]],
+  ["job.color_changed", "Job Color Changed", "Schedule & Jobs", "A job color changed.", ["job"], ["job.color_changed"]],
+  ["job.contact_changed", "Job Contact Changed", "Schedule & Jobs", "A job linked contact changed.", ["job"], ["job.contact_changed"]],
+  ["job.service_added", "Job Service Added", "Schedule & Jobs", "A service was added to a job.", ["job"], ["job.service_added"]],
+  ["job.service_removed", "Job Service Removed", "Schedule & Jobs", "A service was removed from a job.", ["job"], ["job.service_removed"]],
+  ["job.services_changed", "Job Services Changed", "Schedule & Jobs", "A job service list changed.", ["job"], ["job.services_changed"]],
+  ["job.worker_assigned", "Worker Assigned to Job", "Schedule & Jobs", "A worker was assigned to a job.", ["job"], ["job.worker_assigned"]],
+  ["job.worker_removed", "Worker Removed from Job", "Schedule & Jobs", "A worker was removed from a job.", ["job"], ["job.worker_removed"]],
+  ["job.workers_changed", "Job Workers Changed", "Schedule & Jobs", "A job worker list changed.", ["job"], ["job.workers_changed"]],
+  ["job.salesperson_assigned", "Salesperson Assigned to Job", "Schedule & Jobs", "A salesperson was assigned to a job.", ["job"], ["job.salesperson_assigned"]],
+  ["job.salesperson_removed", "Salesperson Removed from Job", "Schedule & Jobs", "A salesperson was removed from a job.", ["job"], ["job.salesperson_removed"]],
+  ["job.salespeople_changed", "Job Salespeople Changed", "Schedule & Jobs", "A job salesperson list changed.", ["job"], ["job.salespeople_changed"]],
+  ["job.first_job_for_contact", "First Job for Contact", "Schedule & Jobs", "A contact received their first job.", ["job"], ["job.first_job_for_contact"]],
+  ["job.repeat_job_for_contact", "Repeat Job for Contact", "Schedule & Jobs", "A contact received a repeat job.", ["job"], ["job.repeat_job_for_contact"]],
+  ["job.created_from_contact", "Job Created from Contact", "Schedule & Jobs", "A job was created from contact context.", ["job"], ["job.created_from_contact"]],
+  ["job.created_from_map", "Job Created from Map", "Schedule & Jobs", "A job was created from map context.", ["job"], ["job.created_from_map"]],
+  ["job.created_manually", "Job Created Manually", "Schedule & Jobs", "A job was manually created.", ["job"], ["job.created_manually"]],
+  ["job.created_by_automation", "Job Created by Automation", "Schedule & Jobs", "A job was created by an automation action.", ["job"], ["job.created_by_automation"]],
   ["sms.received", "SMS Received", "Phone", "An inbound SMS/MMS was received.", ["sms_conversation", "contact"], ["sms.received"]],
   ["sms.sent", "SMS Sent", "Phone", "An SMS/MMS was sent.", ["sms_conversation", "contact"], ["sms.sent"]],
   ["call.missed", "Missed Call", "Phone", "An inbound call was missed.", ["call"], ["call.missed"]],
@@ -85,7 +118,38 @@ const triggerCatalog = [
   ["payment.failed", "Payment Failed", "Payments", "A Stripe payment failed.", ["payment", "contact"], ["payment.failed"]],
   ["service_plan.created", "Service Plan Created", "Service Plans", "A service plan was created.", ["service_plan"], ["service_plan.created"]],
   ["service_plan.serviced", "Service Plan Serviced", "Service Plans", "A service plan was marked serviced.", ["service_plan"], ["service_plan.serviced"]],
-  ["task.completed", "Task Completed", "Tasks", "A todo task was completed.", ["task"], ["task.completed"]]
+  ["task.created", "Task Created", "Tasks", "A task was created.", ["task"], ["task.created"]],
+  ["task.updated", "Task Updated", "Tasks", "A task was updated.", ["task"], ["task.updated"]],
+  ["task.assigned", "Task Assigned", "Tasks", "A task was assigned to a user.", ["task"], ["task.assigned"]],
+  ["task.reassigned", "Task Reassigned", "Tasks", "A task assignee changed.", ["task"], ["task.reassigned"]],
+  ["task.unassigned", "Task Unassigned", "Tasks", "A task was unassigned.", ["task"], ["task.unassigned"]],
+  ["task.due", "Task Due", "Tasks", "A task due time was reached.", ["task"], ["task.due"]],
+  ["task.overdue", "Task Overdue", "Tasks", "A task became overdue while incomplete.", ["task"], ["task.overdue"]],
+  ["task.completed", "Task Completed", "Tasks", "A todo task was completed.", ["task"], ["task.completed"]],
+  ["task.reopened", "Task Reopened", "Tasks", "A completed task was reopened.", ["task"], ["task.reopened"]],
+  ["task.deleted", "Task Deleted", "Tasks", "A task was deleted.", ["task"], ["task.deleted"]],
+  ["task.rescheduled", "Task Rescheduled", "Tasks", "A task due date changed.", ["task"], ["task.rescheduled"]],
+  ["task.title_changed", "Task Title Changed", "Tasks", "A task title changed.", ["task"], ["task.title_changed"]],
+  ["task.due_changed", "Task Due Changed", "Tasks", "A task due date changed.", ["task"], ["task.due_changed"]],
+  ["task.contact_changed", "Task Contact Changed", "Tasks", "Reserved for future contact-linked server task support.", ["task"], ["task.contact_changed"]],
+  ["task.subtask_added", "Subtask Added", "Tasks", "A subtask was added.", ["task"], ["task.subtask_added"]],
+  ["task.subtask_completed", "Subtask Completed", "Tasks", "A subtask was completed.", ["task"], ["task.subtask_completed"]],
+  ["task.all_subtasks_completed", "All Subtasks Completed", "Tasks", "All subtasks transitioned to completed.", ["task"], ["task.all_subtasks_completed"]],
+  ["routine.created", "Routine Created", "Routines", "A routine was created.", ["routine"], ["routine.created"]],
+  ["routine.updated", "Routine Updated", "Routines", "A routine was updated.", ["routine"], ["routine.updated"]],
+  ["routine.due", "Routine Due", "Routines", "A routine occurrence is due.", ["routine"], ["routine.due"]],
+  ["routine.completed", "Routine Completed", "Routines", "A routine occurrence was completed.", ["routine"], ["routine.completed"]],
+  ["routine.missed", "Routine Missed", "Routines", "A routine occurrence was missed.", ["routine"], ["routine.missed"]],
+  ["routine.ended", "Routine Ended", "Routines", "A routine was disabled or deleted.", ["routine"], ["routine.ended"]],
+  ["routine.reactivated", "Routine Reactivated", "Routines", "A disabled routine was re-enabled.", ["routine"], ["routine.reactivated"]],
+  ["routine.weekday_reached", "Routine Weekday Reached", "Routines", "A configured routine weekday was reached.", ["routine"], ["routine.weekday_reached"]],
+  ["customer_reminder.created", "Customer Reminder Created", "Customer Reminders", "A customer reminder was created.", ["customer_reminder"], ["customer_reminder.created"]],
+  ["customer_reminder.due", "Customer Reminder Due", "Customer Reminders", "A customer reminder due time was reached.", ["customer_reminder"], ["customer_reminder.due"]],
+  ["customer_reminder.overdue", "Customer Reminder Overdue", "Customer Reminders", "A customer reminder became overdue.", ["customer_reminder"], ["customer_reminder.overdue"]],
+  ["customer_reminder.completed", "Customer Reminder Completed", "Customer Reminders", "A customer reminder was completed.", ["customer_reminder"], ["customer_reminder.completed"]],
+  ["customer_reminder.rescheduled", "Customer Reminder Rescheduled", "Customer Reminders", "A customer reminder due date changed.", ["customer_reminder"], ["customer_reminder.rescheduled"]],
+  ["customer_reminder.deleted", "Customer Reminder Deleted", "Customer Reminders", "A customer reminder was deleted.", ["customer_reminder"], ["customer_reminder.deleted"]],
+  ["customer_reminder.reopened", "Customer Reminder Reopened", "Customer Reminders", "A completed customer reminder was reopened.", ["customer_reminder"], ["customer_reminder.reopened"]]
 ].map(([key, displayName, category, description, subjectTypes, eventTypes]) => ({
   key,
   display_name: displayName,
@@ -135,6 +199,49 @@ const actionCatalog = [
   ["sms.send", "Send SMS", "Phone", "Sends SMS through the configured company phone line.", ["contact", "sms_conversation"], ["default"]],
   ["internal.send_message", "Send Internal Message", "Company Comms", "Sends a message to a conversation or channel.", ["generic"], ["default"]],
   ["job.create", "Create Job", "Schedule", "Creates a scheduled job.", ["contact"], ["default"]],
+  ["job.update", "Update Job", "Schedule & Jobs", "Updates whitelisted job fields.", ["job"], ["default"]],
+  ["job.reschedule", "Reschedule Job", "Schedule & Jobs", "Changes a job start/end time.", ["job"], ["default"]],
+  ["job.cancel", "Cancel Job", "Schedule & Jobs", "Reserved for future cancellation status; current app distinguishes delete from complete.", ["job"], ["default"]],
+  ["job.delete", "Delete Job", "Schedule & Jobs", "Deletes a job after explicit confirmation.", ["job"], ["default"]],
+  ["job.restore", "Restore Job", "Schedule & Jobs", "Deferred because deleted job recovery is currently local-only.", ["job"], ["default"]],
+  ["job.mark_completed", "Mark Job Completed", "Schedule & Jobs", "Marks a job finished using the current schedule state.", ["job"], ["default"]],
+  ["job.reopen", "Reopen Job", "Schedule & Jobs", "Clears the finished state on a job.", ["job"], ["default"]],
+  ["job.set_start", "Set Job Start", "Schedule & Jobs", "Sets the job start time.", ["job"], ["default"]],
+  ["job.set_end", "Set Job End", "Schedule & Jobs", "Sets the job end time.", ["job"], ["default"]],
+  ["job.set_price", "Set Job Price", "Schedule & Jobs", "Sets the job price.", ["job"], ["default"]],
+  ["job.set_material_cost", "Set Material Cost", "Schedule & Jobs", "Sets material cost.", ["job"], ["default"]],
+  ["job.set_color", "Set Job Color", "Schedule & Jobs", "Sets the job color.", ["job"], ["default"]],
+  ["job.set_contact", "Set Job Contact", "Schedule & Jobs", "Links a job to a contact.", ["job"], ["default"]],
+  ["job.add_service", "Add Job Service", "Schedule & Jobs", "Adds a service item to a job.", ["job"], ["default"]],
+  ["job.remove_service", "Remove Job Service", "Schedule & Jobs", "Removes matching service items from a job.", ["job"], ["default"]],
+  ["job.assign_worker", "Assign Worker", "Schedule & Jobs", "Adds a worker to a job.", ["job"], ["default"]],
+  ["job.remove_worker", "Remove Worker", "Schedule & Jobs", "Removes a worker from a job.", ["job"], ["default"]],
+  ["job.replace_workers", "Replace Workers", "Schedule & Jobs", "Replaces the job worker list.", ["job"], ["default"]],
+  ["job.assign_salesperson", "Assign Salesperson", "Schedule & Jobs", "Adds a salesperson to a job.", ["job"], ["default"]],
+  ["job.remove_salesperson", "Remove Salesperson", "Schedule & Jobs", "Removes a salesperson from a job.", ["job"], ["default"]],
+  ["job.replace_salespeople", "Replace Salespeople", "Schedule & Jobs", "Replaces the job salesperson list.", ["job"], ["default"]],
+  ["job.add_note", "Add Job Note", "Schedule & Jobs", "Appends text to the job notes field.", ["job"], ["default"]],
+  ["job.create_followup", "Create Follow-Up Job", "Schedule & Jobs", "Creates a future job based on the current job.", ["job"], ["default"]],
+  ["schedule.find_available_slots", "Find Available Slots", "Schedule & Jobs", "Deterministically finds open schedule windows.", ["generic"], ["default"]],
+  ["task.update", "Update Task", "Tasks", "Updates whitelisted task fields.", ["task"], ["default"]],
+  ["task.complete", "Complete Task", "Tasks", "Marks a task completed.", ["task"], ["default"]],
+  ["task.reopen", "Reopen Task", "Tasks", "Marks a task incomplete.", ["task"], ["default"]],
+  ["task.delete", "Delete Task", "Tasks", "Deletes a task.", ["task"], ["default"]],
+  ["task.reschedule", "Reschedule Task", "Tasks", "Changes a task due date.", ["task"], ["default"]],
+  ["task.assign", "Assign Task", "Tasks", "Moves a personal task to another company user.", ["task"], ["default"]],
+  ["task.unassign", "Unassign Task", "Tasks", "Moves a task back to the company owner.", ["task"], ["default"]],
+  ["task.add_subtask", "Add Subtask", "Tasks", "Adds a subtask.", ["task"], ["default"]],
+  ["task.complete_subtask", "Complete Subtask", "Tasks", "Marks a subtask completed.", ["task"], ["default"]],
+  ["task.delete_subtask", "Delete Subtask", "Tasks", "Deletes a subtask.", ["task"], ["default"]],
+  ["routine.create", "Create Routine", "Routines", "Creates a recurring routine.", ["generic"], ["default"]],
+  ["routine.update", "Update Routine", "Routines", "Updates a routine.", ["routine"], ["default"]],
+  ["routine.mark_completed", "Mark Routine Completed", "Routines", "Completes an occurrence.", ["routine"], ["default"]],
+  ["routine.end", "End Routine", "Routines", "Disables a routine.", ["routine"], ["default"]],
+  ["customer_reminder.create", "Create Customer Reminder", "Customer Reminders", "Creates a customer reminder.", ["contact"], ["default"]],
+  ["customer_reminder.complete", "Complete Customer Reminder", "Customer Reminders", "Marks a customer reminder complete.", ["customer_reminder"], ["default"]],
+  ["customer_reminder.reschedule", "Reschedule Customer Reminder", "Customer Reminders", "Changes reminder due date.", ["customer_reminder"], ["default"]],
+  ["customer_reminder.delete", "Delete Customer Reminder", "Customer Reminders", "Deletes a customer reminder.", ["customer_reminder"], ["default"]],
+  ["customer_reminder.reopen", "Reopen Customer Reminder", "Customer Reminders", "Marks a customer reminder incomplete.", ["customer_reminder"], ["default"]],
   ["webhook.send", "Send Webhook", "Webhooks", "Sends a bounded HTTP request to an external URL.", ["generic"], ["default"]],
   ["automation.start", "Start Automation", "Automations", "Starts another published automation.", ["generic"], ["default"]]
 ].map(([key, displayName, category, description, subjectTypes, outputs]) => ({
@@ -184,6 +291,49 @@ const actionExecutors = {
   "sms.send": executeSmsSend,
   "internal.send_message": executeInternalMessage,
   "job.create": executeJobCreate,
+  "job.update": executeJobUpdate,
+  "job.reschedule": executeJobReschedule,
+  "job.cancel": executeDeferredAction,
+  "job.delete": executeJobDelete,
+  "job.restore": executeDeferredAction,
+  "job.mark_completed": executeJobMarkCompleted,
+  "job.reopen": executeJobReopen,
+  "job.set_start": executeJobSetStart,
+  "job.set_end": executeJobSetEnd,
+  "job.set_price": executeJobSetPrice,
+  "job.set_material_cost": executeJobSetMaterialCost,
+  "job.set_color": executeJobSetColor,
+  "job.set_contact": executeJobSetContact,
+  "job.add_service": executeJobAddService,
+  "job.remove_service": executeJobRemoveService,
+  "job.assign_worker": executeJobAssignWorker,
+  "job.remove_worker": executeJobRemoveWorker,
+  "job.replace_workers": executeJobReplaceWorkers,
+  "job.assign_salesperson": executeJobAssignSalesperson,
+  "job.remove_salesperson": executeJobRemoveSalesperson,
+  "job.replace_salespeople": executeJobReplaceSalespeople,
+  "job.add_note": executeJobAddNote,
+  "job.create_followup": executeJobCreateFollowup,
+  "schedule.find_available_slots": executeFindAvailableSlots,
+  "task.update": executeTaskUpdate,
+  "task.complete": executeTaskComplete,
+  "task.reopen": executeTaskReopen,
+  "task.delete": executeTaskDelete,
+  "task.reschedule": executeTaskReschedule,
+  "task.assign": executeTaskAssign,
+  "task.unassign": executeTaskUnassign,
+  "task.add_subtask": executeTaskAddSubtask,
+  "task.complete_subtask": executeTaskCompleteSubtask,
+  "task.delete_subtask": executeTaskDeleteSubtask,
+  "routine.create": executeRoutineCreate,
+  "routine.update": executeRoutineUpdate,
+  "routine.mark_completed": executeRoutineMarkCompleted,
+  "routine.end": executeRoutineEnd,
+  "customer_reminder.create": executeCustomerReminderCreate,
+  "customer_reminder.complete": executeCustomerReminderComplete,
+  "customer_reminder.reschedule": executeCustomerReminderReschedule,
+  "customer_reminder.delete": executeCustomerReminderDelete,
+  "customer_reminder.reopen": executeCustomerReminderReopen,
   "webhook.send": executeWebhookSend,
   "automation.start": executeAutomationStart
 };
@@ -242,7 +392,59 @@ function actionConfigFields(key) {
     case "internal.send_message":
       return [commonText("body", "Message"), commonText("conversation_id", "Conversation ID"), commonText("channel_id", "Channel ID"), { key: "recipient_user_ids", label: "Recipients", type: "user_list" }];
     case "job.create":
-      return [commonText("title", "Title"), { key: "start_at", label: "Start", type: "datetime" }, { key: "end_at", label: "End", type: "datetime" }, commonText("notes", "Notes")];
+    case "job.update":
+      return [commonText("title", "Title"), { key: "start_at", label: "Start", type: "datetime_expression" }, { key: "end_at", label: "End", type: "datetime_expression" }, commonText("notes", "Notes"), commonText("contact_id", "Contact ID"), { key: "price_cents", label: "Price", type: "money" }, { key: "material_cost_cents", label: "Material Cost", type: "money" }, commonText("color", "Color"), { key: "service_items", label: "Services", type: "json" }, { key: "worker_user_ids", label: "Workers", type: "user_list" }, { key: "sales_user_ids", label: "Salespeople", type: "user_list" }];
+    case "job.reschedule":
+      return [{ key: "start_at", label: "New Start", type: "datetime_expression" }, { key: "end_at", label: "New End", type: "datetime_expression" }, { key: "preserve_duration", label: "Preserve Duration", type: "boolean" }];
+    case "job.delete":
+      return [{ key: "confirm_delete", label: "Confirm Delete", type: "boolean" }];
+    case "job.set_start":
+      return [{ key: "start_at", label: "Start", type: "datetime_expression" }];
+    case "job.set_end":
+      return [{ key: "end_at", label: "End", type: "datetime_expression" }];
+    case "job.set_price":
+      return [{ key: "price_cents", label: "Price", type: "money" }];
+    case "job.set_material_cost":
+      return [{ key: "material_cost_cents", label: "Material Cost", type: "money" }];
+    case "job.set_color":
+      return [commonText("color", "Color")];
+    case "job.set_contact":
+      return [commonText("contact_id", "Contact ID")];
+    case "job.add_service":
+    case "job.remove_service":
+      return [commonText("service", "Service"), { key: "price_cents", label: "Price", type: "money" }];
+    case "job.assign_worker":
+    case "job.remove_worker":
+      return [commonText("user_id", "Worker")];
+    case "job.replace_workers":
+      return [{ key: "worker_user_ids", label: "Workers", type: "user_list" }];
+    case "job.assign_salesperson":
+    case "job.remove_salesperson":
+      return [commonText("user_id", "Salesperson")];
+    case "job.replace_salespeople":
+      return [{ key: "sales_user_ids", label: "Salespeople", type: "user_list" }];
+    case "job.add_note":
+      return [commonText("notes", "Note")];
+    case "job.create_followup":
+      return [{ key: "amount", label: "Amount", type: "number" }, { key: "unit", label: "Unit", type: "select", options: ["days", "weeks", "months"] }, { key: "copy_services", label: "Copy Services", type: "boolean" }, { key: "copy_workers", label: "Copy Workers", type: "boolean" }, { key: "copy_salespeople", label: "Copy Salespeople", type: "boolean" }, { key: "copy_price", label: "Copy Price", type: "boolean" }];
+    case "schedule.find_available_slots":
+      return [{ key: "range_start", label: "Range Start", type: "datetime_expression" }, { key: "range_end", label: "Range End", type: "datetime_expression" }, { key: "duration_minutes", label: "Duration Minutes", type: "number" }, { key: "worker_user_ids", label: "Workers", type: "user_list" }];
+    case "task.create":
+    case "task.update":
+      return [commonText("title", "Title"), commonText("notes", "Notes"), { key: "due_date", label: "Due Date", type: "datetime_expression" }, { key: "assigned_user_id", label: "Assignee", type: "user" }, { key: "subtasks", label: "Subtasks", type: "string_list" }];
+    case "task.reschedule":
+      return [{ key: "due_date", label: "Due Date", type: "datetime_expression" }];
+    case "task.add_subtask":
+      return [commonText("title", "Subtask")];
+    case "task.complete_subtask":
+    case "task.delete_subtask":
+      return [commonText("title", "Subtask Title")];
+    case "routine.create":
+    case "routine.update":
+      return [commonText("title", "Title"), { key: "time", label: "Time", type: "datetime_expression" }, { key: "weekdays", label: "Weekdays", type: "number_list" }];
+    case "customer_reminder.create":
+    case "customer_reminder.reschedule":
+      return [commonText("title", "Title"), commonText("contact_id", "Contact ID"), commonText("contact_name", "Contact Name"), { key: "due_date", label: "Due Date", type: "datetime_expression" }];
     case "webhook.send":
       return [commonText("url", "URL"), { key: "method", label: "Method", type: "select", options: ["GET", "POST", "PUT", "PATCH", "DELETE"] }, { key: "headers", label: "Headers", type: "json" }, { key: "body", label: "JSON Body", type: "json" }];
     case "automation.start":
@@ -255,11 +457,18 @@ function actionConfigFields(key) {
 function triggerConfigFields(key) {
   const sourceOptions = ["manual", "ios", "zapier", "meta", "webhook", "csv", "phone", "map", "schedule", "automation", "system", "other"];
   const fields = [];
-  if (key.includes("field_changed") || /_(name|phone|email|address|value|job_type|source|u[1-5]|location)_changed$/.test(key)) {
-    fields.push({ key: "field", label: "Field", type: "contact_field" });
+  if (key.includes("field_changed") || /_(name|phone|email|address|value|job_type|source|u[1-5]|location|start|end|date|price|material_cost|color|contact|due|title)_changed$/.test(key)) {
+    fields.push({ key: "field", label: "Field", type: key.startsWith("job.") ? "job_field" : key.startsWith("task.") ? "task_field" : "contact_field" });
     fields.push({ key: "from", label: "From", type: "text" });
     fields.push({ key: "to", label: "To", type: "text" });
   }
+  if (key === "job.relative_time") {
+    fields.push({ key: "reference", label: "Reference", type: "select", options: ["start", "end"] });
+    fields.push({ key: "direction", label: "Direction", type: "select", options: ["before", "after"] });
+    fields.push({ key: "amount", label: "Amount", type: "number" });
+    fields.push({ key: "unit", label: "Unit", type: "select", options: ["minutes", "hours", "days", "weeks"] });
+  }
+  if (key.startsWith("job.")) fields.push({ key: "worker_user_ids", label: "Workers", type: "user_list" }, { key: "sales_user_ids", label: "Salespeople", type: "user_list" }, { key: "services", label: "Services", type: "string_list" });
   if (key.includes("tag_") || key.includes("tags_changed")) fields.push({ key: "tags", label: "Tags", type: "tag_list" }, { key: "tag_match", label: "Tag Match", type: "select", options: ["any", "one_of", "all"] });
   if (key.startsWith("lead.")) fields.push({ key: "sources", label: "Sources", type: "source_list", options: sourceOptions });
   if (key.includes("stage_") || key.includes("opportunity") || key.includes("pipeline.won") || key.includes("pipeline.lost") || key.includes("pipeline.reopened")) {
@@ -345,7 +554,50 @@ function conditionFieldCatalog() {
     ["pipeline.salesperson_id", "Salesperson ID", "Pipeline", "user", textOps],
     ["pipeline.salesperson_name", "Salesperson Name", "Pipeline", "text", textOps],
     ["pipeline.days_in_stage", "Days in Stage", "Pipeline", "number", numberOps],
-    ["pipeline.reminder_exists", "Reminder Exists", "Pipeline", "boolean", boolOps]
+    ["pipeline.reminder_exists", "Reminder Exists", "Pipeline", "boolean", boolOps],
+    ["job.exists", "Job Exists", "Schedule & Jobs", "boolean", boolOps],
+    ["job.id", "Job ID", "Schedule & Jobs", "text", textOps],
+    ["job.contact_id", "Job Contact", "Schedule & Jobs", "text", textOps],
+    ["job.start_at", "Job Start", "Schedule & Jobs", "date", dateOps],
+    ["job.end_at", "Job End", "Schedule & Jobs", "date", dateOps],
+    ["job.duration", "Job Duration", "Schedule & Jobs", "number", numberOps],
+    ["job.price_cents", "Job Price", "Schedule & Jobs", "number", numberOps],
+    ["job.material_cost_cents", "Material Cost", "Schedule & Jobs", "number", numberOps],
+    ["job.color", "Job Color", "Schedule & Jobs", "text", textOps],
+    ["job.finished_at", "Job Completed At", "Schedule & Jobs", "date", dateOps],
+    ["job.completed", "Job Completed", "Schedule & Jobs", "boolean", boolOps],
+    ["job.overdue", "Job Overdue", "Schedule & Jobs", "boolean", boolOps],
+    ["job.service_items", "Job Services", "Schedule & Jobs", "text", textOps],
+    ["job.worker_user_ids", "Worker IDs", "Schedule & Jobs", "text", textOps],
+    ["job.sales_user_ids", "Salesperson IDs", "Schedule & Jobs", "text", textOps],
+    ["job.has_workers", "Has Workers", "Schedule & Jobs", "boolean", boolOps],
+    ["job.has_salesperson", "Has Salesperson", "Schedule & Jobs", "boolean", boolOps],
+    ["task.exists", "Task Exists", "Tasks", "boolean", boolOps],
+    ["task.title", "Task Title", "Tasks", "text", textOps],
+    ["task.due_at", "Task Due", "Tasks", "date", dateOps],
+    ["task.completed", "Task Completed", "Tasks", "boolean", boolOps],
+    ["task.overdue", "Task Overdue", "Tasks", "boolean", boolOps],
+    ["task.assigned_user", "Task Assignee", "Tasks", "user", textOps],
+    ["task.subtask_count", "Subtask Count", "Tasks", "number", numberOps],
+    ["task.completed_subtask_count", "Completed Subtasks", "Tasks", "number", numberOps],
+    ["task.all_subtasks_completed", "All Subtasks Completed", "Tasks", "boolean", boolOps],
+    ["routine.exists", "Routine Exists", "Routines", "boolean", boolOps],
+    ["routine.active", "Routine Active", "Routines", "boolean", boolOps],
+    ["routine.title", "Routine Title", "Routines", "text", textOps],
+    ["routine.completed_today", "Completed Today", "Routines", "boolean", boolOps],
+    ["routine.due_today", "Due Today", "Routines", "boolean", boolOps],
+    ["routine.missed_today", "Missed Today", "Routines", "boolean", boolOps],
+    ["customer_reminder.exists", "Reminder Exists", "Customer Reminders", "boolean", boolOps],
+    ["customer_reminder.contact_id", "Reminder Contact", "Customer Reminders", "text", textOps],
+    ["customer_reminder.due_at", "Reminder Due", "Customer Reminders", "date", dateOps],
+    ["customer_reminder.completed", "Reminder Completed", "Customer Reminders", "boolean", boolOps],
+    ["customer_reminder.overdue", "Reminder Overdue", "Customer Reminders", "boolean", boolOps],
+    ["customer_reminder.title", "Reminder Title", "Customer Reminders", "text", textOps],
+    ["time.now", "Current Time", "Time", "date", dateOps],
+    ["time.day_of_week", "Day of Week", "Time", "number", numberOps],
+    ["time.is_weekday", "Is Weekday", "Time", "boolean", boolOps],
+    ["time.is_weekend", "Is Weekend", "Time", "boolean", boolOps],
+    ["company.timezone", "Company Timezone", "Time", "text", textOps]
   ].map(([key, displayName, category, valueType, operators]) => ({ key, display_name: displayName, category, value_type: valueType, operators }));
 }
 
@@ -355,6 +607,10 @@ function templateVariableCatalog() {
     "contact.u1", "contact.u2", "contact.u3", "contact.u4", "contact.u5",
     "lead.source", "lead.external_id", "lead.form_id", "lead.page_id", "lead.submitted_at",
     "pipeline.stage_name", "pipeline.opportunity_value", "pipeline.salesperson_name",
+    "job.id", "job.start_at", "job.end_at", "job.price_cents", "job.material_cost_cents", "job.service_items", "job.contact_id",
+    "task.id", "task.title", "task.due_at",
+    "routine.id", "routine.title",
+    "customer_reminder.id", "customer_reminder.title", "customer_reminder.due_at",
     "company.name", "event.type", "event.payload.form_id", "event.payload.page_id", "variables.some_name"
   ].map((key) => ({ key, token: `{{${key}}}` }));
 }
@@ -400,6 +656,127 @@ export async function emitAutomationEvent(event) {
     console.error("[automations] emit failed", { eventType: event.eventType, code: e?.code, message: e?.message });
     return null;
   }
+}
+
+export async function syncAutomationSchedulesForJob(companyId, job) {
+  if (!ctx?.pool || !companyId || !job?.id) return;
+  await cancelScheduledForSubject(companyId, "job", job.id, ["job.start_time_reached", "job.overdue", "job.relative_time"]);
+  if (job.finished_at) return;
+  const start = new Date(job.start || job.start_at);
+  const end = new Date(job.end || job.end_at);
+  const sourceVersion = `${job.updated_at || ""}:${Number.isNaN(start.getTime()) ? job.start || job.start_at : start.toISOString()}:${Number.isNaN(end.getTime()) ? job.end || job.end_at : end.toISOString()}`;
+  if (!Number.isNaN(start.getTime())) {
+    await enqueueScheduledAutomationEvent({
+      companyId, eventType: "job.start_time_reached", subjectType: "job", subjectId: job.id,
+      scheduledFor: start, scheduleKey: `job.start_time_reached:${job.id}:${start.toISOString()}`, sourceVersion,
+      payload: { job_id: job.id, contact_id: job.contact_id || null, start: start.toISOString(), end: Number.isNaN(end.getTime()) ? null : end.toISOString() }
+    });
+  }
+  if (!Number.isNaN(end.getTime())) {
+    await enqueueScheduledAutomationEvent({
+      companyId, eventType: "job.overdue", subjectType: "job", subjectId: job.id,
+      scheduledFor: end, scheduleKey: `job.overdue:${job.id}:${end.toISOString()}`, sourceVersion,
+      payload: { job_id: job.id, contact_id: job.contact_id || null, start: Number.isNaN(start.getTime()) ? null : start.toISOString(), end: end.toISOString() }
+    });
+  }
+  const relativeTriggers = (await ctx.pool.query(
+    `SELECT n.id, n.config
+       FROM automation_definitions d
+       JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
+       JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
+      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'job.relative_time'`,
+    [companyId]
+  )).rows;
+  for (const trigger of relativeTriggers) {
+    const config = trigger.config || {};
+    const basis = config.reference === "end" ? end : start;
+    if (Number.isNaN(basis.getTime())) continue;
+    const ms = durationAmountMs(Number(config.amount || 0), config.unit || "minutes");
+    const when = new Date(basis.getTime() + (config.direction === "after" ? ms : -ms));
+    await enqueueScheduledAutomationEvent({
+      companyId, eventType: "job.relative_time", subjectType: "job", subjectId: job.id,
+      scheduledFor: when, scheduleKey: `job.relative_time:${trigger.id}:${job.id}:${basis.toISOString()}:${config.direction || "before"}:${config.amount || 0}:${config.unit || "minutes"}`,
+      sourceVersion,
+      payload: { job_id: job.id, contact_id: job.contact_id || null, trigger_node_id: trigger.id, reference: config.reference || "start", direction: config.direction || "before", amount: Number(config.amount || 0), unit: config.unit || "minutes", basis_time: basis.toISOString() }
+    });
+  }
+}
+
+export async function syncAutomationSchedulesForTask(companyId, task) {
+  if (!ctx?.pool || !companyId || !task?.id) return;
+  await cancelScheduledForSubject(companyId, "task", task.id, ["task.due", "task.overdue"]);
+  if (task.completed || !task.due_date) return;
+  const due = new Date(task.due_date);
+  if (Number.isNaN(due.getTime())) return;
+  const payload = { task_id: task.id, title: task.title, due_date: due.toISOString() };
+  await enqueueScheduledAutomationEvent({ companyId, eventType: "task.due", subjectType: "task", subjectId: task.id, scheduledFor: due, scheduleKey: `task.due:${task.id}:${due.toISOString()}`, payload });
+  await enqueueScheduledAutomationEvent({ companyId, eventType: "task.overdue", subjectType: "task", subjectId: task.id, scheduledFor: due, scheduleKey: `task.overdue:${task.id}:${due.toISOString()}`, payload });
+}
+
+export async function syncAutomationSchedulesForCustomerReminder(companyId, reminder) {
+  if (!ctx?.pool || !companyId || !reminder?.id) return;
+  await cancelScheduledForSubject(companyId, "customer_reminder", reminder.id, ["customer_reminder.due", "customer_reminder.overdue"]);
+  if (reminder.completed || !reminder.due_date) return;
+  const due = new Date(reminder.due_date);
+  if (Number.isNaN(due.getTime())) return;
+  const payload = { reminder_id: reminder.id, contact_id: reminder.contact_id || null, title: reminder.title || null, due_date: due.toISOString() };
+  await enqueueScheduledAutomationEvent({ companyId, eventType: "customer_reminder.due", subjectType: "customer_reminder", subjectId: reminder.id, scheduledFor: due, scheduleKey: `customer_reminder.due:${reminder.id}:${due.toISOString()}`, payload });
+  await enqueueScheduledAutomationEvent({ companyId, eventType: "customer_reminder.overdue", subjectType: "customer_reminder", subjectId: reminder.id, scheduledFor: due, scheduleKey: `customer_reminder.overdue:${reminder.id}:${due.toISOString()}`, payload });
+}
+
+export async function syncAutomationSchedulesForRoutine(companyId, routine) {
+  if (!ctx?.pool || !companyId || !routine?.id) return;
+  await cancelScheduledForSubject(companyId, "routine", routine.id, ["routine.due", "routine.missed", "routine.weekday_reached"]);
+  if (!routine.enabled) return;
+  const weekdays = Array.isArray(routine.weekdays) ? routine.weekdays.map(Number) : [];
+  const baseTime = routine.time ? new Date(routine.time) : new Date();
+  for (let offset = 0; offset < 14; offset++) {
+    const date = new Date(Date.now() + offset * 86400000);
+    const jsDay = date.getDay() + 1;
+    if (weekdays.length && !weekdays.includes(jsDay)) continue;
+    date.setUTCHours(baseTime.getUTCHours(), baseTime.getUTCMinutes(), 0, 0);
+    const dayKey = date.toISOString().slice(0, 10);
+    const payload = { routine_id: routine.id, title: routine.title, occurrence_date: dayKey };
+    await enqueueScheduledAutomationEvent({ companyId, eventType: "routine.weekday_reached", subjectType: "routine", subjectId: routine.id, scheduledFor: date, scheduleKey: `routine.weekday_reached:${routine.id}:${dayKey}`, payload });
+    await enqueueScheduledAutomationEvent({ companyId, eventType: "routine.due", subjectType: "routine", subjectId: routine.id, scheduledFor: date, scheduleKey: `routine.due:${routine.id}:${dayKey}`, payload });
+    await enqueueScheduledAutomationEvent({ companyId, eventType: "routine.missed", subjectType: "routine", subjectId: routine.id, scheduledFor: new Date(date.getTime() + 24 * 3600000), scheduleKey: `routine.missed:${routine.id}:${dayKey}`, payload });
+  }
+}
+
+export async function cancelAutomationSchedulesForSubject(companyId, subjectType, subjectId) {
+  if (!ctx?.pool || !companyId || !subjectType || !subjectId) return;
+  await ctx.pool.query(
+    `UPDATE automation_scheduled_events SET status = 'canceled', updated_at = now()
+      WHERE company_id = $1 AND subject_type = $2 AND subject_id = $3 AND status = 'scheduled'`,
+    [companyId, subjectType, String(subjectId)]
+  );
+}
+
+async function enqueueScheduledAutomationEvent({ companyId, eventType, subjectType, subjectId, scheduledFor, scheduleKey, sourceVersion = null, payload = {} }) {
+  await ctx.pool.query(
+    `INSERT INTO automation_scheduled_events(company_id, event_type, subject_type, subject_id, scheduled_for, schedule_key, source_version, payload)
+     VALUES($1,$2,$3,$4,$5::timestamptz,$6,$7,$8::jsonb)
+     ON CONFLICT(company_id, schedule_key)
+     DO UPDATE SET scheduled_for = EXCLUDED.scheduled_for, source_version = EXCLUDED.source_version, payload = EXCLUDED.payload, status = 'scheduled', updated_at = now()`,
+    [companyId, eventType, subjectType, String(subjectId), scheduledFor.toISOString(), scheduleKey, sourceVersion, JSON.stringify(payload)]
+  );
+}
+
+async function cancelScheduledForSubject(companyId, subjectType, subjectId, eventTypes) {
+  await ctx.pool.query(
+    `UPDATE automation_scheduled_events
+        SET status = 'canceled', updated_at = now()
+      WHERE company_id = $1 AND subject_type = $2 AND subject_id = $3 AND event_type = ANY($4::text[]) AND status = 'scheduled'`,
+    [companyId, subjectType, String(subjectId), eventTypes]
+  );
+}
+
+function durationAmountMs(amount, unit) {
+  const n = Math.max(0, Number(amount || 0));
+  if (String(unit).startsWith("week")) return n * 7 * 86400000;
+  if (String(unit).startsWith("day")) return n * 86400000;
+  if (String(unit).startsWith("hour")) return n * 3600000;
+  return n * 60000;
 }
 
 async function bootstrapAutomationSchema() {
@@ -610,6 +987,26 @@ async function bootstrapAutomationSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS contact_activities_company_contact_idx ON contact_activities(company_id, contact_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS automation_scheduled_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      subject_type TEXT,
+      subject_id TEXT,
+      scheduled_for TIMESTAMPTZ NOT NULL,
+      schedule_key TEXT NOT NULL,
+      source_version TEXT,
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      source TEXT NOT NULL DEFAULT 'automation_scheduler',
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      fired_at TIMESTAMPTZ,
+      UNIQUE(company_id, schedule_key)
+    );
+    CREATE INDEX IF NOT EXISTS automation_scheduled_events_due_idx ON automation_scheduled_events(status, scheduled_for);
+    CREATE INDEX IF NOT EXISTS automation_scheduled_events_subject_idx ON automation_scheduled_events(company_id, subject_type, subject_id, status);
   `);
 }
 
@@ -943,7 +1340,18 @@ function validateGraphPayload(payload) {
       if (["pipeline.create_opportunity", "pipeline.move_stage", "pipeline.reopen"].includes(config.action_key) && !config.stage_id) errors.push(`stage_required:${nodeKey}`);
       if (config.action_key === "pipeline.set_value" && config.value == null && config.value_cents == null) errors.push(`value_required:${nodeKey}`);
       if (config.action_key === "contact.set_custom_field" && !["u1", "u2", "u3", "u4", "u5"].includes(config.field)) errors.push(`custom_field_required:${nodeKey}`);
+      if (config.action_key === "job.create" && (!config.title || !config.start_at)) errors.push(`job_create_missing_title_or_start:${nodeKey}`);
+      if (config.action_key === "job.reschedule" && !config.start_at) errors.push(`job_reschedule_missing_start:${nodeKey}`);
+      if (config.action_key === "job.delete" && config.confirm_delete !== true) errors.push(`job_delete_confirmation_required:${nodeKey}`);
+      if (["job.assign_worker", "job.remove_worker", "job.assign_salesperson", "job.remove_salesperson"].includes(config.action_key) && !config.user_id) errors.push(`job_user_required:${nodeKey}`);
+      if (["job.add_service", "job.remove_service"].includes(config.action_key) && !(config.service || config.name)) errors.push(`job_service_required:${nodeKey}`);
+      if (config.action_key === "schedule.find_available_slots" && Number(config.duration_minutes || 0) <= 0) errors.push(`availability_duration_required:${nodeKey}`);
+      if (config.action_key === "task.create" && !config.title) errors.push(`task_title_required:${nodeKey}`);
+      if (config.action_key === "task.reschedule" && !config.due_date) errors.push(`task_due_required:${nodeKey}`);
+      if (config.action_key === "routine.create" && !config.title) errors.push(`routine_title_required:${nodeKey}`);
+      if (config.action_key === "customer_reminder.create" && !config.due_date) errors.push(`customer_reminder_due_required:${nodeKey}`);
     }
+    if (nodeType === "trigger" && config.trigger_key === "job.relative_time" && (!config.reference || !config.direction || !config.amount || !config.unit)) errors.push(`relative_time_trigger_incomplete:${nodeKey}`);
   }
   for (const edge of edges) {
     if (!nodeIds.has(edge.source_node_id || edge.sourceNodeId)) errors.push(`edge_source_missing:${edge.id || ""}`);
@@ -1335,6 +1743,7 @@ function triggerMatchesEvent(node, event) {
   const events = Array.isArray(config.event_types) ? config.event_types : [key];
   if (!events.includes(event.event_type)) return false;
   const payload = event.payload || {};
+  if (payload.trigger_node_id && payload.trigger_node_id !== node.id) return false;
   if (payload.origin_run_id && config.allow_automation_origin !== true) return false;
   if (Array.isArray(config.sources) && config.sources.length) {
     const source = String(payload.source || event.source || "").toLowerCase();
@@ -1363,6 +1772,20 @@ function triggerMatchesEvent(node, event) {
   if (stageIds.length && !stageIds.includes(eventStageId)) return false;
   if (config.from_stage_id && config.from_stage_id !== "any" && config.from_stage_id !== (payload.previous_stage_id || payload.old_stage_id || payload.from_stage_id)) return false;
   if (config.to_stage_id && config.to_stage_id !== "any" && config.to_stage_id !== eventStageId) return false;
+  if (key.startsWith("job.")) {
+    if (Array.isArray(config.worker_user_ids) && config.worker_user_ids.length) {
+      const workers = [...(payload.worker_ids_added || []), ...(payload.added || []), ...(payload.worker_user_ids || [])];
+      if (!config.worker_user_ids.some((id) => workers.includes(id))) return false;
+    }
+    if (Array.isArray(config.sales_user_ids) && config.sales_user_ids.length) {
+      const sales = [...(payload.salesperson_ids_added || []), ...(payload.added || []), ...(payload.sales_user_ids || [])];
+      if (!config.sales_user_ids.some((id) => sales.includes(id))) return false;
+    }
+    if (Array.isArray(config.services) && config.services.length) {
+      const services = normalizeServiceItems(payload.services || payload.added_services || payload.service_items || []).map((s) => s.name.toLowerCase());
+      if (!config.services.some((s) => services.includes(String(s).toLowerCase()))) return false;
+    }
+  }
   return true;
 }
 
@@ -1511,9 +1934,19 @@ async function createWaitForNode(run, node) {
     return createWait(run, node, "duration", { resume_at: resumeAt.toISOString() });
   }
   if (mode === "until_datetime") {
-    const value = resolveTemplate(node.config?.until || node.config?.datetime || "", context);
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) throw new Error("invalid_wait_datetime");
+    let date = null;
+    if (node.config?.relative_basis) {
+      date = resolveDateExpression({
+        basis: node.config.relative_basis,
+        direction: node.config.relative_direction || "before",
+        amount: Number(node.config.relative_amount || 0),
+        unit: node.config.relative_unit || "hours"
+      }, context);
+    } else {
+      const value = resolveTemplate(node.config?.until || node.config?.datetime || "", context);
+      date = new Date(value);
+    }
+    if (!date || Number.isNaN(date.getTime())) throw new Error("invalid_wait_datetime");
     return createWait(run, node, "until_datetime", { resume_at: date.toISOString() });
   }
   if (mode === "event_wait") {
@@ -1606,12 +2039,82 @@ async function resumeWait(wait, port) {
 function startAutomationProcessors() {
   setInterval(() => processAutomationEvents().catch((e) => console.error("[automations] processor failed", e?.message || e)), 5000).unref?.();
   setInterval(() => processDueWaits().catch((e) => console.error("[automations] wait processor failed", e?.message || e)), 5000).unref?.();
+  setInterval(() => processScheduledAutomationEvents().catch((e) => console.error("[automations] scheduled event processor failed", e?.message || e)), 30000).unref?.();
   setInterval(() => ctx.pool.query(`UPDATE automation_definitions SET status = 'published', pause_until = NULL WHERE status = 'paused' AND pause_until IS NOT NULL AND pause_until <= now() AND active_version_id IS NOT NULL`).catch(() => {}), 60000).unref?.();
+}
+
+async function processScheduledAutomationEvents() {
+  const db = await ctx.pool.connect();
+  let rows = [];
+  try {
+    await db.query("BEGIN");
+    rows = (await db.query(
+      `UPDATE automation_scheduled_events
+          SET status = 'firing', updated_at = now()
+        WHERE id IN (
+          SELECT id FROM automation_scheduled_events
+           WHERE status = 'scheduled' AND scheduled_for <= now()
+           ORDER BY scheduled_for ASC
+           LIMIT 50
+           FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *`
+    )).rows;
+    await db.query("COMMIT");
+  } catch (e) {
+    await db.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    db.release();
+  }
+  for (const row of rows) {
+    if (!(await shouldFireScheduledAutomationEvent(row))) {
+      await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'canceled', updated_at = now() WHERE id = $1`, [row.id]);
+      continue;
+    }
+    const eventId = await emitAutomationEvent({
+      companyId: row.company_id,
+      eventType: row.event_type,
+      subjectType: row.subject_type,
+      subjectId: row.subject_id,
+      source: row.source,
+      dedupeKey: row.schedule_key,
+      payload: row.payload || {},
+      occurredAt: row.scheduled_for
+    });
+    await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'fired', fired_at = now(), updated_at = now() WHERE id = $1`, [row.id]);
+    if (!eventId) console.warn("[automations] scheduled event emitted no id", { scheduleKey: row.schedule_key });
+  }
+}
+
+async function shouldFireScheduledAutomationEvent(row) {
+  if (row.subject_type === "job") {
+    const job = (await ctx.pool.query(`SELECT finished_at FROM schedule_events WHERE id = $1 AND company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    if (!job) return false;
+    if (row.event_type === "job.overdue" && job.finished_at) return false;
+  }
+  if (row.subject_type === "task") {
+    const task = (await ctx.pool.query(`SELECT completed FROM todo_tasks tt JOIN users u ON u.id = tt.user_id WHERE tt.id = $1 AND u.company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    if (!task) return false;
+    if (row.event_type === "task.overdue" && task.completed) return false;
+  }
+  if (row.subject_type === "customer_reminder") {
+    const reminder = (await ctx.pool.query(`SELECT completed FROM todo_customer_reminders cr JOIN users u ON u.id = cr.user_id WHERE cr.id = $1 AND u.company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    if (!reminder) return false;
+    if (row.event_type === "customer_reminder.overdue" && reminder.completed) return false;
+  }
+  if (row.subject_type === "routine" && row.event_type === "routine.missed") {
+    const dayKey = row.payload?.occurrence_date;
+    const done = await ctx.pool.query(`SELECT 1 FROM todo_routine_done rd JOIN users u ON u.id = rd.user_id WHERE rd.routine_id = $1 AND rd.day_key = $2 AND u.company_id = $3 LIMIT 1`, [row.subject_id, dayKey, row.company_id]);
+    if (done.rowCount) return false;
+  }
+  return true;
 }
 
 async function buildRunContext(run, options = {}) {
   const event = run.trigger_event_id ? (await ctx.pool.query(`SELECT * FROM automation_events WHERE id = $1`, [run.trigger_event_id])).rows[0] : null;
-  const company = (await ctx.pool.query(`SELECT id, name, website, address, phone, email FROM companies WHERE id = $1`, [run.company_id])).rows[0] || {};
+  const company = (await ctx.pool.query(`SELECT id, name, website, address, phone, email, timezone, business_days, business_open_time, business_close_time FROM companies WHERE id = $1`, [run.company_id])).rows[0] || {};
+  const now = new Date();
   const variables = Object.fromEntries((await ctx.pool.query(`SELECT name, value FROM automation_variables WHERE run_id = $1`, [run.id])).rows.map((r) => [r.name, r.value]));
   const nodeRows = options.slim ? [] : (await ctx.pool.query(`SELECT node_key, output_snapshot FROM automation_run_nodes WHERE run_id = $1 ORDER BY created_at ASC`, [run.id])).rows;
   const nodes = {};
@@ -1621,7 +2124,17 @@ async function buildRunContext(run, options = {}) {
     event: event ? { id: event.id, type: event.event_type, payload: event.payload || {}, subject_type: event.subject_type, subject_id: event.subject_id } : {},
     variables,
     nodes,
-    subject: { type: run.subject_type, id: run.subject_id }
+    subject: { type: run.subject_type, id: run.subject_id },
+    time: {
+      now: now.toISOString(),
+      hour: now.getUTCHours(),
+      minute: now.getUTCMinutes(),
+      day_of_week: now.getUTCDay() + 1,
+      date: now.toISOString().slice(0, 10),
+      is_weekday: now.getUTCDay() >= 1 && now.getUTCDay() <= 5,
+      is_weekend: now.getUTCDay() === 0 || now.getUTCDay() === 6,
+      is_business_hours: isWithinBusinessHours(now, company)
+    }
   };
   if (!options.slim) {
     const subject = await loadSubject(run.company_id, run.subject_type, run.subject_id);
@@ -1637,18 +2150,83 @@ async function buildRunContext(run, options = {}) {
   return context;
 }
 
+function isWithinBusinessHours(date, company) {
+  const days = Array.isArray(company.business_days) ? company.business_days.map(Number) : [1, 2, 3, 4, 5];
+  const day = date.getUTCDay() || 7;
+  if (!days.includes(day)) return false;
+  const hhmm = `${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}`;
+  return hhmm >= (company.business_open_time || "09:00") && hhmm <= (company.business_close_time || "17:00");
+}
+
 async function loadSubject(companyId, subjectType, subjectId) {
   if (!subjectType || !subjectId) return null;
   if (subjectType === "contact") return loadContactContext(companyId, subjectId);
-  if (subjectType === "job") return (await ctx.pool.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
+  if (subjectType === "job") return loadJobContext(companyId, subjectId);
   if (subjectType === "opportunity") return (await ctx.pool.query(`SELECT * FROM opportunities WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
   if (subjectType === "sms_conversation") return (await ctx.pool.query(`SELECT sc.* FROM sms_conversations sc JOIN phone_lines pl ON pl.id = sc.phone_line_id WHERE sc.id = $1 AND pl.company_id = $2`, [subjectId, companyId])).rows[0] || null;
   if (subjectType === "call") return (await ctx.pool.query(`SELECT * FROM phone_calls WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
   if (subjectType === "voicemail") return (await ctx.pool.query(`SELECT * FROM voicemails WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
   if (subjectType === "service_plan") return (await ctx.pool.query(`SELECT * FROM service_plans WHERE id::text = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
-  if (subjectType === "task") return (await ctx.pool.query(`SELECT tt.* FROM todo_tasks tt JOIN users u ON u.id = tt.user_id WHERE tt.id = $1 AND u.company_id = $2`, [subjectId, companyId])).rows[0] || null;
+  if (subjectType === "task") return loadTaskContext(companyId, subjectId);
+  if (subjectType === "routine") return loadRoutineContext(companyId, subjectId);
+  if (subjectType === "customer_reminder") return loadCustomerReminderContext(companyId, subjectId);
   if (subjectType === "payment") return (await ctx.pool.query(`SELECT * FROM payment_records WHERE id::text = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
   return null;
+}
+
+async function loadTaskContext(companyId, taskId) {
+  const task = (await ctx.pool.query(`SELECT tt.* FROM todo_tasks tt JOIN users u ON u.id = tt.user_id WHERE tt.id = $1 AND u.company_id = $2`, [taskId, companyId])).rows[0];
+  if (!task) return { exists: false };
+  const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
+  const completedSubtasks = subtasks.filter((s) => s?.completed).length;
+  return { ...task, exists: true, due_at: task.due_date, overdue: task.due_date ? new Date(task.due_date) < new Date() && !task.completed : false, assigned_user: task.user_id, subtask_count: subtasks.length, completed_subtask_count: completedSubtasks, all_subtasks_completed: subtasks.length > 0 && completedSubtasks === subtasks.length };
+}
+
+async function loadJobContext(companyId, jobId) {
+  const job = (await ctx.pool.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2`, [jobId, companyId])).rows[0];
+  if (!job) return { exists: false };
+  const workers = await userNames(companyId, jsonArray(job.worker_user_ids));
+  const sales = await userNames(companyId, jsonArray(job.sales_user_ids));
+  const start = new Date(job.start_at);
+  const end = new Date(job.end_at);
+  return {
+    ...job,
+    exists: true,
+    start: job.start_at,
+    end: job.end_at,
+    duration: Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) ? null : Math.round((end.getTime() - start.getTime()) / 60000),
+    completed: !!job.finished_at,
+    canceled: false,
+    deleted: false,
+    overdue: !job.finished_at && !Number.isNaN(end.getTime()) && end < new Date(),
+    services: normalizeServiceItems(job.service_items || job.services || []).map((s) => s.name),
+    worker_ids: jsonArray(job.worker_user_ids),
+    salesperson_ids: jsonArray(job.sales_user_ids),
+    worker_names: workers,
+    salesperson_names: sales,
+    has_workers: jsonArray(job.worker_user_ids).length > 0,
+    has_salesperson: jsonArray(job.sales_user_ids).length > 0,
+    source: "schedule"
+  };
+}
+
+async function userNames(companyId, ids) {
+  if (!ids.length) return [];
+  return (await ctx.pool.query(`SELECT display_name, email FROM users WHERE company_id = $1 AND id = ANY($2::uuid[])`, [companyId, ids])).rows.map((r) => r.display_name || r.email || "");
+}
+
+async function loadRoutineContext(companyId, routineId) {
+  const routine = (await ctx.pool.query(`SELECT tr.* FROM todo_routines tr JOIN users u ON u.id = tr.user_id WHERE tr.id = $1 AND u.company_id = $2`, [routineId, companyId])).rows[0];
+  if (!routine) return { exists: false };
+  const dayKey = new Date().toISOString().slice(0, 10);
+  const done = await ctx.pool.query(`SELECT 1 FROM todo_routine_done rd JOIN users u ON u.id = rd.user_id WHERE rd.routine_id = $1 AND rd.day_key = $2 AND u.company_id = $3 LIMIT 1`, [routineId, dayKey, companyId]);
+  return { ...routine, exists: true, active: !!routine.enabled, completed_today: done.rowCount > 0, due_today: Array.isArray(routine.weekdays) ? routine.weekdays.includes(new Date().getDay() + 1) : false, missed_today: done.rowCount === 0 };
+}
+
+async function loadCustomerReminderContext(companyId, reminderId) {
+  const reminder = (await ctx.pool.query(`SELECT cr.* FROM todo_customer_reminders cr JOIN users u ON u.id = cr.user_id WHERE cr.id = $1 AND u.company_id = $2`, [reminderId, companyId])).rows[0];
+  if (!reminder) return { exists: false };
+  return { ...reminder, exists: true, due_at: reminder.due_date, overdue: reminder.due_date ? new Date(reminder.due_date) < new Date() && !reminder.completed : false };
 }
 
 async function loadContactContext(companyId, contactId) {
@@ -2229,17 +2807,241 @@ async function updateReminderArchived(run, node, config, eventType) {
 }
 
 async function executeTaskCreate(run, node, config) {
+  const existingId = await getRunVariable(run.id, `idempotency:${node.id}:task_id`);
+  if (existingId) {
+    const existing = await loadTaskContext(run.company_id, existingId);
+    if (existing?.exists) return { task_id: existingId, reused: true };
+  }
   const context = await buildRunContext(run);
   const title = resolveTemplate(config.title || "Automation task", context);
   const assignee = await resolveCompanyUser(run.company_id, resolveTemplate(config.assigned_user_id || "", context));
-  const due = resolveTemplate(config.due_date || config.due_at || "", context) || null;
+  const dueDate = config.due_date || config.due_at ? resolveDateExpression(config.due_date || config.due_at, context) : null;
+  const due = dueDate?.toISOString() || null;
   const id = randomUUID();
+  const subtasks = normalizeTags(resolveConfig(config.subtasks || [], context)).map((title) => ({ title, completed: false }));
   const { rows } = await ctx.pool.query(
     `INSERT INTO todo_tasks(id, user_id, title, due_date, reminders, subtasks, completed, color_hex)
-     VALUES($1,$2,$3,$4::timestamptz,'[]'::jsonb,'[]'::jsonb,false,$5) RETURNING id, title, due_date`,
-    [id, assignee, title, due, config.color_hex || "#3478F6"]
+     VALUES($1,$2,$3,$4::timestamptz,'[]'::jsonb,$5::jsonb,false,$6) RETURNING *`,
+    [id, assignee, title, due, JSON.stringify(subtasks), config.color_hex || "#3478F6"]
   );
-  return rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:task_id`, id);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "task.created", subjectType: "task", subjectId: id, source: "automation", dedupeKey: `task.created:${id}`, payload: automationPayload(run, node, { task_id: id, title, due_date: due }) });
+  await syncAutomationSchedulesForTask(run.company_id, rows[0]);
+  return { task_id: id, due_at: rows[0].due_date, title: rows[0].title };
+}
+
+async function executeTaskUpdate(run, node, config) {
+  const context = await buildRunContext(run);
+  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  const updates = {};
+  if (config.title != null) updates.title = resolveTemplate(config.title, context);
+  if (config.due_date != null) updates.due_date = resolveDateExpression(config.due_date, context)?.toISOString() || null;
+  if (config.completed != null) updates.completed = !!config.completed;
+  if (config.assigned_user_id != null) updates.user_id = await resolveCompanyUser(run.company_id, resolveTemplate(config.assigned_user_id, context));
+  return updateTaskRow(run, node, task, updates);
+}
+async function executeTaskComplete(run, node, config) { return executeTaskUpdate(run, node, { ...config, completed: true }); }
+async function executeTaskReopen(run, node, config) { return executeTaskUpdate(run, node, { ...config, completed: false }); }
+async function executeTaskReschedule(run, node, config) { return executeTaskUpdate(run, node, { ...config, due_date: config.due_date }); }
+async function executeTaskAssign(run, node, config) { return executeTaskUpdate(run, node, { ...config, assigned_user_id: config.assigned_user_id || config.user_id }); }
+async function executeTaskUnassign(run, node, config) { return executeTaskUpdate(run, node, { ...config, assigned_user_id: "" }); }
+
+async function executeTaskDelete(run, node, config) {
+  const context = await buildRunContext(run);
+  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  await ctx.pool.query(`DELETE FROM todo_tasks WHERE id = $1`, [task.id]);
+  await cancelScheduledForSubject(run.company_id, "task", task.id, ["task.due", "task.overdue"]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "task.deleted", subjectType: "task", subjectId: task.id, source: "automation", payload: automationPayload(run, node, { task_id: task.id, title: task.title }) });
+  return { task_id: task.id, deleted: true };
+}
+
+async function executeTaskAddSubtask(run, node, config) {
+  const context = await buildRunContext(run);
+  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  const title = resolveTemplate(config.title || "", context).trim();
+  if (!title) throw new Error("subtask_title_required");
+  const subtasks = jsonArray(task.subtasks);
+  subtasks.push({ title, completed: false });
+  return updateTaskRow(run, node, task, { subtasks });
+}
+
+async function executeTaskCompleteSubtask(run, node, config) {
+  const context = await buildRunContext(run);
+  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  const title = resolveTemplate(config.title || "", context).trim().toLowerCase();
+  const subtasks = jsonArray(task.subtasks).map((s) => (String(s.title || "").toLowerCase() === title ? { ...s, completed: true } : s));
+  return updateTaskRow(run, node, task, { subtasks });
+}
+
+async function executeTaskDeleteSubtask(run, node, config) {
+  const context = await buildRunContext(run);
+  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  const title = resolveTemplate(config.title || "", context).trim().toLowerCase();
+  const subtasks = jsonArray(task.subtasks).filter((s) => String(s.title || "").toLowerCase() !== title);
+  return updateTaskRow(run, node, task, { subtasks });
+}
+
+async function resolveTask(companyId, subjectId, explicitId, context) {
+  const taskId = resolveTemplate(explicitId || context.task?.id || subjectId || "", context);
+  const task = (await ctx.pool.query(`SELECT tt.* FROM todo_tasks tt JOIN users u ON u.id = tt.user_id WHERE tt.id = $1 AND u.company_id = $2`, [taskId, companyId])).rows[0];
+  if (!task) throw new Error("task_not_found");
+  return task;
+}
+
+async function updateTaskRow(run, node, before, updates) {
+  const cols = Object.keys(updates);
+  if (!cols.length) return { task_id: before.id, updated: [] };
+  const sets = cols.map((key, i) => `${key} = $${i + 3}${key === "subtasks" ? "::jsonb" : ""}`);
+  const values = cols.map((key) => key === "subtasks" ? JSON.stringify(updates[key]) : updates[key]);
+  const { rows } = await ctx.pool.query(`UPDATE todo_tasks SET ${sets.join(", ")}, completed_at = CASE WHEN completed = true AND completed_at IS NULL THEN now() WHEN completed = false THEN NULL ELSE completed_at END, updated_at = now() WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [before.id, run.company_id, ...values]);
+  const after = rows[0];
+  await emitTaskMutationEvents(run.company_id, before, after, "automation", null, automationPayload(run, node, { task_id: after.id }));
+  await syncAutomationSchedulesForTask(run.company_id, after);
+  return { task_id: after.id, updated: cols, due_at: after.due_date };
+}
+
+async function emitTaskMutationEvents(companyId, before, after, source, actorUserId, payload = {}) {
+  const taskId = after?.id || before?.id;
+  if (!before) {
+    await emitAutomationEvent({ companyId, eventType: "task.created", subjectType: "task", subjectId: taskId, actorUserId, source, dedupeKey: `task.created:${taskId}`, payload: { ...payload, task_id: taskId, title: after.title, due_date: after.due_date } });
+    return;
+  }
+  const fields = ["title", "due_date", "completed", "user_id", "subtasks"];
+  const changed = fields.map((field) => ({ field, old_value: before[field] ?? null, new_value: after[field] ?? null })).filter((f) => JSON.stringify(f.old_value) !== JSON.stringify(f.new_value));
+  if (!changed.length) return;
+  await emitAutomationEvent({ companyId, eventType: "task.updated", subjectType: "task", subjectId: taskId, actorUserId, source, payload: { ...payload, task_id: taskId, changed_fields: changed } });
+  if (changed.some((f) => f.field === "title")) await emitAutomationEvent({ companyId, eventType: "task.title_changed", subjectType: "task", subjectId: taskId, actorUserId, source, payload });
+  if (changed.some((f) => f.field === "due_date")) {
+    await emitAutomationEvent({ companyId, eventType: "task.due_changed", subjectType: "task", subjectId: taskId, actorUserId, source, payload });
+    await emitAutomationEvent({ companyId, eventType: "task.rescheduled", subjectType: "task", subjectId: taskId, actorUserId, source, payload });
+  }
+  if (!before.completed && after.completed) await emitAutomationEvent({ companyId, eventType: "task.completed", subjectType: "task", subjectId: taskId, actorUserId, source, dedupeKey: `task.completed:${taskId}:${after.completed_at || "completed"}`, payload: { ...payload, completed_at: after.completed_at } });
+  if (before.completed && !after.completed) await emitAutomationEvent({ companyId, eventType: "task.reopened", subjectType: "task", subjectId: taskId, actorUserId, source, payload });
+  if (before.user_id !== after.user_id) await emitAutomationEvent({ companyId, eventType: before.user_id ? "task.reassigned" : "task.assigned", subjectType: "task", subjectId: taskId, actorUserId, source, payload: { ...payload, previous_user_id: before.user_id, user_id: after.user_id } });
+  await emitSubtaskEvents(companyId, taskId, before, after, source, actorUserId, payload);
+}
+
+async function emitSubtaskEvents(companyId, taskId, before, after, source, actorUserId, payload) {
+  const oldTasks = jsonArray(before.subtasks);
+  const newTasks = jsonArray(after.subtasks);
+  if (newTasks.length > oldTasks.length) await emitAutomationEvent({ companyId, eventType: "task.subtask_added", subjectType: "task", subjectId: taskId, actorUserId, source, payload });
+  const oldCompleted = oldTasks.filter((s) => s.completed).length;
+  const newCompleted = newTasks.filter((s) => s.completed).length;
+  if (newCompleted > oldCompleted) await emitAutomationEvent({ companyId, eventType: "task.subtask_completed", subjectType: "task", subjectId: taskId, actorUserId, source, payload });
+  if (oldTasks.length > 0 && oldCompleted < oldTasks.length && newTasks.length > 0 && newCompleted === newTasks.length) await emitAutomationEvent({ companyId, eventType: "task.all_subtasks_completed", subjectType: "task", subjectId: taskId, actorUserId, source, payload });
+}
+
+async function executeRoutineCreate(run, node, config) {
+  const existingId = await getRunVariable(run.id, `idempotency:${node.id}:routine_id`);
+  if (existingId) return { routine_id: existingId, reused: true };
+  const context = await buildRunContext(run);
+  const owner = await resolveCompanyUser(run.company_id, config.assigned_user_id || "");
+  const id = randomUUID();
+  const title = resolveTemplate(config.title || "Automation routine", context);
+  const time = resolveDateExpression(config.time || "now", context)?.toISOString() || null;
+  const weekdays = Array.isArray(config.weekdays) ? config.weekdays.map(Number) : [1, 2, 3, 4, 5];
+  const { rows } = await ctx.pool.query(`INSERT INTO todo_routines(id, user_id, title, time, weekdays, reminders, enabled, color_hex) VALUES($1,$2,$3,$4::timestamptz,$5::jsonb,'[]'::jsonb,true,$6) RETURNING *`, [id, owner, title, time, JSON.stringify(weekdays), config.color_hex || "#3478F6"]);
+  await setRunVariable(run.id, `idempotency:${node.id}:routine_id`, id);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "routine.created", subjectType: "routine", subjectId: id, source: "automation", dedupeKey: `routine.created:${id}`, payload: automationPayload(run, node, { routine_id: id, title }) });
+  await syncAutomationSchedulesForRoutine(run.company_id, rows[0]);
+  return { routine_id: id };
+}
+
+async function executeRoutineUpdate(run, node, config) {
+  const context = await buildRunContext(run);
+  const routine = await resolveRoutine(run.company_id, run.subject_id, config.routine_id, context);
+  const updates = {};
+  if (config.title != null) updates.title = resolveTemplate(config.title, context);
+  if (config.time != null) updates.time = resolveDateExpression(config.time, context)?.toISOString() || null;
+  if (config.weekdays != null) updates.weekdays = Array.isArray(config.weekdays) ? config.weekdays.map(Number) : [];
+  return updateRoutineRow(run, node, routine, updates);
+}
+
+async function executeRoutineMarkCompleted(run, node, config) {
+  const context = await buildRunContext(run);
+  const routine = await resolveRoutine(run.company_id, run.subject_id, config.routine_id, context);
+  const dayKey = resolveTemplate(config.day_key || new Date().toISOString().slice(0, 10), context);
+  await ctx.pool.query(`INSERT INTO todo_routine_done(user_id, routine_id, day_key) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, [routine.user_id, routine.id, dayKey]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "routine.completed", subjectType: "routine", subjectId: routine.id, source: "automation", dedupeKey: `routine.completed:${routine.id}:${dayKey}`, payload: automationPayload(run, node, { routine_id: routine.id, day_key: dayKey }) });
+  return { routine_id: routine.id, day_key: dayKey };
+}
+
+async function executeRoutineEnd(run, node, config) {
+  const context = await buildRunContext(run);
+  const routine = await resolveRoutine(run.company_id, run.subject_id, config.routine_id, context);
+  return updateRoutineRow(run, node, routine, { enabled: false });
+}
+
+async function resolveRoutine(companyId, subjectId, explicitId, context) {
+  const routineId = resolveTemplate(explicitId || context.routine?.id || subjectId || "", context);
+  const row = (await ctx.pool.query(`SELECT tr.* FROM todo_routines tr JOIN users u ON u.id = tr.user_id WHERE tr.id = $1 AND u.company_id = $2`, [routineId, companyId])).rows[0];
+  if (!row) throw new Error("routine_not_found");
+  return row;
+}
+
+async function updateRoutineRow(run, node, before, updates) {
+  const cols = Object.keys(updates);
+  const sets = cols.map((key, i) => `${key} = $${i + 3}${key === "weekdays" ? "::jsonb" : ""}`);
+  const values = cols.map((key) => key === "weekdays" ? JSON.stringify(updates[key]) : updates[key]);
+  const { rows } = await ctx.pool.query(`UPDATE todo_routines SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [before.id, run.company_id, ...values]);
+  const after = rows[0];
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "routine.updated", subjectType: "routine", subjectId: after.id, source: "automation", payload: automationPayload(run, node, { routine_id: after.id }) });
+  if (before.enabled && !after.enabled) await emitAutomationEvent({ companyId: run.company_id, eventType: "routine.ended", subjectType: "routine", subjectId: after.id, source: "automation", payload: automationPayload(run, node, { routine_id: after.id }) });
+  if (!before.enabled && after.enabled) await emitAutomationEvent({ companyId: run.company_id, eventType: "routine.reactivated", subjectType: "routine", subjectId: after.id, source: "automation", payload: automationPayload(run, node, { routine_id: after.id }) });
+  await syncAutomationSchedulesForRoutine(run.company_id, after);
+  return { routine_id: after.id, updated: cols };
+}
+
+async function executeCustomerReminderCreate(run, node, config) {
+  const existingId = await getRunVariable(run.id, `idempotency:${node.id}:customer_reminder_id`);
+  if (existingId) return { reminder_id: existingId, reused: true };
+  const context = await buildRunContext(run);
+  const contactId = await resolveContactId(run, context, config).catch(() => null);
+  const contact = contactId ? await loadContactContext(run.company_id, contactId) : null;
+  const owner = await resolveCompanyUser(run.company_id, config.assigned_user_id || "");
+  const id = randomUUID();
+  const due = resolveDateExpression(config.due_date || config.due_at || "", context)?.toISOString() || null;
+  const title = resolveTemplate(config.title || "Customer reminder", context);
+  const { rows } = await ctx.pool.query(`INSERT INTO todo_customer_reminders(id, user_id, title, contact_id, contact_name, phone, due_date, completed, color_hex) VALUES($1,$2,$3,$4,$5,$6,$7::timestamptz,false,$8) RETURNING *`, [id, owner, title, contactId, config.contact_name || contact?.name || "Customer", contact?.phone || null, due, config.color_hex || "#3478F6"]);
+  await setRunVariable(run.id, `idempotency:${node.id}:customer_reminder_id`, id);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "customer_reminder.created", subjectType: "customer_reminder", subjectId: id, source: "automation", dedupeKey: `customer_reminder.created:${id}`, payload: automationPayload(run, node, { reminder_id: id, contact_id: contactId, due_date: due }) });
+  await syncAutomationSchedulesForCustomerReminder(run.company_id, rows[0]);
+  return { reminder_id: id, due_at: due };
+}
+
+async function executeCustomerReminderComplete(run, node, config) { return updateCustomerReminder(run, node, config, { completed: true }); }
+async function executeCustomerReminderReopen(run, node, config) { return updateCustomerReminder(run, node, config, { completed: false }); }
+async function executeCustomerReminderReschedule(run, node, config) {
+  const context = await buildRunContext(run);
+  return updateCustomerReminder(run, node, config, { due_date: resolveDateExpression(config.due_date || config.due_at || "", context)?.toISOString() || null });
+}
+async function executeCustomerReminderDelete(run, node, config) {
+  const context = await buildRunContext(run);
+  const reminder = await resolveCustomerReminder(run.company_id, run.subject_id, config.reminder_id, context);
+  await ctx.pool.query(`DELETE FROM todo_customer_reminders WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2)`, [reminder.id, run.company_id]);
+  await cancelScheduledForSubject(run.company_id, "customer_reminder", reminder.id, ["customer_reminder.due", "customer_reminder.overdue"]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "customer_reminder.deleted", subjectType: "customer_reminder", subjectId: reminder.id, source: "automation", payload: automationPayload(run, node, { reminder_id: reminder.id }) });
+  return { reminder_id: reminder.id, deleted: true };
+}
+
+async function updateCustomerReminder(run, node, config, updates) {
+  const context = await buildRunContext(run);
+  const before = await resolveCustomerReminder(run.company_id, run.subject_id, config.reminder_id, context);
+  const cols = Object.keys(updates);
+  const sets = cols.map((key, i) => `${key} = $${i + 3}`);
+  const { rows } = await ctx.pool.query(`UPDATE todo_customer_reminders SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [before.id, run.company_id, ...cols.map((k) => updates[k])]);
+  const after = rows[0];
+  const eventType = before.completed === false && after.completed ? "customer_reminder.completed" : before.completed && !after.completed ? "customer_reminder.reopened" : "customer_reminder.rescheduled";
+  await emitAutomationEvent({ companyId: run.company_id, eventType, subjectType: "customer_reminder", subjectId: after.id, source: "automation", payload: automationPayload(run, node, { reminder_id: after.id, due_date: after.due_date }) });
+  await syncAutomationSchedulesForCustomerReminder(run.company_id, after);
+  return { reminder_id: after.id, due_at: after.due_date, completed: after.completed };
+}
+
+async function resolveCustomerReminder(companyId, subjectId, explicitId, context) {
+  const reminderId = resolveTemplate(explicitId || context.customer_reminder?.id || subjectId || "", context);
+  const row = (await ctx.pool.query(`SELECT cr.* FROM todo_customer_reminders cr JOIN users u ON u.id = cr.user_id WHERE cr.id = $1 AND u.company_id = $2`, [reminderId, companyId])).rows[0];
+  if (!row) throw new Error("customer_reminder_not_found");
+  return row;
 }
 
 async function resolveCompanyUser(companyId, userId) {
@@ -2326,21 +3128,306 @@ async function executeInternalMessage(run, node, config) {
 }
 
 async function executeJobCreate(run, node, config) {
+  const existingId = await getRunVariable(run.id, `idempotency:${node.id}:job_id`);
+  if (existingId) {
+    const existing = await loadSubject(run.company_id, "job", existingId);
+    if (existing) return { job_id: existingId, reused: true };
+  }
   const context = await buildRunContext(run);
   const owner = await resolveCompanyUser(run.company_id, config.assigned_user_id);
   const id = randomUUID();
   const title = resolveTemplate(config.title || "Automation job", context);
-  const start = new Date(resolveTemplate(config.start_at || "", context) || Date.now());
-  const end = new Date(resolveTemplate(config.end_at || "", context) || start.getTime() + 3600000);
+  const start = resolveDateExpression(config.start_at || config.start || "", context) || new Date();
+  const end = resolveDateExpression(config.end_at || config.end || "", context) || new Date(start.getTime() + 3600000);
   const contactId = config.contact_id ? resolveTemplate(config.contact_id, context) : (run.subject_type === "contact" ? run.subject_id : null);
   if (contactId) await validateSubject(run.company_id, "contact", contactId);
+  const sales = await resolveCompanyUsers(run.company_id, config.sales_user_ids || [owner]);
+  const workers = await resolveCompanyUsers(run.company_id, config.worker_user_ids || []);
+  const serviceItems = normalizeServiceItems(resolveConfig(config.service_items || [], context));
   const { rows } = await ctx.pool.query(
-    `INSERT INTO schedule_events(id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, reminder_minutes, services, service_items, sales_user_ids, worker_user_ids)
-     VALUES($1,$2,$3,$2,$4,$5,$6,$7,$8,$9,'[]'::jsonb,'[]'::jsonb,'[]'::jsonb,$10::jsonb,$11::jsonb)
-     RETURNING id, title, start_at AS start, end_at AS "end"`,
-    [id, owner, run.company_id, title, start.toISOString(), end.toISOString(), config.color || "#3478F6", resolveTemplate(config.notes || "", context) || null, contactId, JSON.stringify([owner]), JSON.stringify([])]
+    `INSERT INTO schedule_events(id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids)
+     VALUES($1,$2,$3,$2,$4,$5,$6,$7,$8,$9,'[]'::jsonb,$10::jsonb,$11::jsonb,$12,$13,$14::jsonb,$15::jsonb)
+     RETURNING *`,
+    [id, owner, run.company_id, title, start.toISOString(), end.toISOString(), config.color || "#3478F6", resolveTemplate(config.notes || "", context) || null, contactId, JSON.stringify(serviceItems.map((s) => s.name)), JSON.stringify(serviceItems), intOrNull(config.price_cents), intOrNull(config.material_cost_cents), JSON.stringify(sales), JSON.stringify(workers)]
   );
-  return rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:job_id`, id);
+  await emitJobMutationEvents(run.company_id, null, rows[0], "automation", null, automationPayload(run, node, { job_id: id, contact_id: contactId }));
+  await syncAutomationSchedulesForJob(run.company_id, rows[0]);
+  return { job_id: id, contact_id: contactId, start: rows[0].start_at, end: rows[0].end_at, price_cents: rows[0].price_cents, service_items: rows[0].service_items };
+}
+
+async function executeJobUpdate(run, node, config) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  const updates = {};
+  const map = { title: "title", notes: "notes", color: "color", contact_id: "contact_id", price_cents: "price_cents", material_cost_cents: "material_cost_cents" };
+  for (const [cfg, col] of Object.entries(map)) if (config[cfg] != null) updates[col] = resolveTemplate(config[cfg], context);
+  if (config.start_at || config.start) updates.start_at = resolveDateExpression(config.start_at || config.start, context)?.toISOString();
+  if (config.end_at || config.end) updates.end_at = resolveDateExpression(config.end_at || config.end, context)?.toISOString();
+  if (config.service_items != null) updates.service_items = normalizeServiceItems(resolveConfig(config.service_items, context));
+  if (config.worker_user_ids != null) updates.worker_user_ids = await resolveCompanyUsers(run.company_id, config.worker_user_ids);
+  if (config.sales_user_ids != null) updates.sales_user_ids = await resolveCompanyUsers(run.company_id, config.sales_user_ids);
+  return updateJobRow(run, node, job, updates);
+}
+
+async function executeJobReschedule(run, node, config) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  const start = resolveDateExpression(config.start_at || config.start || "", context);
+  if (!start) throw new Error("job_start_required");
+  const duration = new Date(job.end_at).getTime() - new Date(job.start_at).getTime();
+  const end = config.preserve_duration !== false ? new Date(start.getTime() + Math.max(duration, 0)) : (resolveDateExpression(config.end_at || config.end || "", context) || new Date(start.getTime() + Math.max(duration, 3600000)));
+  return updateJobRow(run, node, job, { start_at: start.toISOString(), end_at: end.toISOString() });
+}
+
+async function executeJobDelete(run, node, config) {
+  if (config.confirm_delete !== true) throw new Error("confirm_delete_required");
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  await ctx.pool.query(`DELETE FROM schedule_events WHERE id = $1 AND company_id = $2`, [job.id, run.company_id]);
+  await cancelScheduledForSubject(run.company_id, "job", job.id, ["job.start_time_reached", "job.overdue", "job.relative_time"]);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "job.deleted", subjectType: "job", subjectId: job.id, source: "automation", payload: automationPayload(run, node, { job_id: job.id, contact_id: job.contact_id }) });
+  return { job_id: job.id, deleted: true };
+}
+
+async function executeJobMarkCompleted(run, node, config) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  return updateJobRow(run, node, job, { finished_at: new Date().toISOString(), finished_by: await resolveCompanyUser(run.company_id, "") });
+}
+
+async function executeJobReopen(run, node, config) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  return updateJobRow(run, node, job, { finished_at: null, finished_by: null });
+}
+
+async function executeJobSetStart(run, node, config) { return executeJobUpdate(run, node, { job_id: config.job_id, start_at: config.start_at }); }
+async function executeJobSetEnd(run, node, config) { return executeJobUpdate(run, node, { job_id: config.job_id, end_at: config.end_at }); }
+async function executeJobSetPrice(run, node, config) { return executeJobUpdate(run, node, { job_id: config.job_id, price_cents: config.price_cents }); }
+async function executeJobSetMaterialCost(run, node, config) { return executeJobUpdate(run, node, { job_id: config.job_id, material_cost_cents: config.material_cost_cents }); }
+async function executeJobSetColor(run, node, config) { return executeJobUpdate(run, node, { job_id: config.job_id, color: config.color }); }
+async function executeJobSetContact(run, node, config) { return executeJobUpdate(run, node, { job_id: config.job_id, contact_id: config.contact_id }); }
+
+async function executeJobAddService(run, node, config) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  const next = normalizeServiceItems(job.service_items || []);
+  const name = resolveTemplate(config.service || config.name || "", context).trim();
+  if (!name) throw new Error("service_required");
+  if (!next.some((s) => s.name.toLowerCase() === name.toLowerCase())) next.push({ name, price_cents: intOrNull(config.price_cents) });
+  return updateJobRow(run, node, job, { service_items: next });
+}
+
+async function executeJobRemoveService(run, node, config) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  const name = resolveTemplate(config.service || config.name || "", context).trim().toLowerCase();
+  if (!name) throw new Error("service_required");
+  return updateJobRow(run, node, job, { service_items: normalizeServiceItems(job.service_items || []).filter((s) => s.name.toLowerCase() !== name) });
+}
+
+async function executeJobAssignWorker(run, node, config) { return updateJobUserList(run, node, config, "worker_user_ids", "add"); }
+async function executeJobRemoveWorker(run, node, config) { return updateJobUserList(run, node, config, "worker_user_ids", "remove"); }
+async function executeJobReplaceWorkers(run, node, config) { return updateJobUserList(run, node, config, "worker_user_ids", "replace"); }
+async function executeJobAssignSalesperson(run, node, config) { return updateJobUserList(run, node, config, "sales_user_ids", "add"); }
+async function executeJobRemoveSalesperson(run, node, config) { return updateJobUserList(run, node, config, "sales_user_ids", "remove"); }
+async function executeJobReplaceSalespeople(run, node, config) { return updateJobUserList(run, node, config, "sales_user_ids", "replace"); }
+
+async function updateJobUserList(run, node, config, field, mode) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  const current = Array.isArray(job[field]) ? job[field] : [];
+  const ids = await resolveCompanyUsers(run.company_id, mode === "replace" ? (config[field] || []) : [config.user_id]);
+  const next = mode === "replace" ? ids : mode === "add" ? [...new Set([...current, ...ids])] : current.filter((id) => !ids.includes(id));
+  return updateJobRow(run, node, job, { [field]: next });
+}
+
+async function executeJobAddNote(run, node, config) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  const note = resolveTemplate(config.notes || config.note || "", context).trim();
+  if (!note) throw new Error("note_required");
+  return updateJobRow(run, node, job, { notes: [job.notes, note].filter(Boolean).join("\n") });
+}
+
+async function executeJobCreateFollowup(run, node, config) {
+  const context = await buildRunContext(run);
+  const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
+  const amount = Number(config.amount || 1);
+  const unit = config.unit || "weeks";
+  const start = addCalendarDuration(new Date(job.start_at), amount, unit);
+  const duration = new Date(job.end_at).getTime() - new Date(job.start_at).getTime();
+  return executeJobCreate(run, node, {
+    title: config.title || job.title,
+    start_at: start.toISOString(),
+    end_at: new Date(start.getTime() + Math.max(duration, 3600000)).toISOString(),
+    contact_id: job.contact_id,
+    notes: config.notes || job.notes || "",
+    color: job.color,
+    service_items: config.copy_services ? job.service_items : [],
+    worker_user_ids: config.copy_workers ? job.worker_user_ids : [],
+    sales_user_ids: config.copy_salespeople ? job.sales_user_ids : [],
+    price_cents: config.copy_price ? job.price_cents : null,
+    material_cost_cents: config.copy_price ? job.material_cost_cents : null
+  });
+}
+
+async function executeFindAvailableSlots(run, _node, config) {
+  const context = await buildRunContext(run);
+  const start = resolveDateExpression(config.range_start || "now", context) || new Date();
+  const end = resolveDateExpression(config.range_end || "tomorrow", context) || new Date(start.getTime() + 7 * 86400000);
+  const durationMs = Math.max(15, Number(config.duration_minutes || 60)) * 60000;
+  const workers = await resolveCompanyUsers(run.company_id, config.worker_user_ids || []);
+  const jobs = (await ctx.pool.query(
+    `SELECT id, start_at, end_at, worker_user_ids FROM schedule_events WHERE company_id = $1 AND start_at < $3 AND end_at > $2 AND finished_at IS NULL ORDER BY start_at ASC`,
+    [run.company_id, start.toISOString(), end.toISOString()]
+  )).rows;
+  const slots = [];
+  for (let cursor = new Date(start); cursor.getTime() + durationMs <= end.getTime() && slots.length < Number(config.limit || 10); cursor = new Date(cursor.getTime() + 30 * 60000)) {
+    const slotEnd = new Date(cursor.getTime() + durationMs);
+    const overlaps = jobs.some((job) => {
+      if (new Date(job.start_at) >= slotEnd || new Date(job.end_at) <= cursor) return false;
+      if (!workers.length) return true;
+      const assigned = Array.isArray(job.worker_user_ids) ? job.worker_user_ids : [];
+      return workers.some((id) => assigned.includes(id));
+    });
+    if (!overlaps) slots.push({ start: cursor.toISOString(), end: slotEnd.toISOString(), worker_user_ids: workers });
+  }
+  return { slots };
+}
+
+async function resolveJob(companyId, subjectId, explicitId, context) {
+  const jobId = resolveTemplate(explicitId || context.job?.id || subjectId || "", context);
+  if (!jobId) throw new Error("job_id_required");
+  const job = (await ctx.pool.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2`, [jobId, companyId])).rows[0];
+  if (!job) throw new Error("job_not_found");
+  return job;
+}
+
+async function updateJobRow(run, node, before, updates) {
+  const cols = Object.keys(updates);
+  if (!cols.length) return { job_id: before.id, updated: [] };
+  const sets = cols.map((key, i) => `${key} = $${i + 3}${["service_items", "worker_user_ids", "sales_user_ids"].includes(key) ? "::jsonb" : ""}`);
+  const values = cols.map((key) => ["service_items", "worker_user_ids", "sales_user_ids"].includes(key) ? JSON.stringify(updates[key]) : updates[key]);
+  const { rows } = await ctx.pool.query(`UPDATE schedule_events SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [before.id, run.company_id, ...values]);
+  if (!rows.length) throw new Error("job_not_found");
+  await emitJobMutationEvents(run.company_id, before, rows[0], "automation", null, automationPayload(run, node, { job_id: before.id, contact_id: rows[0].contact_id }));
+  await syncAutomationSchedulesForJob(run.company_id, rows[0]);
+  return { job_id: rows[0].id, updated: cols, old_start: before.start_at, new_start: rows[0].start_at, old_end: before.end_at, new_end: rows[0].end_at };
+}
+
+async function emitJobMutationEvents(companyId, before, after, source, actorUserId, payload = {}) {
+  const jobId = after?.id || before?.id;
+  if (!jobId) return;
+  const base = { ...payload, job_id: jobId, contact_id: after?.contact_id || before?.contact_id || null };
+  if (!before) {
+    await emitAutomationEvent({ companyId, eventType: "job.created", subjectType: "job", subjectId: jobId, actorUserId, source, dedupeKey: `job.created:${jobId}`, payload: base });
+    await emitAutomationEvent({ companyId, eventType: "job.scheduled", subjectType: "job", subjectId: jobId, actorUserId, source, dedupeKey: `job.scheduled:${jobId}:${after.start_at}:${after.end_at}`, payload: { ...base, start: after.start_at, end: after.end_at } });
+    if (source === "automation") await emitAutomationEvent({ companyId, eventType: "job.created_by_automation", subjectType: "job", subjectId: jobId, actorUserId, source, dedupeKey: `job.created_by_automation:${jobId}`, payload: base });
+    if (after.contact_id) {
+      const count = (await ctx.pool.query(`SELECT COUNT(*)::int AS count FROM schedule_events WHERE company_id = $1 AND contact_id = $2`, [companyId, after.contact_id])).rows[0]?.count || 0;
+      await emitAutomationEvent({ companyId, eventType: Number(count) <= 1 ? "job.first_job_for_contact" : "job.repeat_job_for_contact", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, job_count_for_contact: Number(count) } });
+    }
+    await emitAssignmentEvents(companyId, jobId, "worker", [], jsonArray(after.worker_user_ids), source, actorUserId, base);
+    await emitAssignmentEvents(companyId, jobId, "salesperson", [], jsonArray(after.sales_user_ids), source, actorUserId, base);
+    return;
+  }
+  const fields = ["title", "start_at", "end_at", "color", "notes", "contact_id", "price_cents", "material_cost_cents", "service_items", "worker_user_ids", "sales_user_ids", "finished_at"];
+  const changed = fields.map((field) => ({ field, old_value: before[field] ?? null, new_value: after[field] ?? null })).filter((f) => JSON.stringify(f.old_value) !== JSON.stringify(f.new_value));
+  if (!changed.length) return;
+  await emitAutomationEvent({ companyId, eventType: "job.updated", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, changed_fields: changed } });
+  await emitAutomationEvent({ companyId, eventType: "job.field_changed", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, changed_fields: changed } });
+  if (changed.some((f) => f.field === "start_at" || f.field === "end_at")) {
+    await emitAutomationEvent({ companyId, eventType: "job.rescheduled", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, old_start: before.start_at, new_start: after.start_at, old_end: before.end_at, new_end: after.end_at } });
+  }
+  for (const change of changed) {
+    const eventType = jobFieldEventType(change.field, before, after);
+    if (eventType) await emitAutomationEvent({ companyId, eventType, subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, changed_fields: [change], field: change.field, old_value: change.old_value, new_value: change.new_value } });
+  }
+  await emitServiceEvents(companyId, jobId, before, after, source, actorUserId, base);
+  await emitAssignmentEvents(companyId, jobId, "worker", jsonArray(before.worker_user_ids), jsonArray(after.worker_user_ids), source, actorUserId, base);
+  await emitAssignmentEvents(companyId, jobId, "salesperson", jsonArray(before.sales_user_ids), jsonArray(after.sales_user_ids), source, actorUserId, base);
+  if (!before.finished_at && after.finished_at) await emitAutomationEvent({ companyId, eventType: "job.completed", subjectType: "job", subjectId: jobId, actorUserId, source, dedupeKey: `job.completed:${jobId}:${after.finished_at}`, payload: { ...base, finished_at: after.finished_at } });
+  if (before.finished_at && !after.finished_at) await emitAutomationEvent({ companyId, eventType: "job.reopened", subjectType: "job", subjectId: jobId, actorUserId, source, payload: base });
+}
+
+function jobFieldEventType(field, before, after) {
+  if (field === "start_at") return "job.start_changed";
+  if (field === "end_at") return "job.end_changed";
+  if (field === "price_cents") return "job.price_changed";
+  if (field === "material_cost_cents") return "job.material_cost_changed";
+  if (field === "color") return "job.color_changed";
+  if (field === "contact_id") return "job.contact_changed";
+  if ((field === "start_at" || field === "end_at") && String(before?.[field]).slice(0, 10) !== String(after?.[field]).slice(0, 10)) return "job.date_changed";
+  return null;
+}
+
+async function emitServiceEvents(companyId, jobId, before, after, source, actorUserId, base) {
+  const oldNames = normalizeServiceItems(before.service_items || before.services || []).map((s) => s.name.toLowerCase());
+  const newItems = normalizeServiceItems(after.service_items || after.services || []);
+  const newNames = newItems.map((s) => s.name.toLowerCase());
+  const added = newItems.filter((s) => !oldNames.includes(s.name.toLowerCase()));
+  const removed = normalizeServiceItems(before.service_items || before.services || []).filter((s) => !newNames.includes(s.name.toLowerCase()));
+  if (added.length) await emitAutomationEvent({ companyId, eventType: "job.service_added", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, services: added.map((s) => s.name) } });
+  if (removed.length) await emitAutomationEvent({ companyId, eventType: "job.service_removed", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, services: removed.map((s) => s.name) } });
+  if (added.length || removed.length) await emitAutomationEvent({ companyId, eventType: "job.services_changed", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, added_services: added, removed_services: removed } });
+}
+
+async function emitAssignmentEvents(companyId, jobId, kind, beforeIds, afterIds, source, actorUserId, base) {
+  const added = afterIds.filter((id) => !beforeIds.includes(id));
+  const removed = beforeIds.filter((id) => !afterIds.includes(id));
+  const prefix = kind === "worker" ? "worker" : "salesperson";
+  if (added.length) await emitAutomationEvent({ companyId, eventType: `job.${prefix}_assigned`, subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, [`${prefix}_ids_added`]: added } });
+  if (removed.length) await emitAutomationEvent({ companyId, eventType: `job.${prefix}_removed`, subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, [`${prefix}_ids_removed`]: removed } });
+  if (added.length || removed.length) await emitAutomationEvent({ companyId, eventType: `job.${prefix === "worker" ? "workers" : "salespeople"}_changed`, subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, added, removed } });
+}
+
+function jsonArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeServiceItems(value) {
+  if (!Array.isArray(value)) return normalizeTags(value).map((name) => ({ name, price_cents: null }));
+  return value.map((item) => typeof item === "string" ? { name: item, price_cents: null } : { name: String(item?.name || "").trim(), price_cents: intOrNull(item?.price_cents) }).filter((s) => s.name);
+}
+
+async function resolveCompanyUsers(companyId, ids) {
+  const requested = Array.isArray(ids) ? ids.filter(Boolean).map(String) : [];
+  if (!requested.length) return [];
+  return (await ctx.pool.query(`SELECT id FROM users WHERE company_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL`, [companyId, requested])).rows.map((r) => r.id);
+}
+
+function resolveDateExpression(value, context) {
+  if (value instanceof Date) return value;
+  if (value && typeof value === "object") {
+    const basis = value.basis || value.reference || "specific";
+    const amount = Number(value.amount || 0);
+    const unit = value.unit || "minutes";
+    const direction = value.direction || "after";
+    let date = basis === "job_start" || basis === "start" ? new Date(context.job?.start_at || context.job?.start || Date.now())
+      : basis === "job_end" || basis === "end" ? new Date(context.job?.end_at || context.job?.end || Date.now())
+        : basis === "task_due" ? new Date(context.task?.due_date || Date.now())
+          : basis === "now" ? new Date()
+            : new Date(resolveTemplate(value.value || value.datetime || "", context));
+    if (Number.isNaN(date.getTime())) return null;
+    if (amount) date = new Date(date.getTime() + (direction === "before" ? -1 : 1) * durationAmountMs(amount, unit));
+    return date;
+  }
+  const text = resolveTemplate(value || "", context).trim();
+  if (!text || text === "now") return new Date();
+  if (text === "tomorrow") return new Date(Date.now() + 86400000);
+  const duration = text.match(/^(\d+)\s+(minute|minutes|hour|hours|day|days|week|weeks)\s+from now$/i);
+  if (duration) return new Date(Date.now() + durationAmountMs(Number(duration[1]), duration[2]));
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function addCalendarDuration(date, amount, unit) {
+  const next = new Date(date);
+  if (String(unit).startsWith("month")) next.setUTCMonth(next.getUTCMonth() + amount);
+  else next.setTime(next.getTime() + durationAmountMs(amount, unit));
+  return next;
 }
 
 async function executeWebhookSend(run, node, config) {

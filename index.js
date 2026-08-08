@@ -8,7 +8,15 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Stripe from "stripe";
 import apn from "@parse/node-apn";
 import twilio from "twilio";
-import { installAutomationSystem, emitAutomationEvent } from "./automations.js";
+import {
+  installAutomationSystem,
+  emitAutomationEvent,
+  syncAutomationSchedulesForJob,
+  syncAutomationSchedulesForTask,
+  syncAutomationSchedulesForRoutine,
+  syncAutomationSchedulesForCustomerReminder,
+  cancelAutomationSchedulesForSubject
+} from "./automations.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -1230,6 +1238,10 @@ async function bootstrap() {
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS address TEXT;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS phone TEXT;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS email TEXT;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'America/New_York';
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_days JSONB NOT NULL DEFAULT '[1,2,3,4,5]'::jsonb;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_open_time TEXT NOT NULL DEFAULT '09:00';
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_close_time TEXT NOT NULL DEFAULT '17:00';
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS service_items JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
@@ -4615,6 +4627,70 @@ async function emitContactTagEvents({ companyId, contactId, actorUserId, source,
   if (added.length || removed.length) await emitAutomationEvent({ companyId, eventType: "contact.tags_changed", subjectType: "contact", subjectId: contactId, actorUserId, source, payload });
 }
 
+function safeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function rowChanges(before, after, fields) {
+  return fields
+    .map((field) => ({ field, old_value: before?.[field] ?? null, new_value: after?.[field] ?? null }))
+    .filter((item) => JSON.stringify(item.old_value) !== JSON.stringify(item.new_value));
+}
+
+async function emitJobRouteEvents(companyId, actorUserId, before, after, source = "schedule.api") {
+  if (!companyId || !after?.id) return;
+  const base = { job_id: after.id, contact_id: after.contact_id || null, title: after.title, start: after.start || after.start_at, end: after.end || after.end_at };
+  if (!before) {
+    await emitAutomationEvent({ companyId, eventType: "job.created", subjectType: "job", subjectId: after.id, actorUserId, source, dedupeKey: `job.created:${after.id}`, payload: base });
+    await emitAutomationEvent({ companyId, eventType: "job.scheduled", subjectType: "job", subjectId: after.id, actorUserId, source, dedupeKey: `job.scheduled:${after.id}:${base.start}:${base.end}`, payload: base });
+    await emitAutomationEvent({ companyId, eventType: "job.created_manually", subjectType: "job", subjectId: after.id, actorUserId, source, dedupeKey: `job.created_manually:${after.id}`, payload: base });
+    if (after.contact_id) {
+      const count = (await pool.query(`SELECT COUNT(*)::int AS count FROM schedule_events WHERE company_id = $1 AND contact_id = $2`, [companyId, after.contact_id])).rows[0]?.count || 0;
+      await emitAutomationEvent({ companyId, eventType: Number(count) <= 1 ? "job.first_job_for_contact" : "job.repeat_job_for_contact", subjectType: "job", subjectId: after.id, actorUserId, source, payload: { ...base, job_count_for_contact: Number(count) } });
+    }
+    await emitJobAssignmentRouteEvents(companyId, actorUserId, after.id, "worker", [], safeArray(after.worker_user_ids), base, source);
+    await emitJobAssignmentRouteEvents(companyId, actorUserId, after.id, "salesperson", [], safeArray(after.sales_user_ids), base, source);
+    return;
+  }
+  const changed = rowChanges(before, after, ["title", "start_at", "end_at", "color", "notes", "contact_id", "price_cents", "material_cost_cents", "service_items", "worker_user_ids", "sales_user_ids", "finished_at"]);
+  if (!changed.length) return;
+  await emitAutomationEvent({ companyId, eventType: "job.updated", subjectType: "job", subjectId: after.id, actorUserId, source, payload: { ...base, changed_fields: changed } });
+  await emitAutomationEvent({ companyId, eventType: "job.field_changed", subjectType: "job", subjectId: after.id, actorUserId, source, payload: { ...base, changed_fields: changed } });
+  if (changed.some((c) => c.field === "start_at" || c.field === "end_at")) {
+    await emitAutomationEvent({ companyId, eventType: "job.rescheduled", subjectType: "job", subjectId: after.id, actorUserId, source, payload: { ...base, old_start: before.start_at, new_start: after.start_at, old_end: before.end_at, new_end: after.end_at } });
+    await emitAutomationEvent({ companyId, eventType: "job.date_changed", subjectType: "job", subjectId: after.id, actorUserId, source, payload: base });
+  }
+  for (const change of changed) {
+    const map = { start_at: "job.start_changed", end_at: "job.end_changed", price_cents: "job.price_changed", material_cost_cents: "job.material_cost_changed", color: "job.color_changed", contact_id: "job.contact_changed" };
+    if (map[change.field]) await emitAutomationEvent({ companyId, eventType: map[change.field], subjectType: "job", subjectId: after.id, actorUserId, source, payload: { ...base, changed_fields: [change] } });
+  }
+  await emitJobServiceRouteEvents(companyId, actorUserId, after.id, before, after, base, source);
+  await emitJobAssignmentRouteEvents(companyId, actorUserId, after.id, "worker", safeArray(before.worker_user_ids), safeArray(after.worker_user_ids), base, source);
+  await emitJobAssignmentRouteEvents(companyId, actorUserId, after.id, "salesperson", safeArray(before.sales_user_ids), safeArray(after.sales_user_ids), base, source);
+  if (!before.finished_at && after.finished_at) await emitAutomationEvent({ companyId, eventType: "job.completed", subjectType: "job", subjectId: after.id, actorUserId, source, dedupeKey: `job.completed:${after.id}:${after.finished_at}`, payload: { ...base, finished_at: after.finished_at } });
+  if (before.finished_at && !after.finished_at) await emitAutomationEvent({ companyId, eventType: "job.reopened", subjectType: "job", subjectId: after.id, actorUserId, source, payload: base });
+}
+
+async function emitJobAssignmentRouteEvents(companyId, actorUserId, jobId, kind, beforeIds, afterIds, base, source) {
+  const added = afterIds.filter((id) => !beforeIds.includes(id));
+  const removed = beforeIds.filter((id) => !afterIds.includes(id));
+  const prefix = kind === "worker" ? "worker" : "salesperson";
+  if (added.length) await emitAutomationEvent({ companyId, eventType: `job.${prefix}_assigned`, subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, added } });
+  if (removed.length) await emitAutomationEvent({ companyId, eventType: `job.${prefix}_removed`, subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, removed } });
+  if (added.length || removed.length) await emitAutomationEvent({ companyId, eventType: `job.${prefix === "worker" ? "workers" : "salespeople"}_changed`, subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, added, removed } });
+}
+
+async function emitJobServiceRouteEvents(companyId, actorUserId, jobId, before, after, base, source) {
+  const oldNames = safeArray(before.service_items || before.services).map((s) => String(s.name || s).toLowerCase());
+  const newItems = safeArray(after.service_items || after.services);
+  const newNames = newItems.map((s) => String(s.name || s).toLowerCase());
+  const added = newItems.filter((s) => !oldNames.includes(String(s.name || s).toLowerCase()));
+  const removed = safeArray(before.service_items || before.services).filter((s) => !newNames.includes(String(s.name || s).toLowerCase()));
+  if (added.length) await emitAutomationEvent({ companyId, eventType: "job.service_added", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, services: added } });
+  if (removed.length) await emitAutomationEvent({ companyId, eventType: "job.service_removed", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, services: removed } });
+  if (added.length || removed.length) await emitAutomationEvent({ companyId, eventType: "job.services_changed", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, added_services: added, removed_services: removed } });
+}
+
 // ---------- contacts (AUTH REQUIRED + COMPANY-SCOPED) ----------
 app.get("/api/contacts", authRequired, async (req, res) => {
   const q = (req.query.q || "").toString().trim();
@@ -6349,7 +6425,7 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
   const workerIDs = Array.isArray(worker_user_ids) ? worker_user_ids : [];
   try {
     const previous = await pool.query(
-      `SELECT worker_user_ids, finished_at FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
+      `SELECT * FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
       [req.params.id, req.userId, req.companyId]
     );
     const oldWorkerIDs = previous.rows.length && Array.isArray(previous.rows[0].worker_user_ids)
@@ -6429,29 +6505,8 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
       }
     }
     if (req.companyId) {
-      if (isNewJob) {
-        await emitAutomationEvent({
-          companyId: req.companyId,
-          eventType: "job.created",
-          subjectType: "job",
-          subjectId: r.rows[0].id,
-          actorUserId: req.userId,
-          source: "schedule.api",
-          dedupeKey: `job.created:${r.rows[0].id}`,
-          payload: { job_id: r.rows[0].id, contact_id: r.rows[0].contact_id, title: r.rows[0].title }
-        });
-      } else if (!previous.rows[0]?.finished_at && r.rows[0].finished_at) {
-        await emitAutomationEvent({
-          companyId: req.companyId,
-          eventType: "job.completed",
-          subjectType: "job",
-          subjectId: r.rows[0].id,
-          actorUserId: req.userId,
-          source: "schedule.api",
-          dedupeKey: `job.completed:${r.rows[0].id}`,
-          payload: { job_id: r.rows[0].id, contact_id: r.rows[0].contact_id, finished_at: r.rows[0].finished_at }
-        });
-      }
+      await emitJobRouteEvents(req.companyId, req.userId, previous.rows[0] || null, r.rows[0], "schedule.api");
+      await syncAutomationSchedulesForJob(req.companyId, r.rows[0]);
     }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_schedule" }); }
@@ -6459,12 +6514,19 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
 
 app.delete("/api/schedule/:id", authRequired, async (req, res) => {
   try {
+    const before = req.companyId
+      ? (await pool.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0]
+      : null;
     if (req.companyId) {
       await pool.query(`DELETE FROM schedule_events WHERE id = $1 AND company_id = $2`,
         [req.params.id, req.companyId]);
     } else {
       await pool.query(`DELETE FROM schedule_events WHERE id = $1 AND user_id = $2`,
         [req.params.id, req.userId]);
+    }
+    if (before && req.companyId) {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "job.deleted", subjectType: "job", subjectId: before.id, actorUserId: req.userId, source: "schedule.api", dedupeKey: `job.deleted:${before.id}`, payload: { job_id: before.id, contact_id: before.contact_id, title: before.title } });
+      await cancelAutomationSchedulesForSubject(req.companyId, "job", before.id);
     }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_schedule" }); }
@@ -6730,7 +6792,7 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
   const { title, due_date, reminders, subtasks, completed, completed_at, color_hex } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
   try {
-    const previous = await pool.query(`SELECT completed FROM todo_tasks WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    const previous = await pool.query(`SELECT * FROM todo_tasks WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
     const r = await pool.query(
       `INSERT INTO todo_tasks
         (id, user_id, title, due_date, reminders, subtasks, completed, completed_at, color_hex)
@@ -6752,17 +6814,23 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
         toBool(completed), completed_at || null, color_hex || null
       ]
     );
-    if (req.companyId && !previous.rows[0]?.completed && r.rows[0].completed) {
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "task.completed",
-        subjectType: "task",
-        subjectId: r.rows[0].id,
-        actorUserId: req.userId,
-        source: "todo.api",
-        dedupeKey: `task.completed:${r.rows[0].id}`,
-        payload: { task_id: r.rows[0].id, title: r.rows[0].title, completed_at: r.rows[0].completed_at }
-      });
+    if (req.companyId) {
+      const before = previous.rows[0] || null;
+      const after = r.rows[0];
+      if (!before) {
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "task.created", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", dedupeKey: `task.created:${after.id}`, payload: { task_id: after.id, title: after.title, due_date: after.due_date } });
+      } else {
+        const changed = rowChanges(before, after, ["title", "due_date", "completed", "subtasks"]);
+        if (changed.length) await emitAutomationEvent({ companyId: req.companyId, eventType: "task.updated", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { task_id: after.id, title: after.title, changed_fields: changed } });
+        if (changed.some((c) => c.field === "title")) await emitAutomationEvent({ companyId: req.companyId, eventType: "task.title_changed", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { task_id: after.id } });
+        if (changed.some((c) => c.field === "due_date")) {
+          await emitAutomationEvent({ companyId: req.companyId, eventType: "task.due_changed", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { task_id: after.id, old_due: before.due_date, new_due: after.due_date } });
+          await emitAutomationEvent({ companyId: req.companyId, eventType: "task.rescheduled", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { task_id: after.id, old_due: before.due_date, new_due: after.due_date } });
+        }
+        if (!before.completed && after.completed) await emitAutomationEvent({ companyId: req.companyId, eventType: "task.completed", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", dedupeKey: `task.completed:${after.id}:${after.completed_at || "completed"}`, payload: { task_id: after.id, title: after.title, completed_at: after.completed_at } });
+        if (before.completed && !after.completed) await emitAutomationEvent({ companyId: req.companyId, eventType: "task.reopened", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { task_id: after.id } });
+      }
+      await syncAutomationSchedulesForTask(req.companyId, after);
     }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_task" }); }
@@ -6770,8 +6838,12 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
 
 app.delete("/api/todo/tasks/:id", authRequired, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM todo_tasks WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]);
+    const before = (await pool.query(`DELETE FROM todo_tasks WHERE id = $1 AND user_id = $2 RETURNING *`,
+      [req.params.id, req.userId])).rows[0];
+    if (before && req.companyId) {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "task.deleted", subjectType: "task", subjectId: before.id, actorUserId: req.userId, source: "todo.api", dedupeKey: `task.deleted:${before.id}`, payload: { task_id: before.id, title: before.title } });
+      await cancelAutomationSchedulesForSubject(req.companyId, "task", before.id);
+    }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_task" }); }
 });
@@ -6792,6 +6864,7 @@ app.put("/api/todo/routines/:id", authRequired, async (req, res) => {
   const { title, time, weekdays, reminders, enabled, color_hex } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
   try {
+    const previous = await pool.query(`SELECT * FROM todo_routines WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
     const r = await pool.query(
       `INSERT INTO todo_routines
         (id, user_id, title, time, weekdays, reminders, enabled, color_hex)
@@ -6812,16 +6885,28 @@ app.put("/api/todo/routines/:id", authRequired, async (req, res) => {
         toBool(enabled, true), color_hex || null
       ]
     );
+    if (req.companyId) {
+      const before = previous.rows[0] || null;
+      const after = r.rows[0];
+      await emitAutomationEvent({ companyId: req.companyId, eventType: before ? "routine.updated" : "routine.created", subjectType: "routine", subjectId: after.id, actorUserId: req.userId, source: "todo.api", dedupeKey: before ? null : `routine.created:${after.id}`, payload: { routine_id: after.id, title: after.title } });
+      if (before?.enabled && !after.enabled) await emitAutomationEvent({ companyId: req.companyId, eventType: "routine.ended", subjectType: "routine", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { routine_id: after.id } });
+      if (before && !before.enabled && after.enabled) await emitAutomationEvent({ companyId: req.companyId, eventType: "routine.reactivated", subjectType: "routine", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { routine_id: after.id } });
+      await syncAutomationSchedulesForRoutine(req.companyId, after);
+    }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_routine" }); }
 });
 
 app.delete("/api/todo/routines/:id", authRequired, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM todo_routines WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]);
+    const before = (await pool.query(`DELETE FROM todo_routines WHERE id = $1 AND user_id = $2 RETURNING *`,
+      [req.params.id, req.userId])).rows[0];
     await pool.query(`DELETE FROM todo_routine_done WHERE routine_id = $1 AND user_id = $2`,
       [req.params.id, req.userId]);
+    if (before && req.companyId) {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "routine.ended", subjectType: "routine", subjectId: before.id, actorUserId: req.userId, source: "todo.api", dedupeKey: `routine.ended:${before.id}`, payload: { routine_id: before.id, title: before.title } });
+      await cancelAutomationSchedulesForSubject(req.companyId, "routine", before.id);
+    }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_routine" }); }
 });
@@ -6847,6 +6932,9 @@ app.put("/api/todo/routine-done", authRequired, async (req, res) => {
        ON CONFLICT DO NOTHING`,
       [req.userId, routine_id, day_key]
     );
+    if (req.companyId) {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "routine.completed", subjectType: "routine", subjectId: routine_id, actorUserId: req.userId, source: "todo.api", dedupeKey: `routine.completed:${routine_id}:${day_key}`, payload: { routine_id, day_key } });
+    }
     res.json({ ok: true });
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_mark_routine_done" }); }
 });
@@ -6880,6 +6968,7 @@ app.put("/api/todo/customer-reminders/:id", authRequired, async (req, res) => {
   const { title, contact_id, contact_name, phone, due_date, completed, color_hex } = req.body || {};
   if (!contact_name) return res.status(400).json({ error: "contact_name_required" });
   try {
+    const previous = await pool.query(`SELECT * FROM todo_customer_reminders WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
     const r = await pool.query(
       `INSERT INTO todo_customer_reminders
         (id, user_id, title, contact_id, contact_name, phone, due_date, completed, color_hex)
@@ -6901,16 +6990,29 @@ app.put("/api/todo/customer-reminders/:id", authRequired, async (req, res) => {
         toBool(completed), color_hex || null
       ]
     );
+    if (req.companyId) {
+      const before = previous.rows[0] || null;
+      const after = r.rows[0];
+      if (!before) await emitAutomationEvent({ companyId: req.companyId, eventType: "customer_reminder.created", subjectType: "customer_reminder", subjectId: after.id, actorUserId: req.userId, source: "todo.api", dedupeKey: `customer_reminder.created:${after.id}`, payload: { reminder_id: after.id, contact_id: after.contact_id, due_date: after.due_date } });
+      else if (!before.completed && after.completed) await emitAutomationEvent({ companyId: req.companyId, eventType: "customer_reminder.completed", subjectType: "customer_reminder", subjectId: after.id, actorUserId: req.userId, source: "todo.api", dedupeKey: `customer_reminder.completed:${after.id}:${after.updated_at || "completed"}`, payload: { reminder_id: after.id, contact_id: after.contact_id } });
+      else if (before.completed && !after.completed) await emitAutomationEvent({ companyId: req.companyId, eventType: "customer_reminder.reopened", subjectType: "customer_reminder", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { reminder_id: after.id, contact_id: after.contact_id } });
+      else if (before.due_date !== after.due_date) await emitAutomationEvent({ companyId: req.companyId, eventType: "customer_reminder.rescheduled", subjectType: "customer_reminder", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { reminder_id: after.id, old_due: before.due_date, new_due: after.due_date } });
+      await syncAutomationSchedulesForCustomerReminder(req.companyId, after);
+    }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_customer_reminder" }); }
 });
 
 app.delete("/api/todo/customer-reminders/:id", authRequired, async (req, res) => {
   try {
-    await pool.query(
-      `DELETE FROM todo_customer_reminders WHERE id = $1 AND user_id = $2`,
+    const before = (await pool.query(
+      `DELETE FROM todo_customer_reminders WHERE id = $1 AND user_id = $2 RETURNING *`,
       [req.params.id, req.userId]
-    );
+    )).rows[0];
+    if (before && req.companyId) {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "customer_reminder.deleted", subjectType: "customer_reminder", subjectId: before.id, actorUserId: req.userId, source: "todo.api", dedupeKey: `customer_reminder.deleted:${before.id}`, payload: { reminder_id: before.id, contact_id: before.contact_id } });
+      await cancelAutomationSchedulesForSubject(req.companyId, "customer_reminder", before.id);
+    }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_customer_reminder" }); }
 });
