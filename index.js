@@ -2161,7 +2161,8 @@ app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
            from_number, to_number, status, started_at
          )
          VALUES($1, $2, $3, $4, 'outbound', $5, $6, $7, now())
-         ON CONFLICT(twilio_call_sid)
+         ON CONFLICT (twilio_call_sid)
+         WHERE twilio_call_sid IS NOT NULL
          DO UPDATE SET
            status = EXCLUDED.status,
            updated_at = now()`,
@@ -2294,7 +2295,8 @@ app.post("/webhooks/twilio/voice/incoming", async (req, res) => {
            from_number, to_number, status, started_at
          )
          VALUES($1, $2, $3, $4, 'inbound', $5, $6, $7, now())
-         ON CONFLICT(twilio_call_sid)
+         ON CONFLICT (twilio_call_sid)
+         WHERE twilio_call_sid IS NOT NULL
          DO UPDATE SET
            status = EXCLUDED.status,
            updated_at = now()`,
@@ -2438,7 +2440,8 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
          ended_at, duration_seconds, disposition
        )
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),$10,${endedAtSQL},$11,$12)
-       ON CONFLICT(twilio_call_sid)
+       ON CONFLICT (twilio_call_sid)
+       WHERE twilio_call_sid IS NOT NULL
        DO UPDATE SET
          twilio_parent_call_sid = COALESCE(EXCLUDED.twilio_parent_call_sid, phone_calls.twilio_parent_call_sid),
          contact_id = COALESCE(phone_calls.contact_id, EXCLUDED.contact_id),
@@ -6891,4 +6894,3 @@ startServer().catch((err) => {
   console.error("Server startup failed:", err);
   process.exit(1);
 });
-
