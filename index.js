@@ -8,6 +8,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Stripe from "stripe";
 import apn from "@parse/node-apn";
 import twilio from "twilio";
+import { installAutomationSystem, emitAutomationEvent } from "./automations.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -2123,6 +2124,23 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
       );
       await client.query("COMMIT");
       console.log("[twilio/sms] inbound stored", { messageSid, phoneLineID: phoneLine.id, conversationID, mediaCount });
+      await emitAutomationEvent({
+        companyId: phoneLine.company_id,
+        eventType: "sms.received",
+        subjectType: "sms_conversation",
+        subjectId: conversationID,
+        source: "twilio.sms",
+        dedupeKey: messageSid ? `sms.received:${messageSid}` : null,
+        payload: {
+          conversation_id: conversationID,
+          contact_id: contactID,
+          message_sid: messageSid || null,
+          from_number: fromNumber,
+          to_number: toNumber,
+          body,
+          media_count: mediaCount
+        }
+      });
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
       throw e;
@@ -2841,6 +2859,22 @@ app.post("/webhooks/twilio/voice/voicemail-recording", async (req, res) => {
     );
 
     if (recordingStatus.toLowerCase() === "completed") {
+      await emitAutomationEvent({
+        companyId: row.company_id,
+        eventType: "voicemail.received",
+        subjectType: "voicemail",
+        subjectId: saved.rows[0].id,
+        source: "twilio.voice",
+        dedupeKey: `voicemail.received:${recordingSid}`,
+        payload: {
+          voicemail_id: saved.rows[0].id,
+          call_id: row.phone_call_id,
+          call_sid: callSid,
+          recording_sid: recordingSid,
+          external_phone_number: externalPhone,
+          contact_id: saved.rows[0]?.contact_id || null
+        }
+      });
       let title = externalPhone || "Unknown caller";
       if (saved.rows[0]?.contact_id) {
         const contact = await pool.query(
@@ -2969,6 +3003,15 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
       );
       if (parentUpdate.rowCount) {
         if (direction === "inbound" && ["busy", "failed", "canceled"].includes(disposition || "")) {
+          await emitAutomationEvent({
+            companyId: line.company_id,
+            eventType: "call.missed",
+            subjectType: "call",
+            subjectId: parentUpdate.rows[0].id,
+            source: "twilio.voice",
+            dedupeKey: `call.missed:${parentCallSid}`,
+            payload: { call_id: parentUpdate.rows[0].id, call_sid: parentCallSid, external_phone_number: externalNumber, contact_id: contactID }
+          });
           sendMissedCallPush({
             companyId: line.company_id,
             callId: parentUpdate.rows[0].id,
@@ -3018,6 +3061,15 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
     );
 
     if (direction === "inbound" && ["busy", "failed", "canceled"].includes(disposition || "")) {
+      await emitAutomationEvent({
+        companyId: line.company_id,
+        eventType: "call.missed",
+        subjectType: "call",
+        subjectId: savedCall.rows[0]?.id,
+        source: "twilio.voice",
+        dedupeKey: `call.missed:${callSid}`,
+        payload: { call_id: savedCall.rows[0]?.id, call_sid: callSid, external_phone_number: externalNumber, contact_id: contactID }
+      });
       sendMissedCallPush({
         companyId: line.company_id,
         callId: savedCall.rows[0]?.id,
@@ -4598,6 +4650,18 @@ app.post("/api/contacts", authRequired, async (req, res) => {
         Array.isArray(lead_info) ? JSON.stringify(lead_info) : null
       ]
     );
+    if (req.companyId) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "contact.created",
+        subjectType: "contact",
+        subjectId: r.rows[0].id,
+        actorUserId: req.userId,
+        source: "contacts.api",
+        dedupeKey: `contact.created:${r.rows[0].id}`,
+        payload: { contact_id: r.rows[0].id, name: r.rows[0].name }
+      });
+    }
     res.status(201).json(r.rows[0]);
   } catch (e) {
     console.error(e);
@@ -4645,6 +4709,17 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
       ]
     );
     if (!r.rowCount) return res.status(404).json({ error: "not_found" });
+    if (req.companyId) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "contact.updated",
+        subjectType: "contact",
+        subjectId: r.rows[0].id,
+        actorUserId: req.userId,
+        source: "contacts.api",
+        payload: { contact_id: r.rows[0].id, changed_fields: Object.keys(req.body || {}) }
+      });
+    }
     res.json(r.rows[0]);
   } catch (e) {
     console.error(e);
@@ -5738,6 +5813,16 @@ app.post("/webhooks/leads/:token", async (req, res) => {
         );
         stageResult.applied = true;
         stageResult.stage_id = autoStageId;
+        await emitAutomationEvent({
+          companyId,
+          eventType: "pipeline.stage_entered",
+          subjectType: "opportunity",
+          subjectId: oppId,
+          actorUserId: userId,
+          source: "lead_intake",
+          dedupeKey: externalLeadId ? `pipeline.stage_entered:${source}:${externalLeadId}:${autoStageId}` : `pipeline.stage_entered:${oppId}:${autoStageId}`,
+          payload: { opportunity_id: oppId, contact_id: contactId, stage_id: autoStageId, source }
+        });
         zLog("stage_assignment_succeeded", { oppId, stageId: autoStageId });
       }
     } catch (e) {
@@ -5764,6 +5849,23 @@ app.post("/webhooks/leads/:token", async (req, res) => {
     responseBody.warning = "stage_assignment_skipped";
     responseBody.stage_skip_reason = stageResult.reason;
   }
+  await emitAutomationEvent({
+    companyId,
+    eventType: "lead.created",
+    subjectType: "contact",
+    subjectId: contactRow.id,
+    actorUserId: userId,
+    source: "lead_intake",
+    dedupeKey: externalLeadId ? `lead.created:${source}:${externalLeadId}` : `lead.created:${contactRow.id}`,
+    payload: {
+      contact_id: contactRow.id,
+      source,
+      external_lead_id: externalLeadId,
+      form_id: formId,
+      page_id: pageId,
+      fallback_used: fallbackUsed
+    }
+  });
   return res.status(201).json(responseBody);
 });
 
@@ -6020,6 +6122,10 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
   const { contact_id, state, stage_id, created_at } = req.body || {};
   if (!contact_id || !state) return res.status(400).json({ error: "missing_params" });
   try {
+    const previous = await pool.query(
+      `SELECT stage_id FROM opportunities WHERE id = $1 AND (user_id = $2 OR company_id = $3) LIMIT 1`,
+      [req.params.id, req.userId, req.companyId || null]
+    );
     const r = await pool.query(
       `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
@@ -6031,6 +6137,18 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
        RETURNING id, contact_id, state, stage_id, created_at`,
       [req.params.id, req.userId, req.companyId || null, contact_id, state, stage_id || null, created_at || null]
     );
+    const oldStageId = previous.rows[0]?.stage_id || null;
+    if (req.companyId && stage_id && oldStageId !== stage_id) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "pipeline.stage_entered",
+        subjectType: "opportunity",
+        subjectId: r.rows[0].id,
+        actorUserId: req.userId,
+        source: "opportunities.api",
+        payload: { opportunity_id: r.rows[0].id, contact_id, stage_id, previous_stage_id: oldStageId }
+      });
+    }
     res.json(r.rows[0]);
   } catch (e) { console.error("[opportunities] upsert failed:", e); res.status(500).json({ error: "failed_upsert_opportunity" }); }
 });
@@ -6073,7 +6191,7 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
   const workerIDs = Array.isArray(worker_user_ids) ? worker_user_ids : [];
   try {
     const previous = await pool.query(
-      `SELECT worker_user_ids FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
+      `SELECT worker_user_ids, finished_at FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
       [req.params.id, req.userId, req.companyId]
     );
     const oldWorkerIDs = previous.rows.length && Array.isArray(previous.rows[0].worker_user_ids)
@@ -6150,6 +6268,31 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
           { schedule_event_id: req.params.id },
           req.userId
         );
+      }
+    }
+    if (req.companyId) {
+      if (isNewJob) {
+        await emitAutomationEvent({
+          companyId: req.companyId,
+          eventType: "job.created",
+          subjectType: "job",
+          subjectId: r.rows[0].id,
+          actorUserId: req.userId,
+          source: "schedule.api",
+          dedupeKey: `job.created:${r.rows[0].id}`,
+          payload: { job_id: r.rows[0].id, contact_id: r.rows[0].contact_id, title: r.rows[0].title }
+        });
+      } else if (!previous.rows[0]?.finished_at && r.rows[0].finished_at) {
+        await emitAutomationEvent({
+          companyId: req.companyId,
+          eventType: "job.completed",
+          subjectType: "job",
+          subjectId: r.rows[0].id,
+          actorUserId: req.userId,
+          source: "schedule.api",
+          dedupeKey: `job.completed:${r.rows[0].id}`,
+          payload: { job_id: r.rows[0].id, contact_id: r.rows[0].contact_id, finished_at: r.rows[0].finished_at }
+        });
       }
     }
     res.json(r.rows[0]);
@@ -6429,6 +6572,7 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
   const { title, due_date, reminders, subtasks, completed, completed_at, color_hex } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
   try {
+    const previous = await pool.query(`SELECT completed FROM todo_tasks WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
     const r = await pool.query(
       `INSERT INTO todo_tasks
         (id, user_id, title, due_date, reminders, subtasks, completed, completed_at, color_hex)
@@ -6450,6 +6594,18 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
         toBool(completed), completed_at || null, color_hex || null
       ]
     );
+    if (req.companyId && !previous.rows[0]?.completed && r.rows[0].completed) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "task.completed",
+        subjectType: "task",
+        subjectId: r.rows[0].id,
+        actorUserId: req.userId,
+        source: "todo.api",
+        dedupeKey: `task.completed:${r.rows[0].id}`,
+        payload: { task_id: r.rows[0].id, title: r.rows[0].title, completed_at: r.rows[0].completed_at }
+      });
+    }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_task" }); }
 });
@@ -7039,6 +7195,18 @@ app.post("/api/service-plans", authRequired, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,'created',$6)`,
       [employerId, req.companyId || null, req.userId, inserted.rows[0].id, contactId, `Created by ${req.userEmail || req.userId}`]
     );
+    if (req.companyId) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "service_plan.created",
+        subjectType: "service_plan",
+        subjectId: inserted.rows[0].id,
+        actorUserId: req.userId,
+        source: "service_plans.api",
+        dedupeKey: `service_plan.created:${inserted.rows[0].id}`,
+        payload: { service_plan_id: inserted.rows[0].id, contact_id: contactId, plan_name }
+      });
+    }
     // Join contact info for the response so the client shows the customer.
     const joined = await pool.query(
       `SELECT sp.*, c.name AS contact_name, c.phone AS contact_phone,
@@ -7312,6 +7480,18 @@ app.post("/api/service-plans/:id/mark-serviced", authRequired, requireEmployer, 
       [employerId, req.companyId || null, req.userId, plan.id, plan.contact_id, completed,
        `Marked serviced by ${req.userEmail || req.userId}`]
     );
+    if (req.companyId) {
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "service_plan.serviced",
+        subjectType: "service_plan",
+        subjectId: plan.id,
+        actorUserId: req.userId,
+        source: "service_plans.api",
+        dedupeKey: `service_plan.serviced:${plan.id}:${completed}`,
+        payload: { service_plan_id: plan.id, contact_id: plan.contact_id, completed_date: completed, next_service_date: next }
+      });
+    }
     res.json(sanitizeServicePlan(updated.rows[0]));
   } catch (e) {
     console.error(e);
@@ -7611,13 +7791,25 @@ app.post("/stripe/webhook", async (req, res) => {
       case "invoice.payment_succeeded": {
         const invoice = event.data.object;
         // Update payment record.
-        await pool.query(
+        const paidRecords = await pool.query(
           `UPDATE payment_records
               SET status = 'succeeded', updated_at = now()
             WHERE stripe_invoice_id = $1
-               OR stripe_subscription_id = $2`,
+               OR stripe_subscription_id = $2
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
           [invoice.id, invoice.subscription || null]
         );
+        for (const rec of paidRecords.rows) {
+          await emitAutomationEvent({
+            companyId: rec.company_id,
+            eventType: "payment.succeeded",
+            subjectType: "payment",
+            subjectId: rec.id,
+            source: "stripe.webhook",
+            dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_invoice_id: invoice.id }
+          });
+        }
         // If this is the initial invoice, mark plan active.
         if (invoice.subscription) {
           const { rows } = await pool.query(
@@ -7640,12 +7832,24 @@ app.post("/stripe/webhook", async (req, res) => {
 
       case "invoice.payment_failed": {
         const invoice = event.data.object;
-        await pool.query(
+        const failedRecords = await pool.query(
           `UPDATE payment_records
               SET status = 'failed', updated_at = now()
-            WHERE stripe_invoice_id = $1`,
+            WHERE stripe_invoice_id = $1
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
           [invoice.id]
         );
+        for (const rec of failedRecords.rows) {
+          await emitAutomationEvent({
+            companyId: rec.company_id,
+            eventType: "payment.failed",
+            subjectType: "payment",
+            subjectId: rec.id,
+            source: "stripe.webhook",
+            dedupeKey: `payment.failed:${event.id}:${rec.id}`,
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_invoice_id: invoice.id }
+          });
+        }
         if (invoice.subscription) {
           const { rows } = await pool.query(
             `UPDATE service_plans
@@ -7664,23 +7868,47 @@ app.post("/stripe/webhook", async (req, res) => {
 
       case "payment_intent.succeeded": {
         const pi = event.data.object;
-        await pool.query(
+        const paidRecords = await pool.query(
           `UPDATE payment_records
               SET status = 'succeeded', updated_at = now()
-            WHERE stripe_payment_intent_id = $1`,
+            WHERE stripe_payment_intent_id = $1
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
           [pi.id]
         );
+        for (const rec of paidRecords.rows) {
+          await emitAutomationEvent({
+            companyId: rec.company_id,
+            eventType: "payment.succeeded",
+            subjectType: "payment",
+            subjectId: rec.id,
+            source: "stripe.webhook",
+            dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
+          });
+        }
         break;
       }
 
       case "payment_intent.payment_failed": {
         const pi = event.data.object;
-        await pool.query(
+        const failedRecords = await pool.query(
           `UPDATE payment_records
               SET status = 'failed', updated_at = now()
-            WHERE stripe_payment_intent_id = $1`,
+            WHERE stripe_payment_intent_id = $1
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
           [pi.id]
         );
+        for (const rec of failedRecords.rows) {
+          await emitAutomationEvent({
+            companyId: rec.company_id,
+            eventType: "payment.failed",
+            subjectType: "payment",
+            subjectId: rec.id,
+            source: "stripe.webhook",
+            dedupeKey: `payment.failed:${event.id}:${rec.id}`,
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
+          });
+        }
         break;
       }
 
@@ -7719,6 +7947,15 @@ async function startServer() {
   }
   serverStarted = true;
   await bootstrap();
+  await installAutomationSystem({
+    app,
+    pool,
+    authRequired,
+    requireEmployer,
+    sendPushToUsers,
+    createTwilioClient,
+    twilioPublicUrl
+  });
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }
 
