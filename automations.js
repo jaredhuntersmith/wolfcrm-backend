@@ -16,7 +16,34 @@ const AUTOMATION_LIMITS = {
   maxJsonBytes: 250000
 };
 
+const AUTOMATION_SAFETY_DEFAULTS = {
+  maxActiveRunsPerAutomation: 25,
+  maxActiveRunsPerSubject: 1,
+  maxCompanyActiveRuns: 100,
+  runStartsPerMinute: 120,
+  nodeExecutionsPerMinute: 2000,
+  maxCustomerMessagesPerRun: 25,
+  maxInternalMessagesPerRun: 100,
+  maxWebhookActionsPerRun: 50,
+  maxChildRunsPerRun: 50,
+  maxTotalIterationsPerRun: 1000,
+  maxRetryDelaySeconds: 86400,
+  eventMaxAttempts: 5,
+  processorLeaseSeconds: 120,
+  nodeLeaseSeconds: 300
+};
+
 let ctx = null;
+
+class AutomationError extends Error {
+  constructor(code, message, options = {}) {
+    super(message || code);
+    this.code = code || "unknown_error";
+    this.errorClass = options.errorClass || classifyErrorCode(this.code);
+    this.retryable = options.retryable ?? isRetryableErrorCode(this.code);
+    this.details = options.details || {};
+  }
+}
 
 const SIDE_EFFECT_FREE_ACTIONS = new Set([
   "contacts.search", "jobs.search", "tasks.search", "map.search_pins", "route.get_stops", "quotes.search", "payments.search", "service_plans.search", "employees.search",
@@ -1945,14 +1972,34 @@ async function bootstrapAutomationSchema() {
       pause_until TIMESTAMPTZ,
       allow_manual_trigger BOOLEAN NOT NULL DEFAULT true,
       max_parallel_runs_per_subject INTEGER,
+      max_active_runs INTEGER,
+      max_active_runs_per_subject INTEGER,
+      concurrency_policy TEXT NOT NULL DEFAULT 'queue',
+      subject_concurrency_policy TEXT NOT NULL DEFAULT 'queue',
       reentry_mode TEXT NOT NULL DEFAULT 'after_previous_completion',
       cooldown_seconds INTEGER,
+      cooldown_basis TEXT NOT NULL DEFAULT 'completed_at',
+      failure_auto_pause_enabled BOOLEAN NOT NULL DEFAULT false,
+      failure_auto_pause_threshold INTEGER NOT NULL DEFAULT 10,
+      failure_auto_pause_window_seconds INTEGER NOT NULL DEFAULT 3600,
+      risk_fingerprint TEXT,
+      risk_acknowledged_at TIMESTAMPTZ,
       metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       updated_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS max_active_runs INTEGER;
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS max_active_runs_per_subject INTEGER;
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS concurrency_policy TEXT NOT NULL DEFAULT 'queue';
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS subject_concurrency_policy TEXT NOT NULL DEFAULT 'queue';
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS cooldown_basis TEXT NOT NULL DEFAULT 'completed_at';
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS failure_auto_pause_enabled BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS failure_auto_pause_threshold INTEGER NOT NULL DEFAULT 10;
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS failure_auto_pause_window_seconds INTEGER NOT NULL DEFAULT 3600;
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS risk_fingerprint TEXT;
+    ALTER TABLE automation_definitions ADD COLUMN IF NOT EXISTS risk_acknowledged_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS automation_definitions_company_status_idx ON automation_definitions(company_id, status);
     CREATE INDEX IF NOT EXISTS automation_definitions_active_version_idx ON automation_definitions(active_version_id);
     CREATE INDEX IF NOT EXISTS automation_definitions_draft_version_idx ON automation_definitions(draft_version_id);
@@ -2020,10 +2067,21 @@ async function bootstrapAutomationSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       processed_at TIMESTAMPTZ,
       processing_status TEXT NOT NULL DEFAULT 'pending',
-      error TEXT
+      error TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TIMESTAMPTZ,
+      locked_at TIMESTAMPTZ,
+      locked_by TEXT,
+      failed_at TIMESTAMPTZ
     );
+    ALTER TABLE automation_events ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE automation_events ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
+    ALTER TABLE automation_events ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+    ALTER TABLE automation_events ADD COLUMN IF NOT EXISTS locked_by TEXT;
+    ALTER TABLE automation_events ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS automation_events_company_type_idx ON automation_events(company_id, event_type, occurred_at DESC);
     CREATE INDEX IF NOT EXISTS automation_events_status_idx ON automation_events(processing_status, processed_at, created_at);
+    CREATE INDEX IF NOT EXISTS automation_events_retry_idx ON automation_events(processing_status, next_attempt_at, created_at);
     CREATE INDEX IF NOT EXISTS automation_events_occurred_idx ON automation_events(occurred_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS automation_events_company_dedupe_uidx ON automation_events(company_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
 
@@ -2043,15 +2101,44 @@ async function bootstrapAutomationSchema() {
       error_message TEXT,
       depth INTEGER NOT NULL DEFAULT 0,
       parent_run_id UUID REFERENCES automation_runs(id) ON DELETE SET NULL,
+      parent_node_id UUID,
       root_run_id UUID REFERENCES automation_runs(id) ON DELETE SET NULL,
+      reentry_key TEXT,
+      stop_reason TEXT,
+      stop_condition_key TEXT,
+      recovered_from_run_id UUID,
+      recovered_from_run_node_id UUID,
+      recovery_start_node_id UUID,
+      recovery_scope_key TEXT,
+      active_execution_ms BIGINT NOT NULL DEFAULT 0,
+      customer_message_count INTEGER NOT NULL DEFAULT 0,
+      internal_message_count INTEGER NOT NULL DEFAULT 0,
+      webhook_action_count INTEGER NOT NULL DEFAULT 0,
+      child_run_count INTEGER NOT NULL DEFAULT 0,
+      total_iteration_count INTEGER NOT NULL DEFAULT 0,
       manual_started_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       dry_run BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS parent_node_id UUID;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS reentry_key TEXT;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS stop_reason TEXT;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS stop_condition_key TEXT;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS recovered_from_run_id UUID;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS recovered_from_run_node_id UUID;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS recovery_start_node_id UUID;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS recovery_scope_key TEXT;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS active_execution_ms BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS customer_message_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS internal_message_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS webhook_action_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS child_run_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS total_iteration_count INTEGER NOT NULL DEFAULT 0;
     CREATE INDEX IF NOT EXISTS automation_runs_company_status_idx ON automation_runs(company_id, status, created_at DESC);
     CREATE INDEX IF NOT EXISTS automation_runs_automation_idx ON automation_runs(automation_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS automation_runs_subject_idx ON automation_runs(company_id, automation_id, subject_type, subject_id);
+    CREATE INDEX IF NOT EXISTS automation_runs_reentry_idx ON automation_runs(company_id, automation_id, reentry_key, status);
 
     CREATE TABLE IF NOT EXISTS automation_run_nodes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2065,12 +2152,22 @@ async function bootstrapAutomationSchema() {
       output_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
       error_code TEXT,
       error_message TEXT,
+      error_class TEXT,
+      retryable BOOLEAN,
+      next_retry_at TIMESTAMPTZ,
+      locked_at TIMESTAMPTZ,
+      locked_by TEXT,
       started_at TIMESTAMPTZ,
       completed_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     ALTER TABLE automation_run_nodes ADD COLUMN IF NOT EXISTS scope_key TEXT NOT NULL DEFAULT 'root';
+    ALTER TABLE automation_run_nodes ADD COLUMN IF NOT EXISTS error_class TEXT;
+    ALTER TABLE automation_run_nodes ADD COLUMN IF NOT EXISTS retryable BOOLEAN;
+    ALTER TABLE automation_run_nodes ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
+    ALTER TABLE automation_run_nodes ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+    ALTER TABLE automation_run_nodes ADD COLUMN IF NOT EXISTS locked_by TEXT;
     CREATE INDEX IF NOT EXISTS automation_run_nodes_run_idx ON automation_run_nodes(run_id, created_at);
     CREATE INDEX IF NOT EXISTS automation_run_nodes_node_idx ON automation_run_nodes(run_id, node_key, attempt_number);
     CREATE INDEX IF NOT EXISTS automation_run_nodes_scope_idx ON automation_run_nodes(run_id, node_key, scope_key, status);
@@ -2129,6 +2226,8 @@ async function bootstrapAutomationSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(run_id, foreach_node_id, parent_scope_key, iteration_key)
     );
+    ALTER TABLE automation_run_iterations ADD COLUMN IF NOT EXISTS retry_of_iteration_id UUID;
+    ALTER TABLE automation_run_iterations ADD COLUMN IF NOT EXISTS attempt_number INTEGER NOT NULL DEFAULT 1;
     CREATE INDEX IF NOT EXISTS automation_run_iterations_status_idx ON automation_run_iterations(run_id, foreach_node_id, parent_scope_key, status, item_index);
     CREATE INDEX IF NOT EXISTS automation_run_iterations_scope_idx ON automation_run_iterations(run_id, scope_key);
 
@@ -2157,6 +2256,85 @@ async function bootstrapAutomationSchema() {
       UNIQUE(run_id, node_id, scope_key, goal_key)
     );
     CREATE INDEX IF NOT EXISTS automation_run_goals_run_idx ON automation_run_goals(run_id, reached_at);
+
+    CREATE TABLE IF NOT EXISTS automation_run_node_attempts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      run_id UUID NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+      run_node_id UUID REFERENCES automation_run_nodes(id) ON DELETE SET NULL,
+      node_id UUID,
+      node_key TEXT NOT NULL,
+      scope_key TEXT NOT NULL DEFAULT 'root',
+      attempt_number INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      error_code TEXT,
+      error_class TEXT,
+      error_message TEXT,
+      retryable BOOLEAN,
+      next_retry_at TIMESTAMPTZ,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS automation_run_node_attempts_run_idx ON automation_run_node_attempts(run_id, node_key, scope_key, attempt_number);
+
+    CREATE TABLE IF NOT EXISTS automation_run_monitors (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      run_id UUID NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+      automation_version_id UUID NOT NULL REFERENCES automation_versions(id) ON DELETE CASCADE,
+      monitor_type TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      monitor_key TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'any',
+      behavior TEXT NOT NULL DEFAULT 'stop',
+      match_subject_type TEXT,
+      match_subject_id TEXT,
+      config JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'active',
+      matched_event_id UUID REFERENCES automation_events(id) ON DELETE SET NULL,
+      matched_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(run_id, monitor_type, monitor_key, event_type)
+    );
+    CREATE INDEX IF NOT EXISTS automation_run_monitors_event_idx ON automation_run_monitors(event_type, status, match_subject_type, match_subject_id);
+    CREATE INDEX IF NOT EXISTS automation_run_monitors_run_idx ON automation_run_monitors(run_id, status);
+
+    CREATE TABLE IF NOT EXISTS automation_dead_letters (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      source_type TEXT NOT NULL,
+      source_id UUID,
+      automation_id UUID,
+      run_id UUID,
+      event_type TEXT,
+      subject_type TEXT,
+      subject_id TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      error_code TEXT,
+      error_message TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      failed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      dismissed_at TIMESTAMPTZ,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+    CREATE INDEX IF NOT EXISTS automation_dead_letters_company_status_idx ON automation_dead_letters(company_id, status, failed_at DESC);
+
+    CREATE TABLE IF NOT EXISTS automation_action_effects (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      run_id UUID NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+      node_id UUID,
+      scope_key TEXT NOT NULL DEFAULT 'root',
+      effect_key TEXT NOT NULL,
+      effect_type TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'started',
+      external_id TEXT,
+      result JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(run_id, node_id, scope_key, effect_key)
+    );
+    CREATE INDEX IF NOT EXISTS automation_action_effects_lookup_idx ON automation_action_effects(run_id, node_id, scope_key, effect_type, status);
 
     CREATE TABLE IF NOT EXISTS automation_logs (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2200,12 +2378,23 @@ async function bootstrapAutomationSchema() {
       status TEXT NOT NULL DEFAULT 'scheduled',
       source TEXT NOT NULL DEFAULT 'automation_scheduler',
       payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TIMESTAMPTZ,
+      error TEXT,
+      locked_at TIMESTAMPTZ,
+      locked_by TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       fired_at TIMESTAMPTZ,
       UNIQUE(company_id, schedule_key)
     );
+    ALTER TABLE automation_scheduled_events ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE automation_scheduled_events ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
+    ALTER TABLE automation_scheduled_events ADD COLUMN IF NOT EXISTS error TEXT;
+    ALTER TABLE automation_scheduled_events ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+    ALTER TABLE automation_scheduled_events ADD COLUMN IF NOT EXISTS locked_by TEXT;
     CREATE INDEX IF NOT EXISTS automation_scheduled_events_due_idx ON automation_scheduled_events(status, scheduled_for);
+    CREATE INDEX IF NOT EXISTS automation_scheduled_events_retry_idx ON automation_scheduled_events(status, next_attempt_at, scheduled_for);
     CREATE INDEX IF NOT EXISTS automation_scheduled_events_subject_idx ON automation_scheduled_events(company_id, subject_type, subject_id, status);
 
     CREATE TABLE IF NOT EXISTS phone_opt_outs (
@@ -2337,9 +2526,14 @@ async function bootstrapAutomationSchema() {
     CREATE INDEX IF NOT EXISTS invoices_due_idx ON invoices(company_id, due_at) WHERE due_at IS NOT NULL;
 
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS automated_customer_messages_enabled BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS automations_enabled BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_emergency_stopped_at TIMESTAMPTZ;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_sms_default_business_hours_policy TEXT NOT NULL DEFAULT 'send_immediately';
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_sms_max_per_contact_hour INTEGER NOT NULL DEFAULT 6;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_sms_max_per_contact_day INTEGER NOT NULL DEFAULT 20;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_max_active_runs INTEGER NOT NULL DEFAULT 100;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_run_starts_per_minute INTEGER NOT NULL DEFAULT 120;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS automation_node_executions_per_minute INTEGER NOT NULL DEFAULT 2000;
   `);
 }
 
@@ -2377,7 +2571,12 @@ function installAutomationRoutes() {
   app.get("/api/automations/settings", authRequired, requireEmployer, async (req, res) => {
     try {
       const { rows } = await ctx.pool.query(
-        `SELECT automated_customer_messages_enabled,
+        `SELECT automations_enabled,
+                automation_emergency_stopped_at,
+                automation_max_active_runs,
+                automation_run_starts_per_minute,
+                automation_node_executions_per_minute,
+                automated_customer_messages_enabled,
                 automation_sms_default_business_hours_policy,
                 automation_sms_max_per_contact_hour,
                 automation_sms_max_per_contact_day
@@ -2394,24 +2593,38 @@ function installAutomationRoutes() {
 
   app.put("/api/automations/settings", authRequired, requireEmployer, async (req, res) => {
     try {
+      const automationsEnabled = req.body?.automations_enabled !== false;
       const enabled = req.body?.automated_customer_messages_enabled !== false;
       const policy = ["send_immediately", "defer_until_business_hours", "skip_if_outside_business_hours"].includes(req.body?.automation_sms_default_business_hours_policy)
         ? req.body.automation_sms_default_business_hours_policy
         : "send_immediately";
       const hourMax = Math.max(0, Math.min(200, Number(req.body?.automation_sms_max_per_contact_hour ?? 6) || 0));
       const dayMax = Math.max(0, Math.min(1000, Number(req.body?.automation_sms_max_per_contact_day ?? 20) || 0));
+      const maxActiveRuns = Math.max(1, Math.min(1000, Number(req.body?.automation_max_active_runs ?? AUTOMATION_SAFETY_DEFAULTS.maxCompanyActiveRuns) || AUTOMATION_SAFETY_DEFAULTS.maxCompanyActiveRuns));
+      const startsPerMinute = Math.max(1, Math.min(5000, Number(req.body?.automation_run_starts_per_minute ?? AUTOMATION_SAFETY_DEFAULTS.runStartsPerMinute) || AUTOMATION_SAFETY_DEFAULTS.runStartsPerMinute));
+      const nodesPerMinute = Math.max(1, Math.min(50000, Number(req.body?.automation_node_executions_per_minute ?? AUTOMATION_SAFETY_DEFAULTS.nodeExecutionsPerMinute) || AUTOMATION_SAFETY_DEFAULTS.nodeExecutionsPerMinute));
       const { rows } = await ctx.pool.query(
         `UPDATE companies
-            SET automated_customer_messages_enabled = $2,
-                automation_sms_default_business_hours_policy = $3,
-                automation_sms_max_per_contact_hour = $4,
-                automation_sms_max_per_contact_day = $5
+            SET automations_enabled = $2,
+                automated_customer_messages_enabled = $3,
+                automation_sms_default_business_hours_policy = $4,
+                automation_sms_max_per_contact_hour = $5,
+                automation_sms_max_per_contact_day = $6,
+                automation_max_active_runs = $7,
+                automation_run_starts_per_minute = $8,
+                automation_node_executions_per_minute = $9,
+                automation_emergency_stopped_at = CASE WHEN $2 THEN NULL ELSE automation_emergency_stopped_at END
           WHERE id = $1
-          RETURNING automated_customer_messages_enabled,
+          RETURNING automations_enabled,
+                    automation_emergency_stopped_at,
+                    automation_max_active_runs,
+                    automation_run_starts_per_minute,
+                    automation_node_executions_per_minute,
+                    automated_customer_messages_enabled,
                     automation_sms_default_business_hours_policy,
                     automation_sms_max_per_contact_hour,
                     automation_sms_max_per_contact_day`,
-        [req.companyId, enabled, policy, hourMax, dayMax]
+        [req.companyId, automationsEnabled, enabled, policy, hourMax, dayMax, maxActiveRuns, startsPerMinute, nodesPerMinute]
       );
       res.json(rows[0] || {});
     } catch (e) {
@@ -2422,6 +2635,7 @@ function installAutomationRoutes() {
 
   app.post("/api/automations/pause-all", authRequired, requireEmployer, async (req, res) => {
     try {
+      await ctx.pool.query(`UPDATE companies SET automations_enabled = false, updated_at = now() WHERE id = $1`, [req.companyId]);
       await ctx.pool.query(`UPDATE automation_definitions SET status = 'paused', updated_at = now() WHERE company_id = $1 AND status = 'published'`, [req.companyId]);
       res.json({ ok: true });
     } catch (e) {
@@ -2432,11 +2646,23 @@ function installAutomationRoutes() {
 
   app.post("/api/automations/resume-all", authRequired, requireEmployer, async (req, res) => {
     try {
+      await ctx.pool.query(`UPDATE companies SET automations_enabled = true, automation_emergency_stopped_at = NULL, updated_at = now() WHERE id = $1`, [req.companyId]);
       await ctx.pool.query(`UPDATE automation_definitions SET status = 'published', pause_until = NULL, updated_at = now() WHERE company_id = $1 AND status = 'paused'`, [req.companyId]);
       res.json({ ok: true });
     } catch (e) {
       console.error("[automations] resume all failed", e?.message || e);
       res.status(500).json({ error: "automation_resume_all_failed" });
+    }
+  });
+
+  app.post("/api/automations/emergency-stop", authRequired, requireEmployer, async (req, res) => {
+    if (req.body?.confirm !== true) return res.status(400).json({ error: "confirmation_required" });
+    try {
+      const result = await emergencyStopCompanyAutomations(req.companyId, req.userId);
+      res.json(result);
+    } catch (e) {
+      console.error("[automations] emergency stop failed", e?.message || e);
+      res.status(500).json({ error: "automation_emergency_stop_failed" });
     }
   });
 
@@ -2502,7 +2728,7 @@ function installAutomationRoutes() {
   });
 
   app.patch("/api/automations/:id", authRequired, requireEmployer, async (req, res) => {
-    const allowed = ["name", "description", "folder_id", "allow_manual_trigger", "max_parallel_runs_per_subject", "reentry_mode", "cooldown_seconds", "metadata"];
+    const allowed = ["name", "description", "folder_id", "allow_manual_trigger", "max_parallel_runs_per_subject", "max_active_runs", "max_active_runs_per_subject", "concurrency_policy", "subject_concurrency_policy", "reentry_mode", "cooldown_seconds", "cooldown_basis", "failure_auto_pause_enabled", "failure_auto_pause_threshold", "failure_auto_pause_window_seconds", "metadata"];
     const sets = [];
     const values = [req.params.id, req.companyId, req.userId];
     for (const key of allowed) {
@@ -2660,18 +2886,84 @@ function installAutomationRoutes() {
 
   app.post("/api/automation-runs/:runId/cancel", authRequired, requireEmployer, async (req, res) => {
     try {
-      const { rows } = await ctx.pool.query(
-        `UPDATE automation_runs SET status = 'canceled', completed_at = now(), updated_at = now()
-          WHERE id = $1 AND company_id = $2 AND status IN ('queued','running','waiting','paused')
-          RETURNING *`,
-        [req.params.runId, req.companyId]
-      );
-      if (!rows.length) return res.status(404).json({ error: "not_found" });
-      await ctx.pool.query(`UPDATE automation_waits SET status = 'canceled', updated_at = now() WHERE run_id = $1 AND status = 'waiting'`, [req.params.runId]);
-      await logRun(rows[0], null, "info", "run.canceled", "Run canceled by employer", { user_id: req.userId });
-      res.json(rows[0]);
+      const result = await cancelAutomationRun(req.params.runId, req.companyId, "run_canceled", "Run canceled by employer", { user_id: req.userId });
+      if (!result.run) return res.status(404).json({ error: "not_found" });
+      res.json(result);
     } catch (e) {
       res.status(500).json({ error: "automation_cancel_failed" });
+    }
+  });
+
+  app.get("/api/automations/health", authRequired, requireEmployer, async (req, res) => {
+    try {
+      res.json(await automationHealth(req.companyId));
+    } catch (e) {
+      res.status(500).json({ error: "automation_health_failed" });
+    }
+  });
+
+  app.get("/api/automations/system-issues", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const { rows } = await ctx.pool.query(
+        `SELECT * FROM automation_dead_letters WHERE company_id = $1 AND status = COALESCE($2, status) ORDER BY failed_at DESC LIMIT 100`,
+        [req.companyId, req.query?.status || "open"]
+      );
+      res.json(rows);
+    } catch (e) {
+      res.status(500).json({ error: "automation_issues_failed" });
+    }
+  });
+
+  app.post("/api/automations/system-issues/:id/dismiss", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const { rows } = await ctx.pool.query(
+        `UPDATE automation_dead_letters SET status = 'dismissed', dismissed_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`,
+        [req.params.id, req.companyId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "not_found" });
+      res.json(rows[0]);
+    } catch (e) {
+      res.status(500).json({ error: "automation_issue_dismiss_failed" });
+    }
+  });
+
+  app.post("/api/automations/system-issues/:id/retry", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const result = await retryDeadLetter(req.params.id, req.companyId, req.userId);
+      if (!result) return res.status(404).json({ error: "not_found" });
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: "automation_issue_retry_failed" });
+    }
+  });
+
+  app.post("/api/automation-runs/:runId/retry", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const result = await retryAutomationRun(req.params.runId, req.companyId, req.userId);
+      if (!result) return res.status(404).json({ error: "not_found" });
+      res.status(202).json(result);
+    } catch (e) {
+      res.status(500).json({ error: "automation_retry_failed" });
+    }
+  });
+
+  app.post("/api/automation-runs/:runId/nodes/:runNodeId/retry", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const result = await retryAutomationRunNode(req.params.runId, req.params.runNodeId, req.companyId, req.userId);
+      if (!result) return res.status(404).json({ error: "not_found" });
+      res.status(202).json(result);
+    } catch (e) {
+      res.status(500).json({ error: "automation_node_retry_failed" });
+    }
+  });
+
+  app.post("/api/automation-runs/:runId/iterations/:iterationId/retry", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const result = await retryAutomationIteration(req.params.runId, req.params.iterationId, req.companyId, req.userId);
+      if (!result) return res.status(404).json({ error: "not_found" });
+      res.status(202).json(result);
+    } catch (e) {
+      res.status(500).json({ error: "automation_iteration_retry_failed" });
     }
   });
 }
@@ -2983,22 +3275,29 @@ async function duplicateAutomation(automationId, companyId, userId) {
   }
 }
 
+function workerId() {
+  return `${process.pid}:${Date.now()}`;
+}
+
 async function processAutomationEvents() {
   if (!ctx?.pool) return;
   const db = await ctx.pool.connect();
   let events = [];
+  const leaseOwner = workerId();
   try {
     await db.query("BEGIN");
     events = (await db.query(
       `SELECT * FROM automation_events
         WHERE processing_status IN ('pending','failed')
           AND processed_at IS NULL
+          AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+          AND (locked_at IS NULL OR locked_at < now() - ($2::int * interval '1 second'))
         ORDER BY occurred_at ASC, created_at ASC
         LIMIT $1
         FOR UPDATE SKIP LOCKED`,
-      [AUTOMATION_LIMITS.eventBatchSize]
+      [AUTOMATION_LIMITS.eventBatchSize, AUTOMATION_SAFETY_DEFAULTS.processorLeaseSeconds]
     )).rows;
-    await db.query(`UPDATE automation_events SET processing_status = 'processing' WHERE id = ANY($1::uuid[])`, [events.map((e) => e.id)]);
+    if (events.length) await db.query(`UPDATE automation_events SET processing_status = 'processing', locked_at = now(), locked_by = $2, attempt_count = attempt_count + 1 WHERE id = ANY($1::uuid[])`, [events.map((e) => e.id), leaseOwner]);
     await db.query("COMMIT");
   } catch (e) {
     await db.query("ROLLBACK").catch(() => {});
@@ -3009,12 +3308,20 @@ async function processAutomationEvents() {
   db.release();
   for (const event of events) {
     try {
+      await applyRunMonitorsForEvent(event);
       await wakeEventWaits(event);
       await startRunsForEvent(event);
-      await ctx.pool.query(`UPDATE automation_events SET processing_status = 'processed', processed_at = now(), error = NULL WHERE id = $1`, [event.id]);
+      await ctx.pool.query(`UPDATE automation_events SET processing_status = 'processed', processed_at = now(), error = NULL, locked_at = NULL, locked_by = NULL WHERE id = $1`, [event.id]);
     } catch (e) {
       console.error("[automations] event processing failed", { id: event.id, eventType: event.event_type, message: e?.message });
-      await ctx.pool.query(`UPDATE automation_events SET processing_status = 'failed', error = $2 WHERE id = $1`, [event.id, (e?.message || "event_failed").slice(0, 1000)]);
+      const attempts = Number(event.attempt_count || 0) + 1;
+      if (attempts >= AUTOMATION_SAFETY_DEFAULTS.eventMaxAttempts) {
+        await ctx.pool.query(`UPDATE automation_events SET processing_status = 'dead_letter', failed_at = now(), error = $2, locked_at = NULL, locked_by = NULL WHERE id = $1`, [event.id, (e?.message || "event_failed").slice(0, 1000)]);
+        await createDeadLetter({ companyId: event.company_id, sourceType: "event", sourceId: event.id, eventType: event.event_type, subjectType: event.subject_type, subjectId: event.subject_id, attempts, errorCode: "event_processing_failed", errorMessage: e?.message || "Event processing failed" });
+      } else {
+        const delay = Math.min(300, 5 * Math.pow(2, attempts - 1));
+        await ctx.pool.query(`UPDATE automation_events SET processing_status = 'failed', error = $2, next_attempt_at = now() + ($3::int * interval '1 second'), locked_at = NULL, locked_by = NULL WHERE id = $1`, [event.id, (e?.message || "event_failed").slice(0, 1000), delay]);
+      }
     }
   }
 }
@@ -3025,7 +3332,10 @@ async function startRunsForEvent(event) {
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
+       JOIN companies c ON c.id = d.company_id
       WHERE d.company_id = $1
+        AND c.automations_enabled = true
+        AND c.automation_emergency_stopped_at IS NULL
         AND d.status = 'published'
         AND (d.pause_until IS NULL OR d.pause_until <= now())
         AND (
@@ -3034,13 +3344,19 @@ async function startRunsForEvent(event) {
         )`,
     [event.company_id, event.event_type]
   );
+  if (!(await companyRunQuotaAllows(event.company_id))) throw new AutomationError("rate_limited", "Company automation start quota reached", { retryable: true });
   for (const automation of rows) {
     const triggers = (await ctx.pool.query(
       `SELECT * FROM automation_nodes WHERE version_id = $1 AND company_id = $2 AND node_type = 'trigger'`,
       [automation.version_id, event.company_id]
     )).rows;
     if (!triggers.some((node) => triggerMatchesEvent(node, event))) continue;
-    if (!(await canStartRun(automation, event))) continue;
+    const startDecision = await canStartRun(automation, event);
+    if (!startDecision.allowed) {
+      if (startDecision.retryable) throw new AutomationError(startDecision.code || "automation_concurrency_full", startDecision.message || "Automation concurrency full", { retryable: true });
+      continue;
+    }
+    const reentryKey = await resolveReentryKey(automation, event);
     const run = await createRun({
       companyId: event.company_id,
       automationId: automation.id,
@@ -3048,9 +3364,11 @@ async function startRunsForEvent(event) {
       triggerEventId: event.id,
       subjectType: event.subject_type,
       subjectId: event.subject_id,
+      reentryKey,
       depth: 0,
       dryRun: false
     });
+    await installRunMonitors(run);
     await logRun(run, null, "info", "trigger.matched", `Trigger matched ${event.event_type}`, { event_id: event.id });
     await runAutomation(run.id);
   }
@@ -3058,25 +3376,150 @@ async function startRunsForEvent(event) {
 
 async function canStartRun(automation, event) {
   const mode = automation.reentry_mode || automation.metadata?.reentry_mode || "after_previous_completion";
-  if (!event.subject_id || mode === "unlimited") return true;
-  const baseParams = [automation.company_id, automation.id, event.subject_type, event.subject_id];
+  const reentryKey = await resolveReentryKey(automation, event);
+  if (!reentryKey || mode === "unlimited") return { allowed: true };
+  const baseParams = [automation.company_id, automation.id, reentryKey];
+  const maxAutomationRuns = Number(automation.max_active_runs || automation.metadata?.max_active_runs || AUTOMATION_SAFETY_DEFAULTS.maxActiveRunsPerAutomation);
+  const activeAutomationRuns = await ctx.pool.query(`SELECT COUNT(*)::int AS count FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND status IN ('queued','running','waiting','paused')`, [automation.company_id, automation.id]);
+  if (maxAutomationRuns > 0 && Number(activeAutomationRuns.rows[0].count) >= maxAutomationRuns) {
+    return { allowed: false, retryable: (automation.concurrency_policy || "queue") === "queue", code: "automation_concurrency_full" };
+  }
+  const maxSubjectRuns = Number(automation.max_active_runs_per_subject || automation.max_parallel_runs_per_subject || automation.metadata?.max_active_runs_per_subject || 0);
+  if (maxSubjectRuns > 0) {
+    const activeSubjectRuns = await ctx.pool.query(`SELECT COUNT(*)::int AS count FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND reentry_key = $3 AND status IN ('queued','running','waiting','paused')`, baseParams);
+    if (Number(activeSubjectRuns.rows[0].count) >= maxSubjectRuns) return { allowed: false, retryable: (automation.subject_concurrency_policy || "queue") === "queue", code: "subject_concurrency_full" };
+  }
   if (mode === "once_ever_per_subject") {
-    const existing = await ctx.pool.query(`SELECT 1 FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND subject_type = $3 AND subject_id = $4 LIMIT 1`, baseParams);
-    return !existing.rowCount;
+    const existing = await ctx.pool.query(`SELECT 1 FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND reentry_key = $3 LIMIT 1`, baseParams);
+    return { allowed: !existing.rowCount };
   }
   if (mode === "once_while_active") {
-    const active = await ctx.pool.query(`SELECT 1 FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND subject_type = $3 AND subject_id = $4 AND status IN ('queued','running','waiting','paused') LIMIT 1`, baseParams);
-    return !active.rowCount;
+    const active = await ctx.pool.query(`SELECT 1 FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND reentry_key = $3 AND status IN ('queued','running','waiting','paused') LIMIT 1`, baseParams);
+    return { allowed: !active.rowCount };
   }
   if (automation.cooldown_seconds) {
+    const basis = automation.cooldown_basis === "started_at" ? "created_at" : "COALESCE(completed_at, updated_at, created_at)";
     const recent = await ctx.pool.query(
-      `SELECT 1 FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND subject_type = $3 AND subject_id = $4 AND created_at > now() - ($5::int * interval '1 second') LIMIT 1`,
+      `SELECT 1 FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND reentry_key = $3 AND ${basis} > now() - ($4::int * interval '1 second') LIMIT 1`,
       [...baseParams, automation.cooldown_seconds]
     );
-    if (recent.rowCount) return false;
+    if (recent.rowCount) return { allowed: false };
   }
-  const active = await ctx.pool.query(`SELECT 1 FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND subject_type = $3 AND subject_id = $4 AND status IN ('queued','running','waiting','paused') LIMIT 1`, baseParams);
-  return !active.rowCount;
+  if (mode === "after_previous_completion") {
+    const active = await ctx.pool.query(`SELECT 1 FROM automation_runs WHERE company_id = $1 AND automation_id = $2 AND reentry_key = $3 AND status IN ('queued','running','waiting','paused') LIMIT 1`, baseParams);
+    return { allowed: !active.rowCount, retryable: true, code: "subject_run_active" };
+  }
+  return { allowed: true };
+}
+
+function normalReentryKey(subjectType, subjectId, fallbackId = null) {
+  return subjectId ? `${subjectType || "generic"}:${subjectId}` : `event:${fallbackId || randomUUID()}`;
+}
+
+async function resolveReentryKey(automation, event) {
+  const template = automation.metadata?.reentry_key_template || automation.metadata?.composite_reentry_key;
+  if (!template) return normalReentryKey(event.subject_type, event.subject_id, event.id);
+  const context = {
+    event: { id: event.id, type: event.event_type, payload: event.payload || {}, subject_type: event.subject_type, subject_id: event.subject_id },
+    subject: { type: event.subject_type, id: event.subject_id }
+  };
+  const resolved = resolveTemplate(template, context).trim();
+  return resolved ? `custom:${resolved}` : normalReentryKey(event.subject_type, event.subject_id, event.id);
+}
+
+async function companyRunQuotaAllows(companyId) {
+  const company = (await ctx.pool.query(`SELECT automation_run_starts_per_minute FROM companies WHERE id = $1`, [companyId])).rows[0] || {};
+  const limit = Number(company.automation_run_starts_per_minute || AUTOMATION_SAFETY_DEFAULTS.runStartsPerMinute);
+  const recent = (await ctx.pool.query(`SELECT COUNT(*)::int AS count FROM automation_runs WHERE company_id = $1 AND created_at > now() - interval '1 minute'`, [companyId])).rows[0]?.count || 0;
+  return Number(recent) < limit;
+}
+
+async function installRunMonitors(run) {
+  const version = (await ctx.pool.query(`SELECT settings FROM automation_versions WHERE id = $1`, [run.automation_version_id])).rows[0];
+  const settings = version?.settings || {};
+  const monitors = [];
+  for (const item of normalizeMonitorSettings(settings.stop_conditions || settings.stopConditions, "stop")) monitors.push(item);
+  for (const item of normalizeMonitorSettings(settings.goals || settings.goal_conditions || settings.goalConditions, "goal")) monitors.push(item);
+  for (const monitor of monitors) {
+    await ctx.pool.query(
+      `INSERT INTO automation_run_monitors(run_id, automation_version_id, monitor_type, event_type, monitor_key, mode, behavior, match_subject_type, match_subject_id, config)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+       ON CONFLICT(run_id, monitor_type, monitor_key, event_type) DO NOTHING`,
+      [run.id, run.automation_version_id, monitor.monitor_type, monitor.event_type, monitor.monitor_key, monitor.mode, monitor.behavior, monitor.match_subject_type || run.subject_type, monitor.match_subject_id || run.subject_id, JSON.stringify(monitor.config || {})]
+    );
+  }
+}
+
+function normalizeMonitorSettings(value, type) {
+  const raw = Array.isArray(value) ? value : [];
+  return raw.flatMap((item, index) => {
+    const preset = monitorPreset(item.preset || item.key || item.event_type || item.eventType);
+    const events = item.event_types || item.eventTypes || (preset ? preset.event_types : [item.event_type || item.eventType].filter(Boolean));
+    return events.map((eventType) => ({
+      monitor_type: type,
+      event_type: eventType,
+      monitor_key: stablePortId(item.monitor_key || item.goal_key || item.key || item.preset || `${type}_${index}`),
+      mode: item.mode || "any",
+      behavior: type === "goal" ? (item.behavior || "record") : "stop",
+      match_subject_type: item.match_subject_type || item.subject_type || null,
+      match_subject_id: item.match_subject_id || item.subject_id || null,
+      config: { ...item, preset: item.preset || preset?.key || null }
+    }));
+  }).filter((m) => m.event_type);
+}
+
+function monitorPreset(key) {
+  const presets = {
+    customer_replies: { key: "customer_replies", event_types: ["sms.reply_received", "sms.received"] },
+    customer_opted_out: { key: "customer_opted_out", event_types: ["sms.opted_out"] },
+    opportunity_won: { key: "opportunity_won", event_types: ["pipeline.won"] },
+    opportunity_lost: { key: "opportunity_lost", event_types: ["pipeline.lost"] },
+    contact_deleted: { key: "contact_deleted", event_types: ["contact.deleted"] },
+    payment_received: { key: "payment_received", event_types: ["payment.succeeded"] },
+    job_completed: { key: "job_completed", event_types: ["job.completed"] },
+    service_plan_canceled: { key: "service_plan_canceled", event_types: ["service_plan.canceled"] }
+  };
+  return presets[String(key || "").replace(/[.-]/g, "_")] || null;
+}
+
+async function applyRunMonitorsForEvent(event) {
+  const { rows } = await ctx.pool.query(
+    `SELECT m.*, r.company_id, r.automation_id, r.status, r.subject_type AS run_subject_type, r.subject_id AS run_subject_id
+       FROM automation_run_monitors m
+       JOIN automation_runs r ON r.id = m.run_id
+      WHERE m.status = 'active'
+        AND m.event_type = $1
+        AND r.company_id = $2
+        AND r.status IN ('queued','running','waiting','paused')`,
+    [event.event_type, event.company_id]
+  );
+  for (const monitor of rows) {
+    if (!monitorEventSubjectMatches(monitor, event)) continue;
+    const claimed = (await ctx.pool.query(
+      `UPDATE automation_run_monitors SET status = 'matched', matched_event_id = $2, matched_at = now(), updated_at = now()
+        WHERE id = $1 AND status = 'active' RETURNING *`,
+      [monitor.id, event.id]
+    )).rows[0];
+    if (!claimed) continue;
+    const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [monitor.run_id])).rows[0];
+    if (!run || ["completed", "failed", "canceled", "stopped"].includes(run.status)) continue;
+    if (monitor.monitor_type === "goal") {
+      await ctx.pool.query(
+        `INSERT INTO automation_run_goals(run_id, node_id, goal_key, metadata, scope_key)
+         VALUES($1,NULL,$2,$3::jsonb,'root') ON CONFLICT DO NOTHING`,
+        [run.id, monitor.monitor_key, JSON.stringify({ event_id: event.id, event_type: event.event_type, monitor: monitor.config || {} })]
+      );
+      if (monitor.behavior !== "stop") continue;
+    }
+    await stopRun(run, "stop_condition", monitor.config?.label || monitor.config?.preset || monitor.monitor_key, monitor.monitor_key);
+    await cancelRunContinuations(run.id);
+  }
+}
+
+function monitorEventSubjectMatches(monitor, event) {
+  const payload = event.payload || {};
+  const targets = [event.subject_id, payload.contact_id, payload.conversation_id, payload.payment_id, payload.quote_id, payload.job_id, payload.service_plan_id, payload.route_id, payload.pin_id].filter(Boolean).map(String);
+  return !monitor.match_subject_id || targets.includes(String(monitor.match_subject_id)) || (String(monitor.run_subject_type || "") === String(event.subject_type || "") && String(monitor.run_subject_id || "") === String(event.subject_id || ""));
 }
 
 async function startManualRun(automationId, companyId, userId, body) {
@@ -3105,18 +3548,20 @@ async function startManualRun(automationId, companyId, userId, body) {
     subjectId: body.subject_id || null,
     manualUserId: userId,
     dryRun: !!body.dry_run,
+    reentryKey: normalReentryKey(body.subject_type || "generic", body.subject_id || eventId, eventId),
     depth: 0
   });
+  await installRunMonitors(run);
   await logRun(run, null, "info", body.dry_run ? "run.dry_start" : "run.manual_start", "Manual run started", { subject_type: body.subject_type, subject_id: body.subject_id });
   setImmediate(() => runAutomation(run.id).catch((e) => console.error("[automations] manual run wake failed", e?.message || e)));
   return run;
 }
 
-async function createRun({ companyId, automationId, versionId, triggerEventId = null, subjectType = null, subjectId = null, manualUserId = null, dryRun = false, parentRunId = null, rootRunId = null, depth = 0 }) {
+async function createRun({ companyId, automationId, versionId, triggerEventId = null, subjectType = null, subjectId = null, manualUserId = null, dryRun = false, parentRunId = null, parentNodeId = null, rootRunId = null, depth = 0, reentryKey = null, recoveredFromRunId = null, recoveredFromRunNodeId = null, recoveryStartNodeId = null, recoveryScopeKey = null }) {
   const { rows } = await ctx.pool.query(
-    `INSERT INTO automation_runs(company_id, automation_id, automation_version_id, trigger_event_id, subject_type, subject_id, status, started_at, manual_started_by_user_id, dry_run, parent_run_id, root_run_id, depth)
-     VALUES($1,$2,$3,$4,$5,$6,'queued',now(),$7,$8,$9,$10,$11) RETURNING *`,
-    [companyId, automationId, versionId, triggerEventId, subjectType, subjectId ? String(subjectId) : null, manualUserId, dryRun, parentRunId, rootRunId, depth]
+    `INSERT INTO automation_runs(company_id, automation_id, automation_version_id, trigger_event_id, subject_type, subject_id, status, started_at, manual_started_by_user_id, dry_run, parent_run_id, parent_node_id, root_run_id, depth, reentry_key, recovered_from_run_id, recovered_from_run_node_id, recovery_start_node_id, recovery_scope_key)
+     VALUES($1,$2,$3,$4,$5,$6,'queued',now(),$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+    [companyId, automationId, versionId, triggerEventId, subjectType, subjectId ? String(subjectId) : null, manualUserId, dryRun, parentRunId, parentNodeId, rootRunId, depth, reentryKey || normalReentryKey(subjectType, subjectId, triggerEventId), recoveredFromRunId, recoveredFromRunNodeId, recoveryStartNodeId, recoveryScopeKey]
   );
   if (!rootRunId) await ctx.pool.query(`UPDATE automation_runs SET root_run_id = id WHERE id = $1`, [rows[0].id]);
   return { ...rows[0], root_run_id: rows[0].root_run_id || rows[0].id };
@@ -3155,11 +3600,12 @@ async function executeFromNode(runId, nodeId, scopeKey = "root", arrival = null)
   if (!node) return;
   if (node.node_type === "note") return;
   if (await shouldStopRun(run)) return stopRun(run, "stop_condition", "Global stop condition matched");
+  await enforceRunBudget(run, node, scopeKey);
   const previous = await ctx.pool.query(
-    `SELECT COUNT(*)::int AS count FROM automation_run_nodes WHERE run_id = $1 AND node_key = $2 AND scope_key = $3 AND status = 'completed'`,
+    `SELECT COUNT(*)::int AS count, COUNT(*) FILTER (WHERE status = 'completed')::int AS completed FROM automation_run_nodes WHERE run_id = $1 AND node_key = $2 AND scope_key = $3`,
     [runId, node.node_key, scopeKey]
   );
-  if (Number(previous.rows[0].count) > 0 && !node.config?.repeatable && !["merge", "foreach"].includes(node.node_type)) {
+  if (Number(previous.rows[0].completed) > 0 && !node.config?.repeatable && !["merge", "foreach"].includes(node.node_type)) {
     await traverse(run, graph, node, "default", scopeKey);
     return;
   }
@@ -3186,14 +3632,28 @@ async function executeFromNode(runId, nodeId, scopeKey = "root", arrival = null)
     }
   } catch (e) {
     const retryCount = Number(node.config?.retry_count || 0);
-    await finishRunNode(runNode.id, "failed", {}, "node_failed", e?.message || "Node failed");
-    await logRun(run, node, "error", "node.failed", `Node ${node.title || node.node_key} failed`, { error: e?.message });
-    if (attempt <= retryCount && isRetrySafe(node)) {
-      const delay = Math.max(1, Number(node.config?.retry_delay_seconds || 10));
-      await createWait(run, node, "duration", { resume_at: new Date(Date.now() + delay * 1000).toISOString(), resume_node_id: node.id, retry: true });
+    const classified = classifyAutomationError(e);
+    await finishRunNode(runNode.id, "failed", {}, classified.code, classified.message, { errorClass: classified.errorClass, retryable: classified.retryable });
+    await logRun(run, node, "error", "node.failed", `Node ${node.title || node.node_key} failed`, { error: classified.message, error_code: classified.code, error_class: classified.errorClass, retryable: classified.retryable, scope_key: scopeKey });
+    const retryPolicy = retryPolicyForNode(node);
+    if (attempt < retryPolicy.maxAttempts && classified.retryable && isRetrySafe(node)) {
+      const delay = retryDelaySeconds(retryPolicy, attempt, run.id, node.id, scopeKey);
+      const retryAt = new Date(Date.now() + delay * 1000).toISOString();
+      await finishRunNode(runNode.id, "waiting_retry", {}, classified.code, classified.message, { errorClass: classified.errorClass, retryable: true, nextRetryAt: retryAt, metadata: { delay_seconds: delay } });
+      await createWait(run, node, "duration", { resume_at: retryAt, resume_port: "default", scope_key: scopeKey, retry: true });
       return;
     }
-    if (node.config?.continue_on_error) {
+    const onError = node.config?.on_error || (node.config?.continue_on_error ? "continue" : "stop");
+    if (onError === "error_path") {
+      await ctx.pool.query(
+        `INSERT INTO automation_variables(run_id, name, value) VALUES($1,$2,$3::jsonb)
+         ON CONFLICT(run_id, name) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [run.id, "error", JSON.stringify({ code: classified.code, message: classified.message, retryable: classified.retryable, node_id: node.id, attempt, details_safe: redact(classified.details || {}) })]
+      );
+      await traverse(run, graph, node, "error", scopeKey);
+      return;
+    }
+    if (onError === "continue" || node.config?.continue_on_error) {
       await traverse(run, graph, node, "error", scopeKey);
       return;
     }
@@ -3359,20 +3819,28 @@ function changedFields(payload) {
 async function beginRunNode(run, node, attempt, scopeKey = "root") {
   const context = await buildRunContext(run, { slim: true, scopeKey });
   const { rows } = await ctx.pool.query(
-    `INSERT INTO automation_run_nodes(run_id, node_id, node_key, status, scope_key, attempt_number, input_snapshot, started_at)
-     VALUES($1,$2,$3,'running',$4,$5,$6::jsonb,now()) RETURNING *`,
-    [run.id, node.id, node.node_key, scopeKey, attempt, JSON.stringify(safeSnapshot(context))]
+    `INSERT INTO automation_run_nodes(run_id, node_id, node_key, status, scope_key, attempt_number, input_snapshot, started_at, locked_at, locked_by)
+     VALUES($1,$2,$3,'running',$4,$5,$6::jsonb,now(),now(),$7) RETURNING *`,
+    [run.id, node.id, node.node_key, scopeKey, attempt, JSON.stringify(safeSnapshot(context)), workerId()]
   );
   await logRun(run, node, "info", "node.started", `Started ${node.title || node.node_key}`, { scope_key: scopeKey });
   return rows[0];
 }
 
-async function finishRunNode(id, status, output, errorCode = null, errorMessage = null) {
+async function finishRunNode(id, status, output, errorCode = null, errorMessage = null, extra = {}) {
   await ctx.pool.query(
-    `UPDATE automation_run_nodes SET status = $2, output_snapshot = $3::jsonb, error_code = $4, error_message = $5, completed_at = now(), updated_at = now()
+    `UPDATE automation_run_nodes SET status = $2, output_snapshot = $3::jsonb, error_code = $4, error_message = $5, error_class = $6, retryable = $7, next_retry_at = $8::timestamptz, locked_at = NULL, locked_by = NULL, completed_at = CASE WHEN $2 IN ('completed','failed','skipped','canceled') THEN now() ELSE completed_at END, updated_at = now()
       WHERE id = $1`,
-    [id, status, JSON.stringify(safeJson(output || {})), errorCode, errorMessage]
+    [id, status, JSON.stringify(safeJson(output || {})), errorCode, errorMessage, extra.errorClass || null, extra.retryable ?? null, extra.nextRetryAt || null]
   );
+  const row = (await ctx.pool.query(`SELECT * FROM automation_run_nodes WHERE id = $1`, [id])).rows[0];
+  if (row) {
+    await ctx.pool.query(
+      `INSERT INTO automation_run_node_attempts(run_id, run_node_id, node_id, node_key, scope_key, attempt_number, status, started_at, completed_at, error_code, error_class, error_message, retryable, next_retry_at, metadata)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)`,
+      [row.run_id, row.id, row.node_id, row.node_key, row.scope_key || "root", row.attempt_number, status, row.started_at, row.completed_at || new Date(), errorCode, extra.errorClass || null, errorMessage, extra.retryable ?? null, extra.nextRetryAt || null, JSON.stringify(redact(extra.metadata || {}))]
+    );
+  }
 }
 
 async function executeNode(run, node, runNode, scopeKey = "root", arrival = null) {
@@ -3474,6 +3942,13 @@ async function executeForeachNode(run, node, scopeKey) {
   const maxItems = Math.min(Math.max(0, Number(node.config?.max_items || AUTOMATION_LIMITS.foreachDefaultMaxItems)), AUTOMATION_LIMITS.foreachHardMaxItems);
   const items = resolveCollection(node.config?.collection, context, { maxItems });
   if (items.length > maxItems) throw new Error("foreach_item_limit_exceeded");
+  const budgeted = await ctx.pool.query(
+    `UPDATE automation_runs SET total_iteration_count = total_iteration_count + $2, updated_at = now()
+      WHERE id = $1 AND total_iteration_count + $2 <= $3
+      RETURNING total_iteration_count`,
+    [run.id, items.length, AUTOMATION_SAFETY_DEFAULTS.maxTotalIterationsPerRun]
+  );
+  if (!budgeted.rowCount) throw new AutomationError("budget_exceeded", "Nested foreach iteration budget exceeded", { retryable: false });
   const mode = node.config?.execution_mode || "sequential";
   const failurePolicy = node.config?.failure_policy || "stop_all";
   const iterationRows = [];
@@ -3696,15 +4171,50 @@ async function failRun(run, code, message) {
     [run.id, code, message]
   );
   await logRun(run, null, "error", "run.failed", message, { code });
+  await maybeAutoPauseAutomation(run, code, message);
 }
 
-async function stopRun(run, code, message) {
+async function stopRun(run, code, message, stopConditionKey = null) {
   await ctx.pool.query(
-    `UPDATE automation_runs SET status = 'stopped', completed_at = COALESCE(completed_at, now()), error_code = $2, error_message = $3, updated_at = now()
+    `UPDATE automation_runs SET status = 'stopped', completed_at = COALESCE(completed_at, now()), error_code = $2, error_message = $3, stop_reason = $3, stop_condition_key = $4, updated_at = now()
       WHERE id = $1`,
-    [run.id, code, message]
+    [run.id, code, message, stopConditionKey]
   );
-  await logRun(run, null, "info", "run.stopped", message, { code });
+  await cancelRunContinuations(run.id);
+  await logRun(run, null, "info", "run.stopped", message, { code, stop_condition_key: stopConditionKey });
+}
+
+async function cancelAutomationRun(runId, companyId, code = "run_canceled", message = "Run canceled", metadata = {}) {
+  const { rows } = await ctx.pool.query(
+    `UPDATE automation_runs SET status = 'canceled', completed_at = now(), error_code = $3, error_message = $4, updated_at = now()
+      WHERE id = $1 AND company_id = $2 AND status IN ('queued','running','waiting','paused')
+      RETURNING *`,
+    [runId, companyId, code, message]
+  );
+  if (!rows.length) return { run: null };
+  const counts = await cancelRunContinuations(runId);
+  await logRun(rows[0], null, "info", "run.canceled", message, metadata);
+  return { run: rows[0], ...counts };
+}
+
+async function cancelRunContinuations(runId) {
+  const waits = await ctx.pool.query(`UPDATE automation_waits SET status = 'canceled', updated_at = now() WHERE run_id = $1 AND status = 'waiting' RETURNING id`, [runId]);
+  const iterations = await ctx.pool.query(`UPDATE automation_run_iterations SET status = 'canceled', updated_at = now() WHERE run_id = $1 AND status IN ('queued','running','waiting') RETURNING id`, [runId]);
+  const nodes = await ctx.pool.query(`UPDATE automation_run_nodes SET status = 'canceled', updated_at = now() WHERE run_id = $1 AND status IN ('queued','running','waiting_retry','waiting') RETURNING id`, [runId]);
+  await ctx.pool.query(`UPDATE automation_run_monitors SET status = 'canceled', updated_at = now() WHERE run_id = $1 AND status = 'active'`, [runId]);
+  return { canceled_waits: waits.rowCount, canceled_iterations: iterations.rowCount, canceled_nodes: nodes.rowCount };
+}
+
+async function emergencyStopCompanyAutomations(companyId, userId) {
+  await ctx.pool.query(`UPDATE companies SET automations_enabled = false, automation_emergency_stopped_at = now(), updated_at = now() WHERE id = $1`, [companyId]);
+  const active = (await ctx.pool.query(`SELECT id FROM automation_runs WHERE company_id = $1 AND status IN ('queued','running','waiting','paused')`, [companyId])).rows;
+  let canceled = 0;
+  for (const row of active) {
+    const result = await cancelAutomationRun(row.id, companyId, "emergency_stop", "Company emergency automation stop", { user_id: userId });
+    if (result.run) canceled += 1;
+  }
+  await ctx.pool.query(`UPDATE automation_definitions SET status = 'paused', updated_at = now() WHERE company_id = $1 AND status = 'published'`, [companyId]);
+  return { ok: true, canceled_runs: canceled };
 }
 
 async function shouldStopRun(run) {
@@ -3774,10 +4284,11 @@ async function createWaitForNode(run, node, scopeKey = "root") {
 }
 
 async function createWait(run, node, waitType, values) {
+  const eventFilter = values.retry ? { ...(values.event_filter || {}), retry: true } : values.event_filter;
   const { rows } = await ctx.pool.query(
     `INSERT INTO automation_waits(run_id, node_id, wait_type, resume_at, event_type, event_filter, timeout_at, status, scope_key, resume_port)
      VALUES($1,$2,$3,$4::timestamptz,$5,$6::jsonb,$7::timestamptz,'waiting',$8,$9) RETURNING *`,
-    [run.id, node.id, waitType, values.resume_at || null, values.event_type || null, values.event_filter ? JSON.stringify(values.event_filter) : null, values.timeout_at || null, values.scope_key || "root", values.resume_port || null]
+    [run.id, node.id, waitType, values.resume_at || null, values.event_type || null, eventFilter ? JSON.stringify(eventFilter) : null, values.timeout_at || null, values.scope_key || "root", values.resume_port || null]
   );
   return rows[0];
 }
@@ -3882,7 +4393,11 @@ async function resumeWait(wait, port) {
   await ctx.pool.query(`UPDATE automation_waits SET status = CASE WHEN $2 = 'timeout' THEN 'timed_out' ELSE 'completed' END, updated_at = now() WHERE id = $1`, [wait.id, resumePort]);
   const node = (await ctx.pool.query(`SELECT * FROM automation_nodes WHERE id = $1`, [wait.node_id])).rows[0];
   if (node) await logRun(run, node, "info", "wait.resumed", `Wait resumed through ${resumePort}`, { wait_id: wait.id, scope_key: wait.scope_key || "root" });
-  await runAutomation(run.id, wait.node_id, resumePort, wait.scope_key || "root");
+  if (wait.event_filter?.retry === true) {
+    await executeFromNode(run.id, wait.node_id, wait.scope_key || "root");
+  } else {
+    await runAutomation(run.id, wait.node_id, resumePort, wait.scope_key || "root");
+  }
 }
 
 function startAutomationProcessors() {
@@ -3899,15 +4414,19 @@ async function processScheduledAutomationEvents() {
     await db.query("BEGIN");
     rows = (await db.query(
       `UPDATE automation_scheduled_events
-          SET status = 'firing', updated_at = now()
+          SET status = 'firing', locked_at = now(), locked_by = $1, attempt_count = attempt_count + 1, updated_at = now()
         WHERE id IN (
           SELECT id FROM automation_scheduled_events
-           WHERE status = 'scheduled' AND scheduled_for <= now()
+           WHERE status IN ('scheduled','failed')
+             AND scheduled_for <= now()
+             AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+             AND (locked_at IS NULL OR locked_at < now() - interval '120 seconds')
            ORDER BY scheduled_for ASC
            LIMIT 50
            FOR UPDATE SKIP LOCKED
         )
-        RETURNING *`
+        RETURNING *`,
+      [workerId()]
     )).rows;
     await db.query("COMMIT");
   } catch (e) {
@@ -3917,22 +4436,33 @@ async function processScheduledAutomationEvents() {
     db.release();
   }
   for (const row of rows) {
-    if (!(await shouldFireScheduledAutomationEvent(row))) {
-      await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'canceled', updated_at = now() WHERE id = $1`, [row.id]);
-      continue;
+    try {
+      if (!(await shouldFireScheduledAutomationEvent(row))) {
+        await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'canceled', locked_at = NULL, locked_by = NULL, updated_at = now() WHERE id = $1`, [row.id]);
+        continue;
+      }
+      const eventId = await emitAutomationEvent({
+        companyId: row.company_id,
+        eventType: row.event_type,
+        subjectType: row.subject_type,
+        subjectId: row.subject_id,
+        source: row.source,
+        dedupeKey: row.schedule_key,
+        payload: row.payload || {},
+        occurredAt: row.scheduled_for
+      });
+      await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'fired', fired_at = now(), locked_at = NULL, locked_by = NULL, updated_at = now() WHERE id = $1`, [row.id]);
+      if (!eventId) console.warn("[automations] scheduled event emitted no id", { scheduleKey: row.schedule_key });
+    } catch (e) {
+      const attempts = Number(row.attempt_count || 0);
+      if (attempts >= AUTOMATION_SAFETY_DEFAULTS.eventMaxAttempts) {
+        await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'dead_letter', error = $2, locked_at = NULL, locked_by = NULL, updated_at = now() WHERE id = $1`, [row.id, (e?.message || "scheduled_event_failed").slice(0, 1000)]);
+        await createDeadLetter({ companyId: row.company_id, sourceType: "scheduled_event", sourceId: row.id, eventType: row.event_type, subjectType: row.subject_type, subjectId: row.subject_id, attempts, errorCode: "scheduled_event_failed", errorMessage: e?.message || "Scheduled event failed" });
+      } else {
+        const delay = Math.min(300, 5 * Math.pow(2, attempts - 1));
+        await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'failed', error = $2, next_attempt_at = now() + ($3::int * interval '1 second'), locked_at = NULL, locked_by = NULL, updated_at = now() WHERE id = $1`, [row.id, (e?.message || "scheduled_event_failed").slice(0, 1000), delay]);
+      }
     }
-    const eventId = await emitAutomationEvent({
-      companyId: row.company_id,
-      eventType: row.event_type,
-      subjectType: row.subject_type,
-      subjectId: row.subject_id,
-      source: row.source,
-      dedupeKey: row.schedule_key,
-      payload: row.payload || {},
-      occurredAt: row.scheduled_for
-    });
-    await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'fired', fired_at = now(), updated_at = now() WHERE id = $1`, [row.id]);
-    if (!eventId) console.warn("[automations] scheduled event emitted no id", { scheduleKey: row.schedule_key });
   }
 }
 
@@ -7645,25 +8175,35 @@ function addCalendarDuration(date, amount, unit) {
   return next;
 }
 
-async function executeWebhookSend(run, node, config) {
-  const context = await buildRunContext(run);
+async function executeWebhookSend(run, node, config, scopeKey = "root") {
+  const existing = await getConfirmedActionEffect(run.id, node.id, scopeKey, "webhook.send");
+  if (existing) return { ...(existing.result || {}), idempotent_replay: true };
+  const context = await buildRunContext(run, { scopeKey });
   const method = (config.method || "POST").toString().toUpperCase();
   if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(method)) throw new Error("unsupported_method");
   const url = new URL(resolveTemplate(config.url || "", context));
   await assertSafeWebhookUrl(url);
   const headers = Object.fromEntries(Object.entries(resolveConfig(config.headers || {}, context)).filter(([k]) => !/authorization|cookie|token|secret/i.test(k)));
+  const idempotencyKey = config.disable_idempotency_key === true ? null : `wolfcrm-auto-${run.id}-${node.id}-${stablePortId(scopeKey)}`;
+  await recordActionEffect(run.id, node.id, scopeKey, "webhook.send", "started", { url: url.origin + url.pathname, method });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.min(15000, Math.max(1000, Number(config.timeout_ms || 8000))));
   try {
     const response = await fetch(url, {
       method,
-      headers: { "content-type": "application/json", ...headers },
+      headers: { "content-type": "application/json", ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}), ...headers },
       body: ["GET", "DELETE"].includes(method) ? undefined : JSON.stringify(resolveConfig(config.body || {}, context)),
       signal: controller.signal
     });
     const text = (await response.text()).slice(0, 4096);
     if (!response.ok && !config.continue_on_http_error) throw new Error(`webhook_http_${response.status}`);
-    return { status: response.status, body: text, headers: safeResponseHeaders(response.headers) };
+    const output = { status: response.status, body: text, headers: safeResponseHeaders(response.headers), idempotency_key: idempotencyKey };
+    await recordActionEffect(run.id, node.id, scopeKey, "webhook.send", "confirmed", output, String(response.status));
+    return output;
+  } catch (e) {
+    if (e?.name === "AbortError") await recordActionEffect(run.id, node.id, scopeKey, "webhook.send", "outcome_unknown", { reason: "timeout" });
+    else await recordActionEffect(run.id, node.id, scopeKey, "webhook.send", "failed", { error: e?.message });
+    throw e;
   } finally {
     clearTimeout(timer);
   }
@@ -7709,6 +8249,7 @@ async function executeAutomationStart(run, node, config) {
     subjectType: run.subject_type,
     subjectId: run.subject_id,
     parentRunId: run.id,
+    parentNodeId: node.id,
     rootRunId: run.root_run_id || run.id,
     depth: run.depth + 1,
     dryRun: run.dry_run
@@ -7725,7 +8266,90 @@ async function validateSubject(companyId, type, id) {
 }
 
 function isRetrySafe(node) {
-  return ["notification.send_push", "sms.send", "webhook.send"].includes(node.config?.action_key);
+  return SIDE_EFFECT_FREE_ACTIONS.has(node.config?.action_key) || ["notification.send_push", "webhook.send", "sms.send", "sms.send_mms", "payment.create_request", "payment.create_payment_link"].includes(node.config?.action_key);
+}
+
+function classifyErrorCode(code) {
+  const value = String(code || "unknown_error");
+  if (/missing|not_found|required|invalid|confirmation/.test(value)) return "validation_error";
+  if (/permission|scope/.test(value)) return "permission_denied";
+  if (/opted_out|dnc/.test(value)) return "recipient_opted_out";
+  if (/stripe_not_connected/.test(value)) return "stripe_not_connected";
+  if (/rate|quota|budget|limit/.test(value)) return "rate_limited";
+  if (/timeout/.test(value)) return "external_timeout";
+  if (/5\d\d|unavailable|econnreset|network/.test(value)) return "external_5xx";
+  if (/4\d\d|twilio_non_retryable|compliance/.test(value)) return "external_4xx";
+  if (/constraint|duplicate/.test(value)) return "database_constraint";
+  if (/cancel/.test(value)) return "run_canceled";
+  if (/loop|depth/.test(value)) return "loop_protection";
+  return "unknown_error";
+}
+
+function isRetryableErrorCode(code) {
+  const value = String(code || "");
+  return /timeout|5\d\d|unavailable|econnreset|network|database_transient|rate_limited|concurrency_full|quota/.test(value);
+}
+
+function classifyAutomationError(error) {
+  if (error instanceof AutomationError) {
+    return { code: error.code, message: error.message, errorClass: error.errorClass, retryable: error.retryable, details: error.details || {} };
+  }
+  const message = error?.message || "Node failed";
+  const code = (message.split(":")[0] || "unknown_error").replace(/[^a-z0-9_]/gi, "_").toLowerCase();
+  const errorClass = classifyErrorCode(code || message);
+  return { code: code || "unknown_error", message, errorClass, retryable: isRetryableErrorCode(code || message), details: {} };
+}
+
+function retryPolicyForNode(node) {
+  const config = node.config || {};
+  const maxAttempts = Math.min(AUTOMATION_LIMITS.maxNodeAttempts, Math.max(1, Number(config.retry_max_attempts || config.retry_count || (config.retry_policy === "default" ? 3 : 1)) || 1));
+  return {
+    maxAttempts,
+    initialDelay: Math.max(1, Number(config.retry_initial_delay_seconds || config.retry_delay_seconds || 10) || 10),
+    multiplier: Math.max(1, Number(config.retry_backoff_multiplier || 2) || 2),
+    maxDelay: Math.min(AUTOMATION_SAFETY_DEFAULTS.maxRetryDelaySeconds, Math.max(1, Number(config.retry_max_delay_seconds || 300) || 300)),
+    jitter: config.retry_jitter !== false
+  };
+}
+
+function retryDelaySeconds(policy, attempt, runId, nodeId, scopeKey) {
+  const base = Math.min(policy.maxDelay, Math.round(policy.initialDelay * Math.pow(policy.multiplier, Math.max(0, attempt - 1))));
+  if (!policy.jitter) return base;
+  const jitter = Math.round(base * 0.2 * hashNumber(`${runId}:${nodeId}:${scopeKey}:${attempt}:retry`));
+  return Math.min(policy.maxDelay, base + jitter);
+}
+
+async function enforceRunBudget(run, node, scopeKey) {
+  const company = (await ctx.pool.query(`SELECT automation_node_executions_per_minute FROM companies WHERE id = $1`, [run.company_id])).rows[0] || {};
+  const version = (await ctx.pool.query(`SELECT settings FROM automation_versions WHERE id = $1`, [run.automation_version_id])).rows[0]?.settings || {};
+  const maxNodes = Math.min(AUTOMATION_LIMITS.maxNodesPerRun, Number(version.max_node_executions || version.maxNodes || AUTOMATION_LIMITS.maxNodesPerRun));
+  if (Number(run.current_node_count || 0) >= maxNodes) throw new AutomationError("budget_exceeded", "Run node execution budget exceeded", { retryable: false });
+  const recentNodes = (await ctx.pool.query(`SELECT COUNT(*)::int AS count FROM automation_run_nodes rn JOIN automation_runs r ON r.id = rn.run_id WHERE r.company_id = $1 AND rn.created_at > now() - interval '1 minute'`, [run.company_id])).rows[0]?.count || 0;
+  if (Number(recentNodes) >= Number(company.automation_node_executions_per_minute || AUTOMATION_SAFETY_DEFAULTS.nodeExecutionsPerMinute)) throw new AutomationError("rate_limited", "Company node execution quota reached", { retryable: true });
+  if (node.node_type === "action") await enforceActionBudget(run, node, scopeKey, version);
+}
+
+async function enforceActionBudget(run, node, scopeKey, versionSettings = {}) {
+  const key = node.config?.action_key || "";
+  const counters = {
+    customer: ["sms.send", "sms.send_mms", "payment.send_payment_sms", "service_plan.send_scheduling_sms", "call.send_followup_sms", "voicemail.send_followup_sms"],
+    internal: ["internal.send_message", "internal.send_dm", "internal.send_group_message", "internal.send_channel_message", "employee.send_internal_message", "employee.send_push", "notification.send_push"],
+    webhook: ["webhook.send"],
+    child: ["automation.start"]
+  };
+  const field = counters.customer.includes(key) ? "customer_message_count" : counters.internal.includes(key) ? "internal_message_count" : counters.webhook.includes(key) ? "webhook_action_count" : counters.child.includes(key) ? "child_run_count" : null;
+  if (!field) return;
+  const limit = field === "customer_message_count" ? Number(versionSettings.max_customer_messages_per_run || AUTOMATION_SAFETY_DEFAULTS.maxCustomerMessagesPerRun)
+    : field === "internal_message_count" ? Number(versionSettings.max_internal_messages_per_run || AUTOMATION_SAFETY_DEFAULTS.maxInternalMessagesPerRun)
+    : field === "webhook_action_count" ? Number(versionSettings.max_webhook_actions_per_run || AUTOMATION_SAFETY_DEFAULTS.maxWebhookActionsPerRun)
+    : Number(versionSettings.max_child_runs_per_run || AUTOMATION_SAFETY_DEFAULTS.maxChildRunsPerRun);
+  const result = await ctx.pool.query(
+    `UPDATE automation_runs SET ${field} = ${field} + 1, updated_at = now()
+      WHERE id = $1 AND ${field} < $2
+      RETURNING ${field}`,
+    [run.id, limit]
+  );
+  if (!result.rowCount) throw new AutomationError("budget_exceeded", `Run ${field.replace(/_/g, " ")} budget exceeded`, { retryable: false, details: { action_key: key, scope_key: scopeKey } });
 }
 
 async function logRun(run, node, level, event, message, metadata = {}) {
@@ -7738,6 +8362,185 @@ async function logRun(run, node, level, event, message, metadata = {}) {
   } catch (e) {
     console.error("[automations] log failed", e?.message || e);
   }
+}
+
+async function createDeadLetter({ companyId, sourceType, sourceId = null, automationId = null, runId = null, eventType = null, subjectType = null, subjectId = null, attempts = 0, errorCode = null, errorMessage = null, metadata = {} }) {
+  await ctx.pool.query(
+    `INSERT INTO automation_dead_letters(company_id, source_type, source_id, automation_id, run_id, event_type, subject_type, subject_id, attempts, error_code, error_message, metadata)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)`,
+    [companyId, sourceType, sourceId, automationId, runId, eventType, subjectType, subjectId ? String(subjectId) : null, attempts, errorCode, (errorMessage || "").slice(0, 1000), JSON.stringify(redact(metadata))]
+  );
+}
+
+async function getConfirmedActionEffect(runId, nodeId, scopeKey, effectType) {
+  return (await ctx.pool.query(
+    `SELECT * FROM automation_action_effects WHERE run_id = $1 AND node_id = $2 AND scope_key = $3 AND effect_type = $4 AND status = 'confirmed' LIMIT 1`,
+    [runId, nodeId, scopeKey, effectType]
+  )).rows[0] || null;
+}
+
+async function recordActionEffect(runId, nodeId, scopeKey, effectType, status, result = {}, externalId = null) {
+  const effectKey = `${effectType}:${runId}:${nodeId}:${scopeKey}`;
+  await ctx.pool.query(
+    `INSERT INTO automation_action_effects(run_id, node_id, scope_key, effect_key, effect_type, status, external_id, result)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+     ON CONFLICT(run_id, node_id, scope_key, effect_key)
+     DO UPDATE SET status = EXCLUDED.status, external_id = COALESCE(EXCLUDED.external_id, automation_action_effects.external_id), result = EXCLUDED.result, updated_at = now()`,
+    [runId, nodeId, scopeKey, effectKey, effectType, status, externalId, JSON.stringify(redact(result || {}))]
+  );
+}
+
+async function retryDeadLetter(id, companyId, userId) {
+  const issue = (await ctx.pool.query(`SELECT * FROM automation_dead_letters WHERE id = $1 AND company_id = $2 AND status = 'open' FOR UPDATE`, [id, companyId])).rows[0];
+  if (!issue) return null;
+  if (issue.source_type === "event" && issue.source_id) {
+    await ctx.pool.query(`UPDATE automation_events SET processing_status = 'pending', next_attempt_at = now(), locked_at = NULL, locked_by = NULL, error = NULL WHERE id = $1 AND company_id = $2`, [issue.source_id, companyId]);
+  }
+  if (issue.source_type === "scheduled_event" && issue.source_id) {
+    await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'scheduled', next_attempt_at = now(), error = NULL, updated_at = now() WHERE id = $1 AND company_id = $2`, [issue.source_id, companyId]);
+  }
+  await ctx.pool.query(`UPDATE automation_dead_letters SET status = 'retried', dismissed_at = now(), metadata = metadata || $3::jsonb WHERE id = $1 AND company_id = $2`, [id, companyId, JSON.stringify({ retried_by_user_id: userId, retried_at: new Date().toISOString() })]);
+  return { ok: true, source_type: issue.source_type, source_id: issue.source_id };
+}
+
+async function automationHealth(companyId) {
+  const scalar = async (sql, params = [companyId]) => Number((await ctx.pool.query(sql, params)).rows[0]?.count || 0);
+  const settings = (await ctx.pool.query(
+    `SELECT automations_enabled, automation_emergency_stopped_at, automated_customer_messages_enabled FROM companies WHERE id = $1`,
+    [companyId]
+  )).rows[0] || {};
+  return {
+    settings,
+    active_automations: await scalar(`SELECT COUNT(*)::int AS count FROM automation_definitions WHERE company_id = $1 AND status = 'published'`),
+    paused_automations: await scalar(`SELECT COUNT(*)::int AS count FROM automation_definitions WHERE company_id = $1 AND status = 'paused'`),
+    runs_today: await scalar(`SELECT COUNT(*)::int AS count FROM automation_runs WHERE company_id = $1 AND created_at >= CURRENT_DATE`),
+    failed_runs_today: await scalar(`SELECT COUNT(*)::int AS count FROM automation_runs WHERE company_id = $1 AND status = 'failed' AND created_at >= CURRENT_DATE`),
+    waiting_runs: await scalar(`SELECT COUNT(*)::int AS count FROM automation_runs WHERE company_id = $1 AND status = 'waiting'`),
+    queued_events: await scalar(`SELECT COUNT(*)::int AS count FROM automation_events WHERE company_id = $1 AND processing_status IN ('pending','failed')`),
+    dead_letter_events: await scalar(`SELECT COUNT(*)::int AS count FROM automation_dead_letters WHERE company_id = $1 AND status = 'open'`),
+    oldest_queued_event_at: (await ctx.pool.query(`SELECT MIN(created_at) AS at FROM automation_events WHERE company_id = $1 AND processing_status IN ('pending','failed')`, [companyId])).rows[0]?.at || null
+  };
+}
+
+async function retryAutomationRun(runId, companyId, userId) {
+  const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1 AND company_id = $2 AND status IN ('failed','stopped','canceled')`, [runId, companyId])).rows[0];
+  if (!run) return null;
+  const recovery = await createRun({
+    companyId,
+    automationId: run.automation_id,
+    versionId: run.automation_version_id,
+    triggerEventId: run.trigger_event_id,
+    subjectType: run.subject_type,
+    subjectId: run.subject_id,
+    manualUserId: userId,
+    dryRun: !!run.dry_run,
+    rootRunId: run.root_run_id || run.id,
+    reentryKey: `${run.reentry_key || normalReentryKey(run.subject_type, run.subject_id, run.trigger_event_id)}:recovery:${randomUUID()}`,
+    recoveredFromRunId: run.id
+  });
+  await cloneRecoveryState(run.id, recovery.id, "root");
+  await installRunMonitors(recovery);
+  setImmediate(() => runAutomation(recovery.id).catch((e) => console.error("[automations] recovery run failed", e?.message || e)));
+  await logRun(recovery, null, "info", "run.recovery_started", "Recovery run started from beginning", { recovered_from_run_id: run.id });
+  return recovery;
+}
+
+async function retryAutomationRunNode(runId, runNodeId, companyId, userId) {
+  const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1 AND company_id = $2 AND status IN ('failed','stopped')`, [runId, companyId])).rows[0];
+  const failedNode = (await ctx.pool.query(`SELECT * FROM automation_run_nodes WHERE id = $1 AND run_id = $2 AND status = 'failed'`, [runNodeId, runId])).rows[0];
+  if (!run || !failedNode?.node_id) return null;
+  const recovery = await createRun({
+    companyId,
+    automationId: run.automation_id,
+    versionId: run.automation_version_id,
+    triggerEventId: run.trigger_event_id,
+    subjectType: run.subject_type,
+    subjectId: run.subject_id,
+    manualUserId: userId,
+    dryRun: !!run.dry_run,
+    rootRunId: run.root_run_id || run.id,
+    reentryKey: `${run.reentry_key || normalReentryKey(run.subject_type, run.subject_id, run.trigger_event_id)}:node_recovery:${failedNode.id}`,
+    recoveredFromRunId: run.id,
+    recoveredFromRunNodeId: failedNode.id,
+    recoveryStartNodeId: failedNode.node_id,
+    recoveryScopeKey: failedNode.scope_key || "root"
+  });
+  await cloneRecoveryState(run.id, recovery.id, failedNode.scope_key || "root");
+  await installRunMonitors(recovery);
+  setImmediate(() => executeFromNode(recovery.id, failedNode.node_id, failedNode.scope_key || "root").catch((e) => console.error("[automations] recovery node failed", e?.message || e)));
+  await logRun(recovery, null, "info", "run.node_recovery_started", "Recovery run started from failed node", { recovered_from_run_id: run.id, recovered_from_run_node_id: failedNode.id });
+  return recovery;
+}
+
+async function retryAutomationIteration(runId, iterationId, companyId, userId) {
+  const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1 AND company_id = $2`, [runId, companyId])).rows[0];
+  const iteration = (await ctx.pool.query(`SELECT * FROM automation_run_iterations WHERE id = $1 AND run_id = $2 AND status = 'failed'`, [iterationId, runId])).rows[0];
+  if (!run || !iteration) return null;
+  const node = (await ctx.pool.query(`SELECT * FROM automation_nodes WHERE id = $1`, [iteration.foreach_node_id])).rows[0];
+  if (!node) return null;
+  const recovery = await createRun({
+    companyId,
+    automationId: run.automation_id,
+    versionId: run.automation_version_id,
+    triggerEventId: run.trigger_event_id,
+    subjectType: run.subject_type,
+    subjectId: run.subject_id,
+    manualUserId: userId,
+    dryRun: !!run.dry_run,
+    rootRunId: run.root_run_id || run.id,
+    reentryKey: `${run.reentry_key || normalReentryKey(run.subject_type, run.subject_id, run.trigger_event_id)}:iteration_recovery:${iteration.id}`,
+    recoveredFromRunId: run.id,
+    recoveryStartNodeId: node.id,
+    recoveryScopeKey: iteration.scope_key
+  });
+  const cloned = (await ctx.pool.query(
+    `INSERT INTO automation_run_iterations(run_id, foreach_node_id, foreach_node_key, parent_scope_key, scope_key, iteration_key, item_index, item_count, item_data, status, retry_of_iteration_id, attempt_number)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'queued',$10,$11) RETURNING *`,
+    [recovery.id, iteration.foreach_node_id, iteration.foreach_node_key, iteration.parent_scope_key, iteration.scope_key, iteration.iteration_key, iteration.item_index, iteration.item_count, JSON.stringify(iteration.item_data || {}), iteration.id, Number(iteration.attempt_number || 1) + 1]
+  )).rows[0];
+  await cloneRecoveryState(run.id, recovery.id, iteration.scope_key);
+  setImmediate(async () => {
+    const graph = await loadGraph(recovery.automation_version_id, recovery.company_id);
+    await traverse(recovery, graph, node, "item", cloned.scope_key);
+  });
+  return recovery;
+}
+
+async function cloneRecoveryState(fromRunId, toRunId, scopeKey) {
+  await ctx.pool.query(
+    `INSERT INTO automation_variables(run_id, name, value)
+     SELECT $2, name, value FROM automation_variables WHERE run_id = $1
+     ON CONFLICT(run_id, name) DO NOTHING`,
+    [fromRunId, toRunId]
+  );
+  const rows = (await ctx.pool.query(
+    `SELECT node_key, output_snapshot, scope_key FROM automation_run_nodes
+      WHERE run_id = $1 AND status = 'completed' AND scope_key IN ('root', $2)
+      ORDER BY created_at ASC`,
+    [fromRunId, scopeKey || "root"]
+  )).rows;
+  for (const row of rows) {
+    await ctx.pool.query(
+      `INSERT INTO automation_run_nodes(run_id, node_id, node_key, status, scope_key, attempt_number, output_snapshot, started_at, completed_at)
+       VALUES($1,NULL,$2,'completed',$3,1,$4::jsonb,now(),now())`,
+      [toRunId, row.node_key, row.scope_key || "root", JSON.stringify(row.output_snapshot || {})]
+    );
+  }
+}
+
+async function maybeAutoPauseAutomation(run, code, message) {
+  const def = (await ctx.pool.query(`SELECT * FROM automation_definitions WHERE id = $1`, [run.automation_id])).rows[0];
+  if (!def?.failure_auto_pause_enabled) return;
+  const threshold = Number(def.failure_auto_pause_threshold || 10);
+  const windowSeconds = Number(def.failure_auto_pause_window_seconds || 3600);
+  const recent = (await ctx.pool.query(
+    `SELECT COUNT(*)::int AS count FROM automation_runs
+      WHERE automation_id = $1 AND status = 'failed' AND updated_at > now() - ($2::int * interval '1 second')`,
+    [run.automation_id, windowSeconds]
+  )).rows[0]?.count || 0;
+  if (Number(recent) + 1 < threshold) return;
+  await ctx.pool.query(`UPDATE automation_definitions SET status = 'paused', updated_at = now(), metadata = metadata || $2::jsonb WHERE id = $1 AND status = 'published'`, [run.automation_id, JSON.stringify({ auto_paused_reason: code, auto_paused_message: message, auto_paused_at: new Date().toISOString() })]);
+  await logRun(run, null, "warn", "automation.auto_paused", "Automation auto-paused after repeated failures", { code, message });
 }
 
 async function loadRunDetail(runId, companyId) {
