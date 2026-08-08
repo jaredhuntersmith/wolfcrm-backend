@@ -1300,6 +1300,72 @@ function installAutomationRoutes() {
     });
   });
 
+  app.get("/api/automations/settings", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const { rows } = await ctx.pool.query(
+        `SELECT automated_customer_messages_enabled,
+                automation_sms_default_business_hours_policy,
+                automation_sms_max_per_contact_hour,
+                automation_sms_max_per_contact_day
+           FROM companies
+          WHERE id = $1`,
+        [req.companyId]
+      );
+      res.json(rows[0] || {});
+    } catch (e) {
+      console.error("[automations] settings failed", e?.message || e);
+      res.status(500).json({ error: "automation_settings_failed" });
+    }
+  });
+
+  app.put("/api/automations/settings", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const enabled = req.body?.automated_customer_messages_enabled !== false;
+      const policy = ["send_immediately", "defer_until_business_hours", "skip_if_outside_business_hours"].includes(req.body?.automation_sms_default_business_hours_policy)
+        ? req.body.automation_sms_default_business_hours_policy
+        : "send_immediately";
+      const hourMax = Math.max(0, Math.min(200, Number(req.body?.automation_sms_max_per_contact_hour ?? 6) || 0));
+      const dayMax = Math.max(0, Math.min(1000, Number(req.body?.automation_sms_max_per_contact_day ?? 20) || 0));
+      const { rows } = await ctx.pool.query(
+        `UPDATE companies
+            SET automated_customer_messages_enabled = $2,
+                automation_sms_default_business_hours_policy = $3,
+                automation_sms_max_per_contact_hour = $4,
+                automation_sms_max_per_contact_day = $5
+          WHERE id = $1
+          RETURNING automated_customer_messages_enabled,
+                    automation_sms_default_business_hours_policy,
+                    automation_sms_max_per_contact_hour,
+                    automation_sms_max_per_contact_day`,
+        [req.companyId, enabled, policy, hourMax, dayMax]
+      );
+      res.json(rows[0] || {});
+    } catch (e) {
+      console.error("[automations] settings update failed", e?.message || e);
+      res.status(500).json({ error: "automation_settings_update_failed" });
+    }
+  });
+
+  app.post("/api/automations/pause-all", authRequired, requireEmployer, async (req, res) => {
+    try {
+      await ctx.pool.query(`UPDATE automation_definitions SET status = 'paused', updated_at = now() WHERE company_id = $1 AND status = 'published'`, [req.companyId]);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("[automations] pause all failed", e?.message || e);
+      res.status(500).json({ error: "automation_pause_all_failed" });
+    }
+  });
+
+  app.post("/api/automations/resume-all", authRequired, requireEmployer, async (req, res) => {
+    try {
+      await ctx.pool.query(`UPDATE automation_definitions SET status = 'published', pause_until = NULL, updated_at = now() WHERE company_id = $1 AND status = 'paused'`, [req.companyId]);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("[automations] resume all failed", e?.message || e);
+      res.status(500).json({ error: "automation_resume_all_failed" });
+    }
+  });
+
   app.get("/api/automations", authRequired, requireEmployer, async (req, res) => {
     try {
       const { rows } = await ctx.pool.query(
@@ -1619,8 +1685,19 @@ function validateGraphPayload(payload) {
       if (config.action_key === "task.reschedule" && !config.due_date) errors.push(`task_due_required:${nodeKey}`);
       if (config.action_key === "routine.create" && !config.title) errors.push(`routine_title_required:${nodeKey}`);
       if (config.action_key === "customer_reminder.create" && !config.due_date) errors.push(`customer_reminder_due_required:${nodeKey}`);
+      if (["sms.send", "call.send_followup_sms", "voicemail.send_followup_sms"].includes(config.action_key) && !config.body) errors.push(`sms_body_required:${nodeKey}`);
+      if (config.action_key === "sms.send_mms" && !config.body && !(Array.isArray(config.media) && config.media.length)) errors.push(`mms_body_or_media_required:${nodeKey}`);
+      if (["sms.delete_local_message"].includes(config.action_key) && !config.message_id) warnings.push(`message_id_defaults_to_context:${nodeKey}`);
+      if (["sms.mark_conversation_read", "sms.mark_conversation_unread", "sms.delete_local_conversation"].includes(config.action_key) && !config.conversation_id) warnings.push(`conversation_id_defaults_to_context:${nodeKey}`);
+      if (config.action_key === "internal.send_dm" && !config.recipient_user_id) errors.push(`internal_recipient_required:${nodeKey}`);
+      if (config.action_key === "internal.send_channel_message" && !config.channel_id) errors.push(`internal_channel_required:${nodeKey}`);
+      if (config.action_key === "internal.create_channel" && !config.name) errors.push(`internal_channel_name_required:${nodeKey}`);
+      if (["call.set_disposition"].includes(config.action_key) && !config.disposition) errors.push(`call_disposition_required:${nodeKey}`);
     }
     if (nodeType === "trigger" && config.trigger_key === "job.relative_time" && (!config.reference || !config.direction || !config.amount || !config.unit)) errors.push(`relative_time_trigger_incomplete:${nodeKey}`);
+    if (nodeType === "trigger" && ["sms.no_reply", "sms.conversation_inactive", "voicemail.unread_for"].includes(config.trigger_key) && Number(config.amount || 0) <= 0) errors.push(`communication_duration_required:${nodeKey}`);
+    if (nodeType === "trigger" && config.trigger_key === "sms.keyword_received" && !(Array.isArray(config.keywords) && config.keywords.length)) errors.push(`sms_keywords_required:${nodeKey}`);
+    if (nodeType === "trigger" && ["call.short_call", "call.long_call"].includes(config.trigger_key) && Number(config.threshold_seconds || 0) <= 0) errors.push(`call_duration_threshold_required:${nodeKey}`);
   }
   for (const edge of edges) {
     if (!nodeIds.has(edge.source_node_id || edge.sourceNodeId)) errors.push(`edge_source_missing:${edge.id || ""}`);
@@ -2055,7 +2132,53 @@ function triggerMatchesEvent(node, event) {
       if (!config.services.some((s) => services.includes(String(s).toLowerCase()))) return false;
     }
   }
+  if (key.startsWith("sms.")) {
+    if (config.known_contact === true && !payload.contact_id) return false;
+    if (config.known_contact === false && payload.contact_id) return false;
+    if (Array.isArray(config.keywords) && config.keywords.length) {
+      if (!matchesTextKeywords(payload.body || payload.message_body || "", config)) return false;
+    }
+    const triggerNumber = normalizePhone(config.external_number || config.phone || "");
+    if (triggerNumber && triggerNumber !== normalizePhone(payload.external_number || payload.external_phone_number || payload.from_number || payload.to_number)) return false;
+  }
+  if (key.startsWith("call.")) {
+    if (config.direction && config.direction !== "any" && config.direction !== payload.direction) return false;
+    if (config.known_contact === true && !payload.contact_id) return false;
+    if (config.known_contact === false && payload.contact_id) return false;
+    if (Number(config.threshold_seconds || 0) > 0 && Number(payload.duration_seconds || 0) < Number(config.threshold_seconds)) return false;
+  }
+  if (key.startsWith("voicemail.")) {
+    if (config.known_contact === true && !payload.contact_id) return false;
+    if (config.known_contact === false && payload.contact_id) return false;
+    if (Number(config.min_duration_seconds || 0) > 0 && Number(payload.duration_seconds || payload.duration || 0) < Number(config.min_duration_seconds)) return false;
+  }
+  if (key.startsWith("internal.")) {
+    if (config.channel_id && config.channel_id !== payload.channel_id) return false;
+    if (config.sender_user_id && config.sender_user_id !== payload.sender_user_id) return false;
+    if (Array.isArray(config.keywords) && config.keywords.length) {
+      if (!matchesTextKeywords(payload.body || payload.message_body || "", config)) return false;
+    }
+  }
   return true;
+}
+
+function matchesTextKeywords(text, config) {
+  const raw = (text || "").toString();
+  const source = config.case_sensitive ? raw : raw.toLowerCase();
+  const keywords = (Array.isArray(config.keywords) ? config.keywords : [])
+    .map((k) => (config.case_sensitive ? String(k) : String(k).toLowerCase()).trim())
+    .filter(Boolean);
+  if (!keywords.length) return true;
+  const mode = config.matching_mode || config.mode || "contains";
+  const matcher = (keyword) => {
+    if (mode === "equals") return source === keyword;
+    if (mode === "starts_with") return source.startsWith(keyword);
+    if (mode === "ends_with") return source.endsWith(keyword);
+    return source.includes(keyword);
+  };
+  return (config.match_all || config.keyword_match === "all")
+    ? keywords.every(matcher)
+    : keywords.some(matcher);
 }
 
 function changedFields(payload) {
@@ -2135,6 +2258,10 @@ async function executeNode(run, node, runNode) {
     }
     await logRun(run, node, "info", "action.started", `Action started ${actionKey}`, {});
     const output = await executor(run, node, node.config || {});
+    if (output?.waiting) {
+      await ctx.pool.query(`UPDATE automation_run_nodes SET status = 'waiting', output_snapshot = $2::jsonb, updated_at = now() WHERE id = $1`, [runNode.id, JSON.stringify(output)]);
+      return output;
+    }
     await logRun(run, node, "info", "action.completed", `Action completed ${actionKey}`, {});
     return { port: "default", output };
   }
@@ -3460,37 +3587,203 @@ async function executePushNotification(run, node, config) {
 }
 
 async function executeSmsSend(run, node, config) {
+  return executeSmsSendShared(run, node, config, { mms: false });
+}
+
+async function executeMmsSend(run, node, config) {
+  return executeSmsSendShared(run, node, config, { mms: true });
+}
+
+async function executeSmsSendShared(run, node, config, options = {}) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:sms_message_id`);
+  if (existing) {
+    const row = (await ctx.pool.query(
+      `SELECT sm.id, sm.twilio_message_sid, sm.conversation_id, sm.to_number, sm.message_status, sm.media_count
+         FROM sms_messages sm
+         JOIN sms_conversations sc ON sc.id = sm.conversation_id
+         JOIN phone_lines pl ON pl.id = sc.phone_line_id
+        WHERE sm.id::text = $1 AND pl.company_id = $2
+        LIMIT 1`,
+      [existing, run.company_id]
+    )).rows[0];
+    if (row) return { message_id: row.id, conversation_id: row.conversation_id, twilio_message_sid: row.twilio_message_sid, status: row.message_status, to_number: row.to_number, media_count: row.media_count, reused: true };
+  }
   const context = await buildRunContext(run);
-  const contactId = await resolveContactId(run, context, config);
-  const contact = (await ctx.pool.query(`SELECT phone FROM contacts WHERE id::text = $1 AND company_id = $2`, [contactId, run.company_id])).rows[0];
-  const toNumber = normalizePhone(contact?.phone);
+  const target = await resolveSmsTarget(run, context, config);
+  const toNumber = normalizePhone(target.phone);
   if (!toNumber) throw new Error("contact_phone_required");
   const line = (await ctx.pool.query(`SELECT id, phone_number FROM phone_lines WHERE company_id = $1 AND active = true AND status = 'active' ORDER BY created_at ASC LIMIT 1`, [run.company_id])).rows[0];
   if (!line) throw new Error("phone_line_required");
   const body = resolveTemplate(config.body || "", context).slice(0, 1600);
-  if (!body) throw new Error("sms_body_required");
+  const media = Array.isArray(config.media) ? config.media.slice(0, 5) : [];
+  if (!body && !media.length) throw new Error(options.mms ? "mms_body_or_media_required" : "sms_body_required");
+  const policy = config.business_hours_policy || config.business_hours || "send_immediately";
+  const eligibility = await canSendAutomatedCustomerMessage(run.company_id, toNumber, target.contact_id, policy);
+  if (!eligibility.allowed) {
+    await logRun(run, node, "warn", "sms.blocked", `Automated SMS blocked: ${eligibility.reason}`, { reason: eligibility.reason, resume_at: eligibility.resume_at || null });
+    if (eligibility.reason === "deferred_until_business_hours" && eligibility.resume_at) {
+      const wait = await ctx.pool.query(
+        `INSERT INTO automation_waits(run_id, node_id, wait_type, resume_at, status)
+         VALUES($1,$2,'until_datetime',$3,'waiting')
+         RETURNING id, resume_at`,
+        [run.id, node.id, eligibility.resume_at]
+      );
+      await ctx.pool.query(`UPDATE automation_runs SET status = 'waiting', updated_at = now() WHERE id = $1`, [run.id]);
+      return { waiting: true, wait_id: wait.rows[0]?.id, reason: eligibility.reason, resume_at: eligibility.resume_at };
+    }
+    return { skipped: true, reason: eligibility.reason, to_number: toNumber };
+  }
   const client = ctx.createTwilioClient();
   if (!client) throw new Error("twilio_not_configured");
-  const sent = await client.messages.create({ from: line.phone_number, to: toNumber, body, statusCallback: ctx.twilioPublicUrl("/webhooks/twilio/message-status") });
+  const sendPayload = { from: line.phone_number, to: toNumber, statusCallback: ctx.twilioPublicUrl("/webhooks/twilio/message-status") };
+  if (body) sendPayload.body = body;
+  if (media.length) sendPayload.mediaUrl = media.map((m) => resolveTemplate(m.url || m.media_url || m, context)).filter(Boolean);
+  const sent = await client.messages.create(sendPayload);
   const conv = (await ctx.pool.query(
     `INSERT INTO sms_conversations(phone_line_id, external_phone_number, contact_id, last_message_at)
      VALUES($1,$2,$3,now())
      ON CONFLICT(phone_line_id, external_phone_number) DO UPDATE SET contact_id = COALESCE(sms_conversations.contact_id, EXCLUDED.contact_id), last_message_at = now(), updated_at = now()
      RETURNING id`,
-    [line.id, toNumber, contactId]
+    [line.id, toNumber, target.contact_id]
   )).rows[0];
   const msg = (await ctx.pool.query(
-    `INSERT INTO sms_messages(conversation_id, twilio_message_sid, direction, from_number, to_number, body, message_status)
-     VALUES($1,$2,'outbound',$3,$4,$5,$6) RETURNING id`,
-    [conv.id, sent.sid || null, line.phone_number, toNumber, body, sent.status || "queued"]
+    `INSERT INTO sms_messages(conversation_id, twilio_message_sid, direction, from_number, to_number, body, message_status, media_count, media)
+     VALUES($1,$2,'outbound',$3,$4,$5,$6,$7,$8::jsonb)
+     RETURNING id, conversation_id, twilio_message_sid, to_number, message_status, media_count, created_at`,
+    [conv.id, sent.sid || null, line.phone_number, toNumber, body || null, sent.status || "queued", media.length, JSON.stringify(media)]
   )).rows[0];
-  return { message_id: msg.id, conversation_id: conv.id, twilio_message_sid: sent.sid };
+  await setRunVariable(run.id, `idempotency:${node.id}:sms_message_id`, msg.id);
+  await emitAutomationEvent({
+    companyId: run.company_id,
+    eventType: media.length ? "sms.mms_sent" : "sms.sent",
+    subjectType: "sms_message",
+    subjectId: msg.id,
+    source: "automation",
+    dedupeKey: `${media.length ? "sms.mms_sent" : "sms.sent"}:${msg.id}`,
+    payload: automationPayload(run, node, { message_id: msg.id, conversation_id: conv.id, contact_id: target.contact_id, external_number: toNumber, status: msg.message_status, body, media_count: media.length })
+  });
+  await syncAutomationSchedulesForSmsOutbound(run.company_id, { ...msg, contact_id: target.contact_id, external_phone_number: toNumber });
+  await syncAutomationSchedulesForSmsConversationActivity(run.company_id, conv.id, msg);
+  return { message_id: msg.id, conversation_id: conv.id, twilio_message_sid: sent.sid, to_number: toNumber, status: msg.message_status, media_count: media.length };
 }
 
 function normalizePhone(value) {
   const s = (value || "").toString().trim();
   if (!s) return "";
   return s.startsWith("+") ? s : `+1${s.replace(/\D/g, "").slice(-10)}`;
+}
+
+async function resolveSmsTarget(run, context, config) {
+  if (config.conversation_id || config.target_mode === "current_conversation") {
+    const conversationId = resolveTemplate(config.conversation_id || context.sms?.conversation_id || "", context);
+    const row = (await ctx.pool.query(
+      `SELECT sc.id, sc.external_phone_number, sc.contact_id
+         FROM sms_conversations sc
+         JOIN phone_lines pl ON pl.id = sc.phone_line_id
+        WHERE sc.id::text = $1 AND pl.company_id = $2 AND sc.deleted_at IS NULL
+        LIMIT 1`,
+      [conversationId, run.company_id]
+    )).rows[0];
+    if (!row) throw new Error("sms_conversation_not_found");
+    return { conversation_id: row.id, contact_id: row.contact_id, phone: row.external_phone_number };
+  }
+  if (config.phone || config.to_phone || config.to_number) {
+    return { contact_id: null, phone: resolveTemplate(config.phone || config.to_phone || config.to_number, context) };
+  }
+  const contactId = await resolveContactId(run, context, config);
+  const contact = (await ctx.pool.query(`SELECT id, phone FROM contacts WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL`, [contactId, run.company_id])).rows[0];
+  if (!contact) throw new Error("contact_not_found");
+  return { contact_id: contact.id, phone: contact.phone };
+}
+
+async function canSendAutomatedCustomerMessage(companyId, normalizedPhone, contactId, policy = "send_immediately") {
+  const company = (await ctx.pool.query(
+    `SELECT automated_customer_messages_enabled,
+            automation_sms_max_per_contact_hour,
+            automation_sms_max_per_contact_day,
+            automation_sms_default_business_hours_policy
+       FROM companies
+      WHERE id = $1`,
+    [companyId]
+  )).rows[0] || {};
+  if (company.automated_customer_messages_enabled === false) return { allowed: false, reason: "automated_customer_messages_disabled" };
+  if (await isPhoneOptedOut(companyId, normalizedPhone)) return { allowed: false, reason: "recipient_opted_out" };
+  const hourMax = Number(company.automation_sms_max_per_contact_hour || 6);
+  const dayMax = Number(company.automation_sms_max_per_contact_day || 20);
+  const rateKey = contactId ? "contact" : "phone";
+  const rateValue = contactId || normalizedPhone;
+  const rate = await ctx.pool.query(
+    `SELECT COUNT(*) FILTER (WHERE sm.created_at >= now() - interval '1 hour')::int AS hour_count,
+            COUNT(*) FILTER (WHERE sm.created_at >= now() - interval '1 day')::int AS day_count
+       FROM sms_messages sm
+       JOIN sms_conversations sc ON sc.id = sm.conversation_id
+       JOIN phone_lines pl ON pl.id = sc.phone_line_id
+      WHERE pl.company_id = $1
+        AND sm.direction = 'outbound'
+        AND ($2 = 'contact' AND sc.contact_id::text = $3 OR $2 = 'phone' AND sc.external_phone_number = $3)`,
+    [companyId, rateKey, rateValue]
+  );
+  if (hourMax > 0 && Number(rate.rows[0]?.hour_count || 0) >= hourMax) return { allowed: false, reason: "automation_sms_hourly_limit" };
+  if (dayMax > 0 && Number(rate.rows[0]?.day_count || 0) >= dayMax) return { allowed: false, reason: "automation_sms_daily_limit" };
+  const effectivePolicy = policy || company.automation_sms_default_business_hours_policy || "send_immediately";
+  if (effectivePolicy !== "send_immediately" && !(await companyWithinBusinessHours(companyId))) {
+    if (effectivePolicy === "skip_if_outside_business_hours") return { allowed: false, reason: "outside_business_hours" };
+    return { allowed: false, reason: "deferred_until_business_hours", resume_at: await nextCompanyBusinessOpening(companyId) };
+  }
+  return { allowed: true };
+}
+
+async function isPhoneOptedOut(companyId, normalizedPhone) {
+  const phone = normalizePhone(normalizedPhone);
+  if (!phone) return false;
+  const row = (await ctx.pool.query(
+    `SELECT status FROM phone_opt_outs WHERE company_id = $1 AND normalized_phone = $2 AND channel = 'sms' LIMIT 1`,
+    [companyId, phone]
+  )).rows[0];
+  return row?.status === "opted_out";
+}
+
+export async function recordPhoneSmsConsent(companyId, phone, status, source = "twilio") {
+  if (!ctx?.pool || !companyId || !phone) return;
+  const normalized = normalizePhone(phone);
+  if (!normalized) return;
+  await ctx.pool.query(
+    `INSERT INTO phone_opt_outs(company_id, normalized_phone, channel, status, source)
+     VALUES($1,$2,'sms',$3,$4)
+     ON CONFLICT(company_id, normalized_phone, channel)
+     DO UPDATE SET status = EXCLUDED.status, source = EXCLUDED.source, updated_at = now()`,
+    [companyId, normalized, status, source]
+  );
+}
+
+async function companyWithinBusinessHours(companyId) {
+  const row = (await ctx.pool.query(`SELECT business_days, business_open_time, business_close_time FROM companies WHERE id = $1`, [companyId])).rows[0];
+  const now = new Date();
+  const day = now.getUTCDay();
+  const days = Array.isArray(row?.business_days) ? row.business_days.map(Number) : [1,2,3,4,5];
+  if (!days.includes(day)) return false;
+  const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const open = timeToMinutes(row?.business_open_time || "09:00");
+  const close = timeToMinutes(row?.business_close_time || "17:00");
+  return minute >= open && minute < close;
+}
+
+async function nextCompanyBusinessOpening(companyId) {
+  const row = (await ctx.pool.query(`SELECT business_days, business_open_time FROM companies WHERE id = $1`, [companyId])).rows[0];
+  const days = Array.isArray(row?.business_days) ? row.business_days.map(Number) : [1,2,3,4,5];
+  const open = timeToMinutes(row?.business_open_time || "09:00");
+  const now = new Date();
+  for (let i = 0; i < 14; i++) {
+    const candidate = new Date(now.getTime() + i * 86400000);
+    candidate.setUTCHours(Math.floor(open / 60), open % 60, 0, 0);
+    if (days.includes(candidate.getUTCDay()) && candidate > now) return candidate.toISOString();
+  }
+  return new Date(now.getTime() + 3600000).toISOString();
+}
+
+function timeToMinutes(value) {
+  const [h, m] = String(value || "09:00").split(":").map((n) => parseInt(n, 10) || 0);
+  return Math.max(0, Math.min(1439, h * 60 + m));
 }
 
 async function executeInternalMessage(run, node, config) {
@@ -3503,6 +3796,7 @@ async function executeInternalMessage(run, node, config) {
     if (!channel) throw new Error("channel_not_found");
     const id = randomUUID();
     await ctx.pool.query(`INSERT INTO messages(id, channel_id, sender_id, body) VALUES($1,$2,$3,$4)`, [id, channel.id, sender, body]);
+    await emitInternalAutomationMessageEvent(run, node, { message_id: id, channel_id: channel.id, sender_user_id: sender, body });
     return { message_id: id, channel_id: channel.id };
   }
   let conversationId = config.conversation_id;
@@ -3518,7 +3812,273 @@ async function executeInternalMessage(run, node, config) {
   if (!member.rowCount) throw new Error("conversation_not_found");
   const id = randomUUID();
   await ctx.pool.query(`INSERT INTO messages(id, conversation_id, sender_id, body) VALUES($1,$2,$3,$4)`, [id, conversationId, sender, body]);
+  await emitInternalAutomationMessageEvent(run, node, { message_id: id, conversation_id: conversationId, sender_user_id: sender, body });
   return { message_id: id, conversation_id: conversationId };
+}
+
+async function executeInternalDm(run, node, config) {
+  const requestedRecipient = config.recipient_user_id || config.user_id;
+  if (!requestedRecipient) throw new Error("recipient_required");
+  const recipient = await validateCompanyUser(run.company_id, requestedRecipient);
+  const sender = await resolveCompanyUser(run.company_id, config.sender_user_id);
+  let conversationId = (await ctx.pool.query(
+    `SELECT c.id
+       FROM conversations c
+       JOIN conversation_participants a ON a.conversation_id = c.id AND a.user_id = $1
+       JOIN conversation_participants b ON b.conversation_id = c.id AND b.user_id = $2
+      WHERE c.company_id = $3
+        AND c.deleted_at IS NULL
+        AND c.is_group = false
+      LIMIT 1`,
+    [sender, recipient, run.company_id]
+  )).rows[0]?.id;
+  if (!conversationId) {
+    conversationId = randomUUID();
+    await ctx.pool.query(`INSERT INTO conversations(id, company_id, is_group, created_by) VALUES($1,$2,false,$3)`, [conversationId, run.company_id, sender]);
+    for (const userId of [sender, recipient]) {
+      await ctx.pool.query(`INSERT INTO conversation_participants(id, conversation_id, user_id) VALUES($1,$2,$3)`, [randomUUID(), conversationId, userId]);
+    }
+  }
+  return executeInternalMessage(run, node, { ...config, conversation_id: conversationId, sender_user_id: sender });
+}
+
+async function executeInternalGroupMessage(run, node, config) {
+  return executeInternalMessage(run, node, config);
+}
+
+async function executeInternalChannelMessage(run, node, config) {
+  return executeInternalMessage(run, node, { ...config, channel_id: config.channel_id });
+}
+
+async function executeInternalCreateGroup(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:conversation_id`);
+  if (existing) return { conversation_id: existing, reused: true };
+  const title = String(config.title || "Automation Group").trim() || "Automation Group";
+  const sender = await resolveCompanyUser(run.company_id, config.sender_user_id);
+  const recipients = await resolveCompanyUsers(run.company_id, config.recipient_user_ids || config.user_ids || []);
+  if (!recipients.length) throw new Error("participants_required");
+  const id = randomUUID();
+  await ctx.pool.query(`INSERT INTO conversations(id, company_id, title, is_group, created_by) VALUES($1,$2,$3,true,$4)`, [id, run.company_id, title, sender]);
+  for (const userId of [...new Set([sender, ...recipients])]) {
+    await ctx.pool.query(`INSERT INTO conversation_participants(id, conversation_id, user_id) VALUES($1,$2,$3)`, [randomUUID(), id, userId]);
+  }
+  await setRunVariable(run.id, `idempotency:${node.id}:conversation_id`, id);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "internal.group_created", subjectType: "internal_conversation", subjectId: id, source: "automation", dedupeKey: `internal.group_created:${id}`, payload: automationPayload(run, node, { conversation_id: id, title }) });
+  return { conversation_id: id };
+}
+
+async function executeInternalCreateChannel(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:channel_id`);
+  if (existing) return { channel_id: existing, reused: true };
+  const name = String(config.name || config.title || "").trim();
+  if (!name) throw new Error("channel_name_required");
+  const sender = await resolveCompanyUser(run.company_id, config.sender_user_id);
+  const row = (await ctx.pool.query(
+    `INSERT INTO channels(id, company_id, name, description, created_by)
+     VALUES($1,$2,$3,$4,$5)
+     RETURNING id`,
+    [randomUUID(), run.company_id, name, config.description || null, sender]
+  )).rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:channel_id`, row.id);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "internal.channel_created", subjectType: "channel", subjectId: row.id, source: "automation", dedupeKey: `internal.channel_created:${row.id}`, payload: automationPayload(run, node, { channel_id: row.id, name }) });
+  return { channel_id: row.id };
+}
+
+async function executeInternalMarkConversationRead(run, _node, config) {
+  const context = await buildRunContext(run);
+  const conversationId = resolveTemplate(config.conversation_id || context.internal?.conversation_id || "", context);
+  const userId = config.user_id || config.recipient_user_id
+    ? await validateCompanyUser(run.company_id, config.user_id || config.recipient_user_id)
+    : await resolveCompanyUser(run.company_id, null);
+  if (!conversationId) throw new Error("conversation_required");
+  const result = await ctx.pool.query(
+    `UPDATE conversation_participants cp
+        SET last_read_at = now()
+       FROM conversations c
+      WHERE cp.conversation_id = c.id
+        AND c.company_id = $1
+        AND cp.conversation_id::text = $2
+        AND cp.user_id = $3`,
+    [run.company_id, conversationId, userId]
+  );
+  if (!result.rowCount) throw new Error("conversation_not_found");
+  return { conversation_id: conversationId, user_id: userId, read: true };
+}
+
+async function validateCompanyUser(companyId, userId) {
+  const row = (await ctx.pool.query(`SELECT id FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`, [userId, companyId])).rows[0];
+  if (!row) throw new Error("user_not_found");
+  return row.id;
+}
+
+async function emitInternalAutomationMessageEvent(run, node, message) {
+  await emitAutomationEvent({
+    companyId: run.company_id,
+    eventType: message.channel_id ? "internal.channel_message_received" : "internal.message_received",
+    subjectType: "internal_message",
+    subjectId: message.message_id,
+    source: "automation",
+    dedupeKey: `internal.message:${message.message_id}`,
+    payload: automationPayload(run, node, {
+      message_id: message.message_id,
+      conversation_id: message.conversation_id || null,
+      channel_id: message.channel_id || null,
+      sender_user_id: message.sender_user_id,
+      body: message.body,
+      message_body: message.body
+    })
+  });
+}
+
+async function executeSmsConversationRead(run, _node, config) {
+  const context = await buildRunContext(run);
+  const conversationId = resolveTemplate(config.conversation_id || context.sms?.conversation_id || "", context);
+  if (!conversationId) throw new Error("sms_conversation_required");
+  const row = (await ctx.pool.query(
+    `UPDATE sms_conversations sc
+        SET last_read_at = now(), updated_at = now()
+       FROM phone_lines pl
+      WHERE sc.id::text = $1 AND pl.id = sc.phone_line_id AND pl.company_id = $2
+      RETURNING sc.id`,
+    [conversationId, run.company_id]
+  )).rows[0];
+  if (!row) throw new Error("sms_conversation_not_found");
+  return { conversation_id: row.id, read: true };
+}
+
+async function executeSmsConversationUnread(run, _node, config) {
+  const context = await buildRunContext(run);
+  const conversationId = resolveTemplate(config.conversation_id || context.sms?.conversation_id || "", context);
+  const row = (await ctx.pool.query(
+    `UPDATE sms_conversations sc
+        SET last_read_at = NULL, updated_at = now()
+       FROM phone_lines pl
+      WHERE sc.id::text = $1 AND pl.id = sc.phone_line_id AND pl.company_id = $2
+      RETURNING sc.id`,
+    [conversationId, run.company_id]
+  )).rows[0];
+  if (!row) throw new Error("sms_conversation_not_found");
+  return { conversation_id: row.id, unread: true };
+}
+
+async function executeSmsDeleteLocalMessage(run, _node, config) {
+  const context = await buildRunContext(run);
+  const messageId = resolveTemplate(config.message_id || context.sms?.message_id || "", context);
+  const row = (await ctx.pool.query(
+    `UPDATE sms_messages sm
+        SET deleted_at = now(), updated_at = now()
+       FROM sms_conversations sc
+       JOIN phone_lines pl ON pl.id = sc.phone_line_id
+      WHERE sm.id::text = $1 AND sm.conversation_id = sc.id AND pl.company_id = $2
+      RETURNING sm.id, sm.conversation_id`,
+    [messageId, run.company_id]
+  )).rows[0];
+  if (!row) throw new Error("sms_message_not_found");
+  return { message_id: row.id, conversation_id: row.conversation_id, deleted_local: true };
+}
+
+async function executeSmsDeleteLocalConversation(run, _node, config) {
+  const context = await buildRunContext(run);
+  const conversationId = resolveTemplate(config.conversation_id || context.sms?.conversation_id || "", context);
+  const row = (await ctx.pool.query(
+    `UPDATE sms_conversations sc
+        SET deleted_at = now(), updated_at = now()
+       FROM phone_lines pl
+      WHERE sc.id::text = $1 AND pl.id = sc.phone_line_id AND pl.company_id = $2
+      RETURNING sc.id`,
+    [conversationId, run.company_id]
+  )).rows[0];
+  if (!row) throw new Error("sms_conversation_not_found");
+  await ctx.pool.query(`UPDATE sms_messages SET deleted_at = COALESCE(deleted_at, now()), updated_at = now() WHERE conversation_id = $1`, [row.id]);
+  return { conversation_id: row.id, deleted_local: true };
+}
+
+async function executeCreateContactFromNumber(run, node, config) {
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:contact_id`);
+  if (existing) return { contact_id: existing, reused: true };
+  const context = await buildRunContext(run);
+  const phone = normalizePhone(resolveTemplate(config.phone || context.sms?.external_number || context.call?.external_number || context.voicemail?.external_number || "", context));
+  if (!phone) throw new Error("phone_required");
+  const existingContact = (await ctx.pool.query(
+    `SELECT id FROM contacts
+      WHERE company_id = $1
+        AND regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g') = regexp_replace($2, '[^0-9]', '', 'g')
+        AND deleted_at IS NULL
+      LIMIT 1`,
+    [run.company_id, phone]
+  )).rows[0];
+  if (existingContact) return { contact_id: existingContact.id, reused: true };
+  const created = (await ctx.pool.query(
+    `INSERT INTO contacts(id, company_id, name, phone, source, tags)
+     VALUES($1,$2,$3,$4,$5,$6)
+     RETURNING id`,
+    [randomUUID(), run.company_id, resolveTemplate(config.name || "New Contact", context), phone, config.source || "automation", normalizeTags(config.tags || []).join(", ")]
+  )).rows[0];
+  await setRunVariable(run.id, `idempotency:${node.id}:contact_id`, created.id);
+  await emitAutomationEvent({ companyId: run.company_id, eventType: "contact.created", subjectType: "contact", subjectId: created.id, source: "automation", dedupeKey: `contact.created:${created.id}`, payload: automationPayload(run, node, { contact_id: created.id, phone }) });
+  return { contact_id: created.id, phone };
+}
+
+async function executeCallSetDisposition(run, _node, config) {
+  const context = await buildRunContext(run);
+  const callId = resolveTemplate(config.call_id || context.call?.id || "", context);
+  const disposition = String(config.disposition || "").trim();
+  if (!callId || !disposition) throw new Error("call_disposition_required");
+  const row = (await ctx.pool.query(`UPDATE phone_calls SET disposition = $3, updated_at = now() WHERE id::text = $1 AND company_id = $2 RETURNING id, disposition`, [callId, run.company_id, disposition])).rows[0];
+  if (!row) throw new Error("call_not_found");
+  return { call_id: row.id, disposition: row.disposition };
+}
+
+async function executeCallCreateCallbackTask(run, node, config) {
+  const context = await buildRunContext(run);
+  const title = config.title || `Call ${context.contact?.name || context.call?.external_number || "customer"} back`;
+  return executeTaskCreate(run, node, { ...config, title, contact_id: config.contact_id || context.call?.contact_id || context.contact?.id });
+}
+
+async function executeCallFollowupSms(run, node, config) {
+  const context = await buildRunContext(run);
+  return executeSmsSendShared(run, node, { ...config, phone: config.phone || context.call?.external_number, contact_id: config.contact_id || context.call?.contact_id }, { mms: false });
+}
+
+async function executeCallAddContactNote(run, node, config) {
+  const context = await buildRunContext(run);
+  return executeContactAddNote(run, node, { ...config, contact_id: config.contact_id || context.call?.contact_id || context.contact?.id, note: config.note || config.body || "Call follow-up note" });
+}
+
+async function executeVoicemailMarkRead(run, _node, config) {
+  return updateVoicemailReadState(run, config, true);
+}
+
+async function executeVoicemailMarkUnread(run, _node, config) {
+  return updateVoicemailReadState(run, config, false);
+}
+
+async function updateVoicemailReadState(run, config, read) {
+  const context = await buildRunContext(run);
+  const voicemailId = resolveTemplate(config.voicemail_id || context.voicemail?.id || "", context);
+  if (!voicemailId) throw new Error("voicemail_required");
+  const row = (await ctx.pool.query(`UPDATE voicemails SET is_read = $3, updated_at = now() WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL RETURNING id, is_read`, [voicemailId, run.company_id, read])).rows[0];
+  if (!row) throw new Error("voicemail_not_found");
+  return { voicemail_id: row.id, read: row.is_read };
+}
+
+async function executeVoicemailDelete(run, _node, config) {
+  const context = await buildRunContext(run);
+  const voicemailId = resolveTemplate(config.voicemail_id || context.voicemail?.id || "", context);
+  const row = (await ctx.pool.query(`UPDATE voicemails SET deleted_at = now(), updated_at = now() WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL RETURNING id`, [voicemailId, run.company_id])).rows[0];
+  if (!row) throw new Error("voicemail_not_found");
+  return { voicemail_id: row.id, deleted: true };
+}
+
+async function executeVoicemailCreateCallbackTask(run, node, config) {
+  const context = await buildRunContext(run);
+  const title = config.title || `Return voicemail from ${context.contact?.name || context.voicemail?.external_number || "customer"}`;
+  return executeTaskCreate(run, node, { ...config, title, contact_id: config.contact_id || context.voicemail?.contact_id || context.contact?.id });
+}
+
+async function executeVoicemailFollowupSms(run, node, config) {
+  const context = await buildRunContext(run);
+  return executeSmsSendShared(run, node, { ...config, phone: config.phone || context.voicemail?.external_number, contact_id: config.contact_id || context.voicemail?.contact_id }, { mms: false });
 }
 
 async function executeJobCreate(run, node, config) {

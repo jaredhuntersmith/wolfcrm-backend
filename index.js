@@ -15,7 +15,12 @@ import {
   syncAutomationSchedulesForTask,
   syncAutomationSchedulesForRoutine,
   syncAutomationSchedulesForCustomerReminder,
-  cancelAutomationSchedulesForSubject
+  cancelAutomationSchedulesForSubject,
+  syncAutomationSchedulesForSmsOutbound,
+  syncAutomationSchedulesForSmsConversationActivity,
+  cancelNoReplySchedulesForConversation,
+  syncAutomationSchedulesForVoicemail,
+  recordPhoneSmsConsent
 } from "./automations.js";
 
 const { Pool } = pkg;
@@ -459,6 +464,38 @@ const callDispositionForStatus = (status) => {
   if (s === "failed") return "failed";
   return null;
 };
+
+const callAutomationEventTypes = ({ status, disposition, direction, durationSeconds }) => {
+  const s = (status || "").toString().trim().toLowerCase();
+  const d = (disposition || "").toString().trim().toLowerCase();
+  const events = [];
+  if (s === "ringing") events.push("call.ringing");
+  if (s === "in-progress" || s === "answered") events.push("call.answered", "call.connected");
+  if (s === "completed") events.push("call.completed");
+  if (d === "busy") events.push("call.busy");
+  if (d === "missed") events.push("call.no_answer");
+  if (d === "failed") events.push("call.failed");
+  if (direction === "inbound" && ["busy", "missed", "failed", "canceled"].includes(d)) events.push("call.missed");
+  if (s === "completed" && Number(durationSeconds || 0) > 0) {
+    if (Number(durationSeconds) <= 30) events.push("call.short_call");
+    if (Number(durationSeconds) >= 300) events.push("call.long_call");
+  }
+  return [...new Set(events)];
+};
+
+async function emitCallAutomationEvents({ companyId, callId, callSid, eventTypes, payload }) {
+  for (const eventType of eventTypes) {
+    await emitAutomationEvent({
+      companyId,
+      eventType,
+      subjectType: "call",
+      subjectId: callId,
+      source: "twilio.voice",
+      dedupeKey: `${eventType}:${callId || callSid}`,
+      payload
+    });
+  }
+}
 
 const emptyMessagingResponse = () => {
   const response = new twilio.twiml.MessagingResponse();
@@ -2080,6 +2117,7 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
     const body = (req.body.Body || "").toString();
     const client = await pool.connect();
     let storedConversationID = null;
+    let storedMessage = null;
     let pushTitle = fromNumber;
 
     try {
@@ -2100,12 +2138,13 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
       storedConversationID = conversationID;
 
       try {
-        await client.query(
+        const messageInsert = await client.query(
           `INSERT INTO sms_messages(
              conversation_id, twilio_message_sid, direction, from_number, to_number,
              body, message_status, media_count, media, twilio_error_code, twilio_error_message
            )
-           VALUES($1,$2,'inbound',$3,$4,$5,$6,$7,$8::jsonb,$9,$10)`,
+           VALUES($1,$2,'inbound',$3,$4,$5,$6,$7,$8::jsonb,$9,$10)
+           RETURNING id, conversation_id, twilio_message_sid, direction, from_number, to_number, body, message_status, media_count, created_at`,
           [
             conversationID,
             messageSid || null,
@@ -2119,6 +2158,7 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
             req.body.ErrorMessage || null
           ]
         );
+        storedMessage = messageInsert.rows[0] || null;
       } catch (e) {
         if (e?.code === "23505" && messageSid) {
           await client.query("ROLLBACK");
@@ -2136,23 +2176,68 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
       );
       await client.query("COMMIT");
       console.log("[twilio/sms] inbound stored", { messageSid, phoneLineID: phoneLine.id, conversationID, mediaCount });
-      await emitAutomationEvent({
-        companyId: phoneLine.company_id,
-        eventType: "sms.received",
-        subjectType: "sms_conversation",
-        subjectId: conversationID,
-        source: "twilio.sms",
-        dedupeKey: messageSid ? `sms.received:${messageSid}` : null,
-        payload: {
+      try {
+        const normalizedBody = body.trim().toUpperCase();
+        if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(normalizedBody)) {
+          await recordPhoneSmsConsent(phoneLine.company_id, fromNumber, "opted_out", "twilio.opt_out");
+        } else if (["START", "YES", "UNSTOP"].includes(normalizedBody)) {
+          await recordPhoneSmsConsent(phoneLine.company_id, fromNumber, "opted_in", "twilio.opt_in");
+        }
+        await cancelNoReplySchedulesForConversation(phoneLine.company_id, conversationID);
+        await syncAutomationSchedulesForSmsConversationActivity(phoneLine.company_id, conversationID, storedMessage || { id: messageSid, created_at: new Date().toISOString() });
+        const counts = await pool.query(
+          `SELECT COUNT(*) FILTER (WHERE direction = 'inbound')::int AS inbound_count,
+                  COUNT(*) FILTER (WHERE direction = 'outbound')::int AS outbound_count,
+                  COUNT(*)::int AS total_count,
+                  MAX(created_at) FILTER (WHERE direction = 'outbound') AS last_outbound_at,
+                  (SELECT id FROM sms_messages WHERE conversation_id = $1 AND direction = 'outbound' ORDER BY created_at DESC LIMIT 1) AS last_outbound_message_id
+             FROM sms_messages
+            WHERE conversation_id = $1 AND deleted_at IS NULL`,
+          [conversationID]
+        );
+        const stats = counts.rows[0] || {};
+        const basePayload = {
+          message_id: storedMessage?.id || null,
           conversation_id: conversationID,
           contact_id: contactID,
+          contact_exists: Boolean(contactID),
           message_sid: messageSid || null,
           from_number: fromNumber,
           to_number: toNumber,
+          external_number: fromNumber,
           body,
-          media_count: mediaCount
+          direction: "inbound",
+          status: messageStatus,
+          media_count: mediaCount,
+          has_media: mediaCount > 0,
+          inbound_count: stats.inbound_count || 0,
+          outbound_count: stats.outbound_count || 0
+        };
+        const subjectId = storedMessage?.id || conversationID;
+        const eventTypes = ["sms.received", "sms.keyword_received", contactID ? "sms.message_received_from_contact" : "sms.message_received_from_unknown_number"];
+        if (mediaCount > 0) eventTypes.push("sms.attachment_received", "sms.mms_received");
+        if (Number(stats.inbound_count || 0) === 1) eventTypes.push("sms.first_inbound");
+        if (Number(stats.total_count || 0) === 1) eventTypes.push("sms.first_message_from_number");
+        if (Number(stats.outbound_count || 0) > 0) {
+          eventTypes.push("sms.reply_received");
+          basePayload.last_outbound_message_id = stats.last_outbound_message_id || null;
+          basePayload.last_outbound_at = stats.last_outbound_at || null;
+          basePayload.reply_latency_seconds = stats.last_outbound_at ? Math.max(0, Math.round((Date.now() - new Date(stats.last_outbound_at).getTime()) / 1000)) : null;
         }
-      });
+        for (const eventType of eventTypes) {
+          await emitAutomationEvent({
+            companyId: phoneLine.company_id,
+            eventType,
+            subjectType: "sms_message",
+            subjectId,
+            source: "twilio.sms",
+            dedupeKey: messageSid ? `${eventType}:${messageSid}` : `${eventType}:${subjectId}`,
+            payload: basePayload
+          });
+        }
+      } catch (automationError) {
+        console.error("[twilio/sms] automation emission failed:", { messageSid, code: automationError?.code, message: automationError?.message });
+      }
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
       throw e;
@@ -2526,7 +2611,7 @@ app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
         companyId: rows[0].company_id,
         externalPhone: toNumber
       });
-      await pool.query(
+      const history = await pool.query(
         `INSERT INTO phone_calls(
            company_id, phone_line_id, contact_id, twilio_call_sid, direction,
            from_number, to_number, status, started_at
@@ -2536,7 +2621,8 @@ app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
          WHERE twilio_call_sid IS NOT NULL
          DO UPDATE SET
            status = EXCLUDED.status,
-           updated_at = now()`,
+           updated_at = now()
+         RETURNING id`,
         [
           rows[0].company_id,
           rows[0].phone_line_id || null,
@@ -2547,6 +2633,16 @@ app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
           (req.body.CallStatus || "initiated").toString()
         ]
       );
+      const callId = history.rows[0]?.id;
+      if (callId) {
+        await emitCallAutomationEvents({
+          companyId: rows[0].company_id,
+          callId,
+          callSid: (req.body.CallSid || "").toString().trim() || callId,
+          eventTypes: ["call.outgoing", "call.started"],
+          payload: { call_id: callId, external_phone_number: toNumber, contact_id: contactID, direction: "outbound", status: (req.body.CallStatus || "initiated").toString(), from_number: callerId, to_number: toNumber }
+        }).catch((automationError) => console.error("[voice outgoing] automation emission failed:", { code: automationError?.code, message: automationError?.message }));
+      }
     } catch (historyError) {
       console.error("[voice outgoing] call history failed; continuing call routing:", {
         code: historyError?.code,
@@ -2660,7 +2756,7 @@ app.post("/webhooks/twilio/voice/incoming", async (req, res) => {
       const contactID = isUsableE164(fromNumber)
         ? await findSmsContactID({ companyId: route.company_id, externalPhone: fromNumber })
         : null;
-      await pool.query(
+      const history = await pool.query(
         `INSERT INTO phone_calls(
            company_id, phone_line_id, contact_id, twilio_call_sid, direction,
            from_number, to_number, status, started_at
@@ -2670,7 +2766,8 @@ app.post("/webhooks/twilio/voice/incoming", async (req, res) => {
          WHERE twilio_call_sid IS NOT NULL
          DO UPDATE SET
            status = EXCLUDED.status,
-           updated_at = now()`,
+           updated_at = now()
+         RETURNING id`,
         [
           route.company_id,
           route.phone_line_id,
@@ -2681,6 +2778,16 @@ app.post("/webhooks/twilio/voice/incoming", async (req, res) => {
           (req.body.CallStatus || "ringing").toString()
         ]
       );
+      const callId = history.rows[0]?.id;
+      if (callId) {
+        await emitCallAutomationEvents({
+          companyId: route.company_id,
+          callId,
+          callSid: (req.body.CallSid || "").toString().trim() || callId,
+          eventTypes: ["call.incoming", "call.ringing"],
+          payload: { call_id: callId, external_phone_number: fromNumber, contact_id: contactID, direction: "inbound", status: (req.body.CallStatus || "ringing").toString(), from_number: fromNumber, to_number: toNumber }
+        }).catch((automationError) => console.error("[voice incoming] automation emission failed:", { code: automationError?.code, message: automationError?.message }));
+      }
     } catch (historyError) {
       console.error("[voice incoming] call history failed; continuing call routing:", {
         code: historyError?.code,
@@ -2856,7 +2963,7 @@ app.post("/webhooks/twilio/voice/voicemail-recording", async (req, res) => {
          duration_seconds = COALESCE(EXCLUDED.duration_seconds, voicemails.duration_seconds),
          deleted_at = NULL,
          updated_at = now()
-       RETURNING id, contact_id`,
+       RETURNING id, contact_id, external_phone_number, duration_seconds, recording_status, created_at`,
       [
         row.company_id,
         row.phone_line_id,
@@ -2871,22 +2978,34 @@ app.post("/webhooks/twilio/voice/voicemail-recording", async (req, res) => {
     );
 
     if (recordingStatus.toLowerCase() === "completed") {
-      await emitAutomationEvent({
-        companyId: row.company_id,
-        eventType: "voicemail.received",
-        subjectType: "voicemail",
-        subjectId: saved.rows[0].id,
-        source: "twilio.voice",
-        dedupeKey: `voicemail.received:${recordingSid}`,
-        payload: {
-          voicemail_id: saved.rows[0].id,
+      try {
+        const voicemail = saved.rows[0];
+        const payload = {
+          voicemail_id: voicemail.id,
           call_id: row.phone_call_id,
           call_sid: callSid,
           recording_sid: recordingSid,
           external_phone_number: externalPhone,
-          contact_id: saved.rows[0]?.contact_id || null
+          contact_id: voicemail.contact_id || null,
+          duration_seconds: voicemail.duration_seconds || null,
+          recording_status: voicemail.recording_status,
+          contact_exists: Boolean(voicemail.contact_id)
+        };
+        for (const eventType of ["voicemail.received", "voicemail.recording_ready", voicemail.contact_id ? "voicemail.from_contact" : "voicemail.from_unknown_number"]) {
+          await emitAutomationEvent({
+            companyId: row.company_id,
+            eventType,
+            subjectType: "voicemail",
+            subjectId: voicemail.id,
+            source: "twilio.voice",
+            dedupeKey: `${eventType}:${recordingSid}`,
+            payload
+          });
         }
-      });
+        await syncAutomationSchedulesForVoicemail(row.company_id, voicemail);
+      } catch (automationError) {
+        console.error("[twilio/voice/voicemail-recording] automation emission failed:", { recordingSid, code: automationError?.code, message: automationError?.message });
+      }
       let title = externalPhone || "Unknown caller";
       if (saved.rows[0]?.contact_id) {
         const contact = await pool.query(
@@ -3014,7 +3133,19 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
         ]
       );
       if (parentUpdate.rowCount) {
-        if (direction === "inbound" && ["busy", "failed", "canceled"].includes(disposition || "")) {
+        try {
+          const payload = { call_id: parentUpdate.rows[0].id, call_sid: parentCallSid, external_phone_number: externalNumber, contact_id: contactID, direction, status, disposition, duration_seconds: duration };
+          await emitCallAutomationEvents({
+            companyId: line.company_id,
+            callId: parentUpdate.rows[0].id,
+            callSid: parentCallSid,
+            eventTypes: callAutomationEventTypes({ status, disposition, direction, durationSeconds: duration }).filter((eventType) => eventType !== "call.missed"),
+            payload
+          });
+        } catch (automationError) {
+          console.error("[twilio/voice/status] call automation emission failed:", { callSid: parentCallSid, code: automationError?.code, message: automationError?.message });
+        }
+        if (direction === "inbound" && ["busy", "failed", "canceled", "missed"].includes(disposition || "")) {
           await emitAutomationEvent({
             companyId: line.company_id,
             eventType: "call.missed",
@@ -3072,7 +3203,7 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
       ]
     );
 
-    if (direction === "inbound" && ["busy", "failed", "canceled"].includes(disposition || "")) {
+    if (direction === "inbound" && ["busy", "failed", "canceled", "missed"].includes(disposition || "")) {
       await emitAutomationEvent({
         companyId: line.company_id,
         eventType: "call.missed",
@@ -3090,6 +3221,18 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
       }).catch((e) => {
         console.error("[twilio/voice/status] missed-call APNs failed:", { callSid, code: e?.code, message: e?.message });
       });
+    }
+    try {
+      const payload = { call_id: savedCall.rows[0]?.id, call_sid: callSid, external_phone_number: externalNumber, contact_id: contactID, direction, status, disposition, duration_seconds: duration };
+      await emitCallAutomationEvents({
+        companyId: line.company_id,
+        callId: savedCall.rows[0]?.id,
+        callSid,
+        eventTypes: callAutomationEventTypes({ status, disposition, direction, durationSeconds: duration }).filter((eventType) => eventType !== "call.missed"),
+        payload
+      });
+    } catch (automationError) {
+      console.error("[twilio/voice/status] call automation emission failed:", { callSid, code: automationError?.code, message: automationError?.message });
     }
 
     res.status(200).type("text/plain").send("OK");
@@ -3191,10 +3334,31 @@ app.post("/api/phone/voicemails/:id/read", authRequired, async (req, res) => {
         WHERE id = $1
           AND company_id = $2
           AND deleted_at IS NULL
-        RETURNING id`,
+        RETURNING id, contact_id, external_phone_number, duration_seconds, recording_status`,
       [req.params.id, req.companyId]
     );
     if (!rows.length) return res.status(404).json({ error: "voicemail_not_found" });
+    try {
+      await cancelAutomationSchedulesForSubject(req.companyId, "voicemail", req.params.id, ["voicemail.unread_for"]);
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "voicemail.read",
+        subjectType: "voicemail",
+        subjectId: rows[0].id,
+        actorUserId: req.userId,
+        source: "ios",
+        dedupeKey: `voicemail.read:${rows[0].id}:${Date.now()}`,
+        payload: {
+          voicemail_id: rows[0].id,
+          contact_id: rows[0].contact_id || null,
+          external_phone_number: rows[0].external_phone_number,
+          duration_seconds: rows[0].duration_seconds || null,
+          recording_status: rows[0].recording_status
+        }
+      });
+    } catch (automationError) {
+      console.error("[phone/voicemail/read] automation emission failed:", { code: automationError?.code, message: automationError?.message });
+    }
     res.json({ ok: true });
   } catch (e) {
     console.error("[phone/voicemail/read] failed:", { code: e?.code, message: e?.message });
@@ -3211,10 +3375,31 @@ app.delete("/api/phone/voicemails/:id", authRequired, async (req, res) => {
         WHERE id = $1
           AND company_id = $2
           AND deleted_at IS NULL
-        RETURNING twilio_recording_sid`,
+        RETURNING id, twilio_recording_sid, contact_id, external_phone_number, duration_seconds, recording_status`,
       [req.params.id, req.companyId]
     );
     if (!rows.length) return res.status(404).json({ error: "voicemail_not_found" });
+    try {
+      await cancelAutomationSchedulesForSubject(req.companyId, "voicemail", req.params.id, ["voicemail.unread_for"]);
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "voicemail.deleted",
+        subjectType: "voicemail",
+        subjectId: rows[0].id,
+        actorUserId: req.userId,
+        source: "ios",
+        dedupeKey: `voicemail.deleted:${rows[0].id}`,
+        payload: {
+          voicemail_id: rows[0].id,
+          contact_id: rows[0].contact_id || null,
+          external_phone_number: rows[0].external_phone_number,
+          duration_seconds: rows[0].duration_seconds || null,
+          recording_status: rows[0].recording_status
+        }
+      });
+    } catch (automationError) {
+      console.error("[phone/voicemail/delete] automation emission failed:", { code: automationError?.code, message: automationError?.message });
+    }
     const recordingSid = (rows[0].twilio_recording_sid || "").toString().trim();
     if (recordingSid) {
       const client = createTwilioClient();
@@ -3374,6 +3559,7 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
     const { rows } = await pool.query(
       `SELECT sc.id AS conversation_id,
               sc.external_phone_number,
+              sc.contact_id,
               pl.id AS phone_line_id,
               pl.phone_number,
               pl.status,
@@ -3484,7 +3670,56 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
         [conversation.conversation_id]
       );
       await db.query("COMMIT");
-      res.status(201).json(inserted.rows[0]);
+      const stored = inserted.rows[0];
+      try {
+        const stats = await pool.query(
+          `SELECT COUNT(*) FILTER (WHERE direction = 'outbound')::int AS outbound_count
+             FROM sms_messages
+            WHERE conversation_id = $1 AND deleted_at IS NULL`,
+          [conversation.conversation_id]
+        );
+        const payload = {
+          message_id: stored.id,
+          conversation_id: stored.conversation_id,
+          contact_id: conversation.contact_id || null,
+          external_number: toNumber,
+          from_number: fromNumber,
+          to_number: toNumber,
+          body,
+          direction: "outbound",
+          status: stored.message_status,
+          media_count: stored.media_count || 0,
+          has_media: Number(stored.media_count || 0) > 0,
+          outbound_count: stats.rows[0]?.outbound_count || 0
+        };
+        await emitAutomationEvent({
+          companyId: req.companyId,
+          eventType: Number(stored.media_count || 0) > 0 ? "sms.mms_sent" : "sms.sent",
+          subjectType: "sms_message",
+          subjectId: stored.id,
+          actorUserId: req.userId,
+          source: "ios",
+          dedupeKey: `${Number(stored.media_count || 0) > 0 ? "sms.mms_sent" : "sms.sent"}:${stored.id}`,
+          payload
+        });
+        if (Number(stats.rows[0]?.outbound_count || 0) === 1) {
+          await emitAutomationEvent({
+            companyId: req.companyId,
+            eventType: "sms.first_outbound",
+            subjectType: "sms_message",
+            subjectId: stored.id,
+            actorUserId: req.userId,
+            source: "ios",
+            dedupeKey: `sms.first_outbound:${stored.conversation_id}`,
+            payload
+          });
+        }
+        await syncAutomationSchedulesForSmsOutbound(req.companyId, { ...stored, contact_id: conversation.contact_id || null, external_phone_number: toNumber });
+        await syncAutomationSchedulesForSmsConversationActivity(req.companyId, stored.conversation_id, stored);
+      } catch (automationError) {
+        console.error("[phone/messages] automation emission failed:", { messageId: stored.id, code: automationError?.code, message: automationError?.message });
+      }
+      res.status(201).json(stored);
     } catch (e) {
       await db.query("ROLLBACK").catch(() => {});
       console.error("[phone/messages] outbound persistence failed:", { code: e?.code, message: e?.message });
@@ -3593,6 +3828,17 @@ app.post("/webhooks/twilio/message-status", async (req, res) => {
     const status = (req.body.MessageStatus || req.body.SmsStatus || "").toString().trim() || null;
     const errorCode = req.body.ErrorCode ? req.body.ErrorCode.toString() : null;
     const errorMessage = req.body.ErrorMessage ? req.body.ErrorMessage.toString() : null;
+    const before = await pool.query(
+      `SELECT sm.id, sm.conversation_id, sm.message_status, sm.direction, sm.from_number, sm.to_number, sm.body,
+              sm.media_count, sc.contact_id, sc.external_phone_number, pl.company_id
+         FROM sms_messages sm
+         JOIN sms_conversations sc ON sc.id = sm.conversation_id
+         JOIN phone_lines pl ON pl.id = sc.phone_line_id
+        WHERE sm.twilio_message_sid = $1
+        LIMIT 1`,
+      [messageSid]
+    );
+    const previous = before.rows[0] || null;
     const { rowCount } = await pool.query(
       `UPDATE sms_messages
           SET message_status = COALESCE($2, message_status),
@@ -3604,6 +3850,44 @@ app.post("/webhooks/twilio/message-status", async (req, res) => {
     );
     if (!rowCount) {
       console.log("[twilio/message-status] message not found", { messageSid, status });
+    } else if (previous && status && status !== previous.message_status) {
+      const mapped = {
+        queued: "sms.queued",
+        sending: "sms.sending",
+        delivered: "sms.delivered",
+        failed: "sms.failed",
+        undelivered: "sms.undelivered"
+      }[status];
+      if (mapped) {
+        try {
+          await emitAutomationEvent({
+            companyId: previous.company_id,
+            eventType: mapped,
+            subjectType: "sms_message",
+            subjectId: previous.id,
+            source: "twilio.status",
+            dedupeKey: `${mapped}:${messageSid}:${status}`,
+            payload: {
+              message_id: previous.id,
+              conversation_id: previous.conversation_id,
+              contact_id: previous.contact_id || null,
+              external_number: previous.external_phone_number,
+              direction: previous.direction,
+              from_number: previous.from_number,
+              to_number: previous.to_number,
+              body: previous.body,
+              status,
+              previous_status: previous.message_status,
+              error_code: errorCode,
+              failure_reason: errorMessage,
+              media_count: previous.media_count || 0,
+              has_media: Number(previous.media_count || 0) > 0
+            }
+          });
+        } catch (automationError) {
+          console.error("[twilio/message-status] automation emission failed:", { messageSid, code: automationError?.code, message: automationError?.message });
+        }
+      }
     }
     res.status(200).type("text/plain").send("OK");
   } catch (e) {
@@ -4062,6 +4346,18 @@ app.post("/api/internal/conversations/private", authRequired, async (req, res) =
       `INSERT INTO conversation_participants(id, conversation_id, user_id) VALUES($1,$2,$3),($4,$2,$5)`,
       [randomUUID(), id, req.userId, randomUUID(), otherUserId]
     );
+    if (req.companyId) {
+      emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "internal.conversation_created",
+        subjectType: "internal_conversation",
+        subjectId: id,
+        actorUserId: req.userId,
+        source: "ios",
+        dedupeKey: `internal.conversation_created:${id}`,
+        payload: { conversation_id: id, is_dm: true, recipient_user_ids: [otherUserId], sender_user_id: req.userId }
+      }).catch((e) => console.error("[internal/private] automation emission failed:", { code: e?.code, message: e?.message }));
+    }
     res.status(201).json({ id });
   } catch (e) { console.error(e); res.status(500).json({ error: "private_conversation_failed" }); }
 });
@@ -4079,6 +4375,18 @@ app.post("/api/internal/conversations/group", authRequired, async (req, res) => 
     await pool.query(`INSERT INTO conversations(id, company_id, title, is_group, created_by) VALUES($1,$2,$3,true,$4)`, [id, req.companyId || null, title, req.userId]);
     for (const userId of ids) {
       await pool.query(`INSERT INTO conversation_participants(id, conversation_id, user_id) VALUES($1,$2,$3)`, [randomUUID(), id, userId]);
+    }
+    if (req.companyId) {
+      emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "internal.group_created",
+        subjectType: "internal_conversation",
+        subjectId: id,
+        actorUserId: req.userId,
+        source: "ios",
+        dedupeKey: `internal.group_created:${id}`,
+        payload: { conversation_id: id, title, recipient_user_ids: ids.filter((userId) => userId !== req.userId), sender_user_id: req.userId, is_group: true }
+      }).catch((e) => console.error("[internal/group] automation emission failed:", { code: e?.code, message: e?.message }));
     }
     res.status(201).json({ id });
   } catch (e) { console.error(e); res.status(500).json({ error: "group_conversation_failed" }); }
@@ -4135,6 +4443,24 @@ app.post("/api/internal/conversations/:id/messages", authRequired, async (req, r
     await attachRows(id, attachments);
     await pool.query(`UPDATE conversations SET updated_at = now() WHERE id = $1`, [req.params.id]);
     const recipients = await pool.query(`SELECT user_id FROM conversation_participants WHERE conversation_id = $1`, [req.params.id]);
+    const recipientIds = recipients.rows.map((r) => r.user_id).filter((userId) => userId !== req.userId);
+    if (req.companyId) {
+      const convo = await pool.query(`SELECT is_group FROM conversations WHERE id = $1 AND company_id = $2 LIMIT 1`, [req.params.id, req.companyId]);
+      const eventTypes = ["internal.message_sent", "internal.message_received", convo.rows[0]?.is_group ? "internal.group_message_received" : "internal.dm_received"];
+      if (attachments.length) eventTypes.push("internal.attachment_received");
+      for (const eventType of eventTypes) {
+        await emitAutomationEvent({
+          companyId: req.companyId,
+          eventType,
+          subjectType: "internal_message",
+          subjectId: id,
+          actorUserId: req.userId,
+          source: "ios",
+          dedupeKey: `${eventType}:${id}`,
+          payload: { message_id: id, conversation_id: req.params.id, sender_user_id: req.userId, recipient_user_ids: recipientIds, body, message_body: body, has_attachments: attachments.length > 0, attachment_count: attachments.length, conversation_type: convo.rows[0]?.is_group ? "group" : "dm" }
+        });
+      }
+    }
     await notifyMany(recipients.rows.map((r) => r.user_id), req.companyId, "internal_message", "New message", body || "Attachment", { conversation_id: req.params.id, message_id: id }, req.userId);
     res.status(201).json((await messageRowsWithAttachments(rows))[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "send_conversation_message_failed" }); }
@@ -4142,7 +4468,19 @@ app.post("/api/internal/conversations/:id/messages", authRequired, async (req, r
 
 app.post("/api/internal/conversations/:id/read", authRequired, async (req, res) => {
   try {
-    await pool.query(`UPDATE conversation_participants SET last_read_at = now() WHERE conversation_id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    const result = await pool.query(`UPDATE conversation_participants SET last_read_at = now() WHERE conversation_id = $1 AND user_id = $2 RETURNING conversation_id`, [req.params.id, req.userId]);
+    if (result.rowCount && req.companyId) {
+      emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "internal.conversation_read",
+        subjectType: "internal_conversation",
+        subjectId: req.params.id,
+        actorUserId: req.userId,
+        source: "ios",
+        dedupeKey: `internal.conversation_read:${req.params.id}:${req.userId}:${Date.now()}`,
+        payload: { conversation_id: req.params.id, user_id: req.userId }
+      }).catch((e) => console.error("[internal/read] automation emission failed:", { code: e?.code, message: e?.message }));
+    }
     res.json({ ok: true });
   } catch (e) { console.error(e); res.status(500).json({ error: "mark_read_failed" }); }
 });
@@ -4174,6 +4512,16 @@ app.delete("/api/internal/channels/:id", authRequired, requireEmployer, async (r
     );
     if (!rows.length) return res.status(404).json({ error: "channel_not_found" });
     await pool.query(`UPDATE messages SET deleted_at = COALESCE(deleted_at, now()), body = '' WHERE channel_id = $1 AND deleted_at IS NULL`, [req.params.id]);
+    emitAutomationEvent({
+      companyId: req.companyId,
+      eventType: "internal.channel_deleted",
+      subjectType: "channel",
+      subjectId: rows[0].id,
+      actorUserId: req.userId,
+      source: "ios",
+      dedupeKey: `internal.channel_deleted:${rows[0].id}`,
+      payload: { channel_id: rows[0].id }
+    }).catch((e) => console.error("[internal/channel/delete] automation emission failed:", { code: e?.code, message: e?.message }));
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "delete_channel_failed" }); }
 });
@@ -4189,6 +4537,18 @@ app.post("/api/internal/channels", authRequired, async (req, res) => {
        RETURNING id, company_id, name, description, created_by, created_at, archived_at`,
       [randomUUID(), req.companyId || null, name, description || null, req.userId]
     );
+    if (req.companyId) {
+      emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "internal.channel_created",
+        subjectType: "channel",
+        subjectId: rows[0].id,
+        actorUserId: req.userId,
+        source: "ios",
+        dedupeKey: `internal.channel_created:${rows[0].id}`,
+        payload: { channel_id: rows[0].id, name: rows[0].name, description: rows[0].description || null }
+      }).catch((e) => console.error("[internal/channel/create] automation emission failed:", { code: e?.code, message: e?.message }));
+    }
     res.status(201).json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "create_channel_failed" }); }
 });
@@ -4235,6 +4595,23 @@ app.post("/api/internal/channels/:id/messages", authRequired, async (req, res) =
       req.companyId ? `SELECT id FROM users WHERE company_id = $1` : `SELECT id FROM users WHERE id = $1`,
       [req.companyId || req.userId]
     );
+    if (req.companyId) {
+      const recipientIds = recipients.rows.map((r) => r.id).filter((userId) => userId !== req.userId);
+      const eventTypes = ["internal.message_sent", "internal.channel_message_received"];
+      if (attachments.length) eventTypes.push("internal.attachment_received");
+      for (const eventType of eventTypes) {
+        await emitAutomationEvent({
+          companyId: req.companyId,
+          eventType,
+          subjectType: "internal_message",
+          subjectId: id,
+          actorUserId: req.userId,
+          source: "ios",
+          dedupeKey: `${eventType}:${id}`,
+          payload: { message_id: id, channel_id: req.params.id, channel_name: channel.rows[0].name, sender_user_id: req.userId, recipient_user_ids: recipientIds, body, message_body: body, has_attachments: attachments.length > 0, attachment_count: attachments.length, conversation_type: "channel" }
+        });
+      }
+    }
     await notifyMany(recipients.rows.map((r) => r.id), req.companyId, "channel_message", `#${channel.rows[0].name}`, body || "Attachment", { channel_id: req.params.id, message_id: id }, req.userId);
     res.status(201).json((await messageRowsWithAttachments(rows))[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "send_channel_message_failed" }); }
@@ -4262,10 +4639,22 @@ app.delete("/api/internal/messages/:id", authRequired, async (req, res) => {
               )
             )
           )
-        RETURNING m.id`,
+        RETURNING m.id, m.conversation_id, m.channel_id`,
       [req.params.id, req.userId, req.role, req.companyId]
     );
     if (!rows.length) return res.status(404).json({ error: "message_not_found" });
+    if (req.companyId) {
+      emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "internal.message_deleted",
+        subjectType: "internal_message",
+        subjectId: rows[0].id,
+        actorUserId: req.userId,
+        source: "ios",
+        dedupeKey: `internal.message_deleted:${rows[0].id}`,
+        payload: { message_id: rows[0].id, conversation_id: rows[0].conversation_id || null, channel_id: rows[0].channel_id || null }
+      }).catch((e) => console.error("[internal/message/delete] automation emission failed:", { code: e?.code, message: e?.message }));
+    }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "delete_message_failed" }); }
 });
