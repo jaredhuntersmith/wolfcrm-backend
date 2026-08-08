@@ -1708,9 +1708,11 @@ function leadContextFromContact(contact, payload) {
 
 async function loadPipelineContext(companyId, contactId) {
   const opp = (await ctx.pool.query(
-    `SELECT o.*, s.name AS stage_name
+    `SELECT o.*, s.name AS stage_name, c.value_cents, u.name AS salesperson_name
        FROM opportunities o
        LEFT JOIN stages s ON s.id = o.stage_id AND (s.company_id = $1 OR s.company_id IS NULL)
+       LEFT JOIN contacts c ON c.id::text = o.contact_id AND c.company_id = $1
+       LEFT JOIN users u ON u.id = o.user_id AND u.company_id = $1
       WHERE o.company_id = $1 AND o.contact_id = $2
       LIMIT 1`,
     [companyId, contactId]
@@ -1725,9 +1727,9 @@ async function loadPipelineContext(companyId, contactId) {
     stage_name: opp.stage_name,
     is_won: opp.state === "won",
     is_lost: opp.state === "lost",
-    opportunity_value: null,
-    salesperson_id: null,
-    salesperson_name: null,
+    opportunity_value: opp.value_cents == null ? null : Number(opp.value_cents) / 100,
+    salesperson_id: opp.user_id,
+    salesperson_name: opp.salesperson_name,
     days_in_stage: created ? Math.floor((Date.now() - new Date(created).getTime()) / 86400000) : null,
     reminder_exists: reminder.rowCount > 0
   };
