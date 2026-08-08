@@ -145,6 +145,92 @@ async function deviceTokensForCompany(companyId) {
   return rows.map((row) => ({ token: row.token, environment: row.environment })).filter((row) => row.token);
 }
 
+async function deviceTokensForUsers(userIds) {
+  const ids = [...new Set((userIds || []).filter(Boolean))];
+  if (!ids.length) return [];
+  const { rows } = await pool.query(
+    `SELECT dt.token,
+            COALESCE(dt.environment, CASE WHEN $2::boolean THEN 'production' ELSE 'sandbox' END) AS environment,
+            dt.user_id
+       FROM device_tokens dt
+      WHERE dt.user_id = ANY($1::uuid[])`,
+    [ids, process.env.APNS_PRODUCTION === "true"]
+  );
+  return rows.map((row) => ({ token: row.token, environment: row.environment, userId: row.user_id })).filter((row) => row.token);
+}
+
+const DEFAULT_PUSH_CATEGORIES = {
+  cellular_sms: true,
+  missed_call: true,
+  voicemail: true,
+  internal_message: true,
+  channel_message: true,
+  job_assignment: true,
+  job_scheduled: true
+};
+
+function normalizePushCategories(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return { ...DEFAULT_PUSH_CATEGORIES, ...source };
+}
+
+async function shouldSendPush({ userId, category }) {
+  if (!userId || !category) return false;
+  const { rows } = await pool.query(
+    `SELECT notifications_enabled, notification_categories
+       FROM zapier_tokens
+      WHERE user_id = $1
+      LIMIT 1`,
+    [userId]
+  );
+  if (!rows.length) {
+    return category === "new_lead" ? false : true;
+  }
+  if (category === "new_lead") {
+    return !!rows[0].notifications_enabled;
+  }
+  const categories = normalizePushCategories(rows[0].notification_categories);
+  return categories[category] !== false;
+}
+
+async function pushEligibleUsers(userIds, category) {
+  const eligible = [];
+  for (const userId of [...new Set((userIds || []).filter(Boolean))]) {
+    try {
+      if (await shouldSendPush({ userId, category })) eligible.push(userId);
+      else console.log("[push] skipped", { category, userId, reason: "preference_disabled" });
+    } catch (e) {
+      console.error("[push] preference check failed:", { category, userId, code: e?.code, message: e?.message });
+    }
+  }
+  return eligible;
+}
+
+async function sendPushToUsers(userIds, category, options) {
+  const eligible = await pushEligibleUsers(userIds, category);
+  console.log("[push] event", { category, userCount: eligible.length });
+  if (!eligible.length) return { skipped: true, reason: "preference_disabled" };
+  const tokens = await deviceTokensForUsers(eligible);
+  if (!tokens.length) return { skipped: true, reason: "no_device_tokens" };
+  const result = await sendApnsPush(tokens, options);
+  console.log("[push] sent", { category, sent: result.sent || 0, failed: result.failed || 0, skipped: result.skipped || false });
+  return result;
+}
+
+async function employerUserIdsForCompany(companyId) {
+  if (!companyId) return [];
+  const { rows } = await pool.query(
+    `SELECT id
+       FROM users
+      WHERE company_id = $1
+        AND deleted_at IS NULL
+        AND role = 'employer'
+      ORDER BY created_at ASC, id ASC`,
+    [companyId]
+  );
+  return rows.map((row) => row.id);
+}
+
 async function phoneUnreadBadgeCount(companyId) {
   if (!companyId) return 0;
   const { rows } = await pool.query(
@@ -197,9 +283,12 @@ async function sendMissedCallPush({ companyId, callId, externalPhone, contactId 
     const name = (contact.rows[0]?.name || "").toString().trim();
     if (name) caller = name;
   }
-  await sendCompanyPhonePush(companyId, {
+  const userIds = await employerUserIdsForCompany(companyId);
+  const badge = await phoneUnreadBadgeCount(companyId).catch(() => null);
+  await sendPushToUsers(userIds, "missed_call", {
     title: `Missed call from ${caller}`,
     body: "Tap to call or text back.",
+    badge,
     contactId: contactId || undefined,
     threadId: callId ? `missed_call_${callId}` : "missed_call",
     payload: {
@@ -633,6 +722,7 @@ async function bootstrap() {
     ALTER TABLE zapier_tokens ADD COLUMN IF NOT EXISTS auto_assign_stage_enabled BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE zapier_tokens ADD COLUMN IF NOT EXISTS notifications_enabled BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE zapier_tokens ADD COLUMN IF NOT EXISTS notification_fields JSONB;
+    ALTER TABLE zapier_tokens ADD COLUMN IF NOT EXISTS notification_categories JSONB NOT NULL DEFAULT '{}'::jsonb;
 
     -- Queue of pending lead notifications for iOS foreground delivery.
     CREATE TABLE IF NOT EXISTS lead_notifications (
@@ -1579,6 +1669,16 @@ async function notifyMany(userIds, companyId, kind, title, body, data = {}, skip
   for (const userId of unique) {
     await createNotification(userId, companyId, kind, title, body, data);
   }
+  if (["internal_message", "channel_message", "job_assignment", "job_scheduled"].includes(kind)) {
+    await sendPushToUsers(unique, kind, {
+      title,
+      body,
+      payload: { type: kind, ...(data || {}) },
+      threadId: kind
+    }).catch((e) => {
+      console.error("[push] notifyMany APNs failed:", { category: kind, code: e?.code, message: e?.message });
+    });
+  }
 }
 
 function parseAttachments(input) {
@@ -2048,9 +2148,12 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
         hasContact: Boolean(contactID),
         mediaCount
       });
-      sendCompanyPhonePush(phoneLine.company_id, {
+      const userIds = await employerUserIdsForCompany(phoneLine.company_id);
+      const badge = await phoneUnreadBadgeCount(phoneLine.company_id).catch(() => null);
+      sendPushToUsers(userIds, "cellular_sms", {
         title: pushTitle,
         body: preview,
+        badge,
         contactId: contactID || undefined,
         threadId: storedConversationID ? `cellular_sms_${storedConversationID}` : "cellular_sms",
         payload: {
@@ -2747,9 +2850,12 @@ app.post("/webhooks/twilio/voice/voicemail-recording", async (req, res) => {
         const name = (contact.rows[0]?.name || "").toString().trim();
         if (name) title = name;
       }
-      sendCompanyPhonePush(row.company_id, {
+      const userIds = await employerUserIdsForCompany(row.company_id);
+      const badge = await phoneUnreadBadgeCount(row.company_id).catch(() => null);
+      sendPushToUsers(userIds, "voicemail", {
         title: `New voicemail from ${title}`,
         body: "Tap to listen.",
+        badge,
         contactId: saved.rows[0]?.contact_id || undefined,
         threadId: `voicemail_${saved.rows[0].id}`,
         payload: {
@@ -4589,7 +4695,8 @@ function integrationPayload(row) {
     auto_stage_id: row.auto_stage_id,
     auto_assign_stage_enabled: !!row.auto_assign_stage_enabled,
     notifications_enabled: !!row.notifications_enabled,
-    notification_fields: Array.isArray(row.notification_fields) ? row.notification_fields : (row.notification_fields || null)
+    notification_fields: Array.isArray(row.notification_fields) ? row.notification_fields : (row.notification_fields || null),
+    notification_categories: normalizePushCategories(row.notification_categories)
   };
 }
 
@@ -4604,11 +4711,22 @@ function sanitizeNotificationFields(input) {
   return cleaned;
 }
 
+const PUSH_CATEGORY_KEYS = new Set(Object.keys(DEFAULT_PUSH_CATEGORIES));
+function sanitizePushCategories(input) {
+  const cleaned = normalizePushCategories(input);
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    for (const [key, value] of Object.entries(input)) {
+      if (PUSH_CATEGORY_KEYS.has(key)) cleaned[key] = value !== false;
+    }
+  }
+  return cleaned;
+}
+
 // GET current token (create if missing)
 app.get("/api/integrations/zapier/token", authRequired, async (req, res) => {
   try {
     let { rows } = await pool.query(
-      `SELECT token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields
+      `SELECT token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields, notification_categories
        FROM zapier_tokens WHERE user_id = $1`,
       [req.userId]
     );
@@ -4618,7 +4736,7 @@ app.get("/api/integrations/zapier/token", authRequired, async (req, res) => {
         `INSERT INTO zapier_tokens (user_id, token, auto_assign_stage_enabled) VALUES ($1, $2, false)`,
         [req.userId, token]
       );
-      rows = [{ token, auto_stage_id: null, auto_assign_stage_enabled: false, notifications_enabled: false, notification_fields: null }];
+      rows = [{ token, auto_stage_id: null, auto_assign_stage_enabled: false, notifications_enabled: false, notification_fields: null, notification_categories: {} }];
     }
     // Self-heal: if the saved stage no longer belongs to the account, quietly clear it.
     const row = rows[0];
@@ -4653,7 +4771,7 @@ app.post("/api/integrations/zapier/token/rotate", authRequired, async (req, res)
       `INSERT INTO zapier_tokens (user_id, token)
        VALUES ($1, $2)
        ON CONFLICT (user_id) DO UPDATE SET token = EXCLUDED.token, created_at = now()
-       RETURNING token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields`,
+       RETURNING token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields, notification_categories`,
       [req.userId, token]
     );
     res.json(integrationPayload(rows[0]));
@@ -4691,7 +4809,7 @@ app.put("/api/integrations/zapier/auto-stage", authRequired, async (req, res) =>
          SET auto_stage_id = $2,
              auto_assign_stage_enabled = CASE WHEN $2::text IS NULL THEN false ELSE auto_assign_stage_enabled END
        WHERE user_id = $1
-       RETURNING token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields`,
+       RETURNING token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields, notification_categories`,
       [req.userId, effectiveStageId]
     );
     if (!rows.length) return res.status(404).json({ error: "token_not_found", message: "No webhook is set up for this account yet." });
@@ -4712,7 +4830,7 @@ app.put("/api/integrations/zapier/auto-assign-enabled", authRequired, async (req
       `UPDATE zapier_tokens
          SET auto_assign_stage_enabled = $2
        WHERE user_id = $1
-       RETURNING token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields`,
+       RETURNING token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields, notification_categories`,
       [req.userId, enabled]
     );
     if (!rows.length) return res.status(404).json({ error: "token_not_found", message: "No webhook is set up for this account yet." });
@@ -4724,18 +4842,20 @@ app.put("/api/integrations/zapier/auto-assign-enabled", authRequired, async (req
 });
 
 // Push-notification preferences for new-lead alerts.
-// Body: { enabled: bool, fields: [string] }
+// Body: { enabled: bool, fields: [string], categories: object }
 app.put("/api/integrations/zapier/notifications", authRequired, async (req, res) => {
   const enabled = !!(req.body && req.body.enabled);
   const fields = sanitizeNotificationFields(req.body && req.body.fields);
+  const categories = sanitizePushCategories(req.body && req.body.categories);
   try {
     const { rows } = await pool.query(
       `UPDATE zapier_tokens
          SET notifications_enabled = $2,
-             notification_fields = $3::jsonb
+             notification_fields = $3::jsonb,
+             notification_categories = $4::jsonb
        WHERE user_id = $1
-       RETURNING token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields`,
-      [req.userId, enabled, fields ? JSON.stringify(fields) : null]
+       RETURNING token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields, notification_categories`,
+      [req.userId, enabled, fields ? JSON.stringify(fields) : null, JSON.stringify(categories)]
     );
     if (!rows.length) return res.status(404).json({ error: "token_not_found", message: "No webhook is set up for this account yet." });
     res.json(integrationPayload(rows[0]));
@@ -4783,13 +4903,23 @@ app.get("/api/integrations/push/diagnostics", authRequired, async (req, res) => 
         LIMIT 5`,
       [req.userId]
     );
+    const prefs = await pool.query(
+      `SELECT notifications_enabled, notification_categories
+         FROM zapier_tokens
+        WHERE user_id = $1
+        LIMIT 1`,
+      [req.userId]
+    );
+    const prefRow = prefs.rows[0] || {};
     res.json({
       ok: true,
       apns_configured: Boolean(process.env.APNS_KEY_P8 && process.env.APNS_KEY_ID && process.env.APNS_TEAM_ID && process.env.APNS_BUNDLE_ID),
       bundle_id_configured: Boolean(process.env.APNS_BUNDLE_ID),
       registered_token_count: rows.length,
       environments: rows.map((row) => row.environment),
-      last_registration_error: rows.find((row) => row.last_registration_error)?.last_registration_error || null
+      last_registration_error: rows.find((row) => row.last_registration_error)?.last_registration_error || null,
+      new_leads_enabled: !!prefRow.notifications_enabled,
+      notification_categories: normalizePushCategories(prefRow.notification_categories)
     });
   } catch (e) {
     console.error("[push/diagnostics] failed:", { code: e?.code, message: e?.message });
@@ -5532,33 +5662,29 @@ app.post("/webhooks/leads/:token", async (req, res) => {
         questions
       });
 
-      // Queue for foreground delivery
-      try {
-        await pool.query(
-          `INSERT INTO lead_notifications (user_id, company_id, contact_id, title, body)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [userId, companyId, contactId, title, notifBody]
-        );
-        zLog("notification_enqueued", { contactId });
-      } catch (e) {
-        zWarn("notification_enqueue_failed", { message: e && e.message ? e.message : "unknown" });
+      const apnsConfigured = Boolean(process.env.APNS_KEY_P8 && process.env.APNS_KEY_ID && process.env.APNS_TEAM_ID && process.env.APNS_BUNDLE_ID);
+      if (!apnsConfigured) {
+        try {
+          await pool.query(
+            `INSERT INTO lead_notifications (user_id, company_id, contact_id, title, body)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [userId, companyId, contactId, title, notifBody]
+          );
+          zLog("notification_enqueued", { contactId });
+        } catch (e) {
+          zWarn("notification_enqueue_failed", { message: e && e.message ? e.message : "unknown" });
+        }
       }
 
-      // Fire real APNs push in parallel
       try {
-        const { rows: tokenRows } = await pool.query(
-          `SELECT token FROM device_tokens WHERE user_id = $1`,
-          [userId]
-        );
-        const deviceTokens = tokenRows.map(r => r.token);
-        if (deviceTokens.length) {
-          const result = await sendApnsPush(deviceTokens, {
-            title, body: notifBody, contactId
-          });
-          zLog("apns_push_result", { contactId, ...result });
-        } else {
-          zLog("apns_push_skipped", { reason: "no_device_tokens" });
-        }
+        const result = await sendPushToUsers([userId], "new_lead", {
+          title,
+          body: notifBody,
+          contactId,
+          threadId: `new_lead_${contactId}`,
+          payload: { type: "new_lead", contact_id: contactId, source }
+        });
+        zLog("apns_push_result", { contactId, ...result });
       } catch (e) {
         zWarn("apns_push_error", { message: e && e.message ? e.message : "unknown" });
       }
