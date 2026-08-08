@@ -53,7 +53,7 @@ function getApnProvider() {
   return apnProviderInstance;
 }
 
-async function sendApnsPush(deviceTokens, { title, body, contactId }) {
+async function sendApnsPush(deviceTokens, { title, body, contactId, payload = {}, badge = null, threadId = null }) {
   const provider = getApnProvider();
   const bundleId = process.env.APNS_BUNDLE_ID;
   if (!provider || !bundleId) {
@@ -67,7 +67,10 @@ async function sendApnsPush(deviceTokens, { title, body, contactId }) {
   note.sound = "default";
   note.topic = bundleId;
   note.expiry = Math.floor(Date.now() / 1000) + 3600;
-  if (contactId) note.payload = { contact_id: contactId };
+  if (Number.isInteger(badge) && badge >= 0) note.badge = badge;
+  if (threadId) note.threadId = threadId;
+  note.payload = { ...payload };
+  if (contactId) note.payload.contact_id = contactId;
   try {
     const result = await provider.send(note, deviceTokens);
     // Prune tokens Apple flagged as unregistered so we stop sending to dead devices.
@@ -83,6 +86,60 @@ async function sendApnsPush(deviceTokens, { title, body, contactId }) {
   } catch (e) {
     console.error("[apns] send failed:", e && e.message ? e.message : e);
     return { sent: 0, failed: deviceTokens.length, error: "send_failed" };
+  }
+}
+
+async function deviceTokensForCompany(companyId) {
+  if (!companyId) return [];
+  const { rows } = await pool.query(
+    `SELECT DISTINCT dt.token
+       FROM device_tokens dt
+       JOIN users u ON u.id = dt.user_id
+      WHERE u.company_id = $1
+        AND u.deleted_at IS NULL
+        AND u.role = 'employer'`,
+    [companyId]
+  );
+  return rows.map((row) => row.token).filter(Boolean);
+}
+
+async function phoneUnreadBadgeCount(companyId) {
+  if (!companyId) return 0;
+  const { rows } = await pool.query(
+    `SELECT
+       COALESCE((
+         SELECT COUNT(*)
+           FROM sms_messages sm
+           JOIN sms_conversations sc ON sc.id = sm.conversation_id
+           JOIN phone_lines pl ON pl.id = sc.phone_line_id
+          WHERE pl.company_id = $1
+            AND sc.deleted_at IS NULL
+            AND sm.deleted_at IS NULL
+            AND sm.direction = 'inbound'
+            AND sm.created_at > COALESCE(sc.last_read_at, '1970-01-01'::timestamptz)
+       ), 0)::int
+       +
+       COALESCE((
+         SELECT COUNT(*)
+           FROM voicemails vm
+          WHERE vm.company_id = $1
+            AND vm.deleted_at IS NULL
+            AND vm.is_read = false
+       ), 0)::int AS count`,
+    [companyId]
+  );
+  return Number(rows[0]?.count || 0);
+}
+
+async function sendCompanyPhonePush(companyId, options) {
+  try {
+    const tokens = await deviceTokensForCompany(companyId);
+    if (!tokens.length) return { skipped: true, reason: "no_device_tokens" };
+    const badge = await phoneUnreadBadgeCount(companyId).catch(() => null);
+    return await sendApnsPush(tokens, { ...options, badge });
+  } catch (e) {
+    console.error("[phone/apns] push failed:", { code: e?.code, message: e?.message });
+    return { sent: 0, failed: 0, error: "phone_push_failed" };
   }
 }
 
