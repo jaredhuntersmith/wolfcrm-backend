@@ -2480,6 +2480,9 @@ app.post("/webhooks/twilio/voice/incoming", async (req, res) => {
 
     const dial = voiceResponse.dial({
       callerId: fromNumber || undefined,
+      action: twilioPublicUrl("/webhooks/twilio/voice/incoming-complete"),
+      method: "POST",
+      timeout: 25,
       statusCallback: twilioPublicUrl("/webhooks/twilio/voice/status"),
       statusCallbackEvent: "initiated ringing answered completed"
     });
@@ -2719,6 +2722,55 @@ app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) 
   } catch (e) {
     console.error("[phone/conversation/messages] failed:", { code: e?.code, message: e?.message });
     res.status(500).json({ error: "phone_messages_failed" });
+  }
+});
+
+app.get("/api/phone/messages/:id/media/:index", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(404).json({ error: "media_not_found" });
+  const mediaIndex = Math.max(0, parseInt(req.params.index || "0", 10) || 0);
+  try {
+    const { rows } = await pool.query(
+      `SELECT sm.media
+         FROM sms_messages sm
+         JOIN sms_conversations sc ON sc.id = sm.conversation_id
+         JOIN phone_lines pl ON pl.id = sc.phone_line_id
+        WHERE sm.id = $1
+          AND pl.company_id = $2
+          AND sm.deleted_at IS NULL
+          AND sc.deleted_at IS NULL
+        LIMIT 1`,
+      [req.params.id, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "media_not_found" });
+    const media = safeSmsMediaArray(rows[0].media);
+    const item = media.find((entry) => Number(entry.index ?? 0) === mediaIndex) || media[mediaIndex];
+    if (!item) return res.status(404).json({ error: "media_not_found" });
+
+    if (item.objectKey) {
+      const cfg = mediaBucketConfig();
+      const s3 = getMediaS3Client();
+      if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured" });
+      const allowedPrefix = `companies/${req.companyId}/messages/`;
+      if (!item.objectKey.toString().startsWith(allowedPrefix)) {
+        return res.status(403).json({ error: "media_forbidden" });
+      }
+      const command = new GetObjectCommand({ Bucket: cfg.bucket, Key: item.objectKey });
+      const signedUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
+      const upstream = await fetch(signedUrl);
+      if (!upstream.ok) return res.status(upstream.status).json({ error: "media_fetch_failed" });
+      const contentType = upstream.headers.get("content-type") || item.contentType || "application/octet-stream";
+      const buffer = Buffer.from(await upstream.arrayBuffer());
+      return res.type(contentType).send(buffer);
+    }
+
+    if (!item.url) return res.status(404).json({ error: "media_not_found" });
+    const upstream = await fetchTwilioResource(item.url);
+    const contentType = upstream.headers.get("content-type") || item.contentType || "application/octet-stream";
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    res.type(contentType).send(buffer);
+  } catch (e) {
+    console.error("[phone/message/media] failed:", { code: e?.code, status: e?.status, message: e?.message });
+    res.status(e?.status || 500).json({ error: "media_fetch_failed" });
   }
 });
 
