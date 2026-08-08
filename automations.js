@@ -1040,6 +1040,7 @@ function templateVariableCatalog() {
 export async function installAutomationSystem(options) {
   ctx = options;
   await bootstrapAutomationSchema();
+  await backfillFinancialAutomationSchedules();
   installAutomationRoutes();
   startAutomationProcessors();
 }
@@ -1374,6 +1375,24 @@ async function cancelScheduledForSubject(companyId, subjectType, subjectId, even
       WHERE company_id = $1 AND subject_type = $2 AND subject_id = $3 AND event_type = ANY($4::text[]) AND status = 'scheduled'`,
     [companyId, subjectType, String(subjectId), eventTypes]
   );
+}
+
+async function backfillFinancialAutomationSchedules() {
+  try {
+    const plans = (await ctx.pool.query(
+      `SELECT * FROM service_plans
+        WHERE company_id IS NOT NULL
+          AND status IN ('active','payment_pending','past_due')
+          AND next_service_date IS NOT NULL
+          AND next_service_date >= CURRENT_DATE
+        LIMIT 1000`
+    )).rows;
+    for (const plan of plans) {
+      await syncAutomationSchedulesForServicePlan(plan.company_id, plan);
+    }
+  } catch (e) {
+    console.error("[automations] financial schedule backfill failed", e?.message || e);
+  }
 }
 
 function durationAmountMs(amount, unit) {
@@ -4886,7 +4905,7 @@ async function executeServicePlanCancel(run, node, config) {
   const plan = await resolveServicePlan(run, await buildRunContext(run), config);
   const stripe = ctx.getStripe ? ctx.getStripe() : null;
   if (stripe && plan.stripe_subscription_id && plan.stripe_connected_account_id) {
-    await stripe.subscriptions.cancel(plan.stripe_subscription_id, { stripeAccount: plan.stripe_connected_account_id, idempotencyKey: `auto_${run.id}_${node.id}_cancel_subscription` }).catch((e) => { throw new Error(`stripe_cancel_failed:${e?.message || "unknown"}`); });
+    await stripe.subscriptions.cancel(plan.stripe_subscription_id, {}, { stripeAccount: plan.stripe_connected_account_id, idempotencyKey: `auto_${run.id}_${node.id}_cancel_subscription` }).catch((e) => { throw new Error(`stripe_cancel_failed:${e?.message || "unknown"}`); });
   }
   const row = (await ctx.pool.query(`UPDATE service_plans SET status = 'canceled', updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [plan.id, run.company_id])).rows[0];
   await cancelScheduledForSubject(run.company_id, "service_plan", row.id, ["service_plan.service_upcoming", "service_plan.service_due", "service_plan.service_overdue"]);
