@@ -296,7 +296,7 @@ async function findSmsContactID({ companyId, externalPhone }) {
 
 const contactMatchJoinSQL = (phoneExpr, companyExpr) => `
   LEFT JOIN LATERAL (
-    SELECT CASE WHEN COUNT(*) = 1 THEN MIN(c.id)::text ELSE NULL END AS id,
+    SELECT CASE WHEN COUNT(*) = 1 THEN MIN(c.id::text) ELSE NULL END AS id,
            CASE WHEN COUNT(*) = 1 THEN MIN(c.name) ELSE NULL END AS name
       FROM contacts c
      WHERE c.company_id = ${companyExpr}
@@ -6891,3 +6891,4 @@ startServer().catch((err) => {
   console.error("Server startup failed:", err);
   process.exit(1);
 });
+
