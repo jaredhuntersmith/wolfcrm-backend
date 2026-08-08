@@ -194,6 +194,8 @@ const normalizeE164Phone = (value) => {
     return digits ? `+${digits}` : "";
   }
   const digits = raw.replace(/[^\d]/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
   return digits ? `+${digits}` : "";
 };
 
@@ -271,7 +273,8 @@ const twilioMediaMetadata = (body) => {
 };
 
 async function findSmsContactID({ companyId, externalPhone }) {
-  const digits = phoneDigits(externalPhone);
+  const normalized = normalizeE164Phone(externalPhone);
+  const digits = phoneDigits(normalized || externalPhone);
   if (!companyId || !digits) return null;
   const localDigits = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
   const { rows } = await pool.query(
@@ -290,6 +293,25 @@ async function findSmsContactID({ companyId, externalPhone }) {
   );
   return rows.length === 1 ? rows[0].id : null;
 }
+
+const contactMatchJoinSQL = (phoneExpr, companyExpr) => `
+  LEFT JOIN LATERAL (
+    SELECT CASE WHEN COUNT(*) = 1 THEN MIN(c.id)::text ELSE NULL END AS id,
+           CASE WHEN COUNT(*) = 1 THEN MIN(c.name) ELSE NULL END AS name
+      FROM contacts c
+     WHERE c.company_id = ${companyExpr}
+       AND regexp_replace(COALESCE(c.phone,''), '[^0-9]', '', 'g') <> ''
+       AND regexp_replace(COALESCE(${phoneExpr},''), '[^0-9]', '', 'g') <> ''
+       AND (
+         regexp_replace(COALESCE(c.phone,''), '[^0-9]', '', 'g') = regexp_replace(COALESCE(${phoneExpr},''), '[^0-9]', '', 'g')
+         OR (
+           length(regexp_replace(COALESCE(${phoneExpr},''), '[^0-9]', '', 'g')) IN (10, 11)
+           AND right(regexp_replace(COALESCE(c.phone,''), '[^0-9]', '', 'g'), 10) =
+               right(regexp_replace(COALESCE(${phoneExpr},''), '[^0-9]', '', 'g'), 10)
+         )
+       )
+  ) matched_contacts ON true
+`;
 
 const normalizeEmail = (email) => (email || "").toString().trim().toLowerCase();
 const passwordIsValid = (password) =>
@@ -567,8 +589,11 @@ async function bootstrap() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(phone_line_id, external_phone_number)
     );
+    ALTER TABLE sms_conversations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+    ALTER TABLE sms_conversations ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS sms_conversations_line_last_idx ON sms_conversations(phone_line_id, last_message_at DESC);
     CREATE INDEX IF NOT EXISTS sms_conversations_contact_idx ON sms_conversations(contact_id);
+    CREATE INDEX IF NOT EXISTS sms_conversations_deleted_idx ON sms_conversations(deleted_at);
 
     CREATE TABLE IF NOT EXISTS sms_messages (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -586,11 +611,13 @@ async function bootstrap() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE sms_messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     CREATE UNIQUE INDEX IF NOT EXISTS sms_messages_twilio_sid_uidx
       ON sms_messages(twilio_message_sid)
       WHERE twilio_message_sid IS NOT NULL;
     CREATE INDEX IF NOT EXISTS sms_messages_conversation_created_idx ON sms_messages(conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS sms_messages_conversation_updated_idx ON sms_messages(conversation_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS sms_messages_deleted_idx ON sms_messages(deleted_at);
 
     CREATE TABLE IF NOT EXISTS phone_calls (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -829,7 +856,9 @@ async function bootstrap() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS conversations_company_updated_idx ON conversations(company_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS conversations_deleted_idx ON conversations(deleted_at);
 
     CREATE TABLE IF NOT EXISTS conversation_participants (
       id TEXT PRIMARY KEY,
@@ -1750,7 +1779,8 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
          DO UPDATE SET
            contact_id = COALESCE(sms_conversations.contact_id, EXCLUDED.contact_id),
            last_message_at = now(),
-           updated_at = now()
+           updated_at = now(),
+           deleted_at = NULL
          RETURNING id`,
         [phoneLine.id, fromNumber, contactID]
       );
@@ -1820,15 +1850,38 @@ app.get("/api/phone/conversations", authRequired, async (req, res) => {
               sc.phone_line_id,
               pl.phone_number AS phone_line_number,
               sc.external_phone_number,
-              sc.contact_id,
-              c.name AS contact_name,
+              COALESCE(sc.contact_id, matched_contacts.id::uuid) AS contact_id,
+              COALESCE(c.name, matched_contacts.name) AS contact_name,
+              lm.body AS last_message_body,
+              lm.direction AS last_message_direction,
+              lm.message_status AS last_message_status,
+              lm.media_count AS last_message_media_count,
+              COALESCE((
+                SELECT COUNT(*)
+                  FROM sms_messages unread
+                 WHERE unread.conversation_id = sc.id
+                   AND unread.direction = 'inbound'
+                   AND unread.deleted_at IS NULL
+                   AND unread.created_at > COALESCE(sc.last_read_at, '1970-01-01'::timestamptz)
+              ), 0)::int AS unread_count,
               sc.last_message_at,
+              sc.last_read_at,
               sc.created_at,
               sc.updated_at
          FROM sms_conversations sc
          JOIN phone_lines pl ON pl.id = sc.phone_line_id
          LEFT JOIN contacts c ON c.id = sc.contact_id AND c.company_id = pl.company_id
+         ${contactMatchJoinSQL("sc.external_phone_number", "pl.company_id")}
+         LEFT JOIN LATERAL (
+           SELECT body, direction, message_status, media_count, created_at
+             FROM sms_messages
+            WHERE conversation_id = sc.id
+              AND deleted_at IS NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+         ) lm ON true
         WHERE pl.company_id = $1
+          AND sc.deleted_at IS NULL
         ORDER BY sc.last_message_at DESC NULLS LAST, sc.updated_at DESC
         LIMIT 200`,
       [req.companyId]
@@ -2343,6 +2396,41 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
       ? await findSmsContactID({ companyId: line.company_id, externalPhone: externalNumber })
       : null;
 
+    if (parentCallSid) {
+      const parentUpdate = await pool.query(
+        `UPDATE phone_calls
+            SET contact_id = COALESCE(phone_calls.contact_id, $2),
+                status = COALESCE($3, phone_calls.status),
+                answered_at = CASE
+                  WHEN $4::timestamptz IS NOT NULL THEN COALESCE(phone_calls.answered_at, $4::timestamptz, now())
+                  ELSE phone_calls.answered_at
+                END,
+                ended_at = CASE
+                  WHEN $5::boolean THEN COALESCE(phone_calls.ended_at, now())
+                  ELSE phone_calls.ended_at
+                END,
+                duration_seconds = COALESCE($6, phone_calls.duration_seconds),
+                disposition = COALESCE($7, phone_calls.disposition),
+                updated_at = now()
+          WHERE twilio_call_sid = $1
+            AND company_id = $8
+          RETURNING id`,
+        [
+          parentCallSid,
+          contactID,
+          status,
+          answeredAtInsert,
+          Boolean(status === "completed" || disposition),
+          duration,
+          disposition,
+          line.company_id
+        ]
+      );
+      if (parentUpdate.rowCount) {
+        return res.status(200).type("text/plain").send("OK");
+      }
+    }
+
     await pool.query(
       `INSERT INTO phone_calls(
          company_id, phone_line_id, contact_id, twilio_call_sid, twilio_parent_call_sid,
@@ -2390,6 +2478,8 @@ app.get("/api/phone/calls", authRequired, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT pc.id,
               pc.direction,
+              CASE WHEN pc.direction = 'inbound' THEN pc.from_number ELSE pc.to_number END AS external_phone_number,
+              CASE WHEN pc.direction = 'inbound' THEN pc.to_number ELSE pc.from_number END AS business_phone_number,
               pc.from_number,
               pc.to_number,
               pc.status,
@@ -2398,11 +2488,21 @@ app.get("/api/phone/calls", authRequired, async (req, res) => {
               pc.answered_at,
               pc.ended_at,
               pc.duration_seconds,
-              pc.contact_id,
-              c.name AS contact_name
+              COALESCE(pc.contact_id, matched_contacts.id::uuid) AS contact_id,
+              COALESCE(c.name, matched_contacts.name) AS contact_name
          FROM phone_calls pc
          LEFT JOIN contacts c ON c.id = pc.contact_id AND c.company_id = pc.company_id
+         ${contactMatchJoinSQL("CASE WHEN pc.direction = 'inbound' THEN pc.from_number ELSE pc.to_number END", "pc.company_id")}
         WHERE pc.company_id = $1
+          AND (
+            pc.twilio_parent_call_sid IS NULL
+            OR NOT EXISTS (
+              SELECT 1
+                FROM phone_calls parent
+               WHERE parent.twilio_call_sid = pc.twilio_parent_call_sid
+                 AND parent.company_id = pc.company_id
+            )
+          )
         ORDER BY pc.started_at DESC
         LIMIT $2`,
       [req.companyId, limit]
@@ -2421,11 +2521,13 @@ app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) 
       `SELECT sc.id
          FROM sms_conversations sc
          JOIN phone_lines pl ON pl.id = sc.phone_line_id
-        WHERE sc.id = $1 AND pl.company_id = $2
+        WHERE sc.id = $1 AND pl.company_id = $2 AND sc.deleted_at IS NULL
         LIMIT 1`,
       [req.params.id, req.companyId]
     );
     if (!owned.rowCount) return res.status(404).json({ error: "conversation_not_found" });
+
+    await pool.query(`UPDATE sms_conversations SET last_read_at = now(), updated_at = now() WHERE id = $1`, [req.params.id]);
 
     const { rows } = await pool.query(
       `SELECT id,
@@ -2444,6 +2546,7 @@ app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) 
               updated_at
          FROM sms_messages
         WHERE conversation_id = $1
+          AND deleted_at IS NULL
         ORDER BY created_at ASC, id ASC
         LIMIT 500`,
       [req.params.id]
@@ -2479,6 +2582,7 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
          FROM sms_conversations sc
          JOIN phone_lines pl ON pl.id = sc.phone_line_id
         WHERE sc.id = $1 AND pl.company_id = $2
+          AND sc.deleted_at IS NULL
         LIMIT 1`,
       [req.params.id, req.companyId]
     );
@@ -2562,6 +2666,80 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
   } catch (e) {
     console.error("[phone/messages] outbound failed:", { code: e?.code, message: e?.message });
     res.status(500).json({ error: "phone_message_send_failed" });
+  }
+});
+
+app.delete("/api/phone/messages/:id", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(404).json({ error: "message_not_found" });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `UPDATE sms_messages sm
+          SET deleted_at = now(), updated_at = now()
+         FROM sms_conversations sc
+         JOIN phone_lines pl ON pl.id = sc.phone_line_id
+        WHERE sm.id = $1
+          AND sm.conversation_id = sc.id
+          AND pl.company_id = $2
+          AND sm.deleted_at IS NULL
+        RETURNING sm.conversation_id`,
+      [req.params.id, req.companyId]
+    );
+    if (!rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "message_not_found" });
+    }
+    const conversationID = rows[0].conversation_id;
+    await client.query(
+      `UPDATE sms_conversations sc
+          SET last_message_at = (
+                SELECT MAX(created_at)
+                  FROM sms_messages
+                 WHERE conversation_id = sc.id
+                   AND deleted_at IS NULL
+              ),
+              updated_at = now()
+        WHERE sc.id = $1`,
+      [conversationID]
+    );
+    await client.query("COMMIT");
+    res.status(204).end();
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[phone/messages] delete failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "delete_phone_message_failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/phone/conversations/:id", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE sms_conversations sc
+          SET deleted_at = now(), updated_at = now()
+         FROM phone_lines pl
+        WHERE sc.id = $1
+          AND pl.id = sc.phone_line_id
+          AND pl.company_id = $2
+          AND sc.deleted_at IS NULL
+        RETURNING sc.id`,
+      [req.params.id, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "conversation_not_found" });
+    await pool.query(
+      `UPDATE sms_messages
+          SET deleted_at = COALESCE(deleted_at, now()), updated_at = now()
+        WHERE conversation_id = $1
+          AND deleted_at IS NULL`,
+      [req.params.id]
+    );
+    res.status(204).end();
+  } catch (e) {
+    console.error("[phone/conversation] delete failed:", { code: e?.code, message: e?.message });
+    res.status(500).json({ error: "delete_phone_conversation_failed" });
   }
 });
 
@@ -3021,6 +3199,7 @@ app.get("/api/internal/conversations", authRequired, async (req, res) => {
             LIMIT 1
          ) lm ON true
         WHERE cp.user_id = $1
+          AND c.deleted_at IS NULL
         ORDER BY COALESCE(lm.created_at, c.updated_at) DESC`,
       [req.userId]
     );
@@ -3094,6 +3273,23 @@ app.get("/api/internal/conversations/:id/messages", authRequired, async (req, re
   } catch (e) { console.error(e); res.status(500).json({ error: "conversation_messages_failed" }); }
 });
 
+app.delete("/api/internal/conversations/:id", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE conversations
+          SET deleted_at = now(), updated_at = now()
+        WHERE id = $1
+          AND company_id = $2
+          AND deleted_at IS NULL
+        RETURNING id`,
+      [req.params.id, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "conversation_not_found" });
+    await pool.query(`UPDATE messages SET deleted_at = COALESCE(deleted_at, now()), body = '' WHERE conversation_id = $1 AND deleted_at IS NULL`, [req.params.id]);
+    res.status(204).end();
+  } catch (e) { console.error(e); res.status(500).json({ error: "delete_conversation_failed" }); }
+});
+
 app.post("/api/internal/conversations/:id/messages", authRequired, async (req, res) => {
   const body = (req.body.body || "").toString();
   const attachments = parseAttachments(req.body.attachments);
@@ -3134,6 +3330,23 @@ app.get("/api/internal/channels", authRequired, async (req, res) => {
     );
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "channels_failed" }); }
+});
+
+app.delete("/api/internal/channels/:id", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE channels
+          SET archived_at = now()
+        WHERE id = $1
+          AND company_id = $2
+          AND archived_at IS NULL
+        RETURNING id`,
+      [req.params.id, req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "channel_not_found" });
+    await pool.query(`UPDATE messages SET deleted_at = COALESCE(deleted_at, now()), body = '' WHERE channel_id = $1 AND deleted_at IS NULL`, [req.params.id]);
+    res.status(204).end();
+  } catch (e) { console.error(e); res.status(500).json({ error: "delete_channel_failed" }); }
 });
 
 app.post("/api/internal/channels", authRequired, async (req, res) => {
@@ -3201,10 +3414,27 @@ app.post("/api/internal/channels/:id/messages", authRequired, async (req, res) =
 app.delete("/api/internal/messages/:id", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `UPDATE messages SET deleted_at = now(), body = ''
-        WHERE id = $1 AND sender_id = $2 AND deleted_at IS NULL
-        RETURNING id`,
-      [req.params.id, req.userId]
+      `UPDATE messages m
+          SET deleted_at = now(), body = ''
+         FROM users sender
+         LEFT JOIN conversations c ON c.id = m.conversation_id
+         LEFT JOIN channels ch ON ch.id = m.channel_id
+        WHERE m.id = $1
+          AND sender.id = m.sender_id
+          AND m.deleted_at IS NULL
+          AND (
+            m.sender_id = $2
+            OR (
+              $3 = 'employer'
+              AND sender.company_id = $4
+              AND (
+                (c.id IS NOT NULL AND c.company_id = $4)
+                OR (ch.id IS NOT NULL AND ch.company_id = $4)
+              )
+            )
+          )
+        RETURNING m.id`,
+      [req.params.id, req.userId, req.role, req.companyId]
     );
     if (!rows.length) return res.status(404).json({ error: "message_not_found" });
     res.status(204).end();
