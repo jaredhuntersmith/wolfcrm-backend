@@ -2717,6 +2717,49 @@ function installAutomationRoutes() {
     }
   });
 
+  app.get("/api/automations/health", authRequired, requireEmployer, async (req, res) => {
+    try {
+      res.json(await automationHealth(req.companyId));
+    } catch (e) {
+      res.status(500).json({ error: "automation_health_failed" });
+    }
+  });
+
+  app.get("/api/automations/system-issues", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const { rows } = await ctx.pool.query(
+        `SELECT * FROM automation_dead_letters WHERE company_id = $1 AND status = COALESCE($2, status) ORDER BY failed_at DESC LIMIT 100`,
+        [req.companyId, req.query?.status || "open"]
+      );
+      res.json(rows);
+    } catch (e) {
+      res.status(500).json({ error: "automation_issues_failed" });
+    }
+  });
+
+  app.post("/api/automations/system-issues/:id/dismiss", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const { rows } = await ctx.pool.query(
+        `UPDATE automation_dead_letters SET status = 'dismissed', dismissed_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`,
+        [req.params.id, req.companyId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "not_found" });
+      res.json(rows[0]);
+    } catch (e) {
+      res.status(500).json({ error: "automation_issue_dismiss_failed" });
+    }
+  });
+
+  app.post("/api/automations/system-issues/:id/retry", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const result = await retryDeadLetter(req.params.id, req.companyId, req.userId);
+      if (!result) return res.status(404).json({ error: "not_found" });
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: "automation_issue_retry_failed" });
+    }
+  });
+
   app.get("/api/automations/:id", authRequired, requireEmployer, async (req, res) => {
     try {
       const detail = await loadAutomationDetail(req.params.id, req.companyId);
@@ -2891,49 +2934,6 @@ function installAutomationRoutes() {
       res.json(result);
     } catch (e) {
       res.status(500).json({ error: "automation_cancel_failed" });
-    }
-  });
-
-  app.get("/api/automations/health", authRequired, requireEmployer, async (req, res) => {
-    try {
-      res.json(await automationHealth(req.companyId));
-    } catch (e) {
-      res.status(500).json({ error: "automation_health_failed" });
-    }
-  });
-
-  app.get("/api/automations/system-issues", authRequired, requireEmployer, async (req, res) => {
-    try {
-      const { rows } = await ctx.pool.query(
-        `SELECT * FROM automation_dead_letters WHERE company_id = $1 AND status = COALESCE($2, status) ORDER BY failed_at DESC LIMIT 100`,
-        [req.companyId, req.query?.status || "open"]
-      );
-      res.json(rows);
-    } catch (e) {
-      res.status(500).json({ error: "automation_issues_failed" });
-    }
-  });
-
-  app.post("/api/automations/system-issues/:id/dismiss", authRequired, requireEmployer, async (req, res) => {
-    try {
-      const { rows } = await ctx.pool.query(
-        `UPDATE automation_dead_letters SET status = 'dismissed', dismissed_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`,
-        [req.params.id, req.companyId]
-      );
-      if (!rows.length) return res.status(404).json({ error: "not_found" });
-      res.json(rows[0]);
-    } catch (e) {
-      res.status(500).json({ error: "automation_issue_dismiss_failed" });
-    }
-  });
-
-  app.post("/api/automations/system-issues/:id/retry", authRequired, requireEmployer, async (req, res) => {
-    try {
-      const result = await retryDeadLetter(req.params.id, req.companyId, req.userId);
-      if (!result) return res.status(404).json({ error: "not_found" });
-      res.json(result);
-    } catch (e) {
-      res.status(500).json({ error: "automation_issue_retry_failed" });
     }
   });
 
@@ -3631,9 +3631,7 @@ async function executeFromNode(runId, nodeId, scopeKey = "root", arrival = null)
       await traverse(run, graph, node, result?.port || "default", scopeKey);
     }
   } catch (e) {
-    const retryCount = Number(node.config?.retry_count || 0);
     const classified = classifyAutomationError(e);
-    await finishRunNode(runNode.id, "failed", {}, classified.code, classified.message, { errorClass: classified.errorClass, retryable: classified.retryable });
     await logRun(run, node, "error", "node.failed", `Node ${node.title || node.node_key} failed`, { error: classified.message, error_code: classified.code, error_class: classified.errorClass, retryable: classified.retryable, scope_key: scopeKey });
     const retryPolicy = retryPolicyForNode(node);
     if (attempt < retryPolicy.maxAttempts && classified.retryable && isRetrySafe(node)) {
@@ -3643,6 +3641,7 @@ async function executeFromNode(runId, nodeId, scopeKey = "root", arrival = null)
       await createWait(run, node, "duration", { resume_at: retryAt, resume_port: "default", scope_key: scopeKey, retry: true });
       return;
     }
+    await finishRunNode(runNode.id, "failed", {}, classified.code, classified.message, { errorClass: classified.errorClass, retryable: classified.retryable });
     const onError = node.config?.on_error || (node.config?.continue_on_error ? "continue" : "stop");
     if (onError === "error_path") {
       await ctx.pool.query(
