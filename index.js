@@ -329,6 +329,45 @@ const twilioMediaMetadata = (body) => {
   return { count, media };
 };
 
+const safeSmsMediaArray = (value) => {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+};
+
+async function fetchTwilioResource(url) {
+  const accountSid = (process.env.TWILIO_ACCOUNT_SID || "").trim();
+  const authToken = (process.env.TWILIO_AUTH_TOKEN || "").trim();
+  if (!accountSid || !authToken) {
+    const error = new Error("twilio_auth_not_configured");
+    error.status = 503;
+    throw error;
+  }
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`
+    }
+  });
+  if (!response.ok) {
+    const error = new Error("twilio_fetch_failed");
+    error.status = response.status;
+    throw error;
+  }
+  return response;
+}
+
+const buildRecordingAudioUrl = (recordingSid) => {
+  const accountSid = (process.env.TWILIO_ACCOUNT_SID || "").trim();
+  return `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${recordingSid}.mp3`;
+};
+
 async function findSmsContactID({ companyId, externalPhone }) {
   const normalized = normalizeE164Phone(externalPhone);
   const digits = phoneDigits(normalized || externalPhone);
