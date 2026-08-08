@@ -7,7 +7,13 @@ const AUTOMATION_LIMITS = {
   maxChildDepth: 12,
   maxRuntimeHours: 24 * 30,
   eventBatchSize: 25,
-  waitBatchSize: 25
+  waitBatchSize: 25,
+  foreachDefaultMaxItems: 100,
+  foreachHardMaxItems: 500,
+  foreachMaxParallelism: 10,
+  maxScopeDepth: 8,
+  maxCollectionOutputItems: 500,
+  maxJsonBytes: 250000
 };
 
 let ctx = null;
@@ -532,6 +538,34 @@ const actionCatalog = [
   ["customer_reminder.reschedule", "Reschedule Customer Reminder", "Customer Reminders", "Changes reminder due date.", ["customer_reminder"], ["default"]],
   ["customer_reminder.delete", "Delete Customer Reminder", "Customer Reminders", "Deletes a customer reminder.", ["customer_reminder"], ["default"]],
   ["customer_reminder.reopen", "Reopen Customer Reminder", "Customer Reminders", "Marks a customer reminder incomplete.", ["customer_reminder"], ["default"]],
+  ["contacts.search", "Search Contacts", "Collections", "Finds company contacts using bounded filters.", ["generic"], ["default"]],
+  ["jobs.search", "Search Jobs", "Collections", "Finds jobs using bounded company-scoped filters.", ["generic"], ["default"]],
+  ["tasks.search", "Search Tasks", "Collections", "Finds tasks using bounded company-scoped filters.", ["generic"], ["default"]],
+  ["map.search_pins", "Search Map Pins", "Collections", "Finds map pins using bounded company-scoped filters.", ["generic"], ["default"]],
+  ["route.get_stops", "Get Route Stops", "Collections", "Returns route stops for the current or selected route.", ["route"], ["default"]],
+  ["quotes.search", "Search Quotes", "Collections", "Finds quote records using bounded filters.", ["generic"], ["default"]],
+  ["payments.search", "Search Payments", "Collections", "Finds payment records using bounded filters.", ["generic"], ["default"]],
+  ["service_plans.search", "Search Service Plans", "Collections", "Finds service plans using bounded filters.", ["generic"], ["default"]],
+  ["employees.search", "Search Employees", "Collections", "Finds active or inactive company users.", ["generic"], ["default"]],
+  ["collection.filter", "Filter Collection", "Collections", "Filters a collection with the canonical condition engine.", ["generic"], ["default"]],
+  ["collection.map", "Map Collection", "Collections", "Builds a deterministic mapped collection from templates.", ["generic"], ["default"]],
+  ["collection.sort", "Sort Collection", "Collections", "Sorts a collection by a field.", ["generic"], ["default"]],
+  ["collection.limit", "Limit Collection", "Collections", "Limits a collection to a bounded number of items.", ["generic"], ["default"]],
+  ["collection.first", "First Item", "Collections", "Returns the first item in a collection.", ["generic"], ["default"]],
+  ["collection.last", "Last Item", "Collections", "Returns the last item in a collection.", ["generic"], ["default"]],
+  ["collection.count", "Count Items", "Collections", "Counts collection items.", ["generic"], ["default"]],
+  ["collection.unique", "Unique Items", "Collections", "Deduplicates collection items.", ["generic"], ["default"]],
+  ["collection.concat", "Concat Collections", "Collections", "Combines bounded collections.", ["generic"], ["default"]],
+  ["collection.flatten", "Flatten Collection", "Collections", "Flattens one array level.", ["generic"], ["default"]],
+  ["collection.contains", "Collection Contains", "Collections", "Checks whether a collection contains a value.", ["generic"], ["default"]],
+  ["variable.increment", "Increment Variable", "Variables", "Atomically increments a numeric run variable.", ["generic"], ["default"]],
+  ["variable.append", "Append Variable", "Variables", "Atomically appends to a run-scoped list variable.", ["generic"], ["default"]],
+  ["object.get", "Get Object Field", "Data", "Reads a safe path from an object.", ["generic"], ["default"]],
+  ["object.build", "Build Object", "Data", "Builds a JSON object from template mappings.", ["generic"], ["default"]],
+  ["coalesce", "First Non-Empty", "Data", "Returns the first non-empty configured value.", ["generic"], ["default"]],
+  ["math", "Math", "Data", "Runs a deterministic numeric operation.", ["generic"], ["default"]],
+  ["text", "Text Transform", "Data", "Runs deterministic text operations.", ["generic"], ["default"]],
+  ["date", "Date Transform", "Data", "Runs deterministic date operations using company timezone context.", ["generic"], ["default"]],
   ["webhook.send", "Send Webhook", "Webhooks", "Sends a bounded HTTP request to an external URL.", ["generic"], ["default"]],
   ["automation.start", "Start Automation", "Automations", "Starts another published automation.", ["generic"], ["default"]]
 ].map(([key, displayName, category, description, subjectTypes, outputs]) => ({
@@ -732,6 +766,34 @@ const actionExecutors = {
   "customer_reminder.reschedule": executeCustomerReminderReschedule,
   "customer_reminder.delete": executeCustomerReminderDelete,
   "customer_reminder.reopen": executeCustomerReminderReopen,
+  "contacts.search": executeContactsSearch,
+  "jobs.search": executeJobsSearch,
+  "tasks.search": executeTasksSearch,
+  "map.search_pins": executeMapSearchPins,
+  "route.get_stops": executeRouteGetStops,
+  "quotes.search": executeQuotesSearch,
+  "payments.search": executePaymentsSearch,
+  "service_plans.search": executeServicePlansSearch,
+  "employees.search": executeEmployeesSearch,
+  "collection.filter": executeCollectionFilter,
+  "collection.map": executeCollectionMap,
+  "collection.sort": executeCollectionSort,
+  "collection.limit": executeCollectionLimit,
+  "collection.first": executeCollectionFirst,
+  "collection.last": executeCollectionLast,
+  "collection.count": executeCollectionCount,
+  "collection.unique": executeCollectionUnique,
+  "collection.concat": executeCollectionConcat,
+  "collection.flatten": executeCollectionFlatten,
+  "collection.contains": executeCollectionContains,
+  "variable.increment": executeVariableIncrement,
+  "variable.append": executeVariableAppend,
+  "object.get": executeObjectGet,
+  "object.build": executeObjectBuild,
+  "coalesce": executeCoalesce,
+  "math": executeMath,
+  "text": executeText,
+  "date": executeDateTransform,
   "webhook.send": executeWebhookSend,
   "automation.start": executeAutomationStart
 };
@@ -991,6 +1053,58 @@ function actionConfigFields(key) {
       return [commonText("measurement_id", "Measurement ID"), commonText("name", "Name")];
     case "measurement.link_contact":
       return [commonText("measurement_id", "Measurement ID"), commonText("contact_id", "Contact ID")];
+    case "contacts.search":
+      return [{ key: "tags", label: "Tags", type: "tag_list" }, commonText("source", "Source"), { key: "limit", label: "Limit", type: "number" }];
+    case "jobs.search":
+      return [{ key: "start_after", label: "Start After", type: "datetime_expression" }, { key: "start_before", label: "Start Before", type: "datetime_expression" }, { key: "completed", label: "Completed", type: "boolean" }, commonText("contact_id", "Contact ID"), { key: "limit", label: "Limit", type: "number" }];
+    case "tasks.search":
+      return [{ key: "completed", label: "Completed", type: "boolean" }, { key: "overdue", label: "Overdue", type: "boolean" }, commonText("contact_id", "Contact ID"), { key: "limit", label: "Limit", type: "number" }];
+    case "map.search_pins":
+      return [{ key: "status", label: "Status", type: "select", options: ["lead", "won", "reloop", "later", "lost"] }, commonText("list_id", "List ID"), { key: "has_contact", label: "Has Contact", type: "boolean" }, { key: "limit", label: "Limit", type: "number" }];
+    case "route.get_stops":
+      return [commonText("route_id", "Route ID"), { key: "filter", label: "Stops", type: "select", options: ["all", "completed", "remaining", "skipped"] }];
+    case "quotes.search":
+      return [{ key: "status", label: "Status", type: "select", options: ["draft", "sent", "accepted", "declined", "expired", "converted"] }, commonText("contact_id", "Contact ID"), { key: "min_total_cents", label: "Minimum Total", type: "money" }, { key: "limit", label: "Limit", type: "number" }];
+    case "payments.search":
+      return [{ key: "status", label: "Status", type: "text" }, commonText("contact_id", "Contact ID"), commonText("service_plan_id", "Service Plan ID"), { key: "limit", label: "Limit", type: "number" }];
+    case "service_plans.search":
+      return [{ key: "status", label: "Status", type: "text" }, commonText("contact_id", "Contact ID"), { key: "limit", label: "Limit", type: "number" }];
+    case "employees.search":
+      return [{ key: "role", label: "Role", type: "select", options: ["any", "employee", "employer"] }, { key: "active", label: "Active", type: "boolean" }, { key: "limit", label: "Limit", type: "number" }];
+    case "collection.filter":
+      return [{ key: "collection", label: "Collection", type: "template" }, { key: "condition", label: "Filter", type: "condition" }];
+    case "collection.map":
+    case "object.build":
+      return [{ key: "collection", label: "Collection", type: "template" }, { key: "mappings", label: "Mappings", type: "json" }];
+    case "collection.sort":
+      return [{ key: "collection", label: "Collection", type: "template" }, commonText("field", "Field"), { key: "direction", label: "Direction", type: "select", options: ["asc", "desc"] }, { key: "value_type", label: "Type", type: "select", options: ["string", "number", "date"] }];
+    case "collection.limit":
+      return [{ key: "collection", label: "Collection", type: "template" }, { key: "limit", label: "Limit", type: "number" }];
+    case "collection.first":
+    case "collection.last":
+    case "collection.count":
+    case "collection.flatten":
+      return [{ key: "collection", label: "Collection", type: "template" }];
+    case "collection.unique":
+      return [{ key: "collection", label: "Collection", type: "template" }, commonText("identity_field", "Identity Field")];
+    case "collection.concat":
+      return [{ key: "collections", label: "Collections", type: "string_list" }];
+    case "collection.contains":
+      return [{ key: "collection", label: "Collection", type: "template" }, commonText("value", "Value"), commonText("field", "Field")];
+    case "variable.increment":
+      return [commonText("name", "Name"), { key: "amount", label: "Amount", type: "number" }];
+    case "variable.append":
+      return [commonText("name", "Name"), commonText("value", "Value"), { key: "dedupe", label: "Dedupe", type: "boolean" }];
+    case "object.get":
+      return [commonText("object", "Object"), commonText("path", "Path")];
+    case "coalesce":
+      return [{ key: "values", label: "Values", type: "string_list" }];
+    case "math":
+      return [commonText("a", "A"), { key: "operation", label: "Operation", type: "select", options: ["add", "subtract", "multiply", "divide", "percentage", "min", "max", "round", "floor", "ceil", "absolute"] }, commonText("b", "B")];
+    case "text":
+      return [{ key: "operation", label: "Operation", type: "select", options: ["join", "concat", "uppercase", "lowercase", "trim", "replace", "substring", "split", "length"] }, commonText("value", "Value"), commonText("delimiter", "Delimiter"), commonText("find", "Find"), commonText("replace", "Replace")];
+    case "date":
+      return [commonText("value", "Date"), { key: "operation", label: "Operation", type: "select", options: ["add", "subtract", "start_of_day", "end_of_day", "next_weekday", "format", "difference"] }, { key: "amount", label: "Amount", type: "number" }, { key: "unit", label: "Unit", type: "select", options: ["minutes", "hours", "days", "weeks", "months", "years"] }, commonText("other", "Other Date")];
     case "webhook.send":
       return [commonText("url", "URL"), { key: "method", label: "Method", type: "select", options: ["GET", "POST", "PUT", "PATCH", "DELETE"] }, { key: "headers", label: "Headers", type: "json" }, { key: "body", label: "JSON Body", type: "json" }];
     case "automation.start":
@@ -1939,6 +2053,7 @@ async function bootstrapAutomationSchema() {
       node_id UUID REFERENCES automation_nodes(id) ON DELETE SET NULL,
       node_key TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'queued',
+      scope_key TEXT NOT NULL DEFAULT 'root',
       attempt_number INTEGER NOT NULL DEFAULT 1,
       input_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
       output_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -1949,8 +2064,10 @@ async function bootstrapAutomationSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE automation_run_nodes ADD COLUMN IF NOT EXISTS scope_key TEXT NOT NULL DEFAULT 'root';
     CREATE INDEX IF NOT EXISTS automation_run_nodes_run_idx ON automation_run_nodes(run_id, created_at);
     CREATE INDEX IF NOT EXISTS automation_run_nodes_node_idx ON automation_run_nodes(run_id, node_key, attempt_number);
+    CREATE INDEX IF NOT EXISTS automation_run_nodes_scope_idx ON automation_run_nodes(run_id, node_key, scope_key, status);
 
     CREATE TABLE IF NOT EXISTS automation_waits (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1962,12 +2079,19 @@ async function bootstrapAutomationSchema() {
       event_filter JSONB,
       timeout_at TIMESTAMPTZ,
       status TEXT NOT NULL DEFAULT 'waiting',
+      scope_key TEXT NOT NULL DEFAULT 'root',
+      resume_port TEXT,
+      matched_event JSONB,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE automation_waits ADD COLUMN IF NOT EXISTS scope_key TEXT NOT NULL DEFAULT 'root';
+    ALTER TABLE automation_waits ADD COLUMN IF NOT EXISTS resume_port TEXT;
+    ALTER TABLE automation_waits ADD COLUMN IF NOT EXISTS matched_event JSONB;
     CREATE INDEX IF NOT EXISTS automation_waits_due_idx ON automation_waits(status, resume_at) WHERE status = 'waiting' AND resume_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS automation_waits_timeout_idx ON automation_waits(status, timeout_at) WHERE status = 'waiting' AND timeout_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS automation_waits_event_idx ON automation_waits(status, event_type) WHERE status = 'waiting' AND event_type IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS automation_waits_scope_idx ON automation_waits(run_id, node_id, scope_key, status);
 
     CREATE TABLE IF NOT EXISTS automation_variables (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1978,6 +2102,55 @@ async function bootstrapAutomationSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(run_id, name)
     );
+
+    CREATE TABLE IF NOT EXISTS automation_run_iterations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      run_id UUID NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+      foreach_node_id UUID REFERENCES automation_nodes(id) ON DELETE SET NULL,
+      foreach_node_key TEXT NOT NULL,
+      parent_scope_key TEXT NOT NULL DEFAULT 'root',
+      scope_key TEXT NOT NULL,
+      iteration_key TEXT NOT NULL,
+      item_index INTEGER NOT NULL,
+      item_count INTEGER NOT NULL,
+      item_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'queued',
+      error TEXT,
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      failed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(run_id, foreach_node_id, parent_scope_key, iteration_key)
+    );
+    CREATE INDEX IF NOT EXISTS automation_run_iterations_status_idx ON automation_run_iterations(run_id, foreach_node_id, parent_scope_key, status, item_index);
+    CREATE INDEX IF NOT EXISTS automation_run_iterations_scope_idx ON automation_run_iterations(run_id, scope_key);
+
+    CREATE TABLE IF NOT EXISTS automation_merge_arrivals (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      run_id UUID NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+      merge_node_id UUID REFERENCES automation_nodes(id) ON DELETE SET NULL,
+      scope_key TEXT NOT NULL DEFAULT 'root',
+      arrival_key TEXT NOT NULL,
+      source_node_id UUID,
+      source_port TEXT,
+      arrived_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      released_at TIMESTAMPTZ,
+      UNIQUE(run_id, merge_node_id, scope_key, arrival_key)
+    );
+    CREATE INDEX IF NOT EXISTS automation_merge_arrivals_lookup_idx ON automation_merge_arrivals(run_id, merge_node_id, scope_key, released_at);
+
+    CREATE TABLE IF NOT EXISTS automation_run_goals (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      run_id UUID NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+      node_id UUID REFERENCES automation_nodes(id) ON DELETE SET NULL,
+      goal_key TEXT NOT NULL,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      scope_key TEXT NOT NULL DEFAULT 'root',
+      reached_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(run_id, node_id, scope_key, goal_key)
+    );
+    CREATE INDEX IF NOT EXISTS automation_run_goals_run_idx ON automation_run_goals(run_id, reached_at);
 
     CREATE TABLE IF NOT EXISTS automation_logs (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2177,8 +2350,18 @@ function installAutomationRoutes() {
       logic_nodes: [
         { key: "condition", display_name: "Condition", category: "Logic", description: "Routes to true or false ports.", outputs: ["true", "false"], config_fields: [{ key: "condition", type: "condition" }] },
         { key: "branch", display_name: "Branch", category: "Logic", description: "Routes by resolved value to named ports.", outputs: ["default"], config_fields: [{ key: "input", type: "template" }, { key: "branches", type: "string_list" }] },
+        { key: "switch", display_name: "Switch", category: "Logic", description: "Routes by ordered deterministic cases.", outputs: ["default"], dynamic_ports: true, config_fields: [{ key: "input", type: "template" }, { key: "cases", type: "switch_cases" }] },
+        { key: "parallel", display_name: "Parallel", category: "Flow Control", description: "Activates every configured output path.", outputs: ["path_a", "path_b"], dynamic_ports: true, config_fields: [{ key: "paths", type: "port_list" }] },
+        { key: "merge", display_name: "Merge", category: "Flow Control", description: "Waits for Any, All, or First inbound path.", outputs: ["default"], config_fields: [{ key: "mode", type: "select", options: ["any", "all", "first"] }] },
+        { key: "foreach", display_name: "For Each", category: "Collections", description: "Runs the ITEM path once for each item, then DONE once.", outputs: ["item", "done"], config_fields: [{ key: "collection", type: "template" }, { key: "execution_mode", type: "select", options: ["sequential", "parallel"] }, { key: "parallelism", type: "number" }, { key: "failure_policy", type: "select", options: ["stop_all", "continue", "collect_errors"] }, { key: "max_items", type: "number" }] },
+        { key: "random_split", display_name: "Random Split", category: "Logic", description: "Chooses one weighted path and persists the choice.", outputs: ["path_a", "path_b"], dynamic_ports: true, config_fields: [{ key: "mode", type: "select", options: ["per_run", "sticky_subject"] }, { key: "paths", type: "weighted_ports" }] },
+        { key: "event_wait_multi", display_name: "Wait for Any Event", category: "Wait & Events", description: "Waits for the first matching event from several subscriptions.", outputs: ["timeout"], dynamic_ports: true, config_fields: [{ key: "events", type: "event_list" }, { key: "timeout", type: "duration" }] },
         { key: "wait", display_name: "Wait", category: "Timing", description: "Persists a duration, date, or event wait.", outputs: ["default", "event", "timeout"], config_fields: [{ key: "mode", type: "select", options: ["duration", "until_datetime", "event_wait"] }] },
         { key: "variable.set", display_name: "Set Variable", category: "Utility", description: "Stores a run variable.", outputs: ["default"], config_fields: [{ key: "name", type: "text" }, { key: "value", type: "template" }] },
+        { key: "goal", display_name: "Goal Reached", category: "Flow Control", description: "Records a workflow goal and continues.", outputs: ["default"], config_fields: [{ key: "goal_key", type: "text" }, { key: "metadata", type: "json" }] },
+        { key: "stop", display_name: "Stop Automation", category: "Flow Control", description: "Stops the entire run.", outputs: [], config_fields: [{ key: "reason", type: "text" }] },
+        { key: "end", display_name: "End Path", category: "Flow Control", description: "Ends only the current path.", outputs: [], config_fields: [{ key: "reason", type: "text" }] },
+        { key: "fail", display_name: "Fail Automation", category: "Flow Control", description: "Fails the run with a configured reason.", outputs: [], config_fields: [{ key: "reason", type: "text" }] },
         { key: "automation.start", display_name: "Start Automation", category: "Utility", description: "Starts another published automation.", outputs: ["default"], config_fields: [{ key: "automation_id", type: "automation" }] },
         { key: "note", display_name: "Note", category: "Notes", description: "Editor-only annotation. Does not execute.", outputs: [], config_fields: [{ key: "title", type: "text" }, { key: "body", type: "multiline" }] }
       ]
@@ -2907,7 +3090,7 @@ async function createRun({ companyId, automationId, versionId, triggerEventId = 
   return { ...rows[0], root_run_id: rows[0].root_run_id || rows[0].id };
 }
 
-async function runAutomation(runId, resumeFromNodeId = null, incomingPort = null) {
+async function runAutomation(runId, resumeFromNodeId = null, incomingPort = null, scopeKey = "root") {
   let run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [runId])).rows[0];
   if (!run || ["completed", "failed", "canceled", "stopped"].includes(run.status)) return;
   if (run.current_node_count >= AUTOMATION_LIMITS.maxNodesPerRun) return failRun(run, "node_limit", "Maximum node executions reached");
@@ -2927,12 +3110,12 @@ async function runAutomation(runId, resumeFromNodeId = null, incomingPort = null
     return;
   }
   for (const node of startNodes.filter(Boolean)) {
-    await executeFromNode(run.id, node.id);
+    await executeFromNode(run.id, node.id, scopeKey);
   }
   await completeRunIfIdle((await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [runId])).rows[0]);
 }
 
-async function executeFromNode(runId, nodeId) {
+async function executeFromNode(runId, nodeId, scopeKey = "root", arrival = null) {
   const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [runId])).rows[0];
   if (!run || ["completed", "failed", "canceled", "stopped"].includes(run.status)) return;
   const graph = await loadGraph(run.automation_version_id, run.company_id);
@@ -2941,22 +3124,34 @@ async function executeFromNode(runId, nodeId) {
   if (node.node_type === "note") return;
   if (await shouldStopRun(run)) return stopRun(run, "stop_condition", "Global stop condition matched");
   const previous = await ctx.pool.query(
-    `SELECT COUNT(*)::int AS count FROM automation_run_nodes WHERE run_id = $1 AND node_key = $2 AND status = 'completed'`,
-    [runId, node.node_key]
+    `SELECT COUNT(*)::int AS count FROM automation_run_nodes WHERE run_id = $1 AND node_key = $2 AND scope_key = $3 AND status = 'completed'`,
+    [runId, node.node_key, scopeKey]
   );
-  if (Number(previous.rows[0].count) > 0 && !node.config?.repeatable) {
-    await traverse(run, graph, node, "default");
+  if (Number(previous.rows[0].count) > 0 && !node.config?.repeatable && !["merge", "foreach"].includes(node.node_type)) {
+    await traverse(run, graph, node, "default", scopeKey);
     return;
   }
   const attempt = Number(previous.rows[0].count) + 1;
   if (attempt > AUTOMATION_LIMITS.maxNodeAttempts) return failRun(run, "node_attempt_limit", `Node ${node.node_key} exceeded attempt limit`);
-  const runNode = await beginRunNode(run, node, attempt);
+  const runNode = await beginRunNode(run, node, attempt, scopeKey);
   try {
-    const result = await executeNode(run, node, runNode);
+    const result = await executeNode(run, node, runNode, scopeKey, arrival);
     if (result?.waiting) return;
+    if (result?.stoppedPath) {
+      await finishRunNode(runNode.id, "completed", result?.output || {});
+      return;
+    }
+    if (result?.stoppedRun) {
+      await finishRunNode(runNode.id, "completed", result?.output || {});
+      return;
+    }
     await finishRunNode(runNode.id, "completed", result?.output || {});
     await ctx.pool.query(`UPDATE automation_runs SET current_node_count = current_node_count + 1, updated_at = now() WHERE id = $1`, [run.id]);
-    await traverse(run, graph, node, result?.port || "default");
+    if (Array.isArray(result?.ports)) {
+      for (const port of result.ports) await traverse(run, graph, node, port, scopeKey);
+    } else {
+      await traverse(run, graph, node, result?.port || "default", scopeKey);
+    }
   } catch (e) {
     const retryCount = Number(node.config?.retry_count || 0);
     await finishRunNode(runNode.id, "failed", {}, "node_failed", e?.message || "Node failed");
@@ -2967,7 +3162,7 @@ async function executeFromNode(runId, nodeId) {
       return;
     }
     if (node.config?.continue_on_error) {
-      await traverse(run, graph, node, "error");
+      await traverse(run, graph, node, "error", scopeKey);
       return;
     }
     await failRun(run, "node_failed", e?.message || "Node failed");
@@ -3128,14 +3323,14 @@ function changedFields(payload) {
   return payload.changed_fields.map((item) => typeof item === "string" ? { field: item } : item).filter((item) => item?.field);
 }
 
-async function beginRunNode(run, node, attempt) {
-  const context = await buildRunContext(run, { slim: true });
+async function beginRunNode(run, node, attempt, scopeKey = "root") {
+  const context = await buildRunContext(run, { slim: true, scopeKey });
   const { rows } = await ctx.pool.query(
-    `INSERT INTO automation_run_nodes(run_id, node_id, node_key, status, attempt_number, input_snapshot, started_at)
-     VALUES($1,$2,$3,'running',$4,$5::jsonb,now()) RETURNING *`,
-    [run.id, node.id, node.node_key, attempt, JSON.stringify(safeSnapshot(context))]
+    `INSERT INTO automation_run_nodes(run_id, node_id, node_key, status, scope_key, attempt_number, input_snapshot, started_at)
+     VALUES($1,$2,$3,'running',$4,$5,$6::jsonb,now()) RETURNING *`,
+    [run.id, node.id, node.node_key, scopeKey, attempt, JSON.stringify(safeSnapshot(context))]
   );
-  await logRun(run, node, "info", "node.started", `Started ${node.title || node.node_key}`, {});
+  await logRun(run, node, "info", "node.started", `Started ${node.title || node.node_key}`, { scope_key: scopeKey });
   return rows[0];
 }
 
@@ -3147,19 +3342,19 @@ async function finishRunNode(id, status, output, errorCode = null, errorMessage 
   );
 }
 
-async function executeNode(run, node, runNode) {
+async function executeNode(run, node, runNode, scopeKey = "root", arrival = null) {
   if (node.node_type === "trigger") {
     await logRun(run, node, "info", "trigger.started", "Trigger node entered", {});
     return { port: "default", output: { triggered: true } };
   }
   if (node.node_type === "condition") {
-    const context = await buildRunContext(run);
+    const context = await buildRunContext(run, { scopeKey });
     const result = evaluateCondition(node.config?.condition || node.config, context);
     await logRun(run, node, "info", result ? "condition.true" : "condition.false", `Condition evaluated ${result ? "true" : "false"}`, {});
     return { port: result ? "true" : "false", output: { result } };
   }
   if (node.node_type === "branch") {
-    const context = await buildRunContext(run);
+    const context = await buildRunContext(run, { scopeKey });
     const value = resolveTemplate(node.config?.input || "", context).trim();
     const branches = Array.isArray(node.config?.branches) ? node.config.branches.map(String) : [];
     const port = branches.includes(value) ? value : "default";
@@ -3167,14 +3362,14 @@ async function executeNode(run, node, runNode) {
     return { port, output: { value, port } };
   }
   if (node.node_type === "wait") {
-    const wait = await createWaitForNode(run, node);
+    const wait = await createWaitForNode(run, node, scopeKey);
     await ctx.pool.query(`UPDATE automation_run_nodes SET status = 'waiting', output_snapshot = $2::jsonb, updated_at = now() WHERE id = $1`, [runNode.id, JSON.stringify({ wait_id: wait.id })]);
     await ctx.pool.query(`UPDATE automation_runs SET status = 'waiting', updated_at = now() WHERE id = $1`, [run.id]);
     await logRun(run, node, "info", "wait.created", "Wait created", { wait_id: wait.id, wait_type: wait.wait_type, resume_at: wait.resume_at, event_type: wait.event_type, timeout_at: wait.timeout_at });
     return { waiting: true };
   }
   if (node.node_type === "utility" && (node.config?.utility_key === "variable.set" || node.config?.action_key === "variable.set")) {
-    const context = await buildRunContext(run);
+    const context = await buildRunContext(run, { scopeKey });
     const name = (node.config?.name || "").toString().trim();
     if (!name) throw new Error("variable_name_required");
     const value = resolveTemplate(node.config?.value ?? "", context);
@@ -3185,6 +3380,28 @@ async function executeNode(run, node, runNode) {
     );
     return { port: "default", output: { name, value } };
   }
+  if (node.node_type === "foreach") return executeForeachNode(run, node, scopeKey);
+  if (node.node_type === "merge") return executeMergeNode(run, node, scopeKey, arrival);
+  if (node.node_type === "parallel") return executeParallelNode(run, node);
+  if (node.node_type === "switch") return executeSwitchNode(run, node, scopeKey);
+  if (node.node_type === "random_split") return executeRandomSplitNode(run, node, scopeKey);
+  if (node.node_type === "event_wait_multi") {
+    const wait = await createMultiEventWait(run, node, scopeKey);
+    await ctx.pool.query(`UPDATE automation_run_nodes SET status = 'waiting', output_snapshot = $2::jsonb, updated_at = now() WHERE id = $1`, [runNode.id, JSON.stringify({ wait_id: wait.id })]);
+    await ctx.pool.query(`UPDATE automation_runs SET status = 'waiting', updated_at = now() WHERE id = $1`, [run.id]);
+    await logRun(run, node, "info", "wait.multi_created", "Multi-event wait created", { wait_id: wait.id, scope_key: scopeKey });
+    return { waiting: true };
+  }
+  if (node.node_type === "goal") return executeGoalNode(run, node, scopeKey);
+  if (node.node_type === "stop") {
+    await stopRun(run, "stop_node", resolveTemplate(node.config?.reason || "Stopped by automation node", await buildRunContext(run, { scopeKey })));
+    return { stoppedRun: true, output: { stopped: true } };
+  }
+  if (node.node_type === "end") return { stoppedPath: true, output: { ended: true, reason: node.config?.reason || null } };
+  if (node.node_type === "fail") {
+    await failRun(run, "fail_node", resolveTemplate(node.config?.reason || "Failed by automation node", await buildRunContext(run, { scopeKey })));
+    return { stoppedRun: true, output: { failed: true } };
+  }
   if (node.node_type === "sub_automation") {
     return executeAutomationStart(run, node, node.config || {});
   }
@@ -3193,13 +3410,13 @@ async function executeNode(run, node, runNode) {
     const executor = actionExecutors[actionKey];
     if (!executor) throw new Error(`unknown_action:${actionKey}`);
     if (run.dry_run) {
-      const context = await buildRunContext(run);
+      const context = await buildRunContext(run, { scopeKey });
       const resolved = resolveConfig(node.config || {}, context);
       await logRun(run, node, "info", "action.dry_run", `Would execute ${actionKey}`, { resolved_config: redact(resolved) });
       return { port: "default", output: { would_execute: actionKey, resolved_config: redact(resolved) } };
     }
     await logRun(run, node, "info", "action.started", `Action started ${actionKey}`, {});
-    const output = await executor(run, node, node.config || {});
+    const output = await executor(run, node, node.config || {}, scopeKey);
     if (output?.waiting) {
       await ctx.pool.query(`UPDATE automation_run_nodes SET status = 'waiting', output_snapshot = $2::jsonb, updated_at = now() WHERE id = $1`, [runNode.id, JSON.stringify(output)]);
       return output;
@@ -3210,11 +3427,11 @@ async function executeNode(run, node, runNode) {
   return { port: "default", output: {} };
 }
 
-async function traverse(run, graph, node, port) {
+async function traverse(run, graph, node, port, scopeKey = "root") {
   const edges = (graph.edgesBySource[node.id] || []).filter((edge) => portMatches(edge.source_port, port)).sort(edgeSort);
   if (!edges.length) return;
   for (const edge of edges) {
-    await executeFromNode(run.id, edge.target_node_id);
+    await executeFromNode(run.id, edge.target_node_id, scopeKey, { source_node_id: node.id, source_port: port, edge_id: edge.id });
   }
 }
 
@@ -3264,12 +3481,12 @@ async function shouldStopRun(run) {
   return evaluateCondition(stop, context);
 }
 
-async function createWaitForNode(run, node) {
-  const context = await buildRunContext(run);
+async function createWaitForNode(run, node, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const mode = node.config?.mode || node.config?.wait_type || "duration";
   if (mode === "duration") {
     const resumeAt = new Date(Date.now() + parseDurationMs(resolveTemplate(node.config?.duration || node.config?.value || "1 minute", context)));
-    return createWait(run, node, "duration", { resume_at: resumeAt.toISOString() });
+    return createWait(run, node, "duration", { resume_at: resumeAt.toISOString(), scope_key: scopeKey });
   }
   if (mode === "until_datetime") {
     let date = null;
@@ -3285,14 +3502,15 @@ async function createWaitForNode(run, node) {
       date = new Date(value);
     }
     if (!date || Number.isNaN(date.getTime())) throw new Error("invalid_wait_datetime");
-    return createWait(run, node, "until_datetime", { resume_at: date.toISOString() });
+    return createWait(run, node, "until_datetime", { resume_at: date.toISOString(), scope_key: scopeKey });
   }
   if (mode === "event_wait") {
     const timeoutMs = node.config?.timeout ? parseDurationMs(resolveTemplate(node.config.timeout, context)) : null;
     return createWait(run, node, "event", {
       event_type: node.config?.event_type,
       event_filter: node.config?.event_filter || null,
-      timeout_at: timeoutMs ? new Date(Date.now() + timeoutMs).toISOString() : null
+      timeout_at: timeoutMs ? new Date(Date.now() + timeoutMs).toISOString() : null,
+      scope_key: scopeKey
     });
   }
   throw new Error("unknown_wait_mode");
@@ -3300,9 +3518,9 @@ async function createWaitForNode(run, node) {
 
 async function createWait(run, node, waitType, values) {
   const { rows } = await ctx.pool.query(
-    `INSERT INTO automation_waits(run_id, node_id, wait_type, resume_at, event_type, event_filter, timeout_at, status)
-     VALUES($1,$2,$3,$4::timestamptz,$5,$6::jsonb,$7::timestamptz,'waiting') RETURNING *`,
-    [run.id, node.id, waitType, values.resume_at || null, values.event_type || null, values.event_filter ? JSON.stringify(values.event_filter) : null, values.timeout_at || null]
+    `INSERT INTO automation_waits(run_id, node_id, wait_type, resume_at, event_type, event_filter, timeout_at, status, scope_key, resume_port)
+     VALUES($1,$2,$3,$4::timestamptz,$5,$6::jsonb,$7::timestamptz,'waiting',$8,$9) RETURNING *`,
+    [run.id, node.id, waitType, values.resume_at || null, values.event_type || null, values.event_filter ? JSON.stringify(values.event_filter) : null, values.timeout_at || null, values.scope_key || "root", values.resume_port || null]
   );
   return rows[0];
 }
@@ -3345,33 +3563,69 @@ async function processDueWaits() {
 
 async function wakeEventWaits(event) {
   const { rows } = await ctx.pool.query(
-    `UPDATE automation_waits w
-        SET status = 'ready', updated_at = now()
-       FROM automation_runs r
-      WHERE w.run_id = r.id
-        AND w.status = 'waiting'
+    `SELECT w.*
+       FROM automation_waits w
+       JOIN automation_runs r ON r.id = w.run_id
+      WHERE w.status = 'waiting'
         AND w.wait_type = 'event'
-        AND w.event_type = $1
-        AND r.company_id = $2
-        AND (
-          w.event_filter IS NULL
-          OR COALESCE(w.event_filter->>'subject_id','') = ''
-          OR w.event_filter->>'subject_id' = $3
-          OR (w.event_filter->>'same_subject')::boolean = true AND r.subject_type = $4 AND r.subject_id = $3
-        )
-      RETURNING w.*`,
-    [event.event_type, event.company_id, event.subject_id || "", event.subject_type || ""]
+        AND r.company_id = $1
+        AND (w.event_type = $2 OR w.event_type = '*')`,
+    [event.company_id, event.event_type]
   );
-  for (const wait of rows) await resumeWait(wait, "event");
+  for (const wait of rows) {
+    const match = eventWaitMatch(wait, event);
+    if (!match.matched) continue;
+    const claimed = (await ctx.pool.query(
+      `UPDATE automation_waits
+          SET status = 'ready', resume_port = $2, matched_event = $3::jsonb, updated_at = now()
+        WHERE id = $1 AND status = 'waiting'
+        RETURNING *`,
+      [wait.id, match.port || "event", JSON.stringify({ event_id: event.id, event_type: event.event_type, payload: safeJson(event.payload || {}), matched_at: new Date().toISOString() })]
+    )).rows[0];
+    if (claimed) await resumeWait(claimed, claimed.resume_port || "event");
+  }
+}
+
+function eventWaitMatch(wait, event) {
+  const filter = wait.event_filter || {};
+  const candidates = Array.isArray(filter.events) && filter.events.length
+    ? filter.events
+    : [{ event_type: wait.event_type, port: "event", filter }];
+  for (const candidate of candidates) {
+    const eventType = candidate.event_type || candidate.type || candidate.key;
+    if (eventType && eventType !== event.event_type) continue;
+    const matchFilter = candidate.filter || candidate.match || candidate;
+    if (!singleEventFilterMatches(matchFilter, event, wait)) continue;
+    return { matched: true, port: candidate.port || candidate.output_port || stablePortId(candidate.label || eventType || "event") };
+  }
+  return { matched: false };
+}
+
+function singleEventFilterMatches(filter, event, wait) {
+  const payload = event.payload || {};
+  if (!filter) return true;
+  if (filter.subject_id && String(filter.subject_id) !== String(event.subject_id || "")) return false;
+  if (filter.subject_type && String(filter.subject_type) !== String(event.subject_type || "")) return false;
+  if (filter.contact_id && String(filter.contact_id) !== String(payload.contact_id || "")) return false;
+  if (filter.conversation_id && String(filter.conversation_id) !== String(payload.conversation_id || "")) return false;
+  if (filter.payment_id && String(filter.payment_id) !== String(payload.payment_id || payload.id || "")) return false;
+  if (filter.quote_id && String(filter.quote_id) !== String(payload.quote_id || payload.id || "")) return false;
+  if (filter.route_id && String(filter.route_id) !== String(payload.route_id || payload.id || "")) return false;
+  if (filter.service_plan_id && String(filter.service_plan_id) !== String(payload.service_plan_id || payload.id || "")) return false;
+  if (filter.same_subject === true) {
+    if (String(event.subject_type || "") !== String(wait.subject_type || event.subject_type || "")) return false;
+  }
+  return true;
 }
 
 async function resumeWait(wait, port) {
   const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [wait.run_id])).rows[0];
   if (!run || ["completed", "failed", "canceled", "stopped"].includes(run.status)) return;
-  await ctx.pool.query(`UPDATE automation_waits SET status = CASE WHEN $2 = 'timeout' THEN 'timed_out' ELSE 'completed' END, updated_at = now() WHERE id = $1`, [wait.id, port]);
+  const resumePort = wait.resume_port || port;
+  await ctx.pool.query(`UPDATE automation_waits SET status = CASE WHEN $2 = 'timeout' THEN 'timed_out' ELSE 'completed' END, updated_at = now() WHERE id = $1`, [wait.id, resumePort]);
   const node = (await ctx.pool.query(`SELECT * FROM automation_nodes WHERE id = $1`, [wait.node_id])).rows[0];
-  if (node) await logRun(run, node, "info", "wait.resumed", `Wait resumed through ${port}`, { wait_id: wait.id });
-  await runAutomation(run.id, wait.node_id, port);
+  if (node) await logRun(run, node, "info", "wait.resumed", `Wait resumed through ${resumePort}`, { wait_id: wait.id, scope_key: wait.scope_key || "root" });
+  await runAutomation(run.id, wait.node_id, resumePort, wait.scope_key || "root");
 }
 
 function startAutomationProcessors() {
@@ -3489,19 +3743,42 @@ async function shouldFireScheduledAutomationEvent(row) {
 }
 
 async function buildRunContext(run, options = {}) {
+  const scopeKey = options.scopeKey || "root";
   const event = run.trigger_event_id ? (await ctx.pool.query(`SELECT * FROM automation_events WHERE id = $1`, [run.trigger_event_id])).rows[0] : null;
   const company = (await ctx.pool.query(`SELECT id, name, website, address, phone, email, timezone, business_days, business_open_time, business_close_time FROM companies WHERE id = $1`, [run.company_id])).rows[0] || {};
   const now = new Date();
   const variables = Object.fromEntries((await ctx.pool.query(`SELECT name, value FROM automation_variables WHERE run_id = $1`, [run.id])).rows.map((r) => [r.name, r.value]));
-  const nodeRows = options.slim ? [] : (await ctx.pool.query(`SELECT node_key, output_snapshot FROM automation_run_nodes WHERE run_id = $1 ORDER BY created_at ASC`, [run.id])).rows;
+  const nodeRows = options.slim ? [] : (await ctx.pool.query(`SELECT node_key, output_snapshot, scope_key FROM automation_run_nodes WHERE run_id = $1 AND scope_key IN ('root', $2) ORDER BY created_at ASC`, [run.id, scopeKey])).rows;
   const nodes = {};
   for (const row of nodeRows) nodes[row.node_key] = { output: row.output_snapshot || {} };
+  const iteration = scopeKey !== "root"
+    ? (await ctx.pool.query(`SELECT * FROM automation_run_iterations WHERE run_id = $1 AND scope_key = $2 LIMIT 1`, [run.id, scopeKey])).rows[0]
+    : null;
+  const parentIteration = iteration?.parent_scope_key && iteration.parent_scope_key !== "root"
+    ? (await ctx.pool.query(`SELECT * FROM automation_run_iterations WHERE run_id = $1 AND scope_key = $2 LIMIT 1`, [run.id, iteration.parent_scope_key])).rows[0]
+    : null;
   const context = {
     company,
     event: event ? { id: event.id, type: event.event_type, payload: event.payload || {}, subject_type: event.subject_type, subject_id: event.subject_id } : {},
     variables,
     nodes,
     subject: { type: run.subject_type, id: run.subject_id },
+    scope: { key: scopeKey },
+    item: iteration?.item_data || null,
+    item_index: iteration?.item_index ?? null,
+    iteration: iteration ? {
+      id: iteration.id,
+      index: iteration.item_index,
+      count: iteration.item_count,
+      first: iteration.item_index === 0,
+      last: iteration.item_index === Number(iteration.item_count || 0) - 1,
+      item: iteration.item_data || null,
+      parent: parentIteration ? {
+        index: parentIteration.item_index,
+        count: parentIteration.item_count,
+        item: parentIteration.item_data || null
+      } : null
+    } : {},
     time: {
       now: now.toISOString(),
       hour: now.getUTCHours(),
@@ -6769,6 +7046,8 @@ function safeSnapshot(context) {
   return {
     event: context.event ? { type: context.event.type, subject_type: context.event.subject_type, subject_id: context.event.subject_id } : null,
     subject: context.subject || null,
+    scope: context.scope || null,
+    iteration: context.iteration || null,
     variables: context.variables || {}
   };
 }
