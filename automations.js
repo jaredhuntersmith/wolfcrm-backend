@@ -3021,6 +3021,8 @@ function validateGraphPayload(payload) {
   const nodeIds = new Set();
   const nodeKeys = new Set();
   const validTypes = new Set(["trigger", "action", "condition", "wait", "branch", "sub_automation", "utility", "note", "foreach", "merge", "parallel", "switch", "random_split", "event_wait_multi", "goal", "stop", "end", "fail"]);
+  const settings = payload.settings || {};
+  validateAutomationSafetySettings(settings, errors, warnings);
   for (const node of nodes) {
     if (!node.id) errors.push("node_missing_id");
     if (!node.node_key && !node.nodeKey) errors.push("node_missing_key");
@@ -3032,6 +3034,7 @@ function validateGraphPayload(payload) {
     if (!validTypes.has(node.node_type || node.nodeType)) errors.push(`invalid_node_type:${nodeKey}`);
     const nodeType = node.node_type || node.nodeType;
     const config = node.config || {};
+    validateNodeSafetyConfig(nodeKey, nodeType, config, errors, warnings);
     if (nodeType === "trigger" && !triggerCatalog.find((t) => t.key === config.trigger_key)) errors.push(`invalid_trigger:${nodeKey}`);
     if (nodeType === "action" && !actionExecutors[config.action_key]) errors.push(`invalid_action:${nodeKey}`);
     if (nodeType === "trigger" && config.trigger_key === "contact.field_changed" && !config.field) errors.push(`field_change_trigger_missing_field:${nodeKey}`);
@@ -3119,9 +3122,68 @@ function validateGraphPayload(payload) {
     if (!nodeIds.has(edge.source_node_id || edge.sourceNodeId)) errors.push(`edge_source_missing:${edge.id || ""}`);
     if (!nodeIds.has(edge.target_node_id || edge.targetNodeId)) errors.push(`edge_target_missing:${edge.id || ""}`);
   }
+  for (const node of nodes) {
+    const nodeKey = node.node_key || node.nodeKey;
+    const config = node.config || {};
+    if ((node.node_type || node.nodeType) === "action" && config.on_error === "error_path") {
+      const hasErrorEdge = edges.some((edge) => (edge.source_node_id || edge.sourceNodeId) === node.id && (edge.source_port || edge.sourcePort) === "error");
+      if (!hasErrorEdge) warnings.push(`error_path_unconnected:${nodeKey}`);
+    }
+  }
   if (!nodes.some((n) => (n.node_type || n.nodeType) === "trigger")) errors.push("trigger_required");
+  detectObviousSelfTriggers(nodes, warnings);
   if (detectCycle(nodes, edges)) warnings.push("cycle_detected_execution_safety_limits_apply");
   return { valid: errors.length === 0, errors, warnings };
+}
+
+function validateAutomationSafetySettings(settings, errors, warnings) {
+  if (settings.reentry_mode === "cooldown" && Number(settings.cooldown_seconds || 0) <= 0) errors.push("cooldown_duration_required");
+  for (const key of ["max_active_runs", "max_active_runs_per_subject", "maximum_node_executions", "max_customer_messages_per_run", "max_webhook_actions_per_run"]) {
+    if (settings[key] != null && Number(settings[key]) <= 0) errors.push(`${key}_invalid`);
+  }
+  if (settings.max_active_runs != null && Number(settings.max_active_runs) > AUTOMATION_SAFETY_DEFAULTS.maxCompanyActiveRuns) errors.push("max_active_runs_over_system_limit");
+  const stops = Array.isArray(settings.stop_conditions || settings.stopConditions) ? (settings.stop_conditions || settings.stopConditions) : [];
+  for (const stop of stops) {
+    const preset = stop?.key || stop?.preset || stop?.type;
+    if (!preset && !stop?.event_type && !stop?.eventType) errors.push("stop_condition_event_required");
+  }
+  const goals = Array.isArray(settings.goals || settings.goal_conditions || settings.goalConditions) ? (settings.goals || settings.goal_conditions || settings.goalConditions) : [];
+  for (const goal of goals) {
+    if (!(goal?.key || goal?.name || goal?.event_type || goal?.eventType)) warnings.push("goal_condition_name_or_event_recommended");
+  }
+}
+
+function validateNodeSafetyConfig(nodeKey, nodeType, config, errors, warnings) {
+  const onError = config.on_error;
+  if (onError && !["stop", "continue", "error_path"].includes(onError)) errors.push(`invalid_on_error:${nodeKey}`);
+  const retryCount = Number(config.retry_count || 0);
+  if (retryCount < 0 || retryCount > AUTOMATION_LIMITS.maxNodeAttempts - 1) errors.push(`retry_count_invalid:${nodeKey}`);
+  if (config.retry_initial_delay_seconds != null && Number(config.retry_initial_delay_seconds) < 0) errors.push(`retry_initial_delay_invalid:${nodeKey}`);
+  if (config.retry_max_delay_seconds != null && (Number(config.retry_max_delay_seconds) <= 0 || Number(config.retry_max_delay_seconds) > AUTOMATION_SAFETY_DEFAULTS.maxRetryDelaySeconds)) errors.push(`retry_max_delay_invalid:${nodeKey}`);
+  if (config.retry_backoff_multiplier != null && Number(config.retry_backoff_multiplier) < 1) errors.push(`retry_backoff_invalid:${nodeKey}`);
+  if (config.timeout_seconds != null && Number(config.timeout_seconds) <= 0) errors.push(`timeout_invalid:${nodeKey}`);
+  if (config.missing_resource_policy && !["fail", "skip"].includes(config.missing_resource_policy)) errors.push(`missing_resource_policy_invalid:${nodeKey}`);
+  if (nodeType === "sub_automation" && config.automation_id && config.automation_id === config.current_automation_id) errors.push(`self_start_not_allowed:${nodeKey}`);
+  if (nodeType === "foreach" && Number(config.max_items || 0) * Number(config.parallelism || 1) > AUTOMATION_SAFETY_DEFAULTS.maxTotalIterationsPerRun) warnings.push(`foreach_nested_budget_may_be_exceeded:${nodeKey}`);
+}
+
+function detectObviousSelfTriggers(nodes, warnings) {
+  const triggers = nodes.filter((n) => (n.node_type || n.nodeType) === "trigger").map((n) => n.config || {});
+  const actions = nodes.filter((n) => (n.node_type || n.nodeType) === "action").map((n) => n.config || {});
+  for (const trigger of triggers) {
+    if (trigger.trigger_key === "contact.tag_added") {
+      const triggerTag = String(trigger.tag || trigger.tag_name || "").toLowerCase();
+      if (triggerTag && actions.some((a) => a.action_key === "contact.add_tag" && normalizeTags(a.tags || a.tag).map((t) => t.toLowerCase()).includes(triggerTag))) {
+        warnings.push("possible_self_trigger:contact_tag");
+      }
+    }
+    if (trigger.trigger_key === "pipeline.stage_changed" || trigger.trigger_key === "pipeline.stage_entered") {
+      const toStage = String(trigger.to_stage_id || trigger.stage_id || "").toLowerCase();
+      if (toStage && actions.some((a) => ["pipeline.move_stage", "pipeline.reopen"].includes(a.action_key) && String(a.stage_id || "").toLowerCase() === toStage)) {
+        warnings.push("possible_self_trigger:pipeline_stage");
+      }
+    }
+  }
 }
 
 function detectCycle(nodes, edges) {
