@@ -404,7 +404,7 @@ const actionCatalog = [
   ["contact.add_activity", "Add Contact Activity", "Contacts", "Adds a server-synced contact activity entry.", ["contact"], ["default"]],
   ["contact.add_to_map", "Add Contact to Map", "Contacts", "Creates a map pin linked to the contact.", ["contact"], ["default"]],
   ["pipeline.create_opportunity", "Create Opportunity", "Pipeline", "Creates an active opportunity for a contact.", ["contact"], ["default"]],
-  ["pipeline.move_stage", "Move Pipeline Stage", "Pipeline", "Moves an existing contact opportunity to a stage.", ["contact", "opportunity"], ["default"]],
+  ["pipeline.move_stage", "Move Pipeline Stage", "Pipeline", "Moves the selected Contact's pipeline opportunity to a Stage. WolfCRM can create the opportunity if it does not exist.", ["contact", "opportunity"], ["default"]],
   ["pipeline.remove_opportunity", "Remove Opportunity", "Pipeline", "Removes a contact from the active pipeline.", ["contact", "opportunity"], ["default"]],
   ["pipeline.mark_won", "Mark Opportunity Won", "Pipeline", "Marks an opportunity sold/won.", ["contact", "opportunity"], ["default"]],
   ["pipeline.mark_lost", "Mark Opportunity Lost", "Pipeline", "Marks an opportunity lost.", ["contact", "opportunity"], ["default"]],
@@ -417,7 +417,7 @@ const actionCatalog = [
   ["pipeline.archive_reminder", "Archive Pipeline Reminder", "Pipeline", "Archives a follow-up reminder.", ["contact", "opportunity"], ["default"]],
   ["task.create", "Create Task", "Tasks", "Creates a todo task.", ["generic"], ["default"]],
   ["notification.send_push", "Send Push Notification", "Notifications", "Sends APNs push notifications to scoped company users.", ["generic"], ["default"]],
-  ["sms.send", "Send SMS", "Phone", "Sends SMS through the configured company phone line.", ["contact", "sms_conversation"], ["default"]],
+  ["sms.send", "Send SMS", "Phone", "Sends SMS to the selected Contact, SMS conversation, or phone number through the configured company phone line.", ["contact", "sms_conversation"], ["default"]],
   ["sms.send_mms", "Send MMS", "Cellular Messaging", "Sends MMS through the configured company phone line.", ["contact", "sms_conversation"], ["default"]],
   ["sms.mark_conversation_read", "Mark SMS Conversation Read", "Cellular Messaging", "Marks a cellular conversation read.", ["sms_conversation"], ["default"]],
   ["sms.mark_conversation_unread", "Mark SMS Conversation Unread", "Cellular Messaging", "Marks a cellular conversation unread.", ["sms_conversation"], ["default"]],
@@ -504,7 +504,6 @@ const actionCatalog = [
   ["route.remove_stop", "Remove Route Stop", "Routes", "Removes a route stop.", ["route_stop"], ["default"]],
   ["route.add_contact", "Add Contact to Route", "Routes", "Adds a contact location to a route.", ["route", "contact"], ["default"]],
   ["route.add_pin", "Add Pin to Route", "Routes", "Adds a map pin to a route.", ["route", "map_pin"], ["default"]],
-  ["route.add_job", "Add Job to Route", "Routes", "Adds a job location to a route.", ["route", "job"], ["default"]],
   ["route.assign_user", "Assign Route Rep", "Routes", "Assigns a route to a company user.", ["route", "employee"], ["default"]],
   ["route.set_date", "Set Route Date", "Routes", "Sets the scheduled route date.", ["route"], ["default"]],
   ["route.optimize", "Optimize Stop Order", "Routes", "Deterministically reorders stops by coordinate distance.", ["route"], ["default"]],
@@ -3034,6 +3033,7 @@ function validateGraphPayload(payload) {
   const validTypes = new Set(["trigger", "action", "condition", "wait", "branch", "sub_automation", "utility", "note", "foreach", "merge", "parallel", "switch", "random_split", "event_wait_multi", "goal", "stop", "end", "fail"]);
   const settings = payload.settings || {};
   validateAutomationSafetySettings(settings, errors, warnings);
+  const hasContactContext = graphProvidesContactContext(nodes);
   for (const node of nodes) {
     if (!node.id) errors.push("node_missing_id");
     if (!node.node_key && !node.nodeKey) errors.push("node_missing_key");
@@ -3079,6 +3079,8 @@ function validateGraphPayload(payload) {
       if (config.action_key === "internal.send_channel_message" && !config.channel_id) errors.push(`internal_channel_required:${nodeKey}`);
       if (config.action_key === "internal.create_channel" && !config.name) errors.push(`internal_channel_name_required:${nodeKey}`);
       if (["call.set_disposition"].includes(config.action_key) && !config.disposition) errors.push(`call_disposition_required:${nodeKey}`);
+      if (config.action_key === "contact.create" && !config.name) errors.push(`contact_name_required:${nodeKey}`);
+      if (actionRequiresContactTarget(config.action_key) && (config.target_mode || "current_contact") === "current_contact" && !hasContactContext) errors.push(`target_contact_required:${nodeKey}`);
       if (config.action_key === "quote.create" && !(Array.isArray(config.line_items) && config.line_items.length)) errors.push(`quote_line_items_required:${nodeKey}`);
       if (config.action_key === "quote.delete" && config.confirm_delete !== true) errors.push(`quote_delete_confirmation_required:${nodeKey}`);
       if (config.action_key === "quote.set_status" && !["draft", "sent", "accepted", "declined", "expired", "converted"].includes(config.status)) errors.push(`quote_status_invalid:${nodeKey}`);
@@ -3152,6 +3154,25 @@ function validateGraphPayload(payload) {
   detectObviousSelfTriggers(nodes, warnings);
   if (detectCycle(nodes, edges)) warnings.push("cycle_detected_execution_safety_limits_apply");
   return { valid: errors.length === 0, errors, warnings };
+}
+
+function graphProvidesContactContext(nodes) {
+  return nodes.some((node) => {
+    if ((node.node_type || node.nodeType) !== "trigger") return false;
+    const key = node.config?.trigger_key || "";
+    return key.startsWith("contact.") || key.startsWith("lead.") || key.startsWith("pipeline.") || key.startsWith("job.") || key.startsWith("sms.") || key.startsWith("call.") || key.startsWith("voicemail.") || key.startsWith("quote.") || key.startsWith("payment.") || key.startsWith("service_plan.");
+  });
+}
+
+function actionRequiresContactTarget(actionKey) {
+  return [
+    "contact.add_tag", "contact.remove_tag", "contact.replace_tags", "contact.clear_tags", "contact.update_fields",
+    "contact.set_source", "contact.set_value", "contact.set_job_type", "contact.set_custom_field", "contact.set_location",
+    "contact.delete", "contact.add_note", "contact.add_activity", "contact.add_to_map", "pipeline.create_opportunity",
+    "pipeline.move_stage", "pipeline.set_value", "pipeline.mark_won", "pipeline.mark_lost", "pipeline.reopen",
+    "pipeline.remove_opportunity", "pipeline.create_reminder", "sms.send", "sms.send_mms", "call.send_followup_sms",
+    "voicemail.send_followup_sms"
+  ].includes(actionKey);
 }
 
 function validateAutomationSafetySettings(settings, errors, warnings) {
