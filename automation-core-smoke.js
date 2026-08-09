@@ -1,7 +1,3 @@
-import pg from "pg";
-
-const { Pool } = pg;
-
 const url = process.env.TEST_DATABASE_URL;
 if (!url) {
   console.log("SKIP: TEST_DATABASE_URL is not set.");
@@ -13,6 +9,8 @@ if (!/test|local|dev/i.test(url)) {
   process.exit(2);
 }
 
+const { default: pg } = await import("pg");
+const { Pool } = pg;
 const pool = new Pool({ connectionString: url });
 
 async function scalar(sql, params = []) {
