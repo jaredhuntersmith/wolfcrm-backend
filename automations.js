@@ -8914,7 +8914,15 @@ async function loadRunDetail(runId, companyId) {
   const iterations = (await ctx.pool.query(`SELECT * FROM automation_run_iterations WHERE run_id = $1 ORDER BY created_at ASC, item_index ASC`, [runId])).rows;
   const merges = (await ctx.pool.query(`SELECT * FROM automation_merge_arrivals WHERE run_id = $1 ORDER BY arrived_at ASC`, [runId])).rows;
   const goals = (await ctx.pool.query(`SELECT * FROM automation_run_goals WHERE run_id = $1 ORDER BY reached_at ASC`, [runId])).rows;
-  return { run, nodes, logs, waits, iterations, merges, goals };
+  return {
+    run: { ...run, active_execution_ms: Number(run.active_execution_ms || 0) },
+    nodes,
+    logs,
+    waits,
+    iterations,
+    merges,
+    goals
+  };
 }
 
 function safeJson(value) {

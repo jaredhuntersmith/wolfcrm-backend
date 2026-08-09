@@ -372,6 +372,8 @@ async function testDraftRunSafety() {
   const dryNodes = await rows(`SELECT output_snapshot FROM automation_run_nodes WHERE run_id = $1 AND node_key IN ('tag_1','pipe_1','sms_1')`, [run.id]);
   assert.equal(dryNodes.length, 3);
   assert.ok(dryNodes.every((r) => r.output_snapshot?.would_execute));
+  const detail = await automationTestHooks.loadRunDetail(run.id, seed.companyId);
+  assert.equal(typeof detail.run.active_execution_ms, "number");
 }
 
 async function testContactToTag() {
