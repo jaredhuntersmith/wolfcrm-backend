@@ -3326,7 +3326,7 @@ function validateResourceTarget(config, nodeKey, contextTypes, errors) {
     const mode = config[modeKey] || currentMode;
     if (config[idKey]) continue;
     if (mode === currentMode && !contextTypes.has(type)) errors.push(`${type}_target_required:${nodeKey}`);
-    if ((mode === "node_output" || mode === "template") && !config[idKey]) errors.push(`${type}_target_required:${nodeKey}`);
+    if (["specific", "node_output", "template"].includes(mode) && !config[idKey]) errors.push(`${type}_target_required:${nodeKey}`);
   }
 }
 

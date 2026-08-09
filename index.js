@@ -8619,6 +8619,34 @@ app.get("/api/contacts/:contactId/payments", authRequired, async (req, res) => {
   }
 });
 
+app.get("/api/payments", authRequired, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 200);
+    if (req.role === "employer") {
+      const { rows } = await pool.query(
+        `SELECT * FROM payment_records
+          WHERE user_id = $1
+          ORDER BY created_at DESC
+          LIMIT $2`,
+        [employerId, limit]
+      );
+      return res.json(rows.map((r) => sanitizePaymentRecord(r)));
+    }
+    const { rows } = await pool.query(
+      `SELECT * FROM payment_records
+        WHERE user_id = $1 AND created_by_user_id = $2
+        ORDER BY created_at DESC
+        LIMIT $3`,
+      [employerId, req.userId, limit]
+    );
+    res.json(rows.map((r) => sanitizePaymentRecord(r, { employeeSafe: true })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "list_payments_failed" });
+  }
+});
+
 app.get("/api/payments/:id", authRequired, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
