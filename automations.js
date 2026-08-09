@@ -51,6 +51,105 @@ const SIDE_EFFECT_FREE_ACTIONS = new Set([
   "object.get", "object.build", "coalesce", "math", "text", "date"
 ]);
 
+const CORE_TRIGGERS = new Set([
+  "manual",
+  "contact.created", "contact.updated", "contact.tag_added", "contact.tag_removed",
+  "pipeline.stage_changed", "pipeline.won", "pipeline.lost",
+  "job.created", "job.completed",
+  "task.due",
+  "sms.received", "sms.reply_received",
+  "call.missed",
+  "payment.succeeded", "payment.failed",
+  "service_plan.service_due",
+  "map.pin_status_changed",
+  "time_clock.clocked_in", "time_clock.clocked_out"
+]);
+
+const HIDDEN_TRIGGERS = new Set([
+  "contact.restored", "contact.assigned", "contact.reassigned", "contact.unassigned",
+  "lead.assigned", "lead.reassigned",
+  "pipeline.salesperson_assigned", "pipeline.salesperson_changed", "pipeline.salesperson_removed",
+  "job.restored", "job.canceled", "job.started",
+  "call.declined",
+  "route.created", "route.updated", "route.deleted", "route.stop_added", "route.stop_removed", "route.reordered",
+  "route.assigned", "route.started", "route.completed", "route.stop_completed", "route.stop_skipped", "route.all_stops_completed", "route.scheduled",
+  "invoice.created", "invoice.issued", "invoice.updated", "invoice.due", "invoice.overdue", "invoice.paid", "invoice.voided", "invoice.deleted", "invoice.total_changed",
+  "map.pin_list_changed", "map.pin_added_to_list", "map.pin_removed_from_list", "map.pin_note_added", "map.pin_visited", "map.pin_knocked",
+  "canvass.knock_recorded", "canvass.outcome_recorded"
+]);
+
+const CORE_ACTIONS = new Set([
+  "contact.create", "contact.add_tag", "contact.update_fields",
+  "pipeline.create_opportunity", "pipeline.move_stage",
+  "task.create", "task.complete",
+  "job.create", "job.mark_completed",
+  "sms.send",
+  "notification.send_push",
+  "payment.create_payment_link",
+  "service_plan.create_service_task"
+]);
+
+const HIDDEN_ACTIONS = new Set([
+  "contact.restore", "contact.assign_user", "contact.unassign_user",
+  "pipeline.assign_salesperson", "pipeline.remove_salesperson",
+  "invoice.generate_pdf",
+  "measurement.link_pin",
+  "job.cancel", "job.restore",
+  "map.add_to_route",
+  "route.create", "route.delete", "route.add_stop", "route.remove_stop", "route.add_contact", "route.add_pin", "route.add_job",
+  "route.assign_user", "route.set_date", "route.optimize", "route.mark_started", "route.mark_completed", "route.complete_stop", "route.skip_stop",
+  "route.get_stops",
+  "quote.create_invoice",
+  "invoice.create", "invoice.issue", "invoice.set_due_date", "invoice.void", "invoice.create_payment_request", "invoice.send_payment_link", "invoice.create_followup_task"
+]);
+
+const DEPRECATED_REPLACEMENTS = {
+  "contact.name_changed": "contact.field_changed",
+  "contact.phone_changed": "contact.field_changed",
+  "contact.email_changed": "contact.field_changed",
+  "contact.address_changed": "contact.field_changed",
+  "contact.value_changed": "contact.field_changed",
+  "contact.job_type_changed": "contact.field_changed",
+  "contact.source_changed": "contact.field_changed",
+  "contact.u1_changed": "contact.field_changed",
+  "contact.u2_changed": "contact.field_changed",
+  "contact.u3_changed": "contact.field_changed",
+  "contact.u4_changed": "contact.field_changed",
+  "contact.u5_changed": "contact.field_changed",
+  "job.start_changed": "job.field_changed",
+  "job.end_changed": "job.field_changed",
+  "job.date_changed": "job.field_changed",
+  "job.price_changed": "job.field_changed",
+  "job.material_cost_changed": "job.field_changed",
+  "job.color_changed": "job.field_changed",
+  "job.contact_changed": "job.field_changed",
+  "quote.mark_sent": "quote.set_status",
+  "quote.mark_accepted": "quote.set_status",
+  "quote.mark_declined": "quote.set_status",
+  "contact.set_source": "contact.update_fields",
+  "contact.set_value": "contact.update_fields",
+  "contact.set_job_type": "contact.update_fields",
+  "contact.set_custom_field": "contact.update_fields"
+};
+
+function triggerVisibility(key) {
+  if (HIDDEN_TRIGGERS.has(key)) return "hidden";
+  if (CORE_TRIGGERS.has(key)) return "core";
+  return "advanced";
+}
+
+function actionVisibility(key) {
+  if (HIDDEN_ACTIONS.has(key)) return "hidden";
+  if (CORE_ACTIONS.has(key)) return "core";
+  return "advanced";
+}
+
+function deprecationFor(key) {
+  const replacement = DEPRECATED_REPLACEMENTS[key];
+  if (!replacement) return {};
+  return { deprecated: true, deprecated_reason: "Use the broader configurable node in new automations.", replacement_key: replacement };
+}
+
 const triggerCatalog = [
   ["manual", "Manual", "Manual", "Starts when an employer manually runs the automation.", ["generic"], ["manual"]],
   ["contact.created", "Contact Created", "Contacts", "A contact was created.", ["contact"], ["contact.created"]],
@@ -381,6 +480,8 @@ const triggerCatalog = [
   config_fields: triggerConfigFields(key),
   outputs: ["default"],
   icon: triggerIcon(key),
+  visibility: triggerVisibility(key),
+  ...deprecationFor(key),
   wired: !["contact.restored", "contact.assigned", "contact.reassigned", "contact.unassigned", "lead.assigned", "lead.reassigned", "pipeline.salesperson_assigned", "pipeline.salesperson_changed", "pipeline.salesperson_removed", "job.restored", "job.canceled", "job.started", "call.declined", "internal.mention_received"].includes(key)
 }));
 
@@ -608,6 +709,8 @@ const actionCatalog = [
   supported_subject_types: subjectTypes,
   outputs,
   icon: actionIcon(key),
+  visibility: actionVisibility(key),
+  ...deprecationFor(key),
   config_fields: actionConfigFields(key)
 }));
 
