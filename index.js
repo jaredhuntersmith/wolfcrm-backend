@@ -757,6 +757,8 @@ async function bootstrap() {
       job_type TEXT,
       u1 TEXT, u2 TEXT, u3 TEXT, u4 TEXT, u5 TEXT,
       lead_info JSONB,
+      deleted_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS contacts_updated_idx ON contacts(updated_at DESC);
@@ -819,6 +821,8 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS device_tokens_user_environment_idx ON device_tokens(user_id, environment);
 
     -- Contact provenance for webhook-imported leads
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS source TEXT;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS external_lead_id TEXT;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS lead_form_id TEXT;
@@ -1027,16 +1031,6 @@ async function bootstrap() {
         AND u.company_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS stages_company_idx ON stages(company_id, order_idx);
 
-    -- Same for opportunities so auto-assigned webhook leads are visible company-wide.
-    ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS company_id UUID;
-    UPDATE opportunities o
-      SET company_id = u.company_id
-      FROM users u
-      WHERE u.id = o.user_id
-        AND o.company_id IS NULL
-        AND u.company_id IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS opportunities_company_idx ON opportunities(company_id);
-
     CREATE TABLE IF NOT EXISTS opportunities (
       id TEXT PRIMARY KEY,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1048,6 +1042,16 @@ async function bootstrap() {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS opportunities_user_contact_idx
       ON opportunities(user_id, contact_id);
+
+    -- Same for opportunities so auto-assigned webhook leads are visible company-wide.
+    ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS company_id UUID;
+    UPDATE opportunities o
+      SET company_id = u.company_id
+      FROM users u
+      WHERE u.id = o.user_id
+        AND o.company_id IS NULL
+        AND u.company_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS opportunities_company_idx ON opportunities(company_id);
 
     CREATE TABLE IF NOT EXISTS schedule_events (
       id TEXT PRIMARY KEY,

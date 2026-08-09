@@ -1650,12 +1650,39 @@ export async function emitAutomationEvent(event) {
         event.occurredAt || null
       ]
     );
-    setImmediate(() => processAutomationEvents().catch((e) => console.error("[automations] event processor wake failed", e?.message || e)));
+    if (!ctx.disableProcessors) setImmediate(() => processAutomationEvents().catch((e) => console.error("[automations] event processor wake failed", e?.message || e)));
     return rows[0]?.id || null;
   } catch (e) {
     console.error("[automations] emit failed", { eventType: event.eventType, code: e?.code, message: e?.message });
     return null;
   }
+}
+
+async function recordProcessedAutomationEvent(event) {
+  if (!ctx?.pool || !event?.companyId || !event?.eventType) return null;
+  const payload = safeJson(event.payload || {});
+  const { rows } = await ctx.pool.query(
+    `INSERT INTO automation_events(
+       id, company_id, event_type, subject_type, subject_id, actor_user_id, source, dedupe_key, payload,
+       occurred_at, processing_status, processed_at
+     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,COALESCE($10::timestamptz, now()),'processed',now())
+     ON CONFLICT (company_id, dedupe_key) WHERE dedupe_key IS NOT NULL
+     DO UPDATE SET id = automation_events.id
+     RETURNING id`,
+    [
+      randomUUID(),
+      event.companyId,
+      event.eventType,
+      event.subjectType || null,
+      event.subjectId ? String(event.subjectId) : null,
+      event.actorUserId || null,
+      event.source || "backend",
+      event.dedupeKey || null,
+      JSON.stringify(payload),
+      event.occurredAt || null
+    ]
+  );
+  return rows[0]?.id || null;
 }
 
 export async function syncAutomationSchedulesForJob(companyId, job) {
@@ -3817,7 +3844,7 @@ async function startManualRun(automationId, companyId, userId, body) {
   )).rows[0];
   if (!automation || !automation.allow_manual_trigger) return null;
   await validateSubject(companyId, body.subject_type || "generic", body.subject_id || null);
-  const eventId = await emitAutomationEvent({
+  const eventId = await recordProcessedAutomationEvent({
     companyId,
     eventType: "manual",
     subjectType: body.subject_type || "generic",
@@ -3840,7 +3867,7 @@ async function startManualRun(automationId, companyId, userId, body) {
   });
   await installRunMonitors(run);
   await logRun(run, null, "info", body.dry_run ? "run.dry_start" : "run.manual_start", "Manual run started", { subject_type: body.subject_type, subject_id: body.subject_id });
-  setImmediate(() => runAutomation(run.id).catch((e) => console.error("[automations] manual run wake failed", e?.message || e)));
+  if (!ctx.disableProcessors) setImmediate(() => runAutomation(run.id).catch((e) => console.error("[automations] manual run wake failed", e?.message || e)));
   return run;
 }
 
@@ -3857,7 +3884,7 @@ async function startDraftTestRun(automationId, companyId, userId, body) {
   const graph = await loadVersionGraph(automation.version_id, companyId);
   const firstTrigger = graph.nodes.find((node) => node.node_type === "trigger");
   const triggerKey = body.trigger_key || firstTrigger?.config?.trigger_key || "manual";
-  const eventId = await emitAutomationEvent({
+  const eventId = await recordProcessedAutomationEvent({
     companyId,
     eventType: triggerKey,
     subjectType: body.subject_type || firstTrigger?.config?.subject_type || "generic",
@@ -3880,7 +3907,7 @@ async function startDraftTestRun(automationId, companyId, userId, body) {
     depth: 0
   });
   await logRun(run, null, "info", "run.draft_test_start", "Draft test run started", { subject_type: body.subject_type, subject_id: body.subject_id, trigger_key: triggerKey });
-  setImmediate(() => runAutomation(run.id).catch((e) => console.error("[automations] draft test wake failed", e?.message || e)));
+  if (!ctx.disableProcessors) setImmediate(() => runAutomation(run.id).catch((e) => console.error("[automations] draft test wake failed", e?.message || e)));
   return run;
 }
 
@@ -3903,7 +3930,10 @@ async function runAutomation(runId, resumeFromNodeId = null, incomingPort = null
   const graph = await loadGraph(run.automation_version_id, run.company_id);
   let startNodes = [];
   if (resumeFromNodeId) {
-    startNodes = graph.edges.filter((e) => e.source_node_id === resumeFromNodeId && portMatches(e.source_port, incomingPort || "default")).sort(edgeSort).map((e) => graph.nodeById.get(e.target_node_id));
+    startNodes = graph.edges
+      .filter((e) => e.source_node_id === resumeFromNodeId && portMatches(e.source_port, incomingPort || "default"))
+      .sort(edgeSort)
+      .map((e) => ({ node: graph.nodeById.get(e.target_node_id), arrival: { source_node_id: resumeFromNodeId, source_port: incomingPort || "default", edge_id: e.id } }));
   } else {
     for (const n of graph.nodes) {
       if (n.node_type === "trigger" && await triggerMatchesRunAsync(n, run)) startNodes.push(n);
@@ -3913,8 +3943,9 @@ async function runAutomation(runId, resumeFromNodeId = null, incomingPort = null
     await completeRunIfIdle(run);
     return;
   }
-  for (const node of startNodes.filter(Boolean)) {
-    await executeFromNode(run.id, node.id, scopeKey);
+  for (const item of startNodes.filter(Boolean)) {
+    const node = item.node || item;
+    await executeFromNode(run.id, node.id, scopeKey, item.arrival || null);
   }
   if (scopeKey === "root") await completeRunIfIdle((await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [runId])).rows[0]);
 }
@@ -4481,7 +4512,7 @@ function edgeSort(a, b) {
 
 async function completeRunIfIdle(run) {
   if (!run || ["completed", "failed", "canceled", "stopped"].includes(run.status)) return;
-  const waiting = await ctx.pool.query(`SELECT 1 FROM automation_waits WHERE run_id = $1 AND status = 'waiting' LIMIT 1`, [run.id]);
+  const waiting = await ctx.pool.query(`SELECT 1 FROM automation_waits WHERE run_id = $1 AND status IN ('waiting','ready') LIMIT 1`, [run.id]);
   if (waiting.rowCount) {
     await ctx.pool.query(`UPDATE automation_runs SET status = 'waiting', updated_at = now() WHERE id = $1`, [run.id]);
     return;
@@ -5244,7 +5275,7 @@ function leadContextFromContact(contact, payload) {
 
 async function loadPipelineContext(companyId, contactId) {
   const opp = (await ctx.pool.query(
-    `SELECT o.*, s.name AS stage_name, c.value_cents, u.name AS salesperson_name
+    `SELECT o.*, s.name AS stage_name, c.value_cents, COALESCE(NULLIF(u.display_name, ''), u.email) AS salesperson_name
        FROM opportunities o
        LEFT JOIN stages s ON s.id = o.stage_id AND (s.company_id = $1 OR s.company_id IS NULL)
        LEFT JOIN contacts c ON c.id::text = o.contact_id AND c.company_id = $1
@@ -5531,8 +5562,8 @@ function containsValue(left, right) {
   return String(left ?? "").toLowerCase().includes(String(right ?? "").toLowerCase());
 }
 
-async function executeContactAddTag(run, node, config) {
-  const context = await buildRunContext(run);
+async function executeContactAddTag(run, node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const contactId = await resolveContactId(run, context, config);
   const tags = normalizeTags(resolveConfig(config.tags || config.tag || [], context));
   const result = await mutateContactTags(run.company_id, contactId, (existing) => uniqueTags([...existing, ...tags]));
@@ -5540,8 +5571,8 @@ async function executeContactAddTag(run, node, config) {
   return { contact_id: contactId, tags: result.next, added_tags: result.added };
 }
 
-async function executeContactRemoveTag(run, node, config) {
-  const context = await buildRunContext(run);
+async function executeContactRemoveTag(run, node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const contactId = await resolveContactId(run, context, config);
   const tags = normalizeTags(resolveConfig(config.tags || config.tag || [], context)).map((t) => t.toLowerCase());
   const result = await mutateContactTags(run.company_id, contactId, (existing) => existing.filter((t) => !tags.includes(t.toLowerCase())));
@@ -5549,8 +5580,8 @@ async function executeContactRemoveTag(run, node, config) {
   return { contact_id: contactId, tags: result.next, removed_tags: result.removed };
 }
 
-async function executeContactUpdateFields(run, node, config) {
-  const context = await buildRunContext(run);
+async function executeContactUpdateFields(run, node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const contactId = await resolveContactId(run, context, config);
   const allowed = ["name", "phone", "email", "address", "job_type", "source", "u1", "u2", "u3", "u4", "u5", "value_cents", "lat", "lng"];
   const updates = {};
@@ -5610,13 +5641,13 @@ function uniqueTags(tags) {
   return out;
 }
 
-async function executeContactCreate(run, node, config) {
+async function executeContactCreate(run, node, config, scopeKey = "root") {
   const existingId = await getRunVariable(run.id, `idempotency:${node.id}:contact_id`);
   if (existingId) {
     const existing = await loadContactContext(run.company_id, existingId);
     if (existing?.exists) return { contact_id: existingId, reused: true };
   }
-  const context = await buildRunContext(run);
+  const context = await buildRunContext(run, { scopeKey });
   const fields = resolveConfig(config, context);
   const name = (fields.name || "").toString().trim();
   if (!name) throw new Error("contact_name_required");
@@ -5659,16 +5690,16 @@ async function executeDeferredAction(_run, _node, config) {
   throw new Error(config?.deferred_reason || "action_deferred_current_schema_does_not_support_this");
 }
 
-async function executeContactReplaceTags(run, node, config) {
-  const context = await buildRunContext(run);
+async function executeContactReplaceTags(run, node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const contactId = await resolveContactId(run, context, config);
   const result = await mutateContactTags(run.company_id, contactId, () => uniqueTags(resolveConfig(config.tags || [], context)));
   await emitContactTagEvents(run, node, contactId, result);
   return { contact_id: contactId, tags: result.next, added_tags: result.added, removed_tags: result.removed };
 }
 
-async function executeContactClearTags(run, node, config) {
-  const context = await buildRunContext(run);
+async function executeContactClearTags(run, node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const contactId = await resolveContactId(run, context, config);
   const result = await mutateContactTags(run.company_id, contactId, () => []);
   await emitContactTagEvents(run, node, contactId, result);
@@ -5727,13 +5758,13 @@ async function executeContactAddToMap(run, node, config) {
   return { pin_id: rows[0].id, contact_id: contactId };
 }
 
-async function executeMapCreatePin(run, node, config) {
+async function executeMapCreatePin(run, node, config, scopeKey = "root") {
   const existing = await getRunVariable(run.id, `idempotency:${node.id}:pin_id`);
   if (existing) {
     const pin = await loadMapPinContext(run.company_id, existing);
     if (pin?.exists) return { pin_id: existing, reused: true };
   }
-  const context = await buildRunContext(run);
+  const context = await buildRunContext(run, { scopeKey });
   const fields = resolveConfig(config, context);
   const contact = fields.contact_id ? await loadContactContext(run.company_id, fields.contact_id) : context.contact;
   const lat = numOrNull(fields.latitude ?? fields.lat ?? contact?.lat ?? context.map?.latitude);
@@ -6197,8 +6228,8 @@ async function emitContactTagEvents(run, node, contactId, result) {
   if (result.added.length || result.removed.length) await emitAutomationEvent({ companyId: run.company_id, eventType: "contact.tags_changed", subjectType: "contact", subjectId: contactId, source: "automation", payload });
 }
 
-async function executePipelineMoveStage(run, node, config) {
-  const context = await buildRunContext(run);
+async function executePipelineMoveStage(run, node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const contactId = await resolveContactId(run, context, config);
   const stageId = resolveTemplate(config.stage_id || "", context);
   const stage = await ctx.pool.query(`SELECT id FROM stages WHERE id = $1 AND company_id = $2`, [stageId, run.company_id]);
@@ -6217,8 +6248,8 @@ async function executePipelineMoveStage(run, node, config) {
   return { opportunity_id: rows[0].id, previous_stage_id: existing?.stage_id || null, stage_id: rows[0].stage_id };
 }
 
-async function executePipelineCreateOpportunity(run, node, config) {
-  const context = await buildRunContext(run);
+async function executePipelineCreateOpportunity(run, node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const contactId = await resolveContactId(run, context, config);
   const existing = (await ctx.pool.query(`SELECT * FROM opportunities WHERE company_id = $1 AND contact_id = $2 LIMIT 1`, [run.company_id, contactId])).rows[0];
   if (existing) {
@@ -6357,13 +6388,13 @@ async function updateReminderArchived(run, node, config, eventType) {
   return { reminder_id: reminderId, archived: true };
 }
 
-async function executeTaskCreate(run, node, config) {
+async function executeTaskCreate(run, node, config, scopeKey = "root") {
   const existingId = await getRunVariable(run.id, `idempotency:${node.id}:task_id`);
   if (existingId) {
     const existing = await loadTaskContext(run.company_id, existingId);
     if (existing?.exists) return { task_id: existingId, reused: true };
   }
-  const context = await buildRunContext(run);
+  const context = await buildRunContext(run, { scopeKey });
   const title = resolveTemplate(config.title || "Automation task", context);
   const assignee = await resolveCompanyUser(run.company_id, resolveTemplate(config.assigned_user_id || "", context));
   const dueDate = config.due_date || config.due_at ? resolveDateExpression(config.due_date || config.due_at, context) : null;
@@ -6381,8 +6412,8 @@ async function executeTaskCreate(run, node, config) {
   return { task_id: id, due_at: rows[0].due_date, title: rows[0].title };
 }
 
-async function executeTaskUpdate(run, node, config) {
-  const context = await buildRunContext(run);
+async function executeTaskUpdate(run, node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
   const updates = {};
   if (config.title != null) updates.title = resolveTemplate(config.title, context);
@@ -6391,7 +6422,7 @@ async function executeTaskUpdate(run, node, config) {
   if (config.assigned_user_id != null) updates.user_id = await resolveCompanyUser(run.company_id, resolveTemplate(config.assigned_user_id, context));
   return updateTaskRow(run, node, task, updates);
 }
-async function executeTaskComplete(run, node, config) { return executeTaskUpdate(run, node, { ...config, completed: true }); }
+async function executeTaskComplete(run, node, config, scopeKey = "root") { return executeTaskUpdate(run, node, { ...config, completed: true }, scopeKey); }
 async function executeTaskReopen(run, node, config) { return executeTaskUpdate(run, node, { ...config, completed: false }); }
 async function executeTaskReschedule(run, node, config) { return executeTaskUpdate(run, node, { ...config, due_date: config.due_date }); }
 async function executeTaskAssign(run, node, config) { return executeTaskUpdate(run, node, { ...config, assigned_user_id: config.assigned_user_id || config.user_id }); }
@@ -6616,12 +6647,12 @@ async function executePushNotification(run, node, config) {
   return { sent: result.sent || 0, failed: result.failed || 0, skipped: !!result.skipped };
 }
 
-async function executeSmsSend(run, node, config) {
-  return executeSmsSendShared(run, node, config, { mms: false });
+async function executeSmsSend(run, node, config, scopeKey = "root") {
+  return executeSmsSendShared(run, node, config, { mms: false, scopeKey });
 }
 
-async function executeMmsSend(run, node, config) {
-  return executeSmsSendShared(run, node, config, { mms: true });
+async function executeMmsSend(run, node, config, scopeKey = "root") {
+  return executeSmsSendShared(run, node, config, { mms: true, scopeKey });
 }
 
 async function executeSmsSendShared(run, node, config, options = {}) {
@@ -6638,7 +6669,7 @@ async function executeSmsSendShared(run, node, config, options = {}) {
     )).rows[0];
     if (row) return { message_id: row.id, conversation_id: row.conversation_id, twilio_message_sid: row.twilio_message_sid, status: row.message_status, to_number: row.to_number, media_count: row.media_count, reused: true };
   }
-  const context = await buildRunContext(run);
+  const context = await buildRunContext(run, { scopeKey: options.scopeKey || "root" });
   const target = await resolveSmsTarget(run, context, config);
   const toNumber = normalizePhone(target.phone);
   if (!toNumber) throw new Error("contact_phone_required");
@@ -7337,10 +7368,10 @@ async function executeInvoiceFollowupTask(run, node, config) {
   return executeTaskCreate(run, node, { ...config, title: config.title || "Invoice follow-up", contact_id: invoice.contact_id });
 }
 
-async function executePaymentCreateRequest(run, node, config) {
+async function executePaymentCreateRequest(run, node, config, scopeKey = "root") {
   const existing = await getRunVariable(run.id, `idempotency:${node.id}:payment_record_id`);
   if (existing) return { payment_record_id: existing, reused: true };
-  const context = await buildRunContext(run);
+  const context = await buildRunContext(run, { scopeKey });
   const contactId = await resolveContactId(run, context, config);
   const amount = intOrNull(resolveTemplate(config.amount_cents || config.amount || "", context));
   if (!amount || amount < 50) throw new Error("payment_amount_required");
@@ -7498,8 +7529,8 @@ async function executeServicePlanCreateNextJob(run, node, config) {
   return executeJobCreate(run, node, { ...config, contact_id: plan.contact_id, title: config.title || plan.plan_name || "Service plan job", start_at: config.start_at || plan.next_service_date, price_cents: config.price_cents || plan.price_cents });
 }
 
-async function executeServicePlanCreateTask(run, node, config) {
-  const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+async function executeServicePlanCreateTask(run, node, config, scopeKey = "root") {
+  const plan = await resolveServicePlan(run, await buildRunContext(run, { scopeKey }), config);
   return executeTaskCreate(run, node, { ...config, title: config.title || `Schedule next service for {{contact.name}}`, contact_id: plan.contact_id, due_date: config.due_date || plan.next_service_date });
 }
 
@@ -7856,13 +7887,13 @@ async function executeMeasurementLinkContact(run, node, config) {
   return { measurement_id: measurement.id, contact_id: contactId };
 }
 
-async function executeJobCreate(run, node, config) {
+async function executeJobCreate(run, node, config, scopeKey = "root") {
   const existingId = await getRunVariable(run.id, `idempotency:${node.id}:job_id`);
   if (existingId) {
     const existing = await loadSubject(run.company_id, "job", existingId);
     if (existing) return { job_id: existingId, reused: true };
   }
-  const context = await buildRunContext(run);
+  const context = await buildRunContext(run, { scopeKey });
   const owner = await resolveCompanyUser(run.company_id, config.assigned_user_id);
   const id = randomUUID();
   const title = resolveTemplate(config.title || "Automation job", context);
@@ -7885,8 +7916,8 @@ async function executeJobCreate(run, node, config) {
   return { job_id: id, contact_id: contactId, start: rows[0].start_at, end: rows[0].end_at, price_cents: rows[0].price_cents, service_items: rows[0].service_items };
 }
 
-async function executeJobUpdate(run, node, config) {
-  const context = await buildRunContext(run);
+async function executeJobUpdate(run, node, config, scopeKey = "root") {
+  const context = await buildRunContext(run, { scopeKey });
   const job = await resolveJob(run.company_id, run.subject_id, config.job_id, context);
   const updates = {};
   const map = { title: "title", notes: "notes", color: "color", contact_id: "contact_id", price_cents: "price_cents", material_cost_cents: "material_cost_cents" };

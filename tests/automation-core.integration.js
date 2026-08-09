@@ -161,8 +161,8 @@ async function seedCompany() {
   await pool.query(`UPDATE companies SET owner_user_id = $1 WHERE id = $2`, [userId, companyId]);
   await pool.query(
     `INSERT INTO phone_lines(company_id, phone_number, twilio_phone_number_sid, status, active)
-     VALUES($1,'+15550001000','PN_TEST','active',true)`,
-    [companyId]
+     VALUES($1,$2,$3,'active',true)`,
+    [companyId, `+1555${String(Math.floor(Math.random() * 10000000)).padStart(7, "0")}`, `PN_TEST_${randomUUID().replace(/-/g, "")}`]
   );
   const stageId = `stage_${randomUUID()}`;
   await pool.query(
@@ -325,7 +325,9 @@ async function testPublishAndRepublish() {
   assert.equal(def.active_version_id, first.published_version.id);
   assert.equal(def.draft_version_id, first.draft_version.id);
   assert.equal(def.status, "published");
-  await automationTestHooks.saveDraftGraph(first.draft_version.id, seed.companyId, graphFrom([t, a], [edge(t, a)]));
+  const t2 = node("trigger_1", "trigger", { trigger_key: "contact.created" });
+  const a2 = node("tag_1", "action", { action_key: "contact.add_tag", target_mode: "current_contact", tags: ["Automation Test Edited"] });
+  await automationTestHooks.saveDraftGraph(first.draft_version.id, seed.companyId, graphFrom([t2, a2], [edge(t2, a2)]));
   const second = await publish(seed, created.automationId);
   assert.equal(second.published_version.version_number, 4);
   assert.equal(second.draft_version.version_number, 5);
@@ -488,13 +490,13 @@ async function testLaterSmsUndeliveredDoesNotRollbackRun() {
 async function testPipelineIdempotency() {
   const seed = await seedCompany();
   const contactId = await createContact(seed);
-  const t = node("trigger_1", "trigger", { trigger_key: "manual" });
+  const t = node("trigger_1", "trigger", { trigger_key: "contact.created" });
   const p1 = node("pipe_1", "action", { action_key: "pipeline.move_stage", target_mode: "current_contact", stage_id: seed.stageId, if_missing: "create" });
   const p2 = node("pipe_2", "action", { action_key: "pipeline.move_stage", target_mode: "current_contact", stage_id: seed.stageId, if_missing: "create" });
   const created = await createAutomation(seed, graphFrom([t, p1, p2], [edge(t, p1), edge(p1, p2)]));
   await publish(seed, created.automationId);
-  const run = await automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, { subject_type: "contact", subject_id: contactId });
-  await automationTestHooks.runAutomation(run.id);
+  await emitContactCreated(seed, contactId);
+  const [run] = await waitForRuns(seed, created.automationId, 1, "pipeline idempotency");
   await assertRunCompleted(run.id);
   assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM opportunities WHERE company_id = $1 AND contact_id = $2`, [seed.companyId, contactId])).count, 1);
 }
@@ -515,7 +517,7 @@ async function testTaskAndJobCore() {
 
   const taskId = await createTask(seed);
   const mt = node("trigger_task", "trigger", { trigger_key: "manual" });
-  const complete = node("task_complete", "action", { action_key: "task.complete", target_mode: "current_task" });
+  const complete = node("task_complete", "action", { action_key: "task.complete", target_mode: "specific_task", task_id: taskId });
   const taskAutomation = await createAutomation(seed, graphFrom([mt, complete], [edge(mt, complete)]));
   await publish(seed, taskAutomation.automationId);
   const taskRun = await automationTestHooks.startManualRun(taskAutomation.automationId, seed.companyId, seed.userId, { subject_type: "task", subject_id: taskId });
@@ -561,9 +563,10 @@ async function testWaitPauseCancel() {
   await assertRunCompleted(run.id);
   assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM todo_tasks WHERE title = 'After wait'`, [])).count, 1);
 
+  const t2 = node("trigger_2", "trigger", { trigger_key: "manual" });
   const wait2 = node("wait_cancel", "wait", { mode: "duration", duration: "1 hour" });
   const task2 = node("task_cancel", "action", { action_key: "task.create", title: "Should not run" });
-  const created2 = await createAutomation(seed, graphFrom([t, wait2, task2], [edge(t, wait2), edge(wait2, task2)]));
+  const created2 = await createAutomation(seed, graphFrom([t2, wait2, task2], [edge(t2, wait2), edge(wait2, task2)]));
   await publish(seed, created2.automationId);
   const run2 = await automationTestHooks.startManualRun(created2.automationId, seed.companyId, seed.userId, {});
   await automationTestHooks.runAutomation(run2.id);
@@ -662,6 +665,79 @@ async function testMapServicePaymentAndDedupe() {
   await waitForRuns(seed, paymentAutomation.automationId, 1, "payment dedupe");
 }
 
+async function testForeachMergeReentryAndRunCompletion() {
+  const seed = await seedCompany();
+  const contacts = [
+    await createContact(seed),
+    await createContact(seed),
+    await createContact(seed)
+  ];
+  const t = node("trigger_1", "trigger", { trigger_key: "manual" });
+  const each = node("foreach_1", "foreach", {
+    collection: JSON.stringify(contacts.map((id) => ({ id }))),
+    execution_mode: "sequential",
+    max_items: 3
+  });
+  const tag = node("tag_item", "action", { action_key: "contact.add_tag", target_mode: "contact_id", contact_id: "{{iteration.item.id}}", tags: ["Processed"] });
+  const doneTask = node("done_task", "action", { action_key: "task.create", title: "Foreach done" });
+  const foreachAutomation = await createAutomation(seed, graphFrom([t, each, tag, doneTask], [edge(t, each), edge(each, tag, "item"), edge(each, doneTask, "done")]));
+  await publish(seed, foreachAutomation.automationId);
+  const foreachRun = await automationTestHooks.startManualRun(foreachAutomation.automationId, seed.companyId, seed.userId, {});
+  await automationTestHooks.runAutomation(foreachRun.id);
+  await assertRunCompleted(foreachRun.id);
+  assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM automation_run_iterations WHERE run_id = $1 AND status = 'completed'`, [foreachRun.id])).count, 3);
+  assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM contacts WHERE company_id = $1 AND tags LIKE '%Processed%'`, [seed.companyId])).count, 3);
+  assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM todo_tasks WHERE user_id = $1 AND title = 'Foreach done'`, [seed.userId])).count, 1);
+
+  const mt = node("merge_trigger", "trigger", { trigger_key: "manual" });
+  const parallel = node("parallel_1", "parallel", { paths: [{ id: "path_a" }, { id: "path_b" }] });
+  const waitA = node("wait_a", "wait", { mode: "duration", duration: "0 seconds" });
+  const waitB = node("wait_b", "wait", { mode: "duration", duration: "0 seconds" });
+  const merge = node("merge_1", "merge", { mode: "all" });
+  const mergedTask = node("merged_task", "action", { action_key: "task.create", title: "Merge complete" });
+  const mergeAutomation = await createAutomation(seed, graphFrom(
+    [mt, parallel, waitA, waitB, merge, mergedTask],
+    [edge(mt, parallel), edge(parallel, waitA, "path_a"), edge(parallel, waitB, "path_b"), edge(waitA, merge), edge(waitB, merge), edge(merge, mergedTask)]
+  ));
+  await publish(seed, mergeAutomation.automationId);
+  const mergeRun = await automationTestHooks.startManualRun(mergeAutomation.automationId, seed.companyId, seed.userId, {});
+  await automationTestHooks.runAutomation(mergeRun.id);
+  await automationTestHooks.processDueWaits();
+  await automationTestHooks.processDueWaits();
+  await assertRunCompleted(mergeRun.id);
+  assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM automation_merge_arrivals WHERE run_id = $1`, [mergeRun.id])).count, 2);
+  assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM todo_tasks WHERE user_id = $1 AND title = 'Merge complete'`, [seed.userId])).count, 1);
+
+  const contactId = await createContact(seed);
+  const rt = node("reentry_trigger", "trigger", { trigger_key: "contact.created" });
+  const ra = node("reentry_tag", "action", { action_key: "contact.add_tag", target_mode: "current_contact", tags: ["Reentry Once"] });
+  const once = await createAutomation(seed, graphFrom([rt, ra], [edge(rt, ra)]), { reentry_mode: "once_ever_per_subject" });
+  await pool.query(`UPDATE automation_definitions SET reentry_mode = 'once_ever_per_subject' WHERE id = $1`, [once.automationId]);
+  await publish(seed, once.automationId);
+  await emitContactCreated(seed, contactId, `contact.created:${contactId}:a`);
+  await emitContactCreated(seed, contactId, `contact.created:${contactId}:b`);
+  await waitForRuns(seed, once.automationId, 1, "once ever reentry");
+
+  const rt2 = node("reentry_trigger", "trigger", { trigger_key: "contact.created" });
+  const ra2 = node("reentry_tag", "action", { action_key: "contact.add_tag", target_mode: "current_contact", tags: ["Reentry Always"] });
+  const always = await createAutomation(seed, graphFrom([rt2, ra2], [edge(rt2, ra2)]), { reentry_mode: "unlimited" });
+  await pool.query(`UPDATE automation_definitions SET reentry_mode = 'unlimited' WHERE id = $1`, [always.automationId]);
+  await publish(seed, always.automationId);
+  await emitContactCreated(seed, contactId, `contact.created:${contactId}:c`);
+  await emitContactCreated(seed, contactId, `contact.created:${contactId}:d`);
+  await waitForRuns(seed, always.automationId, 2, "unlimited reentry");
+
+  const active = await scalar(
+    `SELECT COUNT(*)::int AS count
+       FROM automation_runs
+      WHERE company_id = $1
+        AND status IN ('queued','running')
+        AND NOT EXISTS (SELECT 1 FROM automation_waits w WHERE w.run_id = automation_runs.id AND w.status = 'waiting')`,
+    [seed.companyId]
+  );
+  assert.equal(active.count, 0);
+}
+
 async function testValidationCatalogScopeAndDryRunExternalSafety() {
   const seed = await seedCompany();
   const invalidTask = graphFrom([node("bad_task", "action", { action_key: "task.complete", target_mode: "current_task" })], []);
@@ -670,9 +746,9 @@ async function testValidationCatalogScopeAndDryRunExternalSafety() {
     node("sms", "action", { action_key: "sms.send", target_mode: "phone_number", phone: "{{6062131071}}", body: "Bad" })
   ], []);
   assert.equal(automationTestHooks.validateGraphPayload(invalidPhone).valid, false);
-  const validPhone = graphFrom([
-    node("sms", "action", { action_key: "sms.send", target_mode: "phone_number", phone: "6062131071", body: "Good" })
-  ], []);
+  const phoneTrigger = node("phone_trigger", "trigger", { trigger_key: "manual" });
+  const phoneSms = node("sms", "action", { action_key: "sms.send", target_mode: "phone_number", phone: "6062131071", body: "Good" });
+  const validPhone = graphFrom([phoneTrigger, phoneSms], [edge(phoneTrigger, phoneSms)]);
   assert.equal(automationTestHooks.validateGraphPayload(validPhone).valid, true);
 
   const hiddenActions = automationTestHooks.actionCatalog().filter((a) => a.visibility !== "hidden").map((a) => a.key);
@@ -728,6 +804,7 @@ const tests = [
   ["Wait, due resume, cancel wait", testWaitPauseCancel],
   ["Pause and Pause Until", testPauseAndPauseUntil],
   ["Map pin, service due, payment dedupe", testMapServicePaymentAndDedupe],
+  ["Foreach, Merge ALL, Re-entry, Run completion", testForeachMergeReentryAndRunCompletion],
   ["Validation, catalog, scope, dry-run external safety", testValidationCatalogScopeAndDryRunExternalSafety]
 ];
 
@@ -749,6 +826,11 @@ try {
     }
   }
 } finally {
+  if (failed === 0 && process.env.KEEP_AUTOMATION_TEST_DATA !== "true") {
+    await resetDatabase().catch((error) => {
+      console.error(`WARN cleanup failed: ${error?.message || error}`);
+    });
+  }
   await pool.end().catch(() => {});
   await backend.pool?.end?.().catch(() => {});
 }
