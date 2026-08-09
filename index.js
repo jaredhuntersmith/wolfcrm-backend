@@ -9026,7 +9026,11 @@ async function startServer() {
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }
 
-startServer().catch((err) => {
-  console.error("Server startup failed:", err);
-  process.exit(1);
-});
+export { app, bootstrap, pool, startServer };
+
+if (process.env.WOLFCRM_SKIP_SERVER_START !== "true") {
+  startServer().catch((err) => {
+    console.error("Server startup failed:", err);
+    process.exit(1);
+  });
+}

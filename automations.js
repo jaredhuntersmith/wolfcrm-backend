@@ -1619,7 +1619,7 @@ export async function installAutomationSystem(options) {
   await bootstrapAutomationSchema();
   await backfillFinancialAutomationSchedules();
   installAutomationRoutes();
-  startAutomationProcessors();
+  if (!options.disableProcessors) startAutomationProcessors();
 }
 
 export async function emitAutomationEvent(event) {
@@ -8929,3 +8929,23 @@ function redact(value) {
   }
   return value;
 }
+
+export const automationTestHooks = {
+  actionCatalog: () => actionCatalog,
+  actionExecutors: () => actionExecutors,
+  bootstrapAutomationSchema,
+  cancelAutomationRun,
+  ensureDraftVersion,
+  loadRunDetail,
+  loadVersionGraph,
+  processAutomationEvents,
+  processDueWaits,
+  processScheduledAutomationEvents,
+  publishAutomation,
+  runAutomation,
+  saveDraftGraph,
+  startDraftTestRun,
+  startManualRun,
+  triggerCatalog: () => triggerCatalog,
+  validateGraphPayload
+};
