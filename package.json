@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_ENV=development nodemon index.js"
+    "dev": "NODE_ENV=development nodemon index.js",
+    "test:automation-core": "node tests/automation-core.integration.js",
+    "test:automation": "npm run test:automation-core"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",
