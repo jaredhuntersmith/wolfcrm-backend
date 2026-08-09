@@ -3137,6 +3137,7 @@ function validateGraphPayload(payload) {
   const settings = payload.settings || {};
   validateAutomationSafetySettings(settings, errors, warnings);
   const hasContactContext = graphProvidesContactContext(nodes);
+  const contextTypes = graphProvidedContextTypes(nodes);
   for (const node of nodes) {
     if (!node.id) errors.push("node_missing_id");
     if (!node.node_key && !node.nodeKey) errors.push("node_missing_key");
@@ -3184,6 +3185,7 @@ function validateGraphPayload(payload) {
       if (["call.set_disposition"].includes(config.action_key) && !config.disposition) errors.push(`call_disposition_required:${nodeKey}`);
       if (config.action_key === "contact.create" && !config.name) errors.push(`contact_name_required:${nodeKey}`);
       if (actionRequiresContactTarget(config.action_key) && (config.target_mode || "current_contact") === "current_contact" && !hasContactContext) errors.push(`target_contact_required:${nodeKey}`);
+      validateResourceTarget(config, nodeKey, contextTypes, errors);
       if (config.action_key === "quote.create" && !(Array.isArray(config.line_items) && config.line_items.length)) errors.push(`quote_line_items_required:${nodeKey}`);
       if (config.action_key === "quote.delete" && config.confirm_delete !== true) errors.push(`quote_delete_confirmation_required:${nodeKey}`);
       if (config.action_key === "quote.set_status" && !["draft", "sent", "accepted", "declined", "expired", "converted"].includes(config.status)) errors.push(`quote_status_invalid:${nodeKey}`);
@@ -3265,6 +3267,67 @@ function graphProvidesContactContext(nodes) {
     const key = node.config?.trigger_key || "";
     return key.startsWith("contact.") || key.startsWith("lead.") || key.startsWith("pipeline.") || key.startsWith("job.") || key.startsWith("sms.") || key.startsWith("call.") || key.startsWith("voicemail.") || key.startsWith("quote.") || key.startsWith("payment.") || key.startsWith("service_plan.");
   });
+}
+
+const ACTION_RESOURCE_TARGETS = {
+  job: new Set(["job.update", "job.reschedule", "job.delete", "job.mark_completed", "job.reopen", "job.set_start", "job.set_end", "job.set_price", "job.set_material_cost", "job.set_color", "job.set_contact", "job.add_service", "job.remove_service", "job.assign_worker", "job.remove_worker", "job.replace_workers", "job.assign_salesperson", "job.remove_salesperson", "job.replace_salespeople", "job.add_note", "job.create_followup"]),
+  task: new Set(["task.update", "task.complete", "task.reopen", "task.delete", "task.reschedule", "task.assign", "task.unassign", "task.add_subtask", "task.complete_subtask", "task.delete_subtask"]),
+  quote: new Set(["quote.update", "quote.delete", "quote.add_line_item", "quote.remove_line_item", "quote.replace_line_items", "quote.set_status", "quote.mark_sent", "quote.mark_accepted", "quote.mark_declined", "quote.set_expiration", "quote.convert_to_job", "quote.create_followup_task"]),
+  payment: new Set(["payment.send_payment_sms", "payment.send_payment_push", "payment.create_followup_task"]),
+  service_plan: new Set(["service_plan.update", "service_plan.activate", "service_plan.pause", "service_plan.resume", "service_plan.cancel", "service_plan.mark_serviced", "service_plan.set_price", "service_plan.set_service_interval", "service_plan.set_billing_interval", "service_plan.set_next_service_date", "service_plan.create_next_job", "service_plan.create_service_task", "service_plan.send_scheduling_sms", "service_plan.create_payment_followup"]),
+  map_pin: new Set(["map.update_pin", "map.delete_pin", "map.set_status", "map.add_to_list", "map.remove_from_list", "map.move_to_list", "map.link_contact", "map.unlink_contact", "map.create_contact", "map.add_note", "map.mark_visited", "map.record_knock", "map.schedule_followup"]),
+  employee: new Set(["employee.update_role", "employee.deactivate", "employee.reactivate", "employee.send_push", "employee.send_internal_message", "employee.create_task"])
+};
+
+function graphProvidedContextTypes(nodes) {
+  const types = new Set();
+  for (const node of nodes) {
+    const nodeType = node.node_type || node.nodeType;
+    if (nodeType === "trigger") {
+      const key = node.config?.trigger_key || "";
+      if (key === "manual") types.add("generic");
+      if (key.startsWith("contact.") || key.startsWith("lead.")) types.add("contact");
+      if (key.startsWith("pipeline.")) { types.add("opportunity"); types.add("contact"); }
+      if (key.startsWith("job.")) { types.add("job"); types.add("contact"); }
+      if (key.startsWith("task.")) types.add("task");
+      if (key.startsWith("quote.")) { types.add("quote"); types.add("contact"); }
+      if (key.startsWith("payment.")) { types.add("payment"); types.add("contact"); }
+      if (key.startsWith("service_plan.")) { types.add("service_plan"); types.add("contact"); }
+      if (key.startsWith("map.") || key.startsWith("canvass.")) { types.add("map_pin"); types.add("contact"); }
+      if (key.startsWith("employee.") || key.startsWith("time_clock.")) types.add("employee");
+      if (key.startsWith("time_clock.")) types.add("time_entry");
+    }
+    if (nodeType === "action") {
+      const action = node.config?.action_key || "";
+      if (["contact.create", "map.create_contact", "phone.create_contact_from_number"].includes(action)) types.add("contact");
+      if (["job.create", "job.create_followup", "quote.convert_to_job", "service_plan.create_next_job"].includes(action)) types.add("job");
+      if (["task.create", "call.create_callback_task", "voicemail.create_callback_task", "payment.create_followup_task", "quote.create_followup_task", "service_plan.create_service_task", "employee.create_task", "time_clock.create_review_task"].includes(action)) types.add("task");
+      if (action === "quote.create") types.add("quote");
+      if (["payment.create_request", "payment.create_payment_link"].includes(action)) types.add("payment");
+      if (action === "service_plan.create") types.add("service_plan");
+      if (["map.create_pin", "contact.add_to_map"].includes(action)) types.add("map_pin");
+    }
+  }
+  return types;
+}
+
+function validateResourceTarget(config, nodeKey, contextTypes, errors) {
+  const specs = [
+    ["job", "job_target_mode", "current_job", "job_id"],
+    ["task", "task_target_mode", "current_task", "task_id"],
+    ["quote", "quote_target_mode", "current_quote", "quote_id"],
+    ["payment", "payment_target_mode", "current_payment", "payment_id"],
+    ["service_plan", "service_plan_target_mode", "current_service_plan", "service_plan_id"],
+    ["map_pin", "pin_target_mode", "current_pin", "pin_id"],
+    ["employee", "employee_target_mode", "current_employee", "employee_id"]
+  ];
+  for (const [type, modeKey, currentMode, idKey] of specs) {
+    if (!ACTION_RESOURCE_TARGETS[type]?.has(config.action_key)) continue;
+    const mode = config[modeKey] || currentMode;
+    if (config[idKey]) continue;
+    if (mode === currentMode && !contextTypes.has(type)) errors.push(`${type}_target_required:${nodeKey}`);
+    if ((mode === "node_output" || mode === "template") && !config[idKey]) errors.push(`${type}_target_required:${nodeKey}`);
+  }
 }
 
 function actionRequiresContactTarget(actionKey) {
