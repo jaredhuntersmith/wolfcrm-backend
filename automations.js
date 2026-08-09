@@ -2882,12 +2882,23 @@ function installAutomationRoutes() {
       res.json(result);
     } catch (e) {
       console.error("[automations] publish failed", e?.message || e);
-      res.status(500).json({ error: "automation_publish_failed" });
+      res.status(500).json(safeAutomationErrorResponse(e, "automation_publish_failed", "WolfCRM couldn't create the published automation version."));
     }
   });
 
   app.post("/api/automations/validate-graph", authRequired, requireEmployer, async (req, res) => {
     res.json(validateGraphPayload(req.body || {}));
+  });
+
+  app.post("/api/automations/:id/draft/test", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const run = await startDraftTestRun(req.params.id, req.companyId, req.userId, req.body || {});
+      if (!run) return res.status(404).json({ error: "not_found" });
+      res.status(202).json(run);
+    } catch (e) {
+      console.error("[automations] draft test failed", e?.message || e);
+      res.status(500).json(safeAutomationErrorResponse(e, "automation_draft_test_failed", "WolfCRM couldn't start the draft test run."));
+    }
   });
 
   app.post("/api/automations/:id/manual-run", authRequired, requireEmployer, async (req, res) => {
@@ -3056,6 +3067,12 @@ function validateGraphPayload(payload) {
       if (config.action_key === "customer_reminder.create" && !config.due_date) errors.push(`customer_reminder_due_required:${nodeKey}`);
       if (["sms.send", "call.send_followup_sms", "voicemail.send_followup_sms"].includes(config.action_key) && !config.body) errors.push(`sms_body_required:${nodeKey}`);
       if (config.action_key === "sms.send_mms" && !config.body && !(Array.isArray(config.media) && config.media.length)) errors.push(`mms_body_or_media_required:${nodeKey}`);
+      if (["sms.send", "sms.send_mms", "call.send_followup_sms", "voicemail.send_followup_sms"].includes(config.action_key)) {
+        const targetMode = config.target_mode || (config.phone ? "phone_number" : "current_contact");
+        if (targetMode === "phone_number" && !config.phone) errors.push(`sms_phone_required:${nodeKey}`);
+        if (targetMode === "phone_template" && !config.phone) errors.push(`sms_phone_variable_required:${nodeKey}`);
+        if (isBracedNumericLiteral(config.phone)) errors.push(`sms_phone_number_wrapped_as_template:${nodeKey}`);
+      }
       if (["sms.delete_local_message"].includes(config.action_key) && !config.message_id) warnings.push(`message_id_defaults_to_context:${nodeKey}`);
       if (["sms.mark_conversation_read", "sms.mark_conversation_unread", "sms.delete_local_conversation"].includes(config.action_key) && !config.conversation_id) warnings.push(`conversation_id_defaults_to_context:${nodeKey}`);
       if (config.action_key === "internal.send_dm" && !config.recipient_user_id) errors.push(`internal_recipient_required:${nodeKey}`);
@@ -3078,6 +3095,7 @@ function validateGraphPayload(payload) {
       if (config.action_key === "map.schedule_followup" && Number(config.amount || 0) <= 0) errors.push(`map_followup_amount_required:${nodeKey}`);
       if (config.action_key === "route.delete" && config.confirm_delete !== true) errors.push(`route_delete_confirmation_required:${nodeKey}`);
       if (["route.add_stop", "route.add_contact", "route.add_pin", "route.add_job"].includes(config.action_key) && !config.route_id) warnings.push(`route_context_required_at_runtime:${nodeKey}`);
+      if (config.action_key === "route.add_job" && !config.job_id && config.target_mode !== "current_job") warnings.push(`route_job_context_required_at_runtime:${nodeKey}`);
       if (config.action_key === "employee.update_role" && config.confirm_sensitive_change !== true) errors.push(`employee_role_confirmation_required:${nodeKey}`);
       if (config.action_key === "employee.deactivate" && config.confirm_deactivate !== true) errors.push(`employee_deactivate_confirmation_required:${nodeKey}`);
       if (config.action_key === "time_clock.flag_for_review" && !config.review_reason) warnings.push(`time_review_reason_recommended:${nodeKey}`);
@@ -3247,28 +3265,48 @@ async function saveDraftGraph(versionId, companyId, payload) {
 }
 
 async function publishAutomation(automationId, companyId, userId) {
-  const draft = await ensureDraftVersion(automationId, companyId, userId);
-  if (!draft) return null;
-  const graph = await loadVersionGraph(draft.id, companyId);
-  const validation = validateGraphPayload({ nodes: graph.nodes, edges: graph.edges, settings: graph.settings });
-  if (!validation.valid) return validation;
   const db = await ctx.pool.connect();
   try {
     await db.query("BEGIN");
-    const maxRow = (await db.query(`SELECT COALESCE(MAX(version_number),0)::int AS n FROM automation_versions WHERE automation_id = $1 AND status = 'published'`, [automationId])).rows[0];
+    const definition = (await db.query(`SELECT * FROM automation_definitions WHERE id = $1 AND company_id = $2 FOR UPDATE`, [automationId, companyId])).rows[0];
+    if (!definition) {
+      await db.query("ROLLBACK");
+      return null;
+    }
+    let draft = definition.draft_version_id
+      ? (await db.query(`SELECT * FROM automation_versions WHERE id = $1 AND company_id = $2 AND status = 'draft'`, [definition.draft_version_id, companyId])).rows[0]
+      : null;
+    if (!draft) {
+      draft = (await db.query(
+        `INSERT INTO automation_versions(automation_id, company_id, version_number, status, created_by_user_id)
+         VALUES($1,$2,COALESCE((SELECT MAX(version_number) FROM automation_versions WHERE automation_id = $1),0) + 1,'draft',$3)
+         RETURNING *`,
+        [automationId, companyId, userId]
+      )).rows[0];
+      await db.query(`UPDATE automation_definitions SET draft_version_id = $2 WHERE id = $1`, [automationId, draft.id]);
+    }
+    const graph = await loadVersionGraph(draft.id, companyId);
+    const validation = validateGraphPayload({ nodes: graph.nodes, edges: graph.edges, settings: graph.settings });
+    if (!validation.valid) {
+      await db.query("ROLLBACK");
+      return validation;
+    }
+    const maxRow = (await db.query(`SELECT COALESCE(MAX(version_number),0)::int AS n FROM automation_versions WHERE automation_id = $1`, [automationId])).rows[0];
+    const publishedNumber = Number(maxRow.n || 0) + 1;
     const published = (await db.query(
       `INSERT INTO automation_versions(automation_id, company_id, version_number, status, settings, created_by_user_id, published_at)
        SELECT automation_id, company_id, $3, 'published', settings, $4, now()
          FROM automation_versions WHERE id = $1 AND company_id = $2
        RETURNING *`,
-      [draft.id, companyId, maxRow.n + 1, userId]
+      [draft.id, companyId, publishedNumber, userId]
     )).rows[0];
     await copyGraph(db, draft.id, published.id, companyId);
     await db.query(`UPDATE automation_versions SET status = 'retired', updated_at = now() WHERE automation_id = $1 AND company_id = $2 AND status = 'published' AND id <> $3`, [automationId, companyId, published.id]);
+    const nextDraftNumber = published.version_number + 1;
     const newDraft = (await db.query(
       `INSERT INTO automation_versions(automation_id, company_id, version_number, status, settings, created_by_user_id)
        VALUES($1,$2,$3,'draft',$4::jsonb,$5) RETURNING *`,
-      [automationId, companyId, published.version_number + 1, JSON.stringify(published.settings || {}), userId]
+      [automationId, companyId, nextDraftNumber, JSON.stringify(published.settings || {}), userId]
     )).rows[0];
     await copyGraph(db, published.id, newDraft.id, companyId);
     await db.query(
@@ -3616,6 +3654,46 @@ async function startManualRun(automationId, companyId, userId, body) {
   await installRunMonitors(run);
   await logRun(run, null, "info", body.dry_run ? "run.dry_start" : "run.manual_start", "Manual run started", { subject_type: body.subject_type, subject_id: body.subject_id });
   setImmediate(() => runAutomation(run.id).catch((e) => console.error("[automations] manual run wake failed", e?.message || e)));
+  return run;
+}
+
+async function startDraftTestRun(automationId, companyId, userId, body) {
+  const automation = (await ctx.pool.query(
+    `SELECT d.*, v.id AS version_id
+       FROM automation_definitions d
+       JOIN automation_versions v ON v.id = d.draft_version_id
+      WHERE d.id = $1 AND d.company_id = $2 AND v.status = 'draft'`,
+    [automationId, companyId]
+  )).rows[0];
+  if (!automation) return null;
+  await validateSubject(companyId, body.subject_type || "generic", body.subject_id || null);
+  const graph = await loadVersionGraph(automation.version_id, companyId);
+  const firstTrigger = graph.nodes.find((node) => node.node_type === "trigger");
+  const triggerKey = body.trigger_key || firstTrigger?.config?.trigger_key || "manual";
+  const eventId = await emitAutomationEvent({
+    companyId,
+    eventType: triggerKey,
+    subjectType: body.subject_type || firstTrigger?.config?.subject_type || "generic",
+    subjectId: body.subject_id || null,
+    actorUserId: userId,
+    source: "manual",
+    dedupeKey: `draft_test:${automationId}:${userId}:${randomUUID()}`,
+    payload: { manual: true, draft_test: true, input: body.input || {}, ...(body.payload || {}) }
+  });
+  const run = await createRun({
+    companyId,
+    automationId,
+    versionId: automation.version_id,
+    triggerEventId: eventId,
+    subjectType: body.subject_type || "generic",
+    subjectId: body.subject_id || null,
+    manualUserId: userId,
+    dryRun: true,
+    reentryKey: `draft_test:${automationId}:${eventId}`,
+    depth: 0
+  });
+  await logRun(run, null, "info", "run.draft_test_start", "Draft test run started", { subject_type: body.subject_type, subject_id: body.subject_id, trigger_key: triggerKey });
+  setImmediate(() => runAutomation(run.id).catch((e) => console.error("[automations] draft test wake failed", e?.message || e)));
   return run;
 }
 
@@ -6452,13 +6530,18 @@ async function resolveSmsTarget(run, context, config) {
     if (!row) throw new Error("sms_conversation_not_found");
     return { conversation_id: row.id, contact_id: row.contact_id, phone: row.external_phone_number };
   }
-  if (config.phone || config.to_phone || config.to_number) {
+  if (config.target_mode === "phone_number" || config.target_mode === "phone_template" || config.phone || config.to_phone || config.to_number) {
+    if (isBracedNumericLiteral(config.phone || config.to_phone || config.to_number)) throw new Error("sms_phone_number_wrapped_as_template");
     return { contact_id: null, phone: resolveTemplate(config.phone || config.to_phone || config.to_number, context) };
   }
   const contactId = await resolveContactId(run, context, config);
   const contact = (await ctx.pool.query(`SELECT id, phone FROM contacts WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL`, [contactId, run.company_id])).rows[0];
   if (!contact) throw new Error("contact_not_found");
   return { contact_id: contact.id, phone: contact.phone };
+}
+
+function isBracedNumericLiteral(value) {
+  return /^\s*\{\{\s*\+?\d[\d\s().-]*\s*\}\}\s*$/.test(String(value || ""));
 }
 
 async function canSendAutomatedCustomerMessage(companyId, normalizedPhone, contactId, policy = "send_immediately") {
@@ -8618,6 +8701,26 @@ async function loadRunDetail(runId, companyId) {
 
 function safeJson(value) {
   return JSON.parse(JSON.stringify(value || {}));
+}
+
+function safeAutomationErrorResponse(error, fallbackCode, fallbackMessage) {
+  const message = String(error?.message || "");
+  let code = fallbackCode;
+  if (error?.code === "23505" || /duplicate key|unique/i.test(message)) code = "version_number_conflict";
+  if (/stage_not_found/i.test(message)) code = "missing_stage";
+  if (/contact_not_found/i.test(message)) code = "missing_contact";
+  if (/validation/i.test(message)) code = "validation_failed";
+  const friendly = {
+    version_number_conflict: "WolfCRM couldn't create a unique published automation version.",
+    missing_stage: "The selected Pipeline Stage no longer exists.",
+    missing_contact: "The selected Contact no longer exists.",
+    validation_failed: "Fix the highlighted automation settings before publishing."
+  };
+  return {
+    error: fallbackCode,
+    code,
+    message: friendly[code] || fallbackMessage
+  };
 }
 
 function safeSnapshot(context) {
