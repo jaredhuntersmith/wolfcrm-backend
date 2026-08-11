@@ -27,6 +27,7 @@ import {
   syncAutomationSchedulesForMapPin,
   syncAutomationSchedulesForTimeEntry
 } from "./automations.js";
+import { installFinanceSystem } from "./finance.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -9026,6 +9027,12 @@ async function startServer() {
     createTwilioClient,
     twilioPublicUrl,
     getStripe
+  });
+  await installFinanceSystem({
+    app,
+    pool,
+    authRequired,
+    requireEmployer
   });
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }
