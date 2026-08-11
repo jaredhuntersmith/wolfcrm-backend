@@ -1,7 +1,20 @@
+import {
+  estimateDebtPayoff,
+  requiredPaymentForTarget,
+  summarizeBudget,
+  goalMetrics
+} from "./finance-calculations.js";
+
 const VALID_ACCOUNT_TYPES = new Set(["cash", "checking", "savings", "other"]);
 const VALID_CURRENCIES = new Set(["usd"]);
 const VALID_DIRECTIONS = new Set(["income", "expense"]);
 const VALID_RECURRENCES = new Set(["none", "weekly", "biweekly", "monthly", "yearly"]);
+const VALID_DEBT_TYPES = new Set(["federal_tax", "state_tax", "local_tax", "credit_card", "personal_loan", "business_loan", "auto_loan", "medical", "other"]);
+const VALID_DEBT_PRIORITIES = new Set(["high", "normal", "low"]);
+const VALID_DEBT_STATUSES = new Set(["active", "paid"]);
+const VALID_BUDGET_PERIODS = new Set(["weekly", "monthly", "yearly"]);
+const VALID_GOAL_TYPES = new Set(["emergency_fund", "tax_payoff", "equipment_purchase", "vehicle_purchase", "moving_fund", "general_savings", "custom"]);
+const VALID_GOAL_STATUSES = new Set(["active", "completed"]);
 
 function cleanString(value, maxLength = 200) {
   return (value || "").toString().trim().slice(0, maxLength);
@@ -87,6 +100,31 @@ function normalizeCurrency(value) {
   return VALID_CURRENCIES.has(currency) ? currency : null;
 }
 
+function normalizeSet(value, validSet, fallback = null, maxLength = 40) {
+  const normalized = cleanString(value || fallback || "", maxLength).toLowerCase();
+  return validSet.has(normalized) ? normalized : null;
+}
+
+function parseOptionalCents(value, fieldName) {
+  if (value === null || value === undefined || value === "") return null;
+  return parseCents(value, fieldName);
+}
+
+function parseOptionalDateOnly(value, fieldName) {
+  if (value === null || value === undefined || value === "") return null;
+  return parseDateOnly(value, fieldName);
+}
+
+function parseOptionalAprBasisPoints(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) return Number(value.trim());
+  const error = new Error("apr_basis_points_invalid");
+  error.statusCode = 400;
+  error.code = "apr_basis_points_invalid";
+  throw error;
+}
+
 function financeAccountPayload(row) {
   return {
     id: row.id,
@@ -135,6 +173,7 @@ function financePlannedItemPayload(row) {
     company_id: row.company_id,
     account_id: row.account_id,
     account_name: row.account_name || null,
+    debt_id: row.debt_id || null,
     title: row.title,
     direction: row.direction,
     amount_cents: Number(row.amount_cents || 0),
@@ -147,6 +186,97 @@ function financePlannedItemPayload(row) {
     created_by: row.created_by,
     created_at: row.created_at,
     updated_at: row.updated_at
+  };
+}
+
+function isTaxDebt(type) {
+  return type === "federal_tax" || type === "state_tax" || type === "local_tax";
+}
+
+function debtPayload(row) {
+  return {
+    id: row.id,
+    company_id: row.company_id,
+    name: row.name,
+    debt_type: row.debt_type,
+    current_balance_cents: Number(row.current_balance_cents || 0),
+    original_balance_cents: row.original_balance_cents === null || row.original_balance_cents === undefined ? null : Number(row.original_balance_cents),
+    minimum_payment_cents: Number(row.minimum_payment_cents || 0),
+    planned_payment_cents: Number(row.planned_payment_cents || 0),
+    apr_basis_points: row.apr_basis_points === null || row.apr_basis_points === undefined ? null : Number(row.apr_basis_points),
+    next_due_date: row.next_due_date instanceof Date ? row.next_due_date.toISOString().slice(0, 10) : row.next_due_date,
+    target_payoff_date: row.target_payoff_date instanceof Date ? row.target_payoff_date.toISOString().slice(0, 10) : row.target_payoff_date,
+    status: row.status,
+    priority: row.priority,
+    notes: row.notes,
+    planned_item_id: row.planned_item_id,
+    archived_at: row.archived_at,
+    created_by: row.created_by,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function debtPaymentPayload(row) {
+  return {
+    id: row.id,
+    company_id: row.company_id,
+    debt_id: row.debt_id,
+    amount_cents: Number(row.amount_cents || 0),
+    payment_date: row.payment_date instanceof Date ? row.payment_date.toISOString().slice(0, 10) : row.payment_date,
+    note: row.note,
+    finance_account_id: row.finance_account_id,
+    created_by: row.created_by,
+    created_at: row.created_at
+  };
+}
+
+function budgetPayload(row) {
+  return {
+    id: row.id,
+    company_id: row.company_id,
+    name: row.name,
+    category: row.category,
+    limit_cents: Number(row.limit_cents || 0),
+    period: row.period,
+    start_date: row.start_date instanceof Date ? row.start_date.toISOString().slice(0, 10) : row.start_date,
+    end_date: row.end_date instanceof Date ? row.end_date.toISOString().slice(0, 10) : row.end_date,
+    notes: row.notes,
+    archived_at: row.archived_at,
+    created_by: row.created_by,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function goalPayload(row) {
+  return {
+    id: row.id,
+    company_id: row.company_id,
+    name: row.name,
+    goal_type: row.goal_type,
+    target_amount_cents: Number(row.target_amount_cents || 0),
+    current_amount_cents: Number(row.current_amount_cents || 0),
+    target_date: row.target_date instanceof Date ? row.target_date.toISOString().slice(0, 10) : row.target_date,
+    status: row.status,
+    notes: row.notes,
+    archived_at: row.archived_at,
+    created_by: row.created_by,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function goalContributionPayload(row) {
+  return {
+    id: row.id,
+    company_id: row.company_id,
+    goal_id: row.goal_id,
+    amount_cents: Number(row.amount_cents || 0),
+    contribution_date: row.contribution_date instanceof Date ? row.contribution_date.toISOString().slice(0, 10) : row.contribution_date,
+    note: row.note,
+    created_by: row.created_by,
+    created_at: row.created_at
   };
 }
 
@@ -199,6 +329,7 @@ async function installFinanceSchema(pool) {
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
       account_id UUID REFERENCES finance_accounts(id) ON DELETE SET NULL,
+      debt_id UUID,
       title TEXT NOT NULL,
       direction TEXT NOT NULL CHECK (direction IN ('income','expense')),
       amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0),
@@ -217,6 +348,111 @@ async function installFinanceSchema(pool) {
       ON finance_planned_items(company_id, scheduled_date);
     CREATE INDEX IF NOT EXISTS finance_planned_items_company_active_idx
       ON finance_planned_items(company_id, archived_at, scheduled_date);
+
+    CREATE TABLE IF NOT EXISTS finance_debts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      debt_type TEXT NOT NULL CHECK (debt_type IN ('federal_tax','state_tax','local_tax','credit_card','personal_loan','business_loan','auto_loan','medical','other')),
+      current_balance_cents BIGINT NOT NULL CHECK (current_balance_cents >= 0),
+      original_balance_cents BIGINT CHECK (original_balance_cents IS NULL OR original_balance_cents >= 0),
+      minimum_payment_cents BIGINT NOT NULL DEFAULT 0 CHECK (minimum_payment_cents >= 0),
+      planned_payment_cents BIGINT NOT NULL DEFAULT 0 CHECK (planned_payment_cents >= 0),
+      apr_basis_points INTEGER CHECK (apr_basis_points IS NULL OR apr_basis_points >= 0),
+      next_due_date DATE,
+      target_payoff_date DATE,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paid')),
+      priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('high','normal','low')),
+      notes TEXT,
+      planned_item_id UUID,
+      archived_at TIMESTAMPTZ,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS finance_debts_company_active_idx
+      ON finance_debts(company_id, archived_at, status, priority);
+    CREATE INDEX IF NOT EXISTS finance_debts_company_type_idx
+      ON finance_debts(company_id, debt_type);
+
+    CREATE TABLE IF NOT EXISTS finance_debt_payments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      debt_id UUID NOT NULL REFERENCES finance_debts(id) ON DELETE RESTRICT,
+      amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
+      payment_date DATE NOT NULL,
+      note TEXT,
+      finance_account_id UUID REFERENCES finance_accounts(id) ON DELETE SET NULL,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS finance_debt_payments_debt_date_idx
+      ON finance_debt_payments(company_id, debt_id, payment_date DESC);
+
+    CREATE TABLE IF NOT EXISTS finance_budgets (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL,
+      limit_cents BIGINT NOT NULL CHECK (limit_cents >= 0),
+      period TEXT NOT NULL CHECK (period IN ('weekly','monthly','yearly')),
+      start_date DATE NOT NULL,
+      end_date DATE,
+      notes TEXT,
+      archived_at TIMESTAMPTZ,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CHECK (end_date IS NULL OR end_date >= start_date)
+    );
+    CREATE INDEX IF NOT EXISTS finance_budgets_company_active_idx
+      ON finance_budgets(company_id, archived_at, period, category);
+
+    CREATE TABLE IF NOT EXISTS finance_goals (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      goal_type TEXT NOT NULL CHECK (goal_type IN ('emergency_fund','tax_payoff','equipment_purchase','vehicle_purchase','moving_fund','general_savings','custom')),
+      target_amount_cents BIGINT NOT NULL CHECK (target_amount_cents >= 0),
+      current_amount_cents BIGINT NOT NULL DEFAULT 0 CHECK (current_amount_cents >= 0),
+      target_date DATE,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed')),
+      notes TEXT,
+      archived_at TIMESTAMPTZ,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS finance_goals_company_status_idx
+      ON finance_goals(company_id, archived_at, status);
+
+    CREATE TABLE IF NOT EXISTS finance_goal_contributions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      goal_id UUID NOT NULL REFERENCES finance_goals(id) ON DELETE RESTRICT,
+      amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
+      contribution_date DATE NOT NULL,
+      note TEXT,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS finance_goal_contributions_goal_date_idx
+      ON finance_goal_contributions(company_id, goal_id, contribution_date DESC);
+  `);
+
+  await pool.query(`ALTER TABLE finance_planned_items ADD COLUMN IF NOT EXISTS debt_id UUID`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS finance_planned_items_debt_idx ON finance_planned_items(company_id, debt_id)`);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'finance_planned_items_debt_id_fkey'
+      ) THEN
+        ALTER TABLE finance_planned_items
+          ADD CONSTRAINT finance_planned_items_debt_id_fkey
+          FOREIGN KEY (debt_id) REFERENCES finance_debts(id) ON DELETE SET NULL;
+      END IF;
+    END $$;
   `);
 }
 
@@ -402,6 +638,213 @@ async function loadProjection(pool, companyId, horizonDays = 30) {
   });
 }
 
+function todayDateString() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function periodBounds(period, anchorDate = todayDateString()) {
+  const [year, month, day] = anchorDate.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (period === "weekly") {
+    const mondayOffset = (date.getUTCDay() + 6) % 7;
+    const start = addDays(anchorDate, -mondayOffset);
+    return { start_date: start, end_date: addDays(start, 6) };
+  }
+  if (period === "yearly") {
+    return { start_date: `${year}-01-01`, end_date: `${year}-12-31` };
+  }
+  const start = `${year}-${String(month).padStart(2, "0")}-01`;
+  const end = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+  return { start_date: start, end_date: end };
+}
+
+function debtPaymentCategory(debtType) {
+  return isTaxDebt(debtType) ? "Taxes" : "Debt Payment";
+}
+
+async function syncDebtPlannedItem(client, companyId, debt, userId) {
+  const shouldSchedule = debt.archived_at === null && debt.status === "active" && Number(debt.planned_payment_cents || 0) > 0;
+  if (!shouldSchedule) {
+    await client.query(
+      `UPDATE finance_planned_items
+          SET archived_at = COALESCE(archived_at, now()),
+              updated_at = now()
+        WHERE company_id = $1
+          AND debt_id = $2
+          AND archived_at IS NULL`,
+      [companyId, debt.id]
+    );
+    return null;
+  }
+
+  const scheduledDate = debt.next_due_date ? dateOnlyFromDb(debt.next_due_date) : todayDateString();
+  const category = debtPaymentCategory(debt.debt_type);
+  const existing = await client.query(
+    `SELECT *
+       FROM finance_planned_items
+      WHERE company_id = $1
+        AND debt_id = $2
+      ORDER BY archived_at NULLS FIRST, created_at ASC
+      LIMIT 1`,
+    [companyId, debt.id]
+  );
+
+  if (existing.rows.length) {
+    const { rows } = await client.query(
+      `UPDATE finance_planned_items
+          SET title = $3,
+              direction = 'expense',
+              amount_cents = $4,
+              scheduled_date = $5,
+              category = $6,
+              recurrence = 'monthly',
+              recurrence_end_date = NULL,
+              archived_at = NULL,
+              updated_at = now()
+        WHERE id = $1
+          AND company_id = $2
+        RETURNING *`,
+      [existing.rows[0].id, companyId, `${debt.name} Payment`, debt.planned_payment_cents, scheduledDate, category]
+    );
+    return rows[0];
+  }
+
+  const { rows } = await client.query(
+    `INSERT INTO finance_planned_items (
+       company_id, debt_id, title, direction, amount_cents, scheduled_date,
+       category, recurrence, created_by
+     ) VALUES ($1,$2,$3,'expense',$4,$5,$6,'monthly',$7)
+     RETURNING *`,
+    [companyId, debt.id, `${debt.name} Payment`, debt.planned_payment_cents, scheduledDate, category, userId]
+  );
+  await client.query(
+    `UPDATE finance_debts
+        SET planned_item_id = $3,
+            updated_at = now()
+      WHERE id = $1
+        AND company_id = $2`,
+    [debt.id, companyId, rows[0].id]
+  );
+  return rows[0];
+}
+
+async function loadDebts(pool, companyId, includeArchived = false) {
+  const { rows } = await pool.query(
+    `SELECT *
+       FROM finance_debts
+      WHERE company_id = $1
+        AND ($2::boolean OR archived_at IS NULL)
+      ORDER BY archived_at NULLS FIRST,
+               CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+               created_at DESC`,
+    [companyId, includeArchived]
+  );
+  return rows.map(debtPayload);
+}
+
+function debtPayoffForPayload(debt, startDate = todayDateString()) {
+  const payoff = estimateDebtPayoff({
+    balanceCents: debt.current_balance_cents,
+    paymentCents: debt.planned_payment_cents,
+    aprBasisPoints: debt.apr_basis_points,
+    startDate
+  });
+  const target = debt.target_payoff_date
+    ? requiredPaymentForTarget({
+      balanceCents: debt.current_balance_cents,
+      aprBasisPoints: debt.apr_basis_points,
+      startDate,
+      targetDate: debt.target_payoff_date
+    })
+    : null;
+  return {
+    debt_id: debt.id,
+    current_balance_cents: debt.current_balance_cents,
+    planned_payment_cents: debt.planned_payment_cents,
+    ...payoff,
+    target_payoff_date: debt.target_payoff_date,
+    target_required_payment_cents: target?.required_payment_cents ?? null,
+    target_status: target?.status ?? null,
+    target_payment_difference_cents: target?.required_payment_cents === null || target?.required_payment_cents === undefined
+      ? null
+      : target.required_payment_cents - debt.planned_payment_cents
+  };
+}
+
+function buildDebtSummary(debts) {
+  const active = debts.filter((debt) => !debt.archived_at && debt.status === "active");
+  const taxDebt = active.filter((debt) => isTaxDebt(debt.debt_type));
+  const otherDebt = active.filter((debt) => !isTaxDebt(debt.debt_type));
+  const payoffDates = active.map((debt) => debtPayoffForPayload(debt).estimated_payoff_date).filter(Boolean);
+  const incomplete = active.some((debt) => debt.current_balance_cents > 0 && debt.planned_payment_cents <= 0);
+  return {
+    total_debt_cents: active.reduce((sum, debt) => sum + debt.current_balance_cents, 0),
+    tax_debt_cents: taxDebt.reduce((sum, debt) => sum + debt.current_balance_cents, 0),
+    other_debt_cents: otherDebt.reduce((sum, debt) => sum + debt.current_balance_cents, 0),
+    monthly_planned_payments_cents: active.reduce((sum, debt) => sum + debt.planned_payment_cents, 0),
+    active_debt_count: active.length,
+    payment_plan_incomplete: incomplete,
+    estimated_debt_free_date: incomplete || payoffDates.length !== active.length ? null : payoffDates.sort().at(-1) || null,
+    tax_debt_free_date: taxDebt.some((debt) => debt.current_balance_cents > 0 && debt.planned_payment_cents <= 0)
+      ? null
+      : taxDebt.map((debt) => debtPayoffForPayload(debt).estimated_payoff_date).filter(Boolean).sort().at(-1) || null
+  };
+}
+
+async function loadBudgetSummary(pool, companyId, period = "monthly") {
+  const bounds = periodBounds(period);
+  const budgetsResult = await pool.query(
+    `SELECT *
+       FROM finance_budgets
+      WHERE company_id = $1
+        AND archived_at IS NULL
+        AND period = $2
+        AND start_date <= $4
+        AND (end_date IS NULL OR end_date >= $3)
+      ORDER BY category ASC, name ASC`,
+    [companyId, period, bounds.start_date, bounds.end_date]
+  );
+  const plannedItems = await loadActivePlannedItems(pool, companyId);
+  const occurrences = plannedItems.flatMap((item) => expandPlannedItemOccurrences(item, bounds.start_date, bounds.end_date));
+  const budgets = budgetsResult.rows.map(budgetPayload);
+  const summaries = budgets.map((budget) => ({
+    ...summarizeBudget({ budget, occurrences }),
+    period: budget.period,
+    period_start_date: bounds.start_date,
+    period_end_date: bounds.end_date
+  }));
+  return {
+    period,
+    period_start_date: bounds.start_date,
+    period_end_date: bounds.end_date,
+    total_limit_cents: summaries.reduce((sum, budget) => sum + budget.limit_cents, 0),
+    total_planned_spend_cents: summaries.reduce((sum, budget) => sum + budget.planned_spend_cents, 0),
+    on_plan_count: summaries.filter((budget) => budget.status === "on_plan").length,
+    over_plan_count: summaries.filter((budget) => budget.status === "over_plan").length,
+    budgets: summaries
+  };
+}
+
+function buildGoalsSummary(goals, startDate = todayDateString()) {
+  const active = goals.filter((goal) => !goal.archived_at && goal.status === "active");
+  return {
+    active_goal_count: active.length,
+    total_target_cents: active.reduce((sum, goal) => sum + goal.target_amount_cents, 0),
+    total_current_cents: active.reduce((sum, goal) => sum + goal.current_amount_cents, 0),
+    goals: active.slice(0, 3).map((goal) => ({
+      goal_id: goal.id,
+      name: goal.name,
+      goal_type: goal.goal_type,
+      ...goalMetrics({
+        targetAmountCents: goal.target_amount_cents,
+        currentAmountCents: goal.current_amount_cents,
+        targetDate: goal.target_date,
+        startDate
+      })
+    }))
+  };
+}
+
 export async function installFinanceSystem({ app, pool, authRequired, requireEmployer }) {
   if (!app || !pool || !authRequired || !requireEmployer) {
     throw new Error("finance_installer_missing_dependencies");
@@ -424,11 +867,25 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
       const accounts = await loadActiveAccounts(pool, req.companyId);
       const projection = await loadProjection(pool, req.companyId, 30);
       const plannedItems = await loadActivePlannedItems(pool, req.companyId);
+      const debts = await loadDebts(pool, req.companyId);
+      const budgets = await loadBudgetSummary(pool, req.companyId, "monthly");
+      const goalsResult = await pool.query(
+        `SELECT *
+           FROM finance_goals
+          WHERE company_id = $1
+            AND archived_at IS NULL
+          ORDER BY created_at DESC`,
+        [req.companyId]
+      );
+      const goals = goalsResult.rows.map(goalPayload);
       res.json({
         ...overviewFromAccounts(accounts),
         projection,
         upcoming: projection.events.slice(0, 8),
-        planned_item_count: plannedItems.length
+        planned_item_count: plannedItems.length,
+        debt_summary: buildDebtSummary(debts),
+        budget_summary: budgets,
+        goals_summary: buildGoalsSummary(goals)
       });
     } catch (error) {
       handleFinanceError(res, error, "finance_overview_failed");
