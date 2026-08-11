@@ -279,6 +279,29 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
     }
   });
 
+  app.get("/api/finance/transactions/:id/receipts", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const tx = await pool.query(`SELECT id FROM finance_transactions WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      if (!tx.rows.length) return res.status(404).json({ error: "finance_transaction_not_found", message: "Transaction was not found." });
+      const { rows } = await pool.query(
+        `SELECT r.*, t.merchant_name AS transaction_merchant_name, t.amount_cents AS transaction_amount_cents,
+                a.name AS account_name, a.institution_name
+           FROM finance_receipts r
+           JOIN finance_transactions t ON t.id = r.transaction_id AND t.company_id = r.company_id
+           JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = r.company_id
+          WHERE r.company_id = $1
+            AND r.transaction_id = $2
+            AND r.archived_at IS NULL
+          ORDER BY r.created_at DESC`,
+        [req.companyId, req.params.id]
+      );
+      res.json(rows.map(receiptPayload));
+    } catch (error) {
+      handleReceiptError(res, error, "finance_transaction_receipts_failed");
+    }
+  });
+
   app.post("/api/finance/receipts", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
