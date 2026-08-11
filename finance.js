@@ -7,6 +7,7 @@ import {
 import { installPlaidRoutes, installPlaidSchema } from "./finance-plaid.js";
 import { isLiquidFinanceAccount } from "./finance-plaid-helpers.js";
 import { installReceiptRoutes, installReceiptSchema } from "./finance-receipts.js";
+import { installFinanceAIRoutes, installFinanceAISchema } from "./finance-ai.js";
 
 const VALID_ACCOUNT_TYPES = new Set(["cash", "checking", "savings", "other"]);
 const VALID_CURRENCIES = new Set(["usd"]);
@@ -467,6 +468,7 @@ async function installFinanceSchema(pool) {
   `);
   await installPlaidSchema(pool);
   await installReceiptSchema(pool);
+  await installFinanceAISchema(pool);
 }
 
 function requireCompany(req, res) {
@@ -488,7 +490,7 @@ function handleFinanceError(res, error, fallback) {
   return res.status(500).json({ error: fallback, message: "Finance request failed." });
 }
 
-async function loadActiveAccounts(pool, companyId) {
+export async function loadActiveAccounts(pool, companyId) {
   const { rows } = await pool.query(
     `SELECT *
        FROM finance_accounts
@@ -519,7 +521,7 @@ function overviewFromAccounts(accounts) {
   };
 }
 
-async function ensureFinanceSettings(pool, companyId) {
+export async function ensureFinanceSettings(pool, companyId) {
   const { rows } = await pool.query(
     `INSERT INTO finance_settings (company_id)
      VALUES ($1)
@@ -623,7 +625,7 @@ export function buildProjection({ startingBalanceCents, minimumReserveCents, pla
   };
 }
 
-async function loadActivePlannedItems(pool, companyId) {
+export async function loadActivePlannedItems(pool, companyId) {
   const { rows } = await pool.query(
     `SELECT p.*, a.name AS account_name
        FROM finance_planned_items p
@@ -636,7 +638,7 @@ async function loadActivePlannedItems(pool, companyId) {
   return rows.map(financePlannedItemPayload);
 }
 
-async function loadProjection(pool, companyId, horizonDays = 30) {
+export async function loadProjection(pool, companyId, horizonDays = 30) {
   const days = Math.max(1, Math.min(Number(horizonDays) || 30, 366));
   const accounts = await loadActiveAccounts(pool, companyId);
   const settings = await ensureFinanceSettings(pool, companyId);
@@ -655,11 +657,11 @@ async function loadProjection(pool, companyId, horizonDays = 30) {
   });
 }
 
-function todayDateString() {
+export function todayDateString() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function periodBounds(period, anchorDate = todayDateString()) {
+export function periodBounds(period, anchorDate = todayDateString()) {
   const [year, month, day] = anchorDate.split("-").map(Number);
   const date = new Date(Date.UTC(year, month - 1, day));
   if (period === "weekly") {
@@ -745,7 +747,7 @@ async function syncDebtPlannedItem(client, companyId, debt, userId) {
   return rows[0];
 }
 
-async function loadDebts(pool, companyId, includeArchived = false) {
+export async function loadDebts(pool, companyId, includeArchived = false) {
   const { rows } = await pool.query(
     `SELECT *
        FROM finance_debts
@@ -759,7 +761,7 @@ async function loadDebts(pool, companyId, includeArchived = false) {
   return rows.map(debtPayload);
 }
 
-function debtPayoffForPayload(debt, startDate = todayDateString()) {
+export function debtPayoffForPayload(debt, startDate = todayDateString()) {
   const payoff = estimateDebtPayoff({
     balanceCents: debt.current_balance_cents,
     paymentCents: debt.planned_payment_cents,
@@ -788,7 +790,7 @@ function debtPayoffForPayload(debt, startDate = todayDateString()) {
   };
 }
 
-function buildDebtSummary(debts) {
+export function buildDebtSummary(debts) {
   const active = debts.filter((debt) => !debt.archived_at && debt.status === "active");
   const taxDebt = active.filter((debt) => isTaxDebt(debt.debt_type));
   const otherDebt = active.filter((debt) => !isTaxDebt(debt.debt_type));
@@ -808,7 +810,7 @@ function buildDebtSummary(debts) {
   };
 }
 
-async function loadBudgetSummary(pool, companyId, period = "monthly") {
+export async function loadBudgetSummary(pool, companyId, period = "monthly") {
   const bounds = periodBounds(period);
   const budgetsResult = await pool.query(
     `SELECT *
@@ -864,7 +866,7 @@ async function loadBudgetSummary(pool, companyId, period = "monthly") {
   };
 }
 
-function buildGoalsSummary(goals, startDate = todayDateString()) {
+export function buildGoalsSummary(goals, startDate = todayDateString()) {
   const active = goals.filter((goal) => !goal.archived_at && goal.status === "active");
   return {
     active_goal_count: active.length,
@@ -1928,4 +1930,5 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
 
   installPlaidRoutes({ app, pool, authRequired, requireEmployer });
   installReceiptRoutes({ app, pool, authRequired, requireEmployer });
+  installFinanceAIRoutes({ app, pool, authRequired, requireEmployer });
 }
