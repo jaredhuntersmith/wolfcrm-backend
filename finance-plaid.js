@@ -8,6 +8,7 @@ import {
   safePlaidItemPayload,
   transactionPayloadFromPlaid
 } from "./finance-plaid-helpers.js";
+import { matchUnmatchedReceiptsForTransactions } from "./finance-receipt-matching.js";
 
 function cleanString(value, maxLength = 200) {
   return (value || "").toString().trim().slice(0, maxLength);
@@ -247,6 +248,7 @@ function transactionPayload(row) {
     location_country: row.location_country,
     iso_currency_code: row.iso_currency_code,
     removed_at: row.removed_at,
+    receipt_count: Number(row.receipt_count || 0),
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -465,11 +467,18 @@ export async function syncPlaidTransactions({ pool, plaid, item }) {
   }, originalCursor);
 
   const client = await pool.connect();
+  const changedTransactions = [];
   try {
     await client.query("BEGIN");
     await client.query(`UPDATE finance_plaid_items SET last_attempted_sync_at = now(), status = 'syncing', updated_at = now() WHERE id = $1`, [item.id]);
-    for (const tx of collected.added) await applyPlaidTransaction(client, item.company_id, item, tx);
-    for (const tx of collected.modified) await applyPlaidTransaction(client, item.company_id, item, tx);
+    for (const tx of collected.added) {
+      const row = await applyPlaidTransaction(client, item.company_id, item, tx);
+      if (row) changedTransactions.push(row);
+    }
+    for (const tx of collected.modified) {
+      const row = await applyPlaidTransaction(client, item.company_id, item, tx);
+      if (row) changedTransactions.push(row);
+    }
     for (const removed of collected.removed) await markRemovedTransaction(client, item.company_id, removed.transaction_id);
     await client.query(
       `UPDATE finance_plaid_items
@@ -489,6 +498,10 @@ export async function syncPlaidTransactions({ pool, plaid, item }) {
     throw error;
   } finally {
     client.release();
+  }
+  if (changedTransactions.length) {
+    await matchUnmatchedReceiptsForTransactions(pool, item.company_id, changedTransactions)
+      .catch((error) => console.error("[finance-receipts] rematch after plaid sync failed", { company_id: item.company_id, message: error?.message }));
   }
   return { added: collected.added.length, modified: collected.modified.length, removed: collected.removed.length, next_cursor: collected.next_cursor };
 }
@@ -784,10 +797,15 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
         conditions.push(`t.direction = $${values.length}`);
       } else if (filter === "pending") {
         conditions.push("t.pending = true");
+      } else if (filter === "missing_receipt") {
+        conditions.push("t.direction = 'expense'");
+        conditions.push("t.pending = false");
+        conditions.push("NOT EXISTS (SELECT 1 FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL)");
       }
       values.push(limit, offset);
       const { rows } = await pool.query(
-        `SELECT t.*, a.name AS account_name, a.institution_name
+        `SELECT t.*, a.name AS account_name, a.institution_name,
+                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count
            FROM finance_transactions t
            JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
           WHERE ${conditions.join(" AND ")}
@@ -805,7 +823,8 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     if (!requireCompany(req, res)) return;
     try {
       const { rows } = await pool.query(
-        `SELECT t.*, a.name AS account_name, a.institution_name
+        `SELECT t.*, a.name AS account_name, a.institution_name,
+                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count
            FROM finance_transactions t
            JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
           WHERE t.id = $1 AND t.company_id = $2`,

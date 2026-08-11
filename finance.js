@@ -6,6 +6,7 @@ import {
 } from "./finance-calculations.js";
 import { installPlaidRoutes, installPlaidSchema } from "./finance-plaid.js";
 import { isLiquidFinanceAccount } from "./finance-plaid-helpers.js";
+import { installReceiptRoutes, installReceiptSchema } from "./finance-receipts.js";
 
 const VALID_ACCOUNT_TYPES = new Set(["cash", "checking", "savings", "other"]);
 const VALID_CURRENCIES = new Set(["usd"]);
@@ -465,6 +466,7 @@ async function installFinanceSchema(pool) {
     END $$;
   `);
   await installPlaidSchema(pool);
+  await installReceiptSchema(pool);
 }
 
 function requireCompany(req, res) {
@@ -1925,4 +1927,5 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
   });
 
   installPlaidRoutes({ app, pool, authRequired, requireEmployer });
+  installReceiptRoutes({ app, pool, authRequired, requireEmployer });
 }
