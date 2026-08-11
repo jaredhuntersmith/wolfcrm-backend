@@ -1,4 +1,3 @@
-import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
 import {
   decryptAccessToken,
   encryptAccessToken,
@@ -63,7 +62,8 @@ function requirePlaidConfigured(res) {
   return status;
 }
 
-function plaidClient() {
+async function plaidClient() {
+  const { Configuration, PlaidApi, PlaidEnvironments } = await import("plaid");
   const config = getPlaidConfig();
   const configuration = new Configuration({
     basePath: config.environment === "production" ? PlaidEnvironments.production : PlaidEnvironments.sandbox,
@@ -515,8 +515,8 @@ async function syncRecurring(pool, plaid, item) {
   const accessToken = await decryptItemToken(item);
   const response = await plaid.transactionsRecurringGet({ access_token: accessToken });
   const streams = [
-    ...(response.data.inflow_streams || []),
-    ...(response.data.outflow_streams || [])
+    ...(response.data.inflow_streams || []).map((stream) => ({ ...stream, wolf_direction: "income" })),
+    ...(response.data.outflow_streams || []).map((stream) => ({ ...stream, wolf_direction: "expense" }))
   ];
   for (const stream of streams) {
     const amount = stream.last_amount === null || stream.last_amount === undefined ? null : providerAmountToCents(Math.abs(stream.last_amount.amount || stream.last_amount));
@@ -544,7 +544,7 @@ async function syncRecurring(pool, plaid, item) {
         item.company_id,
         item.id,
         stream.stream_id,
-        stream.transaction_ids?.length && stream.category?.includes("INCOME") ? "income" : (stream.direction || "expense"),
+        stream.wolf_direction,
         stream.merchant_name || null,
         stream.description || stream.name || null,
         stream.personal_finance_category?.primary || null,
@@ -591,7 +591,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
         webhook: config.webhook_url || undefined,
         redirect_uri: config.redirect_uri || undefined
       };
-      const response = await plaidClient().linkTokenCreate(request);
+      const response = await (await plaidClient()).linkTokenCreate(request);
       res.json({ link_token: response.data.link_token, expiration: response.data.expiration });
     } catch (error) {
       handlePlaidError(res, error, "plaid_link_token_failed");
@@ -604,7 +604,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     if (!config) return;
     const publicToken = cleanString(req.body?.public_token, 2048);
     if (!publicToken) return res.status(400).json({ error: "plaid_public_token_required", message: "Plaid public token is required." });
-    const plaid = plaidClient();
+    const plaid = await plaidClient();
     try {
       const exchange = await plaid.itemPublicTokenExchange({ public_token: publicToken });
       const accessToken = exchange.data.access_token;
@@ -685,7 +685,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     try {
       const item = await getPlaidItem(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
-      res.json({ accounts: await refreshBalances(pool, plaidClient(), item) });
+      res.json({ accounts: await refreshBalances(pool, await plaidClient(), item) });
     } catch (error) {
       handlePlaidError(res, error, "plaid_balance_refresh_failed");
     }
@@ -697,7 +697,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     try {
       const item = await getPlaidItem(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
-      const plaid = plaidClient();
+      const plaid = await plaidClient();
       await plaid.transactionsRefresh({ access_token: await decryptItemToken(item) });
       await pool.query(`UPDATE finance_plaid_items SET last_transaction_refresh_at = now(), updated_at = now() WHERE id = $1`, [item.id]);
       const sync = await syncPlaidTransactions({ pool, plaid, item });
@@ -712,7 +712,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     if (!requirePlaidConfigured(res)) return;
     try {
       const { rows } = await pool.query(`SELECT * FROM finance_plaid_items WHERE company_id = $1 AND status <> 'disconnected' AND disconnected_at IS NULL`, [req.companyId]);
-      const plaid = plaidClient();
+      const plaid = await plaidClient();
       const results = [];
       for (const item of rows) {
         const accounts = await refreshBalances(pool, plaid, item);
@@ -733,7 +733,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     try {
       const item = await getPlaidItem(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
-      const response = await plaidClient().linkTokenCreate({
+      const response = await (await plaidClient()).linkTokenCreate({
         user: { client_user_id: `company_${req.companyId}_user_${req.userId}` },
         client_name: "WolfCRM",
         country_codes: ["US"],
@@ -754,7 +754,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     try {
       const item = await getPlaidItem(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
-      await plaidClient().itemRemove({ access_token: await decryptItemToken(item) }).catch((error) => {
+      await (await plaidClient()).itemRemove({ access_token: await decryptItemToken(item) }).catch((error) => {
         if (error?.response?.data?.error_code !== "ITEM_NOT_FOUND") throw error;
       });
       await pool.query(
@@ -855,9 +855,9 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       await pool.query(`UPDATE finance_plaid_items SET last_webhook_at = now(), updated_at = now() WHERE id = $1`, [item.id]);
       res.json({ ok: true });
       if (webhookCode === "SYNC_UPDATES_AVAILABLE") {
-        await syncPlaidTransactions({ pool, plaid: plaidClient(), item }).catch((error) => console.error("[finance-plaid] webhook sync failed", { item_id: item.id, message: error?.message }));
+        await syncPlaidTransactions({ pool, plaid: await plaidClient(), item }).catch((error) => console.error("[finance-plaid] webhook sync failed", { item_id: item.id, message: error?.message }));
       } else if (webhookCode === "RECURRING_TRANSACTIONS_UPDATE") {
-        await syncRecurring(pool, plaidClient(), item).catch((error) => console.error("[finance-plaid] recurring sync failed", { item_id: item.id, message: error?.message }));
+        await syncRecurring(pool, await plaidClient(), item).catch((error) => console.error("[finance-plaid] recurring sync failed", { item_id: item.id, message: error?.message }));
       } else if (webhookCode === "ITEM_LOGIN_REQUIRED" || req.body?.error?.error_code === "ITEM_LOGIN_REQUIRED") {
         await pool.query(`UPDATE finance_plaid_items SET status = 'login_required', error_code = 'ITEM_LOGIN_REQUIRED', updated_at = now() WHERE id = $1`, [item.id]);
       }
