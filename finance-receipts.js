@@ -52,9 +52,9 @@ function handleReceiptError(res, error, fallback) {
 }
 
 function mediaBucketConfig() {
-  const endpoint = process.env.MEDIA_ENDPOINT || process.env.AWS_S3_ENDPOINT;
+  const endpoint = process.env.MEDIA_ENDPOINT || process.env.AWS_ENDPOINT_URL || process.env.AWS_S3_ENDPOINT;
   const bucket = process.env.MEDIA_BUCKET || process.env.AWS_S3_BUCKET_NAME;
-  const region = process.env.MEDIA_REGION || process.env.AWS_REGION || "auto";
+  const region = process.env.MEDIA_REGION || process.env.AWS_DEFAULT_REGION || process.env.AWS_REGION || "auto";
   const accessKeyId = process.env.MEDIA_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID;
   const secretAccessKey = process.env.MEDIA_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY;
   if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
@@ -78,6 +78,19 @@ function getMediaS3Client() {
 
 function receiptObjectPrefix(companyId, receiptId) {
   return `companies/${companyId}/finance-receipts/${receiptId}/`;
+}
+
+function cleanReceiptObjectKey(value, companyId, receiptId, fieldName) {
+  const objectKey = cleanString(value, 500);
+  if (!objectKey) return null;
+  const prefix = receiptObjectPrefix(companyId, receiptId);
+  if (!objectKey.startsWith(prefix) || objectKey.includes("..") || objectKey.includes("\\")) {
+    const error = new Error(`${fieldName}_forbidden`);
+    error.statusCode = 403;
+    error.code = "media_forbidden";
+    throw error;
+  }
+  return objectKey;
 }
 
 function receiptPayload(row) {
@@ -251,6 +264,8 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
     try {
       const filter = cleanString(req.query.filter, 40);
       const search = cleanString(req.query.search, 120);
+      const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
+      const offset = Math.max(Number(req.query.offset || 0), 0);
       const conditions = ["r.company_id = $1"];
       const values = [req.companyId];
       if (filter === "unmatched") conditions.push("r.transaction_id IS NULL AND r.status IN ('unmatched','possible_match','processing_failed')");
@@ -262,6 +277,7 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
         values.push(`%${search.toLowerCase()}%`);
         conditions.push(`(lower(r.merchant_name) LIKE $${values.length} OR lower(COALESCE(r.ocr_text,'')) LIKE $${values.length} OR CAST(r.amount_cents AS TEXT) LIKE $${values.length})`);
       }
+      values.push(limit, offset);
       const { rows } = await pool.query(
         `SELECT r.*, t.merchant_name AS transaction_merchant_name, t.amount_cents AS transaction_amount_cents,
                 a.name AS account_name, a.institution_name
@@ -270,7 +286,7 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
            LEFT JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = r.company_id
           WHERE ${conditions.join(" AND ")}
           ORDER BY r.created_at DESC
-          LIMIT 100`,
+          LIMIT $${values.length - 1} OFFSET $${values.length}`,
         values
       );
       res.json(rows.map(receiptPayload));
@@ -305,6 +321,9 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
   app.post("/api/finance/receipts", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      if (req.body?.object_key || req.body?.thumbnail_object_key) {
+        return res.status(400).json({ error: "receipt_object_key_not_allowed", message: "Receipt image keys must be issued by the server after the receipt is created." });
+      }
       const payload = receiptUpdatePayload(req.body || {});
       const transactionId = cleanString(req.body?.transaction_id, 80) || null;
       if (transactionId) {
@@ -333,8 +352,8 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
           payload.tax_cents, payload.tip_cents, payload.currency, payload.address, payload.city,
           payload.state, payload.postal_code, payload.country, payload.payment_method_text,
           payload.card_last_four, payload.finance_category, payload.business_use, payload.note,
-          payload.ocr_text, payload.ocr_confidence, req.body?.object_key || null,
-          req.body?.thumbnail_object_key || null, payload.mime_type, payload.pixel_width,
+          payload.ocr_text, payload.ocr_confidence, null,
+          null, payload.mime_type, payload.pixel_width,
           payload.pixel_height, payload.file_size_bytes, payload.content_sha256, method,
           transactionId ? 100 : null, transactionId ? new Date() : null, req.userId
         ]
@@ -413,7 +432,9 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
     if (!requireCompany(req, res)) return;
     try {
       const payload = receiptUpdatePayload(req.body || {});
-      const status = VALID_STATUSES.has(req.body?.status) ? req.body.status : (payload.object_key ? "unmatched" : undefined);
+      const objectKey = cleanReceiptObjectKey(req.body?.object_key, req.companyId, req.params.id, "object_key");
+      const thumbnailObjectKey = cleanReceiptObjectKey(req.body?.thumbnail_object_key, req.companyId, req.params.id, "thumbnail_object_key");
+      const status = VALID_STATUSES.has(req.body?.status) ? req.body.status : (objectKey ? "unmatched" : undefined);
       const { rows } = await pool.query(
         `UPDATE finance_receipts
             SET merchant_name = COALESCE($3, merchant_name),
@@ -454,8 +475,8 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
           payload.tax_cents, payload.tip_cents, payload.currency, payload.address, payload.city,
           payload.state, payload.postal_code, payload.country, payload.payment_method_text,
           payload.card_last_four, payload.finance_category, payload.business_use, payload.note,
-          payload.ocr_text, payload.ocr_confidence, req.body?.object_key || null,
-          req.body?.thumbnail_object_key || null, payload.mime_type, payload.pixel_width,
+          payload.ocr_text, payload.ocr_confidence, objectKey,
+          thumbnailObjectKey, payload.mime_type, payload.pixel_width,
           payload.pixel_height, payload.file_size_bytes, payload.content_sha256, status
         ]
       );
