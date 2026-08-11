@@ -775,8 +775,10 @@ function buildDebtSummary(debts) {
   const active = debts.filter((debt) => !debt.archived_at && debt.status === "active");
   const taxDebt = active.filter((debt) => isTaxDebt(debt.debt_type));
   const otherDebt = active.filter((debt) => !isTaxDebt(debt.debt_type));
-  const payoffDates = active.map((debt) => debtPayoffForPayload(debt).estimated_payoff_date).filter(Boolean);
+  const payoffDates = active.map((debt) => debtPayoffForPayload(debt).estimated_payoff_date).filter(Boolean).sort();
+  const taxPayoffDates = taxDebt.map((debt) => debtPayoffForPayload(debt).estimated_payoff_date).filter(Boolean).sort();
   const incomplete = active.some((debt) => debt.current_balance_cents > 0 && debt.planned_payment_cents <= 0);
+  const taxIncomplete = taxDebt.some((debt) => debt.current_balance_cents > 0 && debt.planned_payment_cents <= 0);
   return {
     total_debt_cents: active.reduce((sum, debt) => sum + debt.current_balance_cents, 0),
     tax_debt_cents: taxDebt.reduce((sum, debt) => sum + debt.current_balance_cents, 0),
@@ -784,10 +786,8 @@ function buildDebtSummary(debts) {
     monthly_planned_payments_cents: active.reduce((sum, debt) => sum + debt.planned_payment_cents, 0),
     active_debt_count: active.length,
     payment_plan_incomplete: incomplete,
-    estimated_debt_free_date: incomplete || payoffDates.length !== active.length ? null : payoffDates.sort().at(-1) || null,
-    tax_debt_free_date: taxDebt.some((debt) => debt.current_balance_cents > 0 && debt.planned_payment_cents <= 0)
-      ? null
-      : taxDebt.map((debt) => debtPayoffForPayload(debt).estimated_payoff_date).filter(Boolean).sort().at(-1) || null
+    estimated_debt_free_date: incomplete || payoffDates.length !== active.length ? null : payoffDates[payoffDates.length - 1] || null,
+    tax_debt_free_date: taxIncomplete || taxPayoffDates.length !== taxDebt.length ? null : taxPayoffDates[taxPayoffDates.length - 1] || null
   };
 }
 
@@ -1576,7 +1576,22 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
       const preview = debtPayoffForPayload({ ...debt, planned_payment_cents: previewPayment });
       const currentProjection = await loadProjection(pool, req.companyId, 30);
       const plannedItems = await loadActivePlannedItems(pool, req.companyId);
+      const hasDebtPlan = plannedItems.some((item) => item.debt_id === debt.id);
       const previewItems = plannedItems.map((item) => item.debt_id === debt.id ? { ...item, amount_cents: previewPayment } : item);
+      if (!hasDebtPlan && previewPayment > 0) {
+        previewItems.push({
+          id: `preview_${debt.id}`,
+          debt_id: debt.id,
+          title: `${debt.name} Payment`,
+          direction: "expense",
+          amount_cents: previewPayment,
+          scheduled_date: debt.next_due_date || todayDateString(),
+          category: debtPaymentCategory(debt.debt_type),
+          recurrence: "monthly",
+          recurrence_end_date: null,
+          archived_at: null
+        });
+      }
       const accounts = await loadActiveAccounts(pool, req.companyId);
       const settings = await ensureFinanceSettings(pool, req.companyId);
       const startDate = todayDateString();
