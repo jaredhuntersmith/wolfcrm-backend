@@ -35,6 +35,11 @@ function parseDateOnly(value, fieldName = "date") {
   return raw;
 }
 
+function dateOnlyFromDb(value) {
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return cleanString(value, 20);
+}
+
 function addDays(dateString, days) {
   const [year, month, day] = dateString.split("-").map(Number);
   const date = new Date(Date.UTC(year, month - 1, day + days));
@@ -743,12 +748,12 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
         title: Object.prototype.hasOwnProperty.call(req.body || {}, "title") ? cleanString(req.body.title, 140) : existing.rows[0].title,
         direction: Object.prototype.hasOwnProperty.call(req.body || {}, "direction") ? normalizeDirection(req.body.direction) : existing.rows[0].direction,
         amount_cents: Object.prototype.hasOwnProperty.call(req.body || {}, "amount_cents") ? parseCents(req.body.amount_cents, "amount_cents") : Number(existing.rows[0].amount_cents),
-        scheduled_date: Object.prototype.hasOwnProperty.call(req.body || {}, "scheduled_date") ? parseDateOnly(req.body.scheduled_date, "scheduled_date") : existing.rows[0].scheduled_date.toISOString?.().slice(0, 10) || existing.rows[0].scheduled_date,
+        scheduled_date: Object.prototype.hasOwnProperty.call(req.body || {}, "scheduled_date") ? parseDateOnly(req.body.scheduled_date, "scheduled_date") : dateOnlyFromDb(existing.rows[0].scheduled_date),
         category: Object.prototype.hasOwnProperty.call(req.body || {}, "category") ? cleanString(req.body.category || "Other", 80) || "Other" : existing.rows[0].category,
         recurrence: Object.prototype.hasOwnProperty.call(req.body || {}, "recurrence") ? normalizeRecurrence(req.body.recurrence) : existing.rows[0].recurrence,
         recurrence_end_date: Object.prototype.hasOwnProperty.call(req.body || {}, "recurrence_end_date")
           ? (req.body.recurrence_end_date ? parseDateOnly(req.body.recurrence_end_date, "recurrence_end_date") : null)
-          : (existing.rows[0].recurrence_end_date?.toISOString?.().slice(0, 10) || existing.rows[0].recurrence_end_date),
+          : (existing.rows[0].recurrence_end_date ? dateOnlyFromDb(existing.rows[0].recurrence_end_date) : null),
         notes: Object.prototype.hasOwnProperty.call(req.body || {}, "notes") ? cleanString(req.body.notes, 1000) || null : existing.rows[0].notes
       };
       if (!next.title) return res.status(400).json({ error: "planned_item_title_required", message: "Name is required." });
