@@ -821,9 +821,31 @@ async function loadBudgetSummary(pool, companyId, period = "monthly") {
   );
   const plannedItems = await loadActivePlannedItems(pool, companyId);
   const occurrences = plannedItems.flatMap((item) => expandPlannedItemOccurrences(item, bounds.start_date, bounds.end_date));
+  const actualResult = await pool.query(
+    `SELECT COALESCE(user_category_override, normalized_category, 'Other') AS category,
+            SUM(CASE WHEN status = 'posted' AND pending = false THEN amount_cents ELSE 0 END) AS posted_cents,
+            SUM(CASE WHEN pending = true THEN amount_cents ELSE 0 END) AS pending_cents
+       FROM finance_transactions
+      WHERE company_id = $1
+        AND removed_at IS NULL
+        AND direction = 'expense'
+        AND transaction_date >= $2
+        AND transaction_date <= $3
+      GROUP BY COALESCE(user_category_override, normalized_category, 'Other')`,
+    [companyId, bounds.start_date, bounds.end_date]
+  ).catch(() => ({ rows: [] }));
+  const actualByCategory = new Map(actualResult.rows.map((row) => [
+    row.category,
+    {
+      actual_posted_cents: Number(row.posted_cents || 0),
+      pending_cents: Number(row.pending_cents || 0)
+    }
+  ]));
   const budgets = budgetsResult.rows.map(budgetPayload);
   const summaries = budgets.map((budget) => ({
     ...summarizeBudget({ budget, occurrences }),
+    actual_posted_cents: actualByCategory.get(budget.category)?.actual_posted_cents || 0,
+    pending_cents: actualByCategory.get(budget.category)?.pending_cents || 0,
     period: budget.period,
     period_start_date: bounds.start_date,
     period_end_date: bounds.end_date
