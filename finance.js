@@ -4,6 +4,8 @@ import {
   summarizeBudget,
   goalMetrics
 } from "./finance-calculations.js";
+import { installPlaidRoutes, installPlaidSchema } from "./finance-plaid.js";
+import { isLiquidFinanceAccount } from "./finance-plaid-helpers.js";
 
 const VALID_ACCOUNT_TYPES = new Set(["cash", "checking", "savings", "other"]);
 const VALID_CURRENCIES = new Set(["usd"]);
@@ -133,7 +135,15 @@ function financeAccountPayload(row) {
     account_type: row.account_type,
     source: row.source,
     current_balance_cents: Number(row.current_balance_cents || 0),
+    available_balance_cents: row.available_balance_cents === null || row.available_balance_cents === undefined ? null : Number(row.available_balance_cents),
     currency: row.currency,
+    institution_name: row.institution_name || null,
+    official_name: row.official_name || null,
+    mask: row.mask || null,
+    plaid_account_type: row.plaid_account_type || null,
+    plaid_account_subtype: row.plaid_account_subtype || null,
+    include_in_liquid_cash: row.include_in_liquid_cash === undefined ? true : row.include_in_liquid_cash,
+    last_balance_update_at: row.last_balance_update_at || null,
     archived_at: row.archived_at,
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -454,6 +464,7 @@ async function installFinanceSchema(pool) {
       END IF;
     END $$;
   `);
+  await installPlaidSchema(pool);
 }
 
 function requireCompany(req, res) {
@@ -488,7 +499,9 @@ async function loadActiveAccounts(pool, companyId) {
 }
 
 function overviewFromAccounts(accounts) {
-  const total = accounts.reduce((sum, account) => sum + account.current_balance_cents, 0);
+  const total = accounts
+    .filter((account) => isLiquidFinanceAccount(account) && account.include_in_liquid_cash !== false)
+    .reduce((sum, account) => sum + account.current_balance_cents, 0);
   const physicalCash = accounts
     .filter((account) => account.account_type === "cash")
     .reduce((sum, account) => sum + account.current_balance_cents, 0);
@@ -628,7 +641,9 @@ async function loadProjection(pool, companyId, horizonDays = 30) {
   const startDate = new Date().toISOString().slice(0, 10);
   const endDate = addDays(startDate, days);
   const plannedItems = await loadActivePlannedItems(pool, companyId);
-  const startingBalanceCents = accounts.reduce((sum, account) => sum + account.current_balance_cents, 0);
+  const startingBalanceCents = accounts
+    .filter((account) => isLiquidFinanceAccount(account) && account.include_in_liquid_cash !== false)
+    .reduce((sum, account) => sum + account.current_balance_cents, 0);
   return buildProjection({
     startingBalanceCents,
     minimumReserveCents: settings.minimum_cash_reserve_cents,
@@ -1886,4 +1901,6 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
       handleFinanceError(res, error, "finance_goal_complete_failed");
     }
   });
+
+  installPlaidRoutes({ app, pool, authRequired, requireEmployer });
 }

@@ -211,3 +211,35 @@ export function reconcileTransactionRefs(state, change) {
   next.refs.set(providerId, { provider_transaction_id: providerId, transaction_id: transactionId, is_current: true });
   return next;
 }
+
+export async function collectPlaidSyncPages(fetchPage, originalCursor, maxRestarts = 3) {
+  let cursor = originalCursor || null;
+  let restarts = 0;
+  const collected = { added: [], modified: [], removed: [] };
+
+  while (true) {
+    try {
+      collected.added.length = 0;
+      collected.modified.length = 0;
+      collected.removed.length = 0;
+      cursor = originalCursor || null;
+      let hasMore = true;
+      let nextCursor = cursor;
+      while (hasMore) {
+        const page = await fetchPage(nextCursor);
+        collected.added.push(...(page.added || []));
+        collected.modified.push(...(page.modified || []));
+        collected.removed.push(...(page.removed || []));
+        nextCursor = page.next_cursor;
+        hasMore = Boolean(page.has_more);
+      }
+      return { ...collected, next_cursor: nextCursor, restarts };
+    } catch (error) {
+      if (error?.code === "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION" && restarts < maxRestarts) {
+        restarts += 1;
+        continue;
+      }
+      throw error;
+    }
+  }
+}
