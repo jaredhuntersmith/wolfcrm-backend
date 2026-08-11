@@ -1263,4 +1263,612 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
       handleFinanceError(res, error, "finance_planned_item_archive_failed");
     }
   });
+
+  app.get("/api/finance/debts", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const debts = await loadDebts(pool, req.companyId, req.query.include_archived === "true");
+      res.json({ debts, summary: buildDebtSummary(debts) });
+    } catch (error) {
+      handleFinanceError(res, error, "finance_debts_failed");
+    }
+  });
+
+  app.post("/api/finance/debts", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    const client = await pool.connect();
+    try {
+      const name = cleanString(req.body?.name, 140);
+      const debtType = normalizeSet(req.body?.debt_type, VALID_DEBT_TYPES, "other");
+      const currentBalance = parseCents(req.body?.current_balance_cents ?? 0, "current_balance_cents");
+      const originalBalance = parseOptionalCents(req.body?.original_balance_cents, "original_balance_cents");
+      const minimumPayment = parseCents(req.body?.minimum_payment_cents ?? 0, "minimum_payment_cents");
+      const plannedPayment = parseCents(req.body?.planned_payment_cents ?? 0, "planned_payment_cents");
+      const aprBps = parseOptionalAprBasisPoints(req.body?.apr_basis_points);
+      const nextDue = parseOptionalDateOnly(req.body?.next_due_date, "next_due_date");
+      const targetPayoff = parseOptionalDateOnly(req.body?.target_payoff_date, "target_payoff_date");
+      const priority = normalizeSet(req.body?.priority, VALID_DEBT_PRIORITIES, "normal");
+      const notes = cleanString(req.body?.notes, 1000) || null;
+      if (!name) return res.status(400).json({ error: "debt_name_required", message: "Debt name is required." });
+      if (!debtType) return res.status(400).json({ error: "invalid_debt_type", message: "Choose a valid debt type." });
+      if (!priority) return res.status(400).json({ error: "invalid_debt_priority", message: "Choose a valid priority." });
+      if ([currentBalance, originalBalance ?? 0, minimumPayment, plannedPayment, aprBps ?? 0].some((value) => value < 0)) {
+        return res.status(400).json({ error: "finance_amount_invalid", message: "Amounts cannot be negative." });
+      }
+
+      await client.query("BEGIN");
+      const { rows } = await client.query(
+        `INSERT INTO finance_debts (
+           company_id, name, debt_type, current_balance_cents, original_balance_cents,
+           minimum_payment_cents, planned_payment_cents, apr_basis_points,
+           next_due_date, target_payoff_date, priority, notes, status, created_by
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         RETURNING *`,
+        [
+          req.companyId,
+          name,
+          debtType,
+          currentBalance,
+          originalBalance,
+          minimumPayment,
+          plannedPayment,
+          aprBps,
+          nextDue,
+          targetPayoff,
+          priority,
+          notes,
+          currentBalance === 0 ? "paid" : "active",
+          req.userId
+        ]
+      );
+      await syncDebtPlannedItem(client, req.companyId, rows[0], req.userId);
+      const refreshed = await client.query(`SELECT * FROM finance_debts WHERE id = $1 AND company_id = $2`, [rows[0].id, req.companyId]);
+      await client.query("COMMIT");
+      res.status(201).json(debtPayload(refreshed.rows[0]));
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      handleFinanceError(res, error, "finance_debt_create_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/api/finance/debts/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(`SELECT * FROM finance_debts WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      if (!rows.length) return res.status(404).json({ error: "finance_debt_not_found", message: "Debt was not found." });
+      const debt = debtPayload(rows[0]);
+      res.json({ debt, payoff: debtPayoffForPayload(debt) });
+    } catch (error) {
+      handleFinanceError(res, error, "finance_debt_failed");
+    }
+  });
+
+  app.patch("/api/finance/debts/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const existing = await client.query(`SELECT * FROM finance_debts WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId]);
+      if (!existing.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "finance_debt_not_found", message: "Debt was not found." });
+      }
+      const current = existing.rows[0];
+      const next = {
+        name: Object.prototype.hasOwnProperty.call(req.body || {}, "name") ? cleanString(req.body.name, 140) : current.name,
+        debt_type: Object.prototype.hasOwnProperty.call(req.body || {}, "debt_type") ? normalizeSet(req.body.debt_type, VALID_DEBT_TYPES) : current.debt_type,
+        current_balance_cents: Object.prototype.hasOwnProperty.call(req.body || {}, "current_balance_cents") ? parseCents(req.body.current_balance_cents, "current_balance_cents") : Number(current.current_balance_cents),
+        original_balance_cents: Object.prototype.hasOwnProperty.call(req.body || {}, "original_balance_cents") ? parseOptionalCents(req.body.original_balance_cents, "original_balance_cents") : current.original_balance_cents,
+        minimum_payment_cents: Object.prototype.hasOwnProperty.call(req.body || {}, "minimum_payment_cents") ? parseCents(req.body.minimum_payment_cents, "minimum_payment_cents") : Number(current.minimum_payment_cents),
+        planned_payment_cents: Object.prototype.hasOwnProperty.call(req.body || {}, "planned_payment_cents") ? parseCents(req.body.planned_payment_cents, "planned_payment_cents") : Number(current.planned_payment_cents),
+        apr_basis_points: Object.prototype.hasOwnProperty.call(req.body || {}, "apr_basis_points") ? parseOptionalAprBasisPoints(req.body.apr_basis_points) : current.apr_basis_points,
+        next_due_date: Object.prototype.hasOwnProperty.call(req.body || {}, "next_due_date") ? parseOptionalDateOnly(req.body.next_due_date, "next_due_date") : (current.next_due_date ? dateOnlyFromDb(current.next_due_date) : null),
+        target_payoff_date: Object.prototype.hasOwnProperty.call(req.body || {}, "target_payoff_date") ? parseOptionalDateOnly(req.body.target_payoff_date, "target_payoff_date") : (current.target_payoff_date ? dateOnlyFromDb(current.target_payoff_date) : null),
+        priority: Object.prototype.hasOwnProperty.call(req.body || {}, "priority") ? normalizeSet(req.body.priority, VALID_DEBT_PRIORITIES) : current.priority,
+        notes: Object.prototype.hasOwnProperty.call(req.body || {}, "notes") ? cleanString(req.body.notes, 1000) || null : current.notes
+      };
+      if (!next.name) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "debt_name_required", message: "Debt name is required." });
+      }
+      if (!next.debt_type) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "invalid_debt_type", message: "Choose a valid debt type." });
+      }
+      if (!next.priority) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "invalid_debt_priority", message: "Choose a valid priority." });
+      }
+      if ([next.current_balance_cents, next.original_balance_cents ?? 0, next.minimum_payment_cents, next.planned_payment_cents, next.apr_basis_points ?? 0].some((value) => Number(value) < 0)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "finance_amount_invalid", message: "Amounts cannot be negative." });
+      }
+      const status = next.current_balance_cents === 0 ? "paid" : "active";
+      const { rows } = await client.query(
+        `UPDATE finance_debts
+            SET name = $3,
+                debt_type = $4,
+                current_balance_cents = $5,
+                original_balance_cents = $6,
+                minimum_payment_cents = $7,
+                planned_payment_cents = $8,
+                apr_basis_points = $9,
+                next_due_date = $10,
+                target_payoff_date = $11,
+                priority = $12,
+                notes = $13,
+                status = $14,
+                updated_at = now()
+          WHERE id = $1
+            AND company_id = $2
+          RETURNING *`,
+        [req.params.id, req.companyId, next.name, next.debt_type, next.current_balance_cents, next.original_balance_cents, next.minimum_payment_cents, next.planned_payment_cents, next.apr_basis_points, next.next_due_date, next.target_payoff_date, next.priority, next.notes, status]
+      );
+      await syncDebtPlannedItem(client, req.companyId, rows[0], req.userId);
+      const refreshed = await client.query(`SELECT * FROM finance_debts WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      await client.query("COMMIT");
+      res.json(debtPayload(refreshed.rows[0]));
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      handleFinanceError(res, error, "finance_debt_update_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post("/api/finance/debts/:id/payments", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    const client = await pool.connect();
+    try {
+      const amount = parseCents(req.body?.amount_cents, "amount_cents");
+      const paymentDate = parseDateOnly(req.body?.payment_date || todayDateString(), "payment_date");
+      const note = cleanString(req.body?.note, 1000) || null;
+      const financeAccountId = cleanString(req.body?.finance_account_id, 80) || null;
+      if (amount <= 0) return res.status(400).json({ error: "finance_amount_invalid", message: "Payment amount must be greater than zero." });
+      await client.query("BEGIN");
+      const debtResult = await client.query(
+        `SELECT * FROM finance_debts WHERE id = $1 AND company_id = $2 AND archived_at IS NULL FOR UPDATE`,
+        [req.params.id, req.companyId]
+      );
+      if (!debtResult.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "finance_debt_not_found", message: "Debt was not found." });
+      }
+      const debt = debtResult.rows[0];
+      if (financeAccountId) {
+        const account = await client.query(`SELECT id FROM finance_accounts WHERE id = $1 AND company_id = $2 LIMIT 1`, [financeAccountId, req.companyId]);
+        if (!account.rows.length) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "finance_account_not_found", message: "Finance account was not found." });
+        }
+      }
+      const currentBalance = Number(debt.current_balance_cents || 0);
+      if (amount > currentBalance) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "debt_payment_exceeds_balance", message: "Payment cannot exceed the current debt balance." });
+      }
+      const nextBalance = currentBalance - amount;
+      const payment = await client.query(
+        `INSERT INTO finance_debt_payments (
+           company_id, debt_id, amount_cents, payment_date, note, finance_account_id, created_by
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+         RETURNING *`,
+        [req.companyId, debt.id, amount, paymentDate, note, financeAccountId, req.userId]
+      );
+      const updatedDebt = await client.query(
+        `UPDATE finance_debts
+            SET current_balance_cents = $3,
+                status = $4,
+                updated_at = now()
+          WHERE id = $1
+            AND company_id = $2
+          RETURNING *`,
+        [debt.id, req.companyId, nextBalance, nextBalance === 0 ? "paid" : "active"]
+      );
+      await syncDebtPlannedItem(client, req.companyId, updatedDebt.rows[0], req.userId);
+      await client.query("COMMIT");
+      res.status(201).json({ debt: debtPayload(updatedDebt.rows[0]), payment: debtPaymentPayload(payment.rows[0]) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      handleFinanceError(res, error, "finance_debt_payment_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/api/finance/debts/:id/payments", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const owned = await pool.query(`SELECT id FROM finance_debts WHERE id = $1 AND company_id = $2 LIMIT 1`, [req.params.id, req.companyId]);
+      if (!owned.rows.length) return res.status(404).json({ error: "finance_debt_not_found", message: "Debt was not found." });
+      const { rows } = await pool.query(
+        `SELECT * FROM finance_debt_payments WHERE debt_id = $1 AND company_id = $2 ORDER BY payment_date DESC, created_at DESC`,
+        [req.params.id, req.companyId]
+      );
+      res.json(rows.map(debtPaymentPayload));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_debt_payments_failed");
+    }
+  });
+
+  app.post("/api/finance/debts/:id/archive", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { rows } = await client.query(
+        `UPDATE finance_debts
+            SET archived_at = COALESCE(archived_at, now()),
+                updated_at = now()
+          WHERE id = $1
+            AND company_id = $2
+          RETURNING *`,
+        [req.params.id, req.companyId]
+      );
+      if (!rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "finance_debt_not_found", message: "Debt was not found." });
+      }
+      await syncDebtPlannedItem(client, req.companyId, rows[0], req.userId);
+      await client.query("COMMIT");
+      res.json(debtPayload(rows[0]));
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      handleFinanceError(res, error, "finance_debt_archive_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post("/api/finance/debts/:id/mark-paid", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { rows } = await client.query(
+        `UPDATE finance_debts
+            SET current_balance_cents = 0,
+                status = 'paid',
+                updated_at = now()
+          WHERE id = $1
+            AND company_id = $2
+          RETURNING *`,
+        [req.params.id, req.companyId]
+      );
+      if (!rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "finance_debt_not_found", message: "Debt was not found." });
+      }
+      await syncDebtPlannedItem(client, req.companyId, rows[0], req.userId);
+      await client.query("COMMIT");
+      res.json(debtPayload(rows[0]));
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      handleFinanceError(res, error, "finance_debt_mark_paid_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/api/finance/debts/:id/payoff", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(`SELECT * FROM finance_debts WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      if (!rows.length) return res.status(404).json({ error: "finance_debt_not_found", message: "Debt was not found." });
+      const debt = debtPayload(rows[0]);
+      res.json(debtPayoffForPayload(debt));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_debt_payoff_failed");
+    }
+  });
+
+  app.post("/api/finance/debts/:id/payment-preview", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const previewPayment = parseCents(req.body?.planned_payment_cents, "planned_payment_cents");
+      if (previewPayment < 0) return res.status(400).json({ error: "finance_amount_invalid", message: "Payment cannot be negative." });
+      const { rows } = await pool.query(`SELECT * FROM finance_debts WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      if (!rows.length) return res.status(404).json({ error: "finance_debt_not_found", message: "Debt was not found." });
+      const debt = debtPayload(rows[0]);
+      const current = debtPayoffForPayload(debt);
+      const preview = debtPayoffForPayload({ ...debt, planned_payment_cents: previewPayment });
+      const currentProjection = await loadProjection(pool, req.companyId, 30);
+      const plannedItems = await loadActivePlannedItems(pool, req.companyId);
+      const previewItems = plannedItems.map((item) => item.debt_id === debt.id ? { ...item, amount_cents: previewPayment } : item);
+      const accounts = await loadActiveAccounts(pool, req.companyId);
+      const settings = await ensureFinanceSettings(pool, req.companyId);
+      const startDate = todayDateString();
+      const previewProjection = buildProjection({
+        startingBalanceCents: accounts.reduce((sum, account) => sum + account.current_balance_cents, 0),
+        minimumReserveCents: settings.minimum_cash_reserve_cents,
+        plannedItems: previewItems,
+        startDate,
+        endDate: addDays(startDate, 30)
+      });
+      res.json({ current, preview, current_projection: currentProjection, preview_projection: previewProjection });
+    } catch (error) {
+      handleFinanceError(res, error, "finance_debt_payment_preview_failed");
+    }
+  });
+
+  app.get("/api/finance/budgets", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `SELECT * FROM finance_budgets WHERE company_id = $1 AND ($2::boolean OR archived_at IS NULL) ORDER BY category ASC, name ASC`,
+        [req.companyId, req.query.include_archived === "true"]
+      );
+      res.json(rows.map(budgetPayload));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_budgets_failed");
+    }
+  });
+
+  app.post("/api/finance/budgets", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const name = cleanString(req.body?.name, 140);
+      const category = cleanString(req.body?.category, 80);
+      const limit = parseCents(req.body?.limit_cents, "limit_cents");
+      const period = normalizeSet(req.body?.period, VALID_BUDGET_PERIODS, "monthly");
+      const startDate = parseDateOnly(req.body?.start_date || periodBounds(period || "monthly").start_date, "start_date");
+      const endDate = parseOptionalDateOnly(req.body?.end_date, "end_date");
+      const notes = cleanString(req.body?.notes, 1000) || null;
+      if (!name) return res.status(400).json({ error: "budget_name_required", message: "Budget name is required." });
+      if (!category) return res.status(400).json({ error: "budget_category_required", message: "Budget category is required." });
+      if (!period) return res.status(400).json({ error: "invalid_budget_period", message: "Choose a valid budget period." });
+      if (limit < 0) return res.status(400).json({ error: "finance_amount_invalid", message: "Budget limit cannot be negative." });
+      if (endDate && endDate < startDate) return res.status(400).json({ error: "budget_end_before_start", message: "End date must be after the start date." });
+      const { rows } = await pool.query(
+        `INSERT INTO finance_budgets (company_id, name, category, limit_cents, period, start_date, end_date, notes, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         RETURNING *`,
+        [req.companyId, name, category, limit, period, startDate, endDate, notes, req.userId]
+      );
+      res.status(201).json(budgetPayload(rows[0]));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_budget_create_failed");
+    }
+  });
+
+  app.get("/api/finance/budget-summary", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const period = normalizeSet(req.query.period, VALID_BUDGET_PERIODS, "monthly") || "monthly";
+      res.json(await loadBudgetSummary(pool, req.companyId, period));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_budget_summary_failed");
+    }
+  });
+
+  app.get("/api/finance/budgets/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(`SELECT * FROM finance_budgets WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      if (!rows.length) return res.status(404).json({ error: "finance_budget_not_found", message: "Budget was not found." });
+      const budget = budgetPayload(rows[0]);
+      const summary = await loadBudgetSummary(pool, req.companyId, budget.period);
+      res.json({ budget, summary: summary.budgets.find((item) => item.budget_id === budget.id) || null });
+    } catch (error) {
+      handleFinanceError(res, error, "finance_budget_failed");
+    }
+  });
+
+  app.patch("/api/finance/budgets/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const existing = await pool.query(`SELECT * FROM finance_budgets WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      if (!existing.rows.length) return res.status(404).json({ error: "finance_budget_not_found", message: "Budget was not found." });
+      const current = existing.rows[0];
+      const next = {
+        name: Object.prototype.hasOwnProperty.call(req.body || {}, "name") ? cleanString(req.body.name, 140) : current.name,
+        category: Object.prototype.hasOwnProperty.call(req.body || {}, "category") ? cleanString(req.body.category, 80) : current.category,
+        limit_cents: Object.prototype.hasOwnProperty.call(req.body || {}, "limit_cents") ? parseCents(req.body.limit_cents, "limit_cents") : Number(current.limit_cents),
+        period: Object.prototype.hasOwnProperty.call(req.body || {}, "period") ? normalizeSet(req.body.period, VALID_BUDGET_PERIODS) : current.period,
+        start_date: Object.prototype.hasOwnProperty.call(req.body || {}, "start_date") ? parseDateOnly(req.body.start_date, "start_date") : dateOnlyFromDb(current.start_date),
+        end_date: Object.prototype.hasOwnProperty.call(req.body || {}, "end_date") ? parseOptionalDateOnly(req.body.end_date, "end_date") : (current.end_date ? dateOnlyFromDb(current.end_date) : null),
+        notes: Object.prototype.hasOwnProperty.call(req.body || {}, "notes") ? cleanString(req.body.notes, 1000) || null : current.notes
+      };
+      if (!next.name) return res.status(400).json({ error: "budget_name_required", message: "Budget name is required." });
+      if (!next.category) return res.status(400).json({ error: "budget_category_required", message: "Budget category is required." });
+      if (!next.period) return res.status(400).json({ error: "invalid_budget_period", message: "Choose a valid budget period." });
+      if (next.limit_cents < 0) return res.status(400).json({ error: "finance_amount_invalid", message: "Budget limit cannot be negative." });
+      if (next.end_date && next.end_date < next.start_date) return res.status(400).json({ error: "budget_end_before_start", message: "End date must be after the start date." });
+      const { rows } = await pool.query(
+        `UPDATE finance_budgets
+            SET name = $3, category = $4, limit_cents = $5, period = $6,
+                start_date = $7, end_date = $8, notes = $9, updated_at = now()
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [req.params.id, req.companyId, next.name, next.category, next.limit_cents, next.period, next.start_date, next.end_date, next.notes]
+      );
+      res.json(budgetPayload(rows[0]));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_budget_update_failed");
+    }
+  });
+
+  app.post("/api/finance/budgets/:id/archive", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_budgets SET archived_at = COALESCE(archived_at, now()), updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`,
+        [req.params.id, req.companyId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_budget_not_found", message: "Budget was not found." });
+      res.json(budgetPayload(rows[0]));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_budget_archive_failed");
+    }
+  });
+
+  app.get("/api/finance/goals", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `SELECT * FROM finance_goals WHERE company_id = $1 AND ($2::boolean OR archived_at IS NULL) ORDER BY status ASC, created_at DESC`,
+        [req.companyId, req.query.include_archived === "true"]
+      );
+      const goals = rows.map(goalPayload);
+      res.json({ goals, summary: buildGoalsSummary(goals) });
+    } catch (error) {
+      handleFinanceError(res, error, "finance_goals_failed");
+    }
+  });
+
+  app.post("/api/finance/goals", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const name = cleanString(req.body?.name, 140);
+      const goalType = normalizeSet(req.body?.goal_type, VALID_GOAL_TYPES, "custom");
+      const targetAmount = parseCents(req.body?.target_amount_cents, "target_amount_cents");
+      const currentAmount = parseCents(req.body?.current_amount_cents ?? 0, "current_amount_cents");
+      const targetDate = parseOptionalDateOnly(req.body?.target_date, "target_date");
+      const notes = cleanString(req.body?.notes, 1000) || null;
+      if (!name) return res.status(400).json({ error: "goal_name_required", message: "Goal name is required." });
+      if (!goalType) return res.status(400).json({ error: "invalid_goal_type", message: "Choose a valid goal type." });
+      if (targetAmount < 0 || currentAmount < 0) return res.status(400).json({ error: "finance_amount_invalid", message: "Amounts cannot be negative." });
+      const { rows } = await pool.query(
+        `INSERT INTO finance_goals (company_id, name, goal_type, target_amount_cents, current_amount_cents, target_date, status, notes, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         RETURNING *`,
+        [req.companyId, name, goalType, targetAmount, currentAmount, targetDate, currentAmount >= targetAmount && targetAmount > 0 ? "completed" : "active", notes, req.userId]
+      );
+      res.status(201).json(goalPayload(rows[0]));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_goal_create_failed");
+    }
+  });
+
+  app.get("/api/finance/goals/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(`SELECT * FROM finance_goals WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      if (!rows.length) return res.status(404).json({ error: "finance_goal_not_found", message: "Goal was not found." });
+      const goal = goalPayload(rows[0]);
+      res.json({ goal, metrics: goalMetrics({ targetAmountCents: goal.target_amount_cents, currentAmountCents: goal.current_amount_cents, targetDate: goal.target_date, startDate: todayDateString() }) });
+    } catch (error) {
+      handleFinanceError(res, error, "finance_goal_failed");
+    }
+  });
+
+  app.patch("/api/finance/goals/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const existing = await pool.query(`SELECT * FROM finance_goals WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      if (!existing.rows.length) return res.status(404).json({ error: "finance_goal_not_found", message: "Goal was not found." });
+      const current = existing.rows[0];
+      const next = {
+        name: Object.prototype.hasOwnProperty.call(req.body || {}, "name") ? cleanString(req.body.name, 140) : current.name,
+        goal_type: Object.prototype.hasOwnProperty.call(req.body || {}, "goal_type") ? normalizeSet(req.body.goal_type, VALID_GOAL_TYPES) : current.goal_type,
+        target_amount_cents: Object.prototype.hasOwnProperty.call(req.body || {}, "target_amount_cents") ? parseCents(req.body.target_amount_cents, "target_amount_cents") : Number(current.target_amount_cents),
+        current_amount_cents: Object.prototype.hasOwnProperty.call(req.body || {}, "current_amount_cents") ? parseCents(req.body.current_amount_cents, "current_amount_cents") : Number(current.current_amount_cents),
+        target_date: Object.prototype.hasOwnProperty.call(req.body || {}, "target_date") ? parseOptionalDateOnly(req.body.target_date, "target_date") : (current.target_date ? dateOnlyFromDb(current.target_date) : null),
+        status: Object.prototype.hasOwnProperty.call(req.body || {}, "status") ? normalizeSet(req.body.status, VALID_GOAL_STATUSES) : current.status,
+        notes: Object.prototype.hasOwnProperty.call(req.body || {}, "notes") ? cleanString(req.body.notes, 1000) || null : current.notes
+      };
+      if (!next.name) return res.status(400).json({ error: "goal_name_required", message: "Goal name is required." });
+      if (!next.goal_type) return res.status(400).json({ error: "invalid_goal_type", message: "Choose a valid goal type." });
+      if (!next.status) return res.status(400).json({ error: "invalid_goal_status", message: "Choose a valid goal status." });
+      if (next.target_amount_cents < 0 || next.current_amount_cents < 0) return res.status(400).json({ error: "finance_amount_invalid", message: "Amounts cannot be negative." });
+      const { rows } = await pool.query(
+        `UPDATE finance_goals
+            SET name = $3, goal_type = $4, target_amount_cents = $5,
+                current_amount_cents = $6, target_date = $7, status = $8,
+                notes = $9, updated_at = now()
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [req.params.id, req.companyId, next.name, next.goal_type, next.target_amount_cents, next.current_amount_cents, next.target_date, next.status, next.notes]
+      );
+      res.json(goalPayload(rows[0]));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_goal_update_failed");
+    }
+  });
+
+  app.post("/api/finance/goals/:id/contributions", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    const client = await pool.connect();
+    try {
+      const amount = parseCents(req.body?.amount_cents, "amount_cents");
+      const contributionDate = parseDateOnly(req.body?.contribution_date || todayDateString(), "contribution_date");
+      const note = cleanString(req.body?.note, 1000) || null;
+      if (amount <= 0) return res.status(400).json({ error: "finance_amount_invalid", message: "Contribution amount must be greater than zero." });
+      await client.query("BEGIN");
+      const goalResult = await client.query(`SELECT * FROM finance_goals WHERE id = $1 AND company_id = $2 AND archived_at IS NULL FOR UPDATE`, [req.params.id, req.companyId]);
+      if (!goalResult.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "finance_goal_not_found", message: "Goal was not found." });
+      }
+      const goal = goalResult.rows[0];
+      const contribution = await client.query(
+        `INSERT INTO finance_goal_contributions (company_id, goal_id, amount_cents, contribution_date, note, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         RETURNING *`,
+        [req.companyId, goal.id, amount, contributionDate, note, req.userId]
+      );
+      const newCurrent = Number(goal.current_amount_cents || 0) + amount;
+      const updated = await client.query(
+        `UPDATE finance_goals
+            SET current_amount_cents = $3,
+                status = $4,
+                updated_at = now()
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [goal.id, req.companyId, newCurrent, newCurrent >= Number(goal.target_amount_cents || 0) && Number(goal.target_amount_cents || 0) > 0 ? "completed" : "active"]
+      );
+      await client.query("COMMIT");
+      res.status(201).json({ goal: goalPayload(updated.rows[0]), contribution: goalContributionPayload(contribution.rows[0]) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      handleFinanceError(res, error, "finance_goal_contribution_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/api/finance/goals/:id/contributions", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const owned = await pool.query(`SELECT id FROM finance_goals WHERE id = $1 AND company_id = $2 LIMIT 1`, [req.params.id, req.companyId]);
+      if (!owned.rows.length) return res.status(404).json({ error: "finance_goal_not_found", message: "Goal was not found." });
+      const { rows } = await pool.query(
+        `SELECT * FROM finance_goal_contributions WHERE goal_id = $1 AND company_id = $2 ORDER BY contribution_date DESC, created_at DESC`,
+        [req.params.id, req.companyId]
+      );
+      res.json(rows.map(goalContributionPayload));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_goal_contributions_failed");
+    }
+  });
+
+  app.post("/api/finance/goals/:id/archive", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_goals SET archived_at = COALESCE(archived_at, now()), updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`,
+        [req.params.id, req.companyId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_goal_not_found", message: "Goal was not found." });
+      res.json(goalPayload(rows[0]));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_goal_archive_failed");
+    }
+  });
+
+  app.post("/api/finance/goals/:id/complete", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_goals SET status = 'completed', updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`,
+        [req.params.id, req.companyId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_goal_not_found", message: "Goal was not found." });
+      res.json(goalPayload(rows[0]));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_goal_complete_failed");
+    }
+  });
 }
