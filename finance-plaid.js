@@ -1271,7 +1271,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
             AND t.status = 'posted'
             AND t.pending = false
             AND t.removed_at IS NULL
-            AND t.transaction_date >= (CURRENT_DATE - ($2::int || ' months')::interval)
+            AND t.transaction_date >= (CURRENT_DATE - make_interval(months => $2::int))
           ORDER BY t.transaction_date ASC`,
         [req.companyId, lookbackMonths]
       );
@@ -1430,7 +1430,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
             candidate.display_name,
             candidate.direction,
             Number(candidate.median_amount_cents || 0),
-            dateOnlyPayload(candidate.next_expected_date) || dateOnlyPayload(candidate.last_seen_date),
+            dateOnlyPayload(candidate.next_expected_date) || dateOnlyPayload(candidate.last_seen_date) || new Date().toISOString().slice(0, 10),
             candidate.category || (candidate.direction === "income" ? "Other Income" : "Other"),
             candidate.cadence,
             notes,

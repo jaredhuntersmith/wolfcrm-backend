@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  analyzeRecurringTransactionPatterns,
   collectPlaidSyncPages,
   decryptAccessToken,
   encryptAccessToken,
@@ -8,6 +9,8 @@ import {
   getPlaidEnvironmentConfig,
   isLiquidFinanceAccount,
   isSafeLocalDisconnectProviderFailure,
+  monthlyEquivalentCents,
+  normalizeRecurringMerchantName,
   normalizePlaidTransactionAmount,
   plaidAccountToFinanceAccount,
   plaidSecretForEnvironment,
@@ -27,6 +30,25 @@ function run(name, fn) {
       console.error(`FAIL ${name}`);
       throw error;
     });
+}
+
+function recurringTx(merchant, date, amountCents, extras = {}) {
+  return {
+    id: `${merchant}_${date}_${amountCents}`.replace(/\s+/g, "_"),
+    transaction_date: date,
+    merchant_name: merchant,
+    original_name: merchant,
+    direction: extras.direction || "expense",
+    amount_cents: amountCents,
+    status: "posted",
+    pending: false,
+    normalized_category: extras.category || "Other",
+    account_id: extras.account_id || "account_1"
+  };
+}
+
+function candidateFor(transactions, displayName) {
+  return analyzeRecurringTransactionPatterns(transactions).find((candidate) => candidate.display_name === displayName);
 }
 
 await run("encrypt/decrypt access token", () => {
@@ -206,6 +228,98 @@ await run("liquid account rules", () => {
   assert.equal(isLiquidFinanceAccount({ source: "plaid", plaid_account_type: "loan", plaid_account_subtype: "student" }), false);
   assert.equal(isLiquidFinanceAccount({ source: "plaid", plaid_account_type: "depository", plaid_account_subtype: "checking", include_in_liquid_cash: false }), false);
   assert.equal(isLiquidFinanceAccount({ source: "plaid", plaid_account_type: "depository", plaid_account_subtype: "checking", plaid_item_status: "disconnected" }), false);
+});
+
+await run("recurring merchant normalization merges common provider variants", () => {
+  assert.equal(normalizeRecurringMerchantName("NETFLIX.COM 1234"), "NETFLIX");
+  assert.equal(normalizeRecurringMerchantName("PAYPAL *SPOTIFY USA"), "SPOTIFY");
+  assert.equal(normalizeRecurringMerchantName("APPLE.COM/BILL 8273"), "APPLE");
+});
+
+await run("Netflix monthly equal amounts becomes high-confidence subscription", () => {
+  const txs = ["2026-01-10", "2026-02-10", "2026-03-10", "2026-04-10", "2026-05-10", "2026-06-10"]
+    .map((date) => recurringTx("NETFLIX.COM 1234", date, 2299, { category: "Subscription" }));
+  const netflix = candidateFor(txs, "Netflix");
+  assert.equal(netflix.cadence, "monthly");
+  assert.equal(netflix.candidate_type, "subscription");
+  assert.equal(netflix.confidence_label, "high");
+  assert.equal(netflix.next_expected_date, "2026-07-10");
+});
+
+await run("Spotify monthly becomes subscription", () => {
+  const txs = ["2026-01-05", "2026-02-05", "2026-03-05", "2026-04-05", "2026-05-05"]
+    .map((date) => recurringTx("PAYPAL *SPOTIFY", date, 1199, { category: "Subscription" }));
+  const spotify = candidateFor(txs, "Spotify");
+  assert.equal(spotify.candidate_type, "subscription");
+  assert.equal(spotify.cadence, "monthly");
+});
+
+await run("rent monthly becomes recurring bill", () => {
+  const txs = ["2026-01-01", "2026-02-01", "2026-03-01", "2026-04-01", "2026-05-01", "2026-06-01"]
+    .map((date) => recurringTx("Main Street Rent", date, 110000, { category: "Rent" }));
+  const rent = candidateFor(txs, "Main Street Rent");
+  assert.equal(rent.candidate_type, "recurring_bill");
+  assert.equal(rent.cadence, "monthly");
+});
+
+await run("variable electric bill is recurring bill with variability", () => {
+  const txs = [
+    recurringTx("City Electric", "2026-01-12", 11800, { category: "Utilities" }),
+    recurringTx("City Electric", "2026-02-12", 14500, { category: "Utilities" }),
+    recurringTx("City Electric", "2026-03-12", 17100, { category: "Utilities" }),
+    recurringTx("City Electric", "2026-04-12", 13900, { category: "Utilities" })
+  ];
+  const electric = candidateFor(txs, "City Electric");
+  assert.equal(electric.candidate_type, "recurring_bill");
+  assert.equal(electric.variability, "variable");
+});
+
+await run("payroll biweekly becomes recurring income", () => {
+  const txs = ["2026-01-02", "2026-01-16", "2026-01-30", "2026-02-13"]
+    .map((date) => recurringTx("ACME Payroll", date, 220000, { direction: "income", category: "Other Income" }));
+  const payroll = candidateFor(txs, "Acme Payroll");
+  assert.equal(payroll.candidate_type, "recurring_income");
+  assert.equal(payroll.cadence, "biweekly");
+});
+
+await run("fast food and fuel repeats are repeated merchants, not subscriptions", () => {
+  const txs = [
+    ...["2026-01-02", "2026-01-09", "2026-01-16", "2026-01-23"].map((date) => recurringTx("McDonald's", date, 1288, { category: "Food" })),
+    ...["2026-02-02", "2026-02-09", "2026-02-16", "2026-02-23"].map((date) => recurringTx("Shell Oil", date, 4500, { category: "Fuel" }))
+  ];
+  const candidates = analyzeRecurringTransactionPatterns(txs);
+  assert.equal(candidates.find((candidate) => candidate.merchant_normalized === "MCDONALD S").candidate_type, "repeated_merchant");
+  assert.equal(candidates.find((candidate) => candidate.merchant_normalized === "SHELL OIL").candidate_type, "repeated_merchant");
+});
+
+await run("irregular Home Depot does not become recurring obligation", () => {
+  const txs = [
+    recurringTx("Home Depot", "2026-01-02", 18742, { category: "Materials" }),
+    recurringTx("Home Depot", "2026-01-28", 6319, { category: "Materials" }),
+    recurringTx("Home Depot", "2026-03-11", 9144, { category: "Materials" })
+  ];
+  const homeDepot = candidateFor(txs, "Home Depot");
+  assert.ok(!homeDepot || homeDepot.candidate_type === "repeated_merchant");
+});
+
+await run("quarterly insurance and yearly renewal cadences are detected", () => {
+  const txs = [
+    recurringTx("Business Insurance", "2026-01-15", 30000, { category: "Insurance" }),
+    recurringTx("Business Insurance", "2026-04-15", 30000, { category: "Insurance" }),
+    recurringTx("Business Insurance", "2026-07-15", 30000, { category: "Insurance" }),
+    recurringTx("Annual Software Renewal", "2025-06-01", 120000, { category: "Subscription" }),
+    recurringTx("Annual Software Renewal", "2026-06-01", 120000, { category: "Subscription" })
+  ];
+  const candidates = analyzeRecurringTransactionPatterns(txs, { minimumConfidence: 30 });
+  assert.equal(candidates.find((candidate) => candidate.display_name === "Business Insurance").cadence, "quarterly");
+  assert.equal(candidates.find((candidate) => candidate.display_name === "Annual Software Renewal").cadence, "yearly");
+});
+
+await run("monthly equivalent uses cents-safe recurrence math", () => {
+  assert.equal(monthlyEquivalentCents(1200, "weekly"), 5200);
+  assert.equal(monthlyEquivalentCents(1200, "biweekly"), 2600);
+  assert.equal(monthlyEquivalentCents(1200, "quarterly"), 400);
+  assert.equal(monthlyEquivalentCents(1200, "yearly"), 100);
 });
 
 await run("pending to posted keeps stable transaction id", () => {
