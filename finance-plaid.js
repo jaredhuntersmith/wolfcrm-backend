@@ -62,6 +62,9 @@ function handleFinanceDataError(res, error, fallback) {
     });
   }
   console.error("[finance]", fallback, { message: error?.message });
+  if (fallback === "finance_recurring_confirm_failed") {
+    return res.status(500).json({ error: fallback, message: "Couldn't confirm this recurring item. Please try again." });
+  }
   return res.status(500).json({ error: fallback, message: "Finance request failed." });
 }
 
@@ -1639,10 +1642,9 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     try {
       await client.query("BEGIN");
       const existing = await client.query(
-        `SELECT c.*, a.name AS account_name
-           FROM finance_recurring_candidates c
-           LEFT JOIN finance_accounts a ON a.id = c.account_id AND a.company_id = c.company_id
-          WHERE c.id = $1 AND c.company_id = $2
+        `SELECT *
+           FROM finance_recurring_candidates
+          WHERE id = $1 AND company_id = $2
           FOR UPDATE`,
         [req.params.id, req.companyId]
       );
@@ -1652,8 +1654,15 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
         return res.status(404).json({ error: "recurring_candidate_not_found", message: "Recurring item was not found." });
       }
       if (candidate.status === "confirmed" && candidate.linked_planned_item_id) {
+        const account = candidate.account_id
+          ? await client.query(`SELECT name AS account_name FROM finance_accounts WHERE id = $1 AND company_id = $2 LIMIT 1`, [candidate.account_id, req.companyId])
+          : { rows: [] };
         await client.query("COMMIT");
-        return res.json({ candidate: recurringCandidatePayload(candidate), planned_item_id: candidate.linked_planned_item_id, linked_existing: true });
+        return res.json({
+          candidate: recurringCandidatePayload({ ...candidate, account_name: account.rows[0]?.account_name || null }),
+          planned_item_id: candidate.linked_planned_item_id,
+          linked_existing: true
+        });
       }
       if (candidate.candidate_type === "repeated_merchant" || candidate.cadence === "irregular") {
         await client.query("ROLLBACK");
@@ -1716,9 +1725,12 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
           RETURNING *`,
         [candidate.id, req.companyId, plannedItem.id]
       );
+      const account = updated.rows[0]?.account_id
+        ? await client.query(`SELECT name AS account_name FROM finance_accounts WHERE id = $1 AND company_id = $2 LIMIT 1`, [updated.rows[0].account_id, req.companyId])
+        : { rows: [] };
       await client.query("COMMIT");
       res.json({
-        candidate: recurringCandidatePayload(updated.rows[0]),
+        candidate: recurringCandidatePayload({ ...updated.rows[0], account_name: account.rows[0]?.account_name || null }),
         planned_item_id: plannedItem.id,
         linked_existing: linkedExisting
       });

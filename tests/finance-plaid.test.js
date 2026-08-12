@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   analyzeRecurringTransactionPatterns,
   collectPlaidSyncPages,
@@ -21,6 +22,7 @@ import {
 
 const keyA = "0123456789abcdef0123456789abcdef";
 const keyB = "abcdef0123456789abcdef0123456789";
+const financePlaidSource = readFileSync(new URL("../finance-plaid.js", import.meta.url), "utf8");
 
 function run(name, fn) {
   return Promise.resolve()
@@ -49,6 +51,13 @@ function recurringTx(merchant, date, amountCents, extras = {}) {
 
 function candidateFor(transactions, displayName) {
   return analyzeRecurringTransactionPatterns(transactions).find((candidate) => candidate.display_name === displayName);
+}
+
+function routeSource(pathMarker) {
+  const start = financePlaidSource.indexOf(pathMarker);
+  assert.notEqual(start, -1);
+  const nextRoute = financePlaidSource.indexOf("\n  app.", start + pathMarker.length);
+  return financePlaidSource.slice(start, nextRoute === -1 ? undefined : nextRoute);
 }
 
 await run("encrypt/decrypt access token", () => {
@@ -320,6 +329,17 @@ await run("monthly equivalent uses cents-safe recurrence math", () => {
   assert.equal(monthlyEquivalentCents(1200, "biweekly"), 2600);
   assert.equal(monthlyEquivalentCents(1200, "quarterly"), 400);
   assert.equal(monthlyEquivalentCents(1200, "yearly"), 100);
+});
+
+await run("recurring confirm locks candidate row without outer join", () => {
+  const source = routeSource('/api/finance/recurring-candidates/:id/confirm');
+  assert.match(source, /FROM finance_recurring_candidates\s+WHERE id = \$1 AND company_id = \$2\s+FOR UPDATE/);
+  assert.doesNotMatch(source, /LEFT JOIN[\s\S]{0,300}FOR UPDATE/);
+});
+
+await run("recurring confirm is local only and does not call Plaid", () => {
+  const source = routeSource('/api/finance/recurring-candidates/:id/confirm');
+  assert.doesNotMatch(source, /plaidClient|itemRemove|accountsBalanceGet|transactionsSync|linkTokenCreate|itemPublicTokenExchange/);
 });
 
 await run("pending to posted keeps stable transaction id", () => {
