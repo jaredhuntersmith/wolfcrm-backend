@@ -182,6 +182,211 @@ export function totalEffectiveLiquidCashCents(accounts, settings = {}) {
   return (accounts || []).reduce((sum, account) => sum + effectiveFinanceAccountBalanceCents(account, settings), 0);
 }
 
+function dateOnly(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+}
+
+function daysBetween(a, b) {
+  const left = new Date(`${a}T00:00:00Z`);
+  const right = new Date(`${b}T00:00:00Z`);
+  return Math.round((right - left) / 86400000);
+}
+
+function addDaysToDate(dateString, days) {
+  const date = new Date(`${dateString}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function addMonthsClampedDate(dateString, months) {
+  const [year, month, day] = dateString.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1 + months, 1));
+  const maxDay = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
+  date.setUTCDate(Math.min(day, maxDay));
+  return date.toISOString().slice(0, 10);
+}
+
+function median(values) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+}
+
+function average(values) {
+  if (!values.length) return 0;
+  return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
+}
+
+function standardDeviation(values) {
+  if (values.length < 2) return 0;
+  const avg = average(values);
+  const variance = values.reduce((sum, value) => sum + ((value - avg) ** 2), 0) / values.length;
+  return Math.round(Math.sqrt(variance));
+}
+
+function titleCase(value) {
+  return value
+    .toLowerCase()
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+export function normalizeRecurringMerchantName(value) {
+  let text = (value || "").toString().toUpperCase();
+  text = text.replace(/^PAYPAL\s*[*-]\s*/, "");
+  text = text.replace(/^SQ\s*[*-]\s*/, "");
+  text = text.replace(/^TST\s*[*-]\s*/, "");
+  text = text.replace(/APPLE\.COM\/BILL.*/, "APPLE");
+  text = text.replace(/NETFLIX\.COM.*/, "NETFLIX");
+  text = text.replace(/SPOTIFY.*/, "SPOTIFY");
+  text = text.replace(/AMZN MKTP.*/, "AMAZON");
+  text = text.replace(/[^A-Z0-9 ]+/g, " ");
+  text = text.replace(/\b(COM|INC|LLC|USA|US|ONLINE|PAYMENT|PURCHASE|POS|DEBIT|CARD)\b/g, " ");
+  text = text.replace(/\b\d{2,}\b/g, " ");
+  text = text.replace(/\s+/g, " ").trim();
+  return text || "UNKNOWN";
+}
+
+function inferCadence(intervals, occurrenceCount) {
+  if (!intervals.length) return null;
+  const med = median(intervals);
+  const checks = [
+    { cadence: "weekly", min: 6, max: 8, minOccurrences: 3, nextDays: 7 },
+    { cadence: "biweekly", min: 12, max: 16, minOccurrences: 3, nextDays: 14 },
+    { cadence: "monthly", min: 25, max: 35, minOccurrences: 2, nextMonths: 1 },
+    { cadence: "quarterly", min: 75, max: 105, minOccurrences: 2, nextMonths: 3 },
+    { cadence: "yearly", min: 330, max: 400, minOccurrences: 2, nextMonths: 12 }
+  ];
+  return checks.find((check) => occurrenceCount >= check.minOccurrences && med >= check.min && med <= check.max) || null;
+}
+
+function categoryForGroup(transactions) {
+  const counts = new Map();
+  for (const tx of transactions) {
+    const category = tx.normalized_category || tx.category || tx.category_primary || "Other";
+    counts.set(category, (counts.get(category) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || "Other";
+}
+
+function recurringCandidateType({ direction, displayName, category, variability, cadence }) {
+  const text = `${displayName} ${category}`.toUpperCase();
+  if (direction === "income") return "recurring_income";
+  if (text.match(/LOAN|DEBT|CREDIT CARD|IRS|TAX PAYMENT/)) return "debt_payment";
+  if (text.match(/RENT|UTILITY|UTILITIES|ELECTRIC|WATER|GAS BILL|INSURANCE|PHONE|INTERNET|TAX/)) return "recurring_bill";
+  if (text.match(/NETFLIX|SPOTIFY|APPLE|SUBSCRIPTION|DIGITAL|STREAMING|ENTERTAINMENT|SOFTWARE|SAAS/)) return "subscription";
+  if (["weekly", "biweekly", "monthly", "quarterly", "yearly"].includes(cadence) && variability !== "variable") return "recurring_expense";
+  return "repeated_merchant";
+}
+
+function confidenceLabel(score) {
+  if (score >= 78) return "high";
+  if (score >= 55) return "medium";
+  return "low";
+}
+
+export function monthlyEquivalentCents(amountCents, cadence) {
+  switch (cadence) {
+  case "weekly": return Math.round(amountCents * 52 / 12);
+  case "biweekly": return Math.round(amountCents * 26 / 12);
+  case "quarterly": return Math.round(amountCents / 3);
+  case "yearly": return Math.round(amountCents / 12);
+  default: return amountCents;
+  }
+}
+
+export function analyzeRecurringTransactionPatterns(transactions, options = {}) {
+  const groups = new Map();
+  for (const raw of transactions || []) {
+    const date = dateOnly(raw.transaction_date);
+    if (!date || raw.removed_at || raw.pending || raw.status === "pending") continue;
+    const name = raw.merchant_name || raw.original_name || raw.name || raw.description;
+    const normalized = normalizeRecurringMerchantName(name);
+    if (!normalized || normalized === "UNKNOWN") continue;
+    const key = `${raw.direction || "expense"}:${normalized}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({
+      ...raw,
+      transaction_date: date,
+      amount_cents: Number(raw.amount_cents || 0),
+      direction: raw.direction || "expense"
+    });
+  }
+
+  const candidates = [];
+  for (const [key, group] of groups.entries()) {
+    const sorted = group.sort((a, b) => a.transaction_date.localeCompare(b.transaction_date));
+    const occurrenceCount = sorted.length;
+    if (occurrenceCount < 2) continue;
+    const intervals = [];
+    for (let index = 1; index < sorted.length; index += 1) {
+      intervals.push(daysBetween(sorted[index - 1].transaction_date, sorted[index].transaction_date));
+    }
+    const cadenceInfo = inferCadence(intervals, occurrenceCount);
+    const amounts = sorted.map((tx) => tx.amount_cents);
+    const med = median(amounts);
+    const avg = average(amounts);
+    const min = Math.min(...amounts);
+    const max = Math.max(...amounts);
+    const std = standardDeviation(amounts);
+    const variabilityRatio = med > 0 ? (max - min) / med : 0;
+    const variability = variabilityRatio <= 0.05 ? "fixed" : variabilityRatio <= 0.20 ? "mostly_fixed" : "variable";
+    const category = categoryForGroup(sorted);
+    const direction = sorted[0].direction;
+    const merchantNormalized = key.split(":").slice(1).join(":");
+    const displayName = titleCase(merchantNormalized);
+    const cadence = cadenceInfo?.cadence || "irregular";
+    let candidateType = recurringCandidateType({ direction, displayName, category, variability, cadence });
+    if (!cadenceInfo && occurrenceCount >= 3) candidateType = "repeated_merchant";
+    if (!cadenceInfo && occurrenceCount < 3) continue;
+    const cadenceConsistency = cadenceInfo ? intervals.filter((interval) => interval >= cadenceInfo.min && interval <= cadenceInfo.max).length / intervals.length : 0;
+    let score = 20;
+    score += Math.min(25, occurrenceCount * 5);
+    score += Math.round(cadenceConsistency * 30);
+    score += variability === "fixed" ? 20 : variability === "mostly_fixed" ? 12 : 4;
+    if (candidateType !== "repeated_merchant") score += 8;
+    score = Math.max(0, Math.min(100, score));
+    const lastDate = sorted[sorted.length - 1].transaction_date;
+    const nextExpectedDate = cadenceInfo?.nextMonths
+      ? addMonthsClampedDate(lastDate, cadenceInfo.nextMonths)
+      : cadenceInfo?.nextDays
+        ? addDaysToDate(lastDate, cadenceInfo.nextDays)
+        : null;
+    candidates.push({
+      merchant_normalized: merchantNormalized,
+      display_name: displayName,
+      direction,
+      candidate_type: candidateType,
+      cadence,
+      average_amount_cents: avg,
+      median_amount_cents: med,
+      min_amount_cents: min,
+      max_amount_cents: max,
+      variability,
+      variability_score_cents: std,
+      first_seen_date: sorted[0].transaction_date,
+      last_seen_date: lastDate,
+      next_expected_date: nextExpectedDate,
+      occurrence_count: occurrenceCount,
+      confidence_score: score,
+      confidence_label: confidenceLabel(score),
+      source: "wolfcrm_inferred",
+      category,
+      account_id: sorted[sorted.length - 1].account_id || null,
+      source_transaction_ids: sorted.map((tx) => tx.id).filter(Boolean),
+      monthly_equivalent_cents: monthlyEquivalentCents(med, cadence)
+    });
+  }
+  return candidates
+    .filter((candidate) => candidate.confidence_score >= (options.minimumConfidence || 35))
+    .sort((a, b) => b.confidence_score - a.confidence_score || b.occurrence_count - a.occurrence_count);
+}
+
 export function plaidAccountToFinanceAccount(account, item) {
   const balances = account.balances || {};
   const current = balances.current === null || balances.current === undefined ? 0 : providerAmountToCents(balances.current);
