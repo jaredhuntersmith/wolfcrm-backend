@@ -757,6 +757,86 @@ test("resolver ordinal uses recent candidate context", async () => {
   assert.equal(result.entity.id, "tx_1");
 });
 
+test("deterministic fallback answers overview after empty model final", () => {
+  const fallback = financeAIInternals.buildDeterministicFallback([
+    {
+      name: "get_finance_overview",
+      result: {
+        total_liquid_cash_cents: 800000,
+        safe_to_spend_cents: 215000,
+        minimum_cash_reserve_cents: 200000,
+        projection_summary: {
+          lowest_projected_balance_cents: 415000,
+          lowest_projected_balance_date: "2026-08-20",
+          ending_balance_cents: 500000
+        }
+      }
+    }
+  ], "How much money do I have?");
+  assert.ok(fallback.text.includes("$8,000.00"));
+  assert.ok(fallback.text.includes("Safe to spend"));
+});
+
+test("recurring transaction inference identifies monthly subscription and avoids fast food subscription label", async () => {
+  const pool = new FakePool();
+  pool.query = async (sql, values = []) => {
+    pool.queries.push({ sql, values });
+    if (sql.includes("FROM finance_transactions")) return { rows: [
+      { merchant_name: "Netflix", category: "Subscriptions", direction: "expense", amount_cents: 2299, transaction_date: "2026-03-01" },
+      { merchant_name: "Netflix", category: "Subscriptions", direction: "expense", amount_cents: 2299, transaction_date: "2026-04-01" },
+      { merchant_name: "Netflix", category: "Subscriptions", direction: "expense", amount_cents: 2299, transaction_date: "2026-05-01" },
+      { merchant_name: "Netflix", category: "Subscriptions", direction: "expense", amount_cents: 2299, transaction_date: "2026-06-01" },
+      { merchant_name: "Netflix", category: "Subscriptions", direction: "expense", amount_cents: 2299, transaction_date: "2026-07-01" },
+      { merchant_name: "McDonald's", category: "Food", direction: "expense", amount_cents: 1299, transaction_date: "2026-07-01" },
+      { merchant_name: "McDonald's", category: "Food", direction: "expense", amount_cents: 1899, transaction_date: "2026-07-08" },
+      { merchant_name: "McDonald's", category: "Food", direction: "expense", amount_cents: 999, transaction_date: "2026-07-16" }
+    ] };
+    return FakePool.prototype.query.call(pool, sql, values);
+  };
+  const result = await executeFinanceAITool(pool, ctx, "analyze_recurring_transactions", { direction: "expense", months: 12, limit: 10 });
+  const netflix = result.patterns.find((item) => item.merchant_name === "Netflix");
+  const fastFood = result.patterns.find((item) => item.merchant_name === "McDonald's");
+  assert.equal(netflix.classification, "subscription_likely");
+  assert.notEqual(fastFood?.classification, "subscription_likely");
+});
+
+test("deterministic goal draft continuation creates proposal when required fields are complete", async () => {
+  const pool = new FakePool();
+  pool.query = async (sql, values = []) => {
+    pool.queries.push({ sql, values });
+    if (sql.includes("SELECT *") && sql.includes("finance_ai_action_proposals") && sql.includes("status = 'collecting'")) {
+      return { rows: [row({
+        id: "proposal_1",
+        conversation_id: "conv_1",
+        owner_user_id: "user_1",
+        action_type: "create_goal",
+        status: "collecting",
+        payload: { tool_name: "create_goal", args: {}, missing_fields: ["name", "target_amount_cents"] },
+        summary: "Collecting goal"
+      })] };
+    }
+    if (sql.includes("UPDATE finance_ai_action_proposals") && sql.includes("status = 'proposed'")) {
+      return { rows: [row({
+        id: "proposal_1",
+        conversation_id: "conv_1",
+        owner_user_id: "user_1",
+        action_type: "create_goal",
+        status: "proposed",
+        payload: { tool_name: "create_goal", args: values[3] },
+        summary: "Create goal: Xbox Savings for $600.00",
+        risk_level: "normal"
+      })] };
+    }
+    if (sql.includes("INSERT INTO finance_ai_actions")) return { rows: [] };
+    return FakePool.prototype.query.call(pool, sql, values);
+  };
+  const localCtx = { ...ctx, actionProposals: [], userMessage: "make the name xbox savings. doesnt matter what goal type but i guess just make it for toys. $600 by december 1st. nothing saved yet" };
+  const result = await financeAIInternals.handleDeterministicFinanceTurn(pool, localCtx, localCtx.userMessage);
+  assert.equal(result.handled, true);
+  assert.equal(result.responseType, "proposal");
+  assert.equal(localCtx.actionProposals.length, 1);
+});
+
 let passed = 0;
 for (const item of tests) {
   try {
