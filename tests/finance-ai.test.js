@@ -40,6 +40,9 @@ class FakePool {
     if (sql.includes("FROM finance_receipts")) return { rows: [
       { id: "receipt_1", transaction_id: null, status: "unmatched", merchant_name: "Home Depot", purchase_date: "2026-08-11", amount_cents: 30000, finance_category: "Equipment", business_use: "business", match_method: null, match_confidence: null, created_at: new Date().toISOString() }
     ] };
+    if (sql.includes("INSERT INTO finance_ai_action_proposals")) return { rows: [
+      row({ conversation_id: "conv_1", owner_user_id: "user_1", action_type: "create_budget", status: "proposed", payload: { tool_name: "create_budget", args: {} }, summary: "Create budget" })
+    ] };
     if (sql.includes("INSERT INTO finance_ai_actions")) return { rows: [] };
     return { rows: [] };
   }
@@ -204,9 +207,12 @@ test("write tools require explicit intent", async () => {
   await assert.rejects(() => executeFinanceAITool(new FakePool(), ctx, "create_budget", { name: "Ads", category: "Advertising", limit_cents: 100000, period: "monthly" }));
 });
 
-test("explicit write creates audit record", async () => {
+test("explicit write creates action proposal and audit record", async () => {
   const pool = new FakePool();
-  await executeFinanceAITool(pool, { ...ctx, userMessage: "Create an ads budget" }, "create_budget", { name: "Ads", category: "Advertising", limit_cents: 100000, period: "monthly" });
+  const result = await executeFinanceAITool(pool, { ...ctx, userMessage: "Create an ads budget", actionProposals: [] }, "create_budget", { name: "Ads", category: "Advertising", limit_cents: 100000, period: "monthly" });
+  assert.equal(result.requires_confirmation, true);
+  assert.equal(result.proposed_action.status, "proposed");
+  assert.equal(pool.queries.some((query) => query.sql.includes("INSERT INTO finance_ai_action_proposals")), true);
   assert.equal(pool.queries.some((query) => query.sql.includes("INSERT INTO finance_ai_actions")), true);
 });
 
