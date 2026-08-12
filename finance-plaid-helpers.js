@@ -170,11 +170,14 @@ export function plaidAccountToFinanceAccount(account, item) {
   const available = balances.available === null || balances.available === undefined ? null : providerAmountToCents(balances.available);
   const subtype = account.subtype || "other";
   const accountType = subtype === "checking" || subtype === "savings" ? subtype : "other";
+  const shouldUseAvailableAsCurrent = account.type === "depository"
+    && ["checking", "savings", "cash management", "money market", "prepaid"].includes(subtype)
+    && available !== null;
   return {
     name: account.name || account.official_name || "Plaid Account",
     account_type: accountType,
     source: "plaid",
-    current_balance_cents: current,
+    current_balance_cents: shouldUseAvailableAsCurrent ? available : current,
     available_balance_cents: available,
     currency: (balances.iso_currency_code || "USD").toLowerCase(),
     plaid_item_internal_id: item.id,

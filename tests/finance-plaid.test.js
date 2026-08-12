@@ -8,6 +8,7 @@ import {
   isLiquidFinanceAccount,
   isSafeLocalDisconnectProviderFailure,
   normalizePlaidTransactionAmount,
+  plaidAccountToFinanceAccount,
   plaidSecretForEnvironment,
   providerAmountToCents,
   reconcileTransactionRefs
@@ -122,6 +123,40 @@ await run("provider amount to cents", () => {
 await run("Plaid expense/income normalization", () => {
   assert.deepEqual(normalizePlaidTransactionAmount(52.34), { direction: "expense", amount_cents: 5234 });
   assert.deepEqual(normalizePlaidTransactionAmount(-1500), { direction: "income", amount_cents: 150000 });
+});
+
+await run("Plaid depository balance uses available after pending when present", () => {
+  const mapped = plaidAccountToFinanceAccount({
+    account_id: "acc_checking",
+    name: "Checking",
+    type: "depository",
+    subtype: "checking",
+    balances: {
+      current: 1000,
+      available: 875,
+      iso_currency_code: "USD"
+    }
+  }, { id: "item_1", institution_name: "Bank" });
+  assert.equal(mapped.current_balance_cents, 87500);
+  assert.equal(mapped.available_balance_cents, 87500);
+  assert.equal(mapped.include_in_liquid_cash, true);
+});
+
+await run("Plaid credit balance keeps current instead of available credit", () => {
+  const mapped = plaidAccountToFinanceAccount({
+    account_id: "acc_credit",
+    name: "Credit Card",
+    type: "credit",
+    subtype: "credit card",
+    balances: {
+      current: 300,
+      available: 4700,
+      iso_currency_code: "USD"
+    }
+  }, { id: "item_1", institution_name: "Bank" });
+  assert.equal(mapped.current_balance_cents, 30000);
+  assert.equal(mapped.available_balance_cents, 470000);
+  assert.equal(mapped.include_in_liquid_cash, false);
 });
 
 await run("liquid account rules", () => {
