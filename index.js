@@ -6867,7 +6867,7 @@ function quoteScopeSQL(req, alias = "q") {
     : { sql: `${p}user_id = $1`, values: [req.userId] };
 }
 
-app.get("/api/quotes/settings", authRequired, requireEmployer, async (req, res) => {
+app.get("/api/quotes/settings", authRequired, async (req, res) => {
   try {
     if (!req.companyId) return res.status(400).json({ error: "company_required" });
     res.json(await getQuoteSettings(pool, req.companyId));
