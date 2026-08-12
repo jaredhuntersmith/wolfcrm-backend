@@ -5,7 +5,7 @@ import {
   goalMetrics
 } from "./finance-calculations.js";
 import { installPlaidRoutes, installPlaidSchema } from "./finance-plaid.js";
-import { isLiquidFinanceAccount } from "./finance-plaid-helpers.js";
+import { isLiquidFinanceAccount, totalEffectiveLiquidCashCents } from "./finance-plaid-helpers.js";
 import { installReceiptRoutes, installReceiptSchema } from "./finance-receipts.js";
 import { installFinanceAIRoutes, installFinanceAISchema } from "./finance-ai.js";
 
@@ -176,6 +176,7 @@ function financeSettingsPayload(row) {
   return {
     company_id: row.company_id,
     minimum_cash_reserve_cents: Number(row.minimum_cash_reserve_cents || 0),
+    use_available_bank_balance: row.use_available_bank_balance === undefined ? false : Boolean(row.use_available_bank_balance),
     currency: row.currency || "usd",
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -335,6 +336,7 @@ async function installFinanceSchema(pool) {
     CREATE TABLE IF NOT EXISTS finance_settings (
       company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
       minimum_cash_reserve_cents BIGINT NOT NULL DEFAULT 0,
+      use_available_bank_balance BOOLEAN NOT NULL DEFAULT false,
       currency TEXT NOT NULL DEFAULT 'usd',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -469,6 +471,7 @@ async function installFinanceSchema(pool) {
       END IF;
     END $$;
   `);
+  await pool.query(`ALTER TABLE finance_settings ADD COLUMN IF NOT EXISTS use_available_bank_balance BOOLEAN NOT NULL DEFAULT false`);
   await installPlaidSchema(pool);
   await installReceiptSchema(pool);
   await installFinanceAISchema(pool);
@@ -506,10 +509,8 @@ export async function loadActiveAccounts(pool, companyId) {
   return rows.map(financeAccountPayload);
 }
 
-function overviewFromAccounts(accounts) {
-  const total = accounts
-    .filter((account) => isLiquidFinanceAccount(account) && account.include_in_liquid_cash !== false)
-    .reduce((sum, account) => sum + account.current_balance_cents, 0);
+function overviewFromAccounts(accounts, settings = {}) {
+  const total = totalEffectiveLiquidCashCents(accounts, settings);
   const physicalCash = accounts
     .filter((account) => account.source === "manual" && account.account_type === "cash" && account.include_in_liquid_cash !== false)
     .reduce((sum, account) => sum + account.current_balance_cents, 0);
@@ -519,6 +520,7 @@ function overviewFromAccounts(accounts) {
     bank_balance_cents: 0,
     bank_accounts_connected: false,
     currency: "usd",
+    use_available_bank_balance: Boolean(settings.use_available_bank_balance),
     active_account_count: accounts.length,
     manual_account_count: accounts.filter((account) => account.source === "manual").length,
     accounts
@@ -649,9 +651,7 @@ export async function loadProjection(pool, companyId, horizonDays = 30) {
   const startDate = new Date().toISOString().slice(0, 10);
   const endDate = addDays(startDate, days);
   const plannedItems = await loadActivePlannedItems(pool, companyId);
-  const startingBalanceCents = accounts
-    .filter((account) => isLiquidFinanceAccount(account) && account.include_in_liquid_cash !== false)
-    .reduce((sum, account) => sum + account.current_balance_cents, 0);
+  const startingBalanceCents = totalEffectiveLiquidCashCents(accounts, settings);
   return buildProjection({
     startingBalanceCents,
     minimumReserveCents: settings.minimum_cash_reserve_cents,
@@ -910,6 +910,7 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
     if (!requireCompany(req, res)) return;
     try {
       const accounts = await loadActiveAccounts(pool, req.companyId);
+      const settings = await ensureFinanceSettings(pool, req.companyId);
       const projection = await loadProjection(pool, req.companyId, 30);
       const plannedItems = await loadActivePlannedItems(pool, req.companyId);
       const debts = await loadDebts(pool, req.companyId);
@@ -924,7 +925,7 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
       );
       const goals = goalsResult.rows.map(goalPayload);
       res.json({
-        ...overviewFromAccounts(accounts),
+        ...overviewFromAccounts(accounts, settings),
         projection,
         upcoming: projection.events.slice(0, 8),
         planned_item_count: plannedItems.length,
@@ -953,15 +954,19 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
       if (minimumReserveCents < 0) return res.status(400).json({ error: "minimum_cash_reserve_invalid", message: "Minimum reserve cannot be negative." });
       const currency = normalizeCurrency(req.body?.currency || "usd");
       if (!currency) return res.status(400).json({ error: "invalid_currency", message: "Currency is not supported yet." });
+      const useAvailableBankBalance = req.body?.use_available_bank_balance === undefined
+        ? false
+        : Boolean(req.body.use_available_bank_balance);
       const { rows } = await pool.query(
-        `INSERT INTO finance_settings (company_id, minimum_cash_reserve_cents, currency)
-         VALUES ($1,$2,$3)
+        `INSERT INTO finance_settings (company_id, minimum_cash_reserve_cents, use_available_bank_balance, currency)
+         VALUES ($1,$2,$3,$4)
          ON CONFLICT (company_id) DO UPDATE
            SET minimum_cash_reserve_cents = EXCLUDED.minimum_cash_reserve_cents,
+               use_available_bank_balance = EXCLUDED.use_available_bank_balance,
                currency = EXCLUDED.currency,
                updated_at = now()
          RETURNING *`,
-        [req.companyId, minimumReserveCents, currency]
+        [req.companyId, minimumReserveCents, useAvailableBankBalance, currency]
       );
       res.json(financeSettingsPayload(rows[0]));
     } catch (error) {
@@ -1642,7 +1647,7 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
       const settings = await ensureFinanceSettings(pool, req.companyId);
       const startDate = todayDateString();
       const previewProjection = buildProjection({
-        startingBalanceCents: accounts.reduce((sum, account) => sum + account.current_balance_cents, 0),
+        startingBalanceCents: totalEffectiveLiquidCashCents(accounts, settings),
         minimumReserveCents: settings.minimum_cash_reserve_cents,
         plannedItems: previewItems,
         startDate,

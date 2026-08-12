@@ -13,7 +13,7 @@ import {
   periodBounds,
   todayDateString
 } from "./finance.js";
-import { isLiquidFinanceAccount } from "./finance-plaid-helpers.js";
+import { totalEffectiveLiquidCashCents } from "./finance-plaid-helpers.js";
 
 const DEFAULT_MODEL = "gpt-5.6";
 const MAX_TOOL_ITERATIONS = 3;
@@ -872,7 +872,10 @@ function buildPurchasePreviewFallback(result) {
 }
 
 function buildSettingsFallback(result) {
-  return `Your configured minimum cash reserve is ${dollars(result.minimum_cash_reserve_cents)}.`;
+  const basis = result.use_available_bank_balance
+    ? "WolfCRM is using available bank balances when your bank provides them."
+    : "WolfCRM is using current bank balances.";
+  return `Your configured minimum cash reserve is ${dollars(result.minimum_cash_reserve_cents)}. ${basis}`;
 }
 
 function buildProjectionFallback(result) {
@@ -1567,6 +1570,7 @@ async function toolOverview(pool, companyId) {
     total_liquid_cash_cents: projection.starting_balance_cents,
     safe_to_spend_cents: projection.safe_to_spend_cents,
     minimum_cash_reserve_cents: settings.minimum_cash_reserve_cents,
+    use_available_bank_balance: settings.use_available_bank_balance,
     projection_summary: {
       horizon_days: 30,
       ending_balance_cents: projection.ending_balance_cents,
@@ -2234,7 +2238,7 @@ async function previewPurchaseImpact(pool, companyId, args) {
     archived_at: null
   };
   const projection = buildProjection({
-    startingBalanceCents: accounts.filter((account) => isLiquidFinanceAccount(account) && account.include_in_liquid_cash !== false).reduce((sum, account) => sum + account.current_balance_cents, 0),
+    startingBalanceCents: totalEffectiveLiquidCashCents(accounts, settings),
     minimumReserveCents: settings.minimum_cash_reserve_cents,
     plannedItems: [...plannedItems, hypothetical],
     startDate: baseline.start_date,
@@ -2271,7 +2275,7 @@ async function previewIncomeChange(pool, companyId, args) {
     return { ...item, amount_cents: Math.round(item.amount_cents * multiplier) };
   });
   const scenario = buildProjection({
-    startingBalanceCents: accounts.filter((account) => isLiquidFinanceAccount(account) && account.include_in_liquid_cash !== false).reduce((sum, account) => sum + account.current_balance_cents, 0),
+    startingBalanceCents: totalEffectiveLiquidCashCents(accounts, settings),
     minimumReserveCents: settings.minimum_cash_reserve_cents,
     plannedItems: scenarioItems,
     startDate: baseline.start_date,
@@ -2330,7 +2334,7 @@ async function previewDebtPayment(pool, companyId, args) {
   const accounts = await loadActiveAccounts(pool, companyId);
   const settings = await ensureFinanceSettings(pool, companyId);
   const scenario = buildProjection({
-    startingBalanceCents: accounts.filter((account) => isLiquidFinanceAccount(account) && account.include_in_liquid_cash !== false).reduce((sum, account) => sum + account.current_balance_cents, 0),
+    startingBalanceCents: totalEffectiveLiquidCashCents(accounts, settings),
     minimumReserveCents: settings.minimum_cash_reserve_cents,
     plannedItems: scenarioItems,
     startDate: baseline.start_date,
