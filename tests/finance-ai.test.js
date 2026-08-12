@@ -69,10 +69,60 @@ test("transaction filters are company scoped", async () => {
 });
 
 test("spending summary aggregates backend-side", async () => {
-  const result = await executeFinanceAITool(new FakePool(), ctx, "get_spending_summary", { period: "custom", start_date: null, end_date: null, group_by: "category", account_id: null, category: null, merchant_query: null, limit: 10 });
+  const result = await executeFinanceAITool(new FakePool(), ctx, "get_spending_summary", { period: null, start_date: null, end_date: null, group_by: "category", account_id: null, category: null, merchant_query: null, limit: 10 });
   assert.equal(result.groups[0].total_cents, 130000);
   assert.equal(result.posted_spending_cents, 120000);
   assert.equal(result.pending_spending_cents, 10000);
+});
+
+test("spending summary normalizes safe enum synonyms", async () => {
+  const result = await executeFinanceAITool(new FakePool(), ctx, "get_spending_summary", {
+    period: "previous_month",
+    start_date: null,
+    end_date: null,
+    group_by: "categories",
+    direction: "expenses",
+    account_id: null,
+    category: null,
+    merchant_query: null,
+    limit: 10
+  });
+  assert.equal(result.period.key, "last_month");
+  assert.equal(result.group_by, "category");
+  assert.equal(result.direction, "expense");
+});
+
+test("spending summary normalizes merchant plural", async () => {
+  const result = await executeFinanceAITool(new FakePool(), ctx, "get_spending_summary", {
+    period: "last_month",
+    start_date: null,
+    end_date: null,
+    group_by: "merchants",
+    direction: "spending",
+    account_id: null,
+    category: null,
+    merchant_query: null,
+    limit: 10
+  });
+  assert.equal(result.group_by, "merchant");
+  assert.equal(result.direction, "expense");
+});
+
+test("spending summary rejects unknown enum values", async () => {
+  await assert.rejects(
+    () => executeFinanceAITool(new FakePool(), ctx, "get_spending_summary", {
+      period: "last_month",
+      start_date: null,
+      end_date: null,
+      group_by: "merchant_and_category",
+      direction: "expense",
+      account_id: null,
+      category: null,
+      merchant_query: null,
+      limit: 10
+    }),
+    (error) => error.code === "finance_ai_invalid_tool_arguments"
+  );
 });
 
 test("spending summary treats empty data as a zero result", async () => {
@@ -249,9 +299,11 @@ test("tool loop rejects genuinely empty final output", async () => {
 
 test("empty final response after successful tools gets one recovery pass", async () => {
   let createCount = 0;
+  const requests = [];
   const client = {
     responses: {
-      create: async () => {
+      create: async (request) => {
+        requests.push(request);
         createCount += 1;
         if (createCount === 1) {
           return {
@@ -285,6 +337,72 @@ test("empty final response after successful tools gets one recovery pass", async
     ctx
   });
   assert.equal(createCount, 3);
+  assert.equal(Object.prototype.hasOwnProperty.call(requests[2], "tools"), false);
+  assert.match(result.text, /discretionary-looking/);
+});
+
+test("real discretionary-spend failure shape forces final synthesis with tools disabled", async () => {
+  let createCount = 0;
+  const requests = [];
+  const client = {
+    responses: {
+      create: async (request) => {
+        requests.push(request);
+        createCount += 1;
+        if (createCount === 1) {
+          return {
+            output_text: "",
+            output: [{
+              type: "function_call",
+              name: "get_spending_summary",
+              call_id: "first_category",
+              arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "category", direction: "expense", account_id: null, category: null, merchant_query: null, limit: 10 })
+            }]
+          };
+        }
+        if (createCount === 2) {
+          return {
+            output_text: "",
+            output: [
+              {
+                type: "function_call",
+                name: "get_spending_summary",
+                call_id: "merchant_valid",
+                arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "merchant", direction: "expense", account_id: null, category: null, merchant_query: null, limit: 20 })
+              },
+              {
+                type: "function_call",
+                name: "get_spending_summary",
+                call_id: "invalid_combo",
+                arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "merchant_and_category", direction: "expense", account_id: null, category: null, merchant_query: null, limit: 20 })
+              }
+            ]
+          };
+        }
+        if (createCount === 3) {
+          return {
+            output_text: "",
+            output: [{
+              type: "function_call",
+              name: "get_spending_summary",
+              call_id: "third_category",
+              arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "categories", direction: "expenses", account_id: null, category: null, merchant_query: null, limit: 10 })
+            }]
+          };
+        }
+        return { output_text: "Your largest discretionary-looking expenses last month were dining and shopping.", output: [] };
+      }
+    }
+  };
+  const result = await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "What kind of unnecessary expenses did I make last month?" }],
+    ctx
+  });
+  assert.equal(createCount, 4);
+  assert.equal(Object.prototype.hasOwnProperty.call(requests[3], "tools"), false);
   assert.match(result.text, /discretionary-looking/);
 });
 
