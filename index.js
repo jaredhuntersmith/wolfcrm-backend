@@ -27,7 +27,7 @@ import {
   syncAutomationSchedulesForMapPin,
   syncAutomationSchedulesForTimeEntry
 } from "./automations.js";
-import { installFinanceSystem } from "./finance.js";
+import { installFinanceSystem, loadProjection } from "./finance.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -1308,6 +1308,21 @@ async function bootstrap() {
       read_at TIMESTAMPTZ
     );
     CREATE INDEX IF NOT EXISTS notifications_user_unread_idx ON notifications(user_id, read_at, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS dashboard_dismissals (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      item_type TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      fingerprint TEXT NOT NULL DEFAULT '',
+      dismissed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS dashboard_dismissals_unique_idx
+      ON dashboard_dismissals(user_id, item_type, source_id, fingerprint);
+    CREATE INDEX IF NOT EXISTS dashboard_dismissals_user_idx
+      ON dashboard_dismissals(user_id, dismissed_at DESC);
   `);
 
   // Schedule events extra fields (services + price)
