@@ -7637,8 +7637,8 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           COUNT(*) FILTER (WHERE start_at >= $2 AND start_at < $3 AND price_cents IS NULL)::int AS missing_today
          FROM schedule_events
         WHERE company_id = $1
-          AND start_at >= $6
-          AND start_at < $7`,
+          AND start_at >= LEAST($2::timestamptz, $4::timestamptz, $6::timestamptz)
+          AND start_at < GREATEST($3::timestamptz, $5::timestamptz, $7::timestamptz)`,
       [req.companyId, todayStart.toISOString(), todayEnd.toISOString(), weekStart.toISOString(), weekEnd.toISOString(), monthStart.toISOString(), monthEnd.toISOString()]
     ) : { rows: [{ today: 0, week: 0, month: 0, missing_today: 0 }] };
 
