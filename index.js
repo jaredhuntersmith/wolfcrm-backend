@@ -5606,42 +5606,45 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
       `SELECT * FROM contacts WHERE id = $1 AND ${scope.sql.replace("$1", "$2")}`,
       [req.params.id, ...scope.values]
     )).rows[0];
-    // lead_info: null means "leave as-is"; explicit array (even empty) overwrites.
-    const leadInfoParam = Array.isArray(lead_info) ? JSON.stringify(lead_info) : null;
+    const body = req.body || {};
+    const has = (key) => Object.prototype.hasOwnProperty.call(body, key);
+    const updates = [];
+    const values = [req.params.id];
+    const addUpdate = (column, value, cast = "") => {
+      values.push(value);
+      updates.push(`${column} = $${values.length}${cast}`);
+    };
+    if (has("name")) addUpdate("name", name || "");
+    if (has("phone")) addUpdate("phone", phone || null);
+    if (has("email")) addUpdate("email", email || null);
+    if (has("address")) addUpdate("address", address || null);
+    if (has("value_cents")) addUpdate("value_cents", Number.isFinite(Number(value_cents)) ? Number(value_cents) : null);
+    if (has("lat")) addUpdate("lat", lat == null ? null : Number(lat));
+    if (has("lng")) addUpdate("lng", lng == null ? null : Number(lng));
+    if (has("address") && !address && !has("lat")) addUpdate("lat", null);
+    if (has("address") && !address && !has("lng")) addUpdate("lng", null);
+    if (has("tags")) addUpdate("tags", Array.isArray(tags) ? tags.join(",") : (tags || null));
+    if (has("job_type")) addUpdate("job_type", job_type || null);
+    if (has("u1")) addUpdate("u1", u1 || null);
+    if (has("u2")) addUpdate("u2", u2 || null);
+    if (has("u3")) addUpdate("u3", u3 || null);
+    if (has("u4")) addUpdate("u4", u4 || null);
+    if (has("u5")) addUpdate("u5", u5 || null);
+    if (has("lead_info")) addUpdate("lead_info", Array.isArray(lead_info) ? JSON.stringify(lead_info) : null, "::jsonb");
+    if (has("source")) addUpdate("source", source || null);
+    if (!updates.length) return res.json(before);
+    addUpdate("updated_at", new Date());
+    values.push(...scope.values);
+    const scopeSQL = scope.sql.replace("$1", `$${values.length - scope.values.length + 1}`);
     const r = await pool.query(
-      `
-      UPDATE contacts SET
-        name = COALESCE($2,name),
-        phone = COALESCE($3,phone),
-        email = COALESCE($4,email),
-        address = COALESCE($5,address),
-        value_cents = COALESCE($6,value_cents),
-        lat = COALESCE($7,lat),
-        lng = COALESCE($8,lng),
-        tags = COALESCE($9,tags),
-        job_type = COALESCE($10,job_type),
-        u1 = COALESCE($11,u1),
-        u2 = COALESCE($12,u2),
-        u3 = COALESCE($13,u3),
-        u4 = COALESCE($14,u4),
-        u5 = COALESCE($15,u5),
-        lead_info = COALESCE($16::jsonb, lead_info),
-        source = COALESCE($17, source)
-      WHERE id = $1 AND ${scope.sql.replace("$1", "$18")}
-      RETURNING *;
-      `,
-      [
-        req.params.id, name, phone, email, address,
-        Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
-        lat ?? null, lng ?? null, tags, job_type, u1, u2, u3, u4, u5,
-        leadInfoParam,
-        source,
-        ...scope.values
-      ]
+      `UPDATE contacts SET ${updates.join(", ")}
+        WHERE id = $1 AND ${scopeSQL}
+        RETURNING *;`,
+      values
     );
     if (!r.rowCount) return res.status(404).json({ error: "not_found" });
     if (req.companyId) {
-      const fields = ["name", "phone", "email", "address", "value_cents", "lat", "lng", "job_type", "u1", "u2", "u3", "u4", "u5", "source"].filter((key) => Object.prototype.hasOwnProperty.call(req.body || {}, key));
+      const fields = ["name", "phone", "email", "address", "value_cents", "lat", "lng", "job_type", "u1", "u2", "u3", "u4", "u5", "source"].filter((key) => has(key));
       const changed = contactChangedFields(before, r.rows[0], fields);
       await emitContactUpdateEvents({ companyId: req.companyId, contactId: r.rows[0].id, actorUserId: req.userId, source: "contacts.api", changedFields: changed });
       if (Object.prototype.hasOwnProperty.call(req.body || {}, "tags")) {
