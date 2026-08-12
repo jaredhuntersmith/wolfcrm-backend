@@ -20,6 +20,14 @@ const MAX_TOOL_ITERATIONS = 5;
 const MAX_CONTEXT_MESSAGES = 12;
 const MAX_MESSAGE_LENGTH = 4000;
 const rateBuckets = new Map();
+const WRITE_TOOL_NAMES = new Set([
+  "create_planned_expense",
+  "create_expected_income",
+  "update_minimum_reserve",
+  "create_goal",
+  "create_budget",
+  "update_debt_planned_payment"
+]);
 
 function cleanString(value, maxLength = 300) {
   return (value || "").toString().trim().slice(0, maxLength);
@@ -76,6 +84,21 @@ function requireCompany(req, res) {
 function handleAIError(res, error, fallback) {
   if (error?.statusCode) {
     return res.status(error.statusCode).json({ error: error.code || fallback, message: error.message || "Finance AI request failed." });
+  }
+  const status = Number(error?.status || error?.response?.status || 0);
+  const providerCode = cleanString(error?.code || error?.error?.code || error?.response?.data?.error?.code, 80);
+  if (status === 429) {
+    const quotaLike = /quota|billing|credit|insufficient/i.test(providerCode || error?.message || "");
+    return res.status(503).json({
+      error: quotaLike ? "openai_quota_unavailable" : "openai_rate_limited",
+      message: quotaLike ? "OpenAI API credits are unavailable." : "OpenAI is rate limiting Finance AI. Try again shortly."
+    });
+  }
+  if (status === 404 || status === 400) {
+    return res.status(502).json({ error: "openai_model_or_api_failed", message: "The configured OpenAI model or API request failed." });
+  }
+  if (status >= 500) {
+    return res.status(502).json({ error: "openai_unavailable", message: "OpenAI is temporarily unavailable." });
   }
   console.error("[finance-ai]", fallback, { message: error?.message, type: error?.type, code: error?.code });
   return res.status(500).json({ error: fallback, message: "Finance AI request failed." });
@@ -855,16 +878,22 @@ async function runResponsesToolLoop({ pool, client, model, input, ctx }) {
       return { text: response.output_text || "I could not produce a response.", toolActivity };
     }
     input.push(...response.output);
-    for (const call of functionCalls) {
-      let result;
-      let status = "succeeded";
+    const runCall = async (call) => {
       try {
         const args = call.arguments ? JSON.parse(call.arguments) : {};
-        result = await executeFinanceAITool(pool, ctx, call.name, args);
+        const result = await executeFinanceAITool(pool, ctx, call.name, args);
+        return { call, result, status: "succeeded" };
       } catch (error) {
-        status = "failed";
-        result = { error: error.code || "tool_failed", message: error.message || "Tool failed." };
+        return { call, result: { error: error.code || "tool_failed", message: error.message || "Tool failed." }, status: "failed" };
       }
+    };
+    const callResults = functionCalls.some((call) => WRITE_TOOL_NAMES.has(call.name))
+      ? []
+      : await Promise.all(functionCalls.map(runCall));
+    if (!callResults.length) {
+      for (const call of functionCalls) callResults.push(await runCall(call));
+    }
+    for (const { call, result, status } of callResults) {
       toolActivity.push({ name: call.name, status });
       input.push({
         type: "function_call_output",
