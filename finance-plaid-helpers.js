@@ -101,8 +101,10 @@ export function normalizePlaidCategory(transaction) {
 
 export function isLiquidFinanceAccount(account) {
   if (account.archived_at) return false;
+  if (account.include_in_liquid_cash === false) return false;
   if (account.source === "manual") return true;
   if (account.source !== "plaid") return false;
+  if (account.plaid_item_status === "disconnected" || account.plaid_item_disconnected_at) return false;
   const type = (account.plaid_account_type || account.account_type || "").toLowerCase();
   const subtype = (account.plaid_account_subtype || "").toLowerCase();
   if (type === "credit" || type === "loan" || type === "investment") return false;

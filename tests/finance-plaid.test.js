@@ -72,6 +72,8 @@ await run("liquid account rules", () => {
   assert.equal(isLiquidFinanceAccount({ source: "plaid", plaid_account_type: "depository", plaid_account_subtype: "savings" }), true);
   assert.equal(isLiquidFinanceAccount({ source: "plaid", plaid_account_type: "credit", plaid_account_subtype: "credit card" }), false);
   assert.equal(isLiquidFinanceAccount({ source: "plaid", plaid_account_type: "loan", plaid_account_subtype: "student" }), false);
+  assert.equal(isLiquidFinanceAccount({ source: "plaid", plaid_account_type: "depository", plaid_account_subtype: "checking", include_in_liquid_cash: false }), false);
+  assert.equal(isLiquidFinanceAccount({ source: "plaid", plaid_account_type: "depository", plaid_account_subtype: "checking", plaid_item_status: "disconnected" }), false);
 });
 
 await run("pending to posted keeps stable transaction id", () => {

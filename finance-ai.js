@@ -1533,6 +1533,8 @@ function safeAccount(account) {
     institution_name: account.institution_name || null,
     mask: account.mask || null,
     include_in_liquid_cash: account.include_in_liquid_cash !== false,
+    connection_status: account.source === "plaid" ? (account.plaid_item_status || "connected") : "manual",
+    disconnected_at: account.plaid_item_disconnected_at || null,
     last_balance_update_at: account.last_balance_update_at || null
   };
 }
@@ -3716,6 +3718,13 @@ async function runResponsesToolLoop({ pool, client, model, input, ctx, executeTo
     }
   }
   financeAIWarn("tool_loop_limit", { requestId, model_ms: modelMs, tools_ms: toolsMs, total_ms: Date.now() - startedAt, tool_count: toolCount });
+  if (successfulReadToolCalls > 0) {
+    try {
+      return await finalSynthesis("tool_loop_limit", MAX_TOOL_ITERATIONS - 1);
+    } catch {
+      // Fall through to deterministic fallback below.
+    }
+  }
   const fallback = buildDeterministicFallback(successfulToolResults, ctx.userMessage);
   if (fallback) {
     financeAILog("deterministic_fallback_used", { requestId, fallback_type: fallback.type, tool_count: toolCount });

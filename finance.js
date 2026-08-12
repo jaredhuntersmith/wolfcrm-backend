@@ -495,11 +495,12 @@ function handleFinanceError(res, error, fallback) {
 
 export async function loadActiveAccounts(pool, companyId) {
   const { rows } = await pool.query(
-    `SELECT *
-       FROM finance_accounts
-      WHERE company_id = $1
-        AND archived_at IS NULL
-      ORDER BY account_type ASC, name ASC`,
+    `SELECT a.*, pi.status AS plaid_item_status, pi.disconnected_at AS plaid_item_disconnected_at
+       FROM finance_accounts a
+       LEFT JOIN finance_plaid_items pi ON pi.id = a.plaid_item_internal_id AND pi.company_id = a.company_id
+      WHERE a.company_id = $1
+        AND a.archived_at IS NULL
+      ORDER BY a.account_type ASC, a.name ASC`,
     [companyId]
   );
   return rows.map(financeAccountPayload);
