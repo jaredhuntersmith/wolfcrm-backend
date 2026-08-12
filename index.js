@@ -7736,7 +7736,13 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
         const weekdays = Array.isArray(row.weekdays) ? row.weekdays.map(Number) : [];
         if (!weekdays.includes(weekday)) continue;
         if (doneKeys.has(`${row.id}:${dayKey}`)) continue;
-        const dueAt = row.time ? new Date(row.time) : day;
+        const dueAt = new Date(day);
+        if (row.time) {
+          const time = new Date(row.time);
+          if (!Number.isNaN(time.getTime())) {
+            dueAt.setUTCHours(time.getUTCHours(), time.getUTCMinutes(), 0, 0);
+          }
+        }
         const section = day >= todayStart && day < todayEnd ? "today" : "upcoming";
         items.push(buildDashboardRoutineItem(row, dayKey, dueAt.toISOString(), section, "normal"));
       }
