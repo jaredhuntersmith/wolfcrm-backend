@@ -44,6 +44,24 @@ export function getPlaidEnvironmentConfig(environment, env = process.env) {
   };
 }
 
+export function isSafeLocalDisconnectProviderFailure(error) {
+  if (!error) return false;
+  if (error.code === "finance_plaid_environment_unavailable") return true;
+  if (error.code === "finance_token_encryption_key_missing" || error.code === "finance_token_encryption_key_invalid") return true;
+  if (error.code === "ETIMEDOUT" || error.code === "ECONNRESET" || error.code === "ENOTFOUND" || error.code === "ECONNABORTED") return true;
+  if ([408, 429, 500, 502, 503, 504].includes(error.response?.status || error.statusCode)) return true;
+  const code = error.response?.data?.error_code || error.code;
+  return [
+    "ITEM_NOT_FOUND",
+    "INVALID_ACCESS_TOKEN",
+    "INVALID_INPUT",
+    "ITEM_LOGIN_REQUIRED",
+    "INSTITUTION_DOWN",
+    "INSTITUTION_NOT_RESPONDING",
+    "PRODUCT_NOT_READY"
+  ].includes(code);
+}
+
 export function encryptionKeyFromEnv(env = process.env) {
   const raw = env.FINANCE_TOKEN_ENCRYPTION_KEY;
   if (!raw) {

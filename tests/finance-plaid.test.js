@@ -6,6 +6,7 @@ import {
   getPlaidConfig,
   getPlaidEnvironmentConfig,
   isLiquidFinanceAccount,
+  isSafeLocalDisconnectProviderFailure,
   normalizePlaidTransactionAmount,
   plaidSecretForEnvironment,
   providerAmountToCents,
@@ -90,6 +91,23 @@ await run("missing sandbox secret is a clear environment config failure", () => 
   };
   assert.equal(getPlaidEnvironmentConfig("sandbox", env).configured, false);
   assert.equal(plaidSecretForEnvironment("sandbox", env), null);
+});
+
+await run("wrong-environment disconnect cleanup failure is local-disconnect safe", () => {
+  assert.equal(isSafeLocalDisconnectProviderFailure({ code: "finance_plaid_environment_unavailable" }), true);
+});
+
+await run("invalid access token disconnect cleanup failure is local-disconnect safe", () => {
+  assert.equal(isSafeLocalDisconnectProviderFailure({ response: { data: { error_code: "INVALID_ACCESS_TOKEN" } } }), true);
+});
+
+await run("provider timeout disconnect cleanup failure is local-disconnect safe", () => {
+  assert.equal(isSafeLocalDisconnectProviderFailure({ code: "ETIMEDOUT" }), true);
+  assert.equal(isSafeLocalDisconnectProviderFailure({ response: { status: 503 } }), true);
+});
+
+await run("already-removed Item cleanup failure is local-disconnect safe", () => {
+  assert.equal(isSafeLocalDisconnectProviderFailure({ response: { data: { error_code: "ITEM_NOT_FOUND" } } }), true);
 });
 
 await run("provider amount to cents", () => {

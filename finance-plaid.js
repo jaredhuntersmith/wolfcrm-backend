@@ -4,6 +4,7 @@ import {
   collectPlaidSyncPages,
   getPlaidEnvironmentConfig,
   getPlaidConfig,
+  isSafeLocalDisconnectProviderFailure,
   normalizePlaidEnvironment,
   plaidAccountToFinanceAccount,
   plaidSecretForEnvironment,
@@ -384,7 +385,7 @@ async function accountsForPlaidItem(pool, companyId, itemId) {
   return rows.map(plaidAccountPayload);
 }
 
-async function markPlaidItemDisconnected(pool, companyId, item, userId, reason = "user_disconnect") {
+async function markPlaidItemDisconnected(pool, companyId, item, userId, reason = "user_disconnect", providerCleanup = null) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -417,7 +418,7 @@ async function markPlaidItemDisconnected(pool, companyId, item, userId, reason =
     await client.query(
       `INSERT INTO finance_plaid_item_events(company_id, plaid_item_internal_id, event_type, event_status, metadata, created_by)
        VALUES($1,$2,'disconnect_plaid_item','succeeded',$3,$4)`,
-      [companyId, item.id, JSON.stringify({ institution_name: item.institution_name || null, reason }), userId || null]
+      [companyId, item.id, JSON.stringify({ institution_name: item.institution_name || null, reason, provider_cleanup: providerCleanup }), userId || null]
     );
     await client.query("COMMIT");
     return updated.rows[0] || { ...item, status: "disconnected", disconnected_at: item.disconnected_at || new Date().toISOString() };
@@ -958,16 +959,36 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       const item = await getPlaidItemIncludingDisconnected(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
       disconnectItemEnvironment = item.environment || null;
+      let providerCleanup = item.status === "disconnected" || item.disconnected_at
+        ? { attempted: false, status: "already_disconnected" }
+        : { attempted: false, status: "skipped" };
       if (item.status !== "disconnected" && !item.disconnected_at) {
-        if (!requirePlaidEnvironmentConfigured(res, item.environment)) return;
-        await (await plaidClientForItem(item)).itemRemove({ access_token: await decryptItemToken(item) }).catch((error) => {
-          const code = error?.response?.data?.error_code;
-          if (code !== "ITEM_NOT_FOUND") throw error;
-        });
+        providerCleanup = { attempted: true, status: "pending" };
+        try {
+          const environmentConfig = getPlaidEnvironmentConfig(item.environment);
+          const activeConfig = getPlaidConfig();
+          if (!environmentConfig.configured || !activeConfig.encryption_configured) {
+            throw plaidEnvironmentUnavailableError(item.environment);
+          }
+          await (await plaidClientForItem(item)).itemRemove({ access_token: await decryptItemToken(item) });
+          providerCleanup = { attempted: true, status: "succeeded" };
+        } catch (error) {
+          const code = error?.response?.data?.error_code || error?.code || "provider_cleanup_failed";
+          if (!isSafeLocalDisconnectProviderFailure(error)) throw error;
+          providerCleanup = {
+            attempted: true,
+            status: code === "ITEM_NOT_FOUND" ? "already_removed" : "failed",
+            code
+          };
+          safePlaidFailureLog("disconnect_provider_cleanup_failed", error, {
+            plaid_item_internal_id: item.id,
+            item_environment: item.environment || null
+          });
+        }
       }
       const updated = item.status === "disconnected" || item.disconnected_at
         ? item
-        : await markPlaidItemDisconnected(pool, req.companyId, item, req.userId);
+        : await markPlaidItemDisconnected(pool, req.companyId, item, req.userId, "user_disconnect", providerCleanup);
       if (item.status === "disconnected" || item.disconnected_at) {
         await pool.query(
           `UPDATE finance_accounts SET include_in_liquid_cash = false, updated_at = now() WHERE plaid_item_internal_id = $1 AND company_id = $2 AND source = 'plaid'`,
@@ -986,7 +1007,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
         already_disconnected: Boolean(item.status === "disconnected" || item.disconnected_at),
         item: safePlaidItemPayload(updated),
         accounts,
-        message: `${updated.institution_name || "Bank"} disconnected. Historical transactions were kept.`
+        message: "Bank disconnected."
       });
     } catch (error) {
       safePlaidFailureLog("disconnect_failed", error, {
