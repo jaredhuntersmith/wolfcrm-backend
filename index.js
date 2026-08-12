@@ -7453,6 +7453,409 @@ app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "weekly_sales_report_failed" }); }
 });
 
+// ---------- DASHBOARD COMMAND CENTER ----------
+const DASHBOARD_DISMISS_TYPES = new Set([
+  "scheduled_job",
+  "job_missing_price",
+  "todo",
+  "routine",
+  "customer_reminder",
+  "finance_upcoming",
+  "notification",
+  "voicemail"
+]);
+
+function parseDashboardDate(value, fallback) {
+  const date = value ? new Date(value) : fallback;
+  return Number.isFinite(date?.getTime()) ? date : fallback;
+}
+
+function dashboardItemKey(item) {
+  return `${item.type}:${item.source_id}:${item.fingerprint || ""}`;
+}
+
+function dashboardMoney(cents) {
+  return Number.isFinite(Number(cents)) ? Number(cents) : null;
+}
+
+function dashboardServiceTitle(row) {
+  const items = Array.isArray(row.service_items) ? row.service_items : [];
+  const names = items.map((item) => String(item?.name || "").trim()).filter(Boolean);
+  if (names.length) return names.slice(0, 2).join(", ");
+  const services = Array.isArray(row.services) ? row.services.map((s) => String(s || "").trim()).filter(Boolean) : [];
+  if (services.length) return services.slice(0, 2).join(", ");
+  return row.title || "Scheduled job";
+}
+
+function buildDashboardJobItem(row, section, priority = "normal") {
+  const serviceTitle = dashboardServiceTitle(row);
+  const price = dashboardMoney(row.price_cents);
+  const subtitleParts = [];
+  if (serviceTitle && serviceTitle !== row.title) subtitleParts.push(serviceTitle);
+  if (row.contact_address) subtitleParts.push(row.contact_address);
+  return {
+    id: `scheduled_job:${row.id}`,
+    type: "scheduled_job",
+    source_type: "scheduled_job",
+    source_id: String(row.id),
+    fingerprint: String(row.updated_at || row.start || ""),
+    section,
+    priority,
+    title: row.contact_name || row.title || "Scheduled job",
+    subtitle: subtitleParts.join(" • "),
+    amount_cents: price,
+    due_at: row.start,
+    system_image: "calendar",
+    tint: "blue",
+    completable: false,
+    dismissible: true,
+    destination: { type: "scheduled_job", id: String(row.id) }
+  };
+}
+
+function buildDashboardTodoItem(row, section, priority) {
+  return {
+    id: `todo:${row.id}`,
+    type: "todo",
+    source_type: "todo",
+    source_id: String(row.id),
+    fingerprint: String(row.updated_at || row.due_date || ""),
+    section,
+    priority,
+    title: row.title,
+    subtitle: row.due_date ? "Due " + new Date(row.due_date).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" }) : "To-do",
+    amount_cents: null,
+    due_at: row.due_date,
+    system_image: "checklist",
+    tint: priority === "high" ? "red" : "purple",
+    completable: true,
+    dismissible: true,
+    destination: { type: "todo", id: String(row.id) }
+  };
+}
+
+function buildDashboardCustomerReminderItem(row, section, priority) {
+  const action = String(row.title || "Follow up").trim();
+  return {
+    id: `customer_reminder:${row.id}`,
+    type: "customer_reminder",
+    source_type: "customer_reminder",
+    source_id: String(row.id),
+    fingerprint: String(row.updated_at || row.due_date || ""),
+    section,
+    priority,
+    title: `${action} with ${row.contact_name}`,
+    subtitle: row.due_date ? "Due " + new Date(row.due_date).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" }) : "Customer follow-up",
+    amount_cents: null,
+    due_at: row.due_date,
+    system_image: "person.crop.circle.badge.clock",
+    tint: priority === "high" ? "red" : "teal",
+    completable: false,
+    dismissible: true,
+    destination: row.contact_id ? { type: "contact", id: String(row.contact_id) } : { type: "todo", id: String(row.id) }
+  };
+}
+
+function buildDashboardRoutineItem(row, dayKey, dueAt, section, priority) {
+  return {
+    id: `routine:${row.id}:${dayKey}`,
+    type: "routine",
+    source_type: "routine",
+    source_id: `${row.id}:${dayKey}`,
+    fingerprint: String(row.updated_at || dayKey),
+    section,
+    priority,
+    title: row.title,
+    subtitle: "Routine",
+    amount_cents: null,
+    due_at: dueAt,
+    system_image: "repeat",
+    tint: "orange",
+    completable: false,
+    dismissible: true,
+    destination: { type: "todo", id: String(row.id) }
+  };
+}
+
+function filterDashboardDismissed(items, dismissals) {
+  const hidden = new Set(dismissals.map((row) => `${row.item_type}:${row.source_id}:${row.fingerprint || ""}`));
+  return items.filter((item) => !hidden.has(dashboardItemKey(item)));
+}
+
+app.get("/api/dashboard/summary", authRequired, async (req, res) => {
+  try {
+    const now = new Date();
+    const todayStart = parseDashboardDate(req.query.today_start, new Date(now.getFullYear(), now.getMonth(), now.getDate()));
+    const todayEnd = parseDashboardDate(req.query.today_end, new Date(todayStart.getTime() + 86400000));
+    const weekStart = parseDashboardDate(req.query.week_start, todayStart);
+    const weekEnd = parseDashboardDate(req.query.week_end, new Date(weekStart.getTime() + 7 * 86400000));
+    const monthStart = parseDashboardDate(req.query.month_start, new Date(now.getFullYear(), now.getMonth(), 1));
+    const monthEnd = parseDashboardDate(req.query.month_end, new Date(now.getFullYear(), now.getMonth() + 1, 1));
+    const upcomingEnd = parseDashboardDate(req.query.upcoming_end, new Date(todayStart.getTime() + 8 * 86400000));
+    const employer = req.role === "employer";
+    const jobScope = employer
+      ? { sql: "se.company_id = $1", values: [req.companyId] }
+      : {
+          sql: `se.company_id = $1 AND (
+                  se.created_by = $2
+                  OR se.sales_user_ids ? $3
+                  OR se.worker_user_ids ? $3
+                )`,
+          values: [req.companyId, req.userId, String(req.userId)]
+        };
+
+    const jobsResult = req.companyId ? await pool.query(
+      `SELECT se.id, se.title, se.start_at AS start, se.end_at AS "end", se.contact_id,
+              se.services, se.service_items, se.price_cents, se.finished_at, se.updated_at,
+              c.name AS contact_name, c.address AS contact_address
+         FROM schedule_events se
+         LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id
+        WHERE ${jobScope.sql}
+          AND se.start_at >= $${jobScope.values.length + 1}
+          AND se.start_at < $${jobScope.values.length + 2}
+        ORDER BY se.start_at ASC
+        LIMIT 80`,
+      [...jobScope.values, todayStart.toISOString(), upcomingEnd.toISOString()]
+    ) : { rows: [] };
+
+    const revenueResult = employer && req.companyId ? await pool.query(
+      `SELECT
+          COALESCE(SUM(price_cents) FILTER (WHERE start_at >= $2 AND start_at < $3), 0)::int AS today,
+          COALESCE(SUM(price_cents) FILTER (WHERE start_at >= $4 AND start_at < $5), 0)::int AS week,
+          COALESCE(SUM(price_cents) FILTER (WHERE start_at >= $6 AND start_at < $7), 0)::int AS month,
+          COUNT(*) FILTER (WHERE start_at >= $2 AND start_at < $3 AND price_cents IS NULL)::int AS missing_today
+         FROM schedule_events
+        WHERE company_id = $1
+          AND start_at >= $6
+          AND start_at < $7`,
+      [req.companyId, todayStart.toISOString(), todayEnd.toISOString(), weekStart.toISOString(), weekEnd.toISOString(), monthStart.toISOString(), monthEnd.toISOString()]
+    ) : { rows: [{ today: 0, week: 0, month: 0, missing_today: 0 }] };
+
+    const [tasksResult, customerResult, routinesResult, doneResult, notificationsResult, dismissalsResult] = await Promise.all([
+      pool.query(
+        `SELECT id, title, due_date, completed, updated_at
+           FROM todo_tasks
+          WHERE user_id = $1
+            AND completed = false
+            AND due_date IS NOT NULL
+            AND due_date < $2
+          ORDER BY due_date ASC
+          LIMIT 40`,
+        [req.userId, upcomingEnd.toISOString()]
+      ),
+      pool.query(
+        `SELECT id, title, contact_id, contact_name, due_date, completed, updated_at
+           FROM todo_customer_reminders
+          WHERE user_id = $1
+            AND completed = false
+            AND due_date IS NOT NULL
+            AND due_date < $2
+          ORDER BY due_date ASC
+          LIMIT 40`,
+        [req.userId, upcomingEnd.toISOString()]
+      ),
+      pool.query(
+        `SELECT id, title, time, weekdays, updated_at
+           FROM todo_routines
+          WHERE user_id = $1
+            AND enabled = true
+          ORDER BY updated_at DESC
+          LIMIT 80`,
+        [req.userId]
+      ),
+      pool.query(
+        `SELECT routine_id, day_key
+           FROM todo_routine_done
+          WHERE user_id = $1`,
+        [req.userId]
+      ),
+      pool.query(
+        `SELECT id, kind, title, body, data, created_at
+           FROM notifications
+          WHERE user_id = $1
+            AND read_at IS NULL
+          ORDER BY created_at DESC
+          LIMIT 12`,
+        [req.userId]
+      ),
+      pool.query(
+        `SELECT item_type, source_id, fingerprint
+           FROM dashboard_dismissals
+          WHERE user_id = $1
+            AND (expires_at IS NULL OR expires_at > now())`,
+        [req.userId]
+      )
+    ]);
+
+    const items = [];
+    const jobsToday = jobsResult.rows.filter((row) => new Date(row.start) >= todayStart && new Date(row.start) < todayEnd);
+    for (const row of jobsToday.slice(0, 10)) {
+      items.push(buildDashboardJobItem(row, "today", "normal"));
+      if (row.price_cents == null) {
+        items.push({
+          id: `job_missing_price:${row.id}`,
+          type: "job_missing_price",
+          source_type: "scheduled_job",
+          source_id: String(row.id),
+          fingerprint: String(row.updated_at || row.start || ""),
+          section: "attention",
+          priority: "high",
+          title: "Job missing price",
+          subtitle: row.contact_name || row.title || "Scheduled job",
+          amount_cents: null,
+          due_at: row.start,
+          system_image: "exclamationmark.triangle.fill",
+          tint: "red",
+          completable: false,
+          dismissible: true,
+          destination: { type: "scheduled_job", id: String(row.id) }
+        });
+      }
+    }
+    for (const row of jobsResult.rows.filter((job) => new Date(job.start) >= todayEnd).slice(0, 8)) {
+      items.push(buildDashboardJobItem(row, "upcoming", "low"));
+    }
+
+    for (const row of tasksResult.rows) {
+      const due = new Date(row.due_date);
+      const section = due < todayStart ? "attention" : due < todayEnd ? "today" : "upcoming";
+      items.push(buildDashboardTodoItem(row, section, section === "attention" ? "high" : "normal"));
+    }
+    for (const row of customerResult.rows) {
+      const due = new Date(row.due_date);
+      const section = due < todayStart ? "attention" : due < todayEnd ? "today" : "upcoming";
+      items.push(buildDashboardCustomerReminderItem(row, section, section === "attention" ? "high" : "normal"));
+    }
+
+    const doneKeys = new Set(doneResult.rows.map((row) => `${row.routine_id}:${row.day_key}`));
+    for (let day = new Date(todayStart); day < upcomingEnd; day = new Date(day.getTime() + 86400000)) {
+      const jsDay = day.getDay();
+      const weekday = jsDay === 0 ? 1 : jsDay + 1;
+      const dayKey = day.toISOString().slice(0, 10);
+      for (const row of routinesResult.rows) {
+        const weekdays = Array.isArray(row.weekdays) ? row.weekdays.map(Number) : [];
+        if (!weekdays.includes(weekday)) continue;
+        if (doneKeys.has(`${row.id}:${dayKey}`)) continue;
+        const dueAt = row.time ? new Date(row.time) : day;
+        const section = day >= todayStart && day < todayEnd ? "today" : "upcoming";
+        items.push(buildDashboardRoutineItem(row, dayKey, dueAt.toISOString(), section, "normal"));
+      }
+    }
+
+    for (const row of notificationsResult.rows) {
+      items.push({
+        id: `notification:${row.id}`,
+        type: "notification",
+        source_type: "notification",
+        source_id: String(row.id),
+        fingerprint: String(row.created_at || ""),
+        section: "attention",
+        priority: "normal",
+        title: row.title,
+        subtitle: row.body || "",
+        amount_cents: null,
+        due_at: row.created_at,
+        system_image: "bell.badge.fill",
+        tint: "orange",
+        completable: false,
+        dismissible: true,
+        destination: { type: row.kind === "voicemail" ? "message_thread" : "notification", id: String(row.id) }
+      });
+    }
+
+    if (employer && req.companyId) {
+      try {
+        const projection = await loadProjection(pool, req.companyId, 7);
+        for (const event of (projection.events || []).slice(0, 8)) {
+          items.push({
+            id: `finance_upcoming:${event.planned_item_id}:${event.occurrence_date}`,
+            type: "finance_upcoming",
+            source_type: "finance_planned_occurrence",
+            source_id: `${event.planned_item_id}:${event.occurrence_date}`,
+            fingerprint: `${event.planned_item_id}:${event.occurrence_date}:${event.signed_amount_cents}`,
+            section: event.occurrence_date <= todayStart.toISOString().slice(0, 10) ? "today" : "upcoming",
+            priority: event.occurrence_date <= todayStart.toISOString().slice(0, 10) ? "normal" : "low",
+            title: event.title,
+            subtitle: event.direction === "income" ? "Expected income" : (event.recurrence === "none" ? "Planned expense" : "Recurring"),
+            amount_cents: Number(event.signed_amount_cents || 0),
+            due_at: event.occurrence_date,
+            system_image: event.direction === "income" ? "arrow.down.circle.fill" : "calendar.badge.clock",
+            tint: event.direction === "income" ? "green" : "red",
+            completable: false,
+            dismissible: true,
+            destination: { type: "finance_upcoming", id: String(event.planned_item_id) }
+          });
+        }
+      } catch (financeError) {
+        console.warn("[dashboard] finance projection skipped", { message: financeError?.message || String(financeError) });
+      }
+    }
+
+    const priorityRank = { critical: 0, high: 1, normal: 2, low: 3 };
+    const sectionRank = { attention: 0, today: 1, upcoming: 2 };
+    const visibleItems = filterDashboardDismissed(items, dismissalsResult.rows)
+      .sort((a, b) => {
+        if (sectionRank[a.section] !== sectionRank[b.section]) return sectionRank[a.section] - sectionRank[b.section];
+        if (a.section === "attention" && priorityRank[a.priority] !== priorityRank[b.priority]) return priorityRank[a.priority] - priorityRank[b.priority];
+        return new Date(a.due_at || 0) - new Date(b.due_at || 0);
+      });
+
+    const revenue = revenueResult.rows[0] || {};
+    res.json({
+      generated_at: new Date().toISOString(),
+      metrics: {
+        jobs_today: jobsToday.length,
+        revenue_today_cents: Number(revenue.today || 0),
+        revenue_week_cents: Number(revenue.week || 0),
+        revenue_month_cents: Number(revenue.month || 0),
+        jobs_missing_prices_today: Number(revenue.missing_today || 0),
+        revenue_visible: employer
+      },
+      items: visibleItems.slice(0, 30)
+    });
+  } catch (e) {
+    console.error("[dashboard] summary failed:", e);
+    res.status(500).json({ error: "dashboard_summary_failed" });
+  }
+});
+
+app.post("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
+  const { type, source_id, fingerprint } = req.body || {};
+  if (!DASHBOARD_DISMISS_TYPES.has(type) || !source_id) return res.status(400).json({ error: "invalid_dashboard_item" });
+  try {
+    await pool.query(
+      `INSERT INTO dashboard_dismissals(company_id, user_id, item_type, source_id, fingerprint)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (user_id, item_type, source_id, fingerprint)
+       DO UPDATE SET dismissed_at = now(), expires_at = NULL`,
+      [req.companyId || null, req.userId, type, String(source_id), String(fingerprint || "")]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[dashboard] dismiss failed:", e);
+    res.status(500).json({ error: "dashboard_dismiss_failed" });
+  }
+});
+
+app.delete("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
+  const { type, source_id, fingerprint } = req.query || {};
+  if (!DASHBOARD_DISMISS_TYPES.has(type) || !source_id) return res.status(400).json({ error: "invalid_dashboard_item" });
+  try {
+    await pool.query(
+      `DELETE FROM dashboard_dismissals
+        WHERE user_id = $1
+          AND item_type = $2
+          AND source_id = $3
+          AND fingerprint = $4`,
+      [req.userId, type, String(source_id), String(fingerprint || "")]
+    );
+    res.status(204).end();
+  } catch (e) {
+    console.error("[dashboard] undismiss failed:", e);
+    res.status(500).json({ error: "dashboard_undismiss_failed" });
+  }
+});
+
 // ---------- MAP PINS ----------
 app.get("/api/map-pins", authRequired, async (req, res) => {
   try {
