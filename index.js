@@ -786,6 +786,42 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS contacts_updated_idx ON contacts(updated_at DESC);
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS lead_info JSONB;
 
+    CREATE TABLE IF NOT EXISTS crm_routes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'saved',
+      start_label TEXT,
+      start_latitude DOUBLE PRECISION,
+      start_longitude DOUBLE PRECISION,
+      ending_behavior TEXT NOT NULL DEFAULT 'finish_at_final_stop',
+      distance_meters DOUBLE PRECISION,
+      travel_time_seconds DOUBLE PRECISION,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS crm_routes_company_updated_idx ON crm_routes(company_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS crm_routes_user_updated_idx ON crm_routes(user_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS crm_route_stops (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      route_id UUID NOT NULL REFERENCES crm_routes(id) ON DELETE CASCADE,
+      company_id UUID,
+      contact_id UUID,
+      stop_order INTEGER NOT NULL,
+      name_snapshot TEXT NOT NULL,
+      address_snapshot TEXT NOT NULL,
+      latitude DOUBLE PRECISION,
+      longitude DOUBLE PRECISION,
+      status TEXT NOT NULL DEFAULT 'not_visited',
+      batch_number INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS crm_route_stops_route_order_idx ON crm_route_stops(route_id, stop_order);
+    CREATE INDEX IF NOT EXISTS crm_route_stops_company_idx ON crm_route_stops(company_id);
+
     CREATE TABLE IF NOT EXISTS zapier_tokens (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       token TEXT UNIQUE NOT NULL,
@@ -5612,6 +5648,233 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "failed_update" });
+  }
+});
+
+function routeScope(req, alias = "r") {
+  if (req.companyId) return { sql: `${alias}.company_id = $1`, values: [req.companyId] };
+  return { sql: `${alias}.user_id = $1`, values: [req.userId] };
+}
+
+function mapRouteRow(row, stops = []) {
+  return {
+    id: row.id,
+    name: row.name,
+    status: row.status,
+    start_label: row.start_label,
+    start_latitude: row.start_latitude,
+    start_longitude: row.start_longitude,
+    ending_behavior: row.ending_behavior,
+    stop_count: Number(row.stop_count || stops.length || 0),
+    distance_meters: row.distance_meters,
+    travel_time_seconds: row.travel_time_seconds,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    stops
+  };
+}
+
+function mapRouteStopRow(row) {
+  return {
+    id: row.id,
+    contact_id: row.contact_id,
+    stop_order: Number(row.stop_order || 0),
+    name: row.name_snapshot,
+    address: row.address_snapshot,
+    latitude: row.latitude,
+    longitude: row.longitude,
+    status: row.status,
+    batch_number: row.batch_number == null ? null : Number(row.batch_number)
+  };
+}
+
+async function fetchRouteWithStops(req, id) {
+  const scope = routeScope(req, "r");
+  const route = await pool.query(
+    `SELECT r.*, COUNT(s.id)::int AS stop_count
+       FROM crm_routes r
+       LEFT JOIN crm_route_stops s ON s.route_id = r.id
+      WHERE r.id = $2 AND ${scope.sql}
+      GROUP BY r.id`,
+    [...scope.values, id]
+  );
+  if (!route.rows.length) return null;
+  const stops = (await pool.query(
+    `SELECT * FROM crm_route_stops WHERE route_id = $1 ORDER BY stop_order ASC`,
+    [id]
+  )).rows.map(mapRouteStopRow);
+  return mapRouteRow(route.rows[0], stops);
+}
+
+async function replaceRouteStops(client, routeId, companyId, stops) {
+  await client.query(`DELETE FROM crm_route_stops WHERE route_id = $1`, [routeId]);
+  const cleanStops = Array.isArray(stops) ? stops : [];
+  for (const raw of cleanStops) {
+    const order = Number(raw.stop_order);
+    const name = (raw.name_snapshot || raw.name || "").toString().trim();
+    const address = (raw.address_snapshot || raw.address || "").toString().trim();
+    if (!Number.isFinite(order) || order < 1 || !name) continue;
+    await client.query(
+      `INSERT INTO crm_route_stops(
+         id, route_id, company_id, contact_id, stop_order, name_snapshot, address_snapshot,
+         latitude, longitude, status, batch_number
+       )
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [
+        randomUUID(),
+        routeId,
+        companyId || null,
+        raw.contact_id || null,
+        order,
+        name,
+        address,
+        Number.isFinite(Number(raw.latitude)) ? Number(raw.latitude) : null,
+        Number.isFinite(Number(raw.longitude)) ? Number(raw.longitude) : null,
+        ["not_visited", "arrived", "completed", "skipped"].includes(raw.status) ? raw.status : "not_visited",
+        Number.isFinite(Number(raw.batch_number)) ? Number(raw.batch_number) : null
+      ]
+    );
+  }
+}
+
+// ---------- routes (AUTH REQUIRED + COMPANY-SCOPED) ----------
+app.get("/api/routes", authRequired, async (req, res) => {
+  try {
+    const scope = routeScope(req, "r");
+    const { rows } = await pool.query(
+      `SELECT r.*, COUNT(s.id)::int AS stop_count
+         FROM crm_routes r
+         LEFT JOIN crm_route_stops s ON s.route_id = r.id
+        WHERE ${scope.sql}
+        GROUP BY r.id
+        ORDER BY r.updated_at DESC
+        LIMIT 50`,
+      scope.values
+    );
+    res.json(rows.map((row) => mapRouteRow(row, [])));
+  } catch (e) {
+    console.error("[routes/list]", e);
+    res.status(500).json({ error: "routes_failed", message: "Couldn't load routes." });
+  }
+});
+
+app.get("/api/routes/:id", authRequired, async (req, res) => {
+  try {
+    const route = await fetchRouteWithStops(req, req.params.id);
+    if (!route) return res.status(404).json({ error: "route_not_found" });
+    res.json(route);
+  } catch (e) {
+    console.error("[routes/get]", e);
+    res.status(500).json({ error: "route_failed", message: "Couldn't load this route." });
+  }
+});
+
+app.post("/api/routes", authRequired, async (req, res) => {
+  const name = (req.body.name || "").toString().trim() || `Route ${new Date().toISOString().slice(0, 10)}`;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const id = randomUUID();
+    await client.query(
+      `INSERT INTO crm_routes(
+         id, company_id, user_id, name, status, start_label, start_latitude, start_longitude,
+         ending_behavior, distance_meters, travel_time_seconds
+       )
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [
+        id,
+        req.companyId || null,
+        req.userId,
+        name,
+        ["active", "saved", "completed", "archived"].includes(req.body.status) ? req.body.status : "saved",
+        req.body.start_label || null,
+        Number.isFinite(Number(req.body.start_latitude)) ? Number(req.body.start_latitude) : null,
+        Number.isFinite(Number(req.body.start_longitude)) ? Number(req.body.start_longitude) : null,
+        ["finish_at_final_stop", "return_to_start"].includes(req.body.ending_behavior) ? req.body.ending_behavior : "finish_at_final_stop",
+        Number.isFinite(Number(req.body.distance_meters)) ? Number(req.body.distance_meters) : null,
+        Number.isFinite(Number(req.body.travel_time_seconds)) ? Number(req.body.travel_time_seconds) : null
+      ]
+    );
+    await replaceRouteStops(client, id, req.companyId, req.body.stops);
+    await client.query("COMMIT");
+    res.status(201).json(await fetchRouteWithStops(req, id));
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[routes/create]", e);
+    res.status(500).json({ error: "route_create_failed", message: "Couldn't save route." });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/api/routes/:id", authRequired, async (req, res) => {
+  const scope = routeScope(req, "r");
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query(`SELECT id FROM crm_routes r WHERE r.id = $2 AND ${scope.sql} FOR UPDATE`, [...scope.values, req.params.id]);
+    if (!existing.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "route_not_found" });
+    }
+    await client.query(
+      `UPDATE crm_routes
+          SET name = COALESCE($2, name),
+              status = COALESCE($3, status),
+              start_label = $4,
+              start_latitude = $5,
+              start_longitude = $6,
+              ending_behavior = COALESCE($7, ending_behavior),
+              distance_meters = $8,
+              travel_time_seconds = $9,
+              updated_at = now()
+        WHERE id = $1`,
+      [
+        req.params.id,
+        (req.body.name || "").toString().trim() || null,
+        ["active", "saved", "completed", "archived"].includes(req.body.status) ? req.body.status : null,
+        req.body.start_label || null,
+        Number.isFinite(Number(req.body.start_latitude)) ? Number(req.body.start_latitude) : null,
+        Number.isFinite(Number(req.body.start_longitude)) ? Number(req.body.start_longitude) : null,
+        ["finish_at_final_stop", "return_to_start"].includes(req.body.ending_behavior) ? req.body.ending_behavior : null,
+        Number.isFinite(Number(req.body.distance_meters)) ? Number(req.body.distance_meters) : null,
+        Number.isFinite(Number(req.body.travel_time_seconds)) ? Number(req.body.travel_time_seconds) : null
+      ]
+    );
+    await replaceRouteStops(client, req.params.id, req.companyId, req.body.stops);
+    await client.query("COMMIT");
+    res.json(await fetchRouteWithStops(req, req.params.id));
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[routes/update]", e);
+    res.status(500).json({ error: "route_update_failed", message: "Couldn't save route." });
+  } finally {
+    client.release();
+  }
+});
+
+app.patch("/api/routes/:routeId/stops/:stopId", authRequired, async (req, res) => {
+  try {
+    const scope = routeScope(req, "r");
+    const allowed = await pool.query(`SELECT r.id FROM crm_routes r WHERE r.id = $2 AND ${scope.sql}`, [...scope.values, req.params.routeId]);
+    if (!allowed.rows.length) return res.status(404).json({ error: "route_not_found" });
+    const status = ["not_visited", "arrived", "completed", "skipped"].includes(req.body.status) ? req.body.status : null;
+    const order = Number.isFinite(Number(req.body.stop_order)) ? Number(req.body.stop_order) : null;
+    const { rows } = await pool.query(
+      `UPDATE crm_route_stops
+          SET status = COALESCE($3, status),
+              stop_order = COALESCE($4, stop_order),
+              updated_at = now()
+        WHERE id = $1 AND route_id = $2
+        RETURNING *`,
+      [req.params.stopId, req.params.routeId, status, order]
+    );
+    if (!rows.length) return res.status(404).json({ error: "route_stop_not_found" });
+    await pool.query(`UPDATE crm_routes SET updated_at = now() WHERE id = $1`, [req.params.routeId]);
+    res.json(mapRouteStopRow(rows[0]));
+  } catch (e) {
+    console.error("[routes/stop/update]", e);
+    res.status(500).json({ error: "route_stop_update_failed", message: "Couldn't update stop." });
   }
 });
 
