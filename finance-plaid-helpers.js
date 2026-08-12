@@ -280,6 +280,7 @@ function recurringCandidateType({ direction, displayName, category, variability,
   if (text.match(/LOAN|DEBT|CREDIT CARD|IRS|TAX PAYMENT/)) return "debt_payment";
   if (text.match(/RENT|UTILITY|UTILITIES|ELECTRIC|WATER|GAS BILL|INSURANCE|PHONE|INTERNET|TAX/)) return "recurring_bill";
   if (text.match(/NETFLIX|SPOTIFY|APPLE|SUBSCRIPTION|DIGITAL|STREAMING|ENTERTAINMENT|SOFTWARE|SAAS/)) return "subscription";
+  if (text.match(/MCDONALD|RESTAURANT|FAST FOOD|FOOD|SHELL|GAS STATION|FUEL|HOME DEPOT|LOWE|HARDWARE|MATERIAL/)) return "repeated_merchant";
   if (["weekly", "biweekly", "monthly", "quarterly", "yearly"].includes(cadence) && variability !== "variable") return "recurring_expense";
   return "repeated_merchant";
 }

@@ -1,4 +1,5 @@
 import {
+  analyzeRecurringTransactionPatterns,
   decryptAccessToken,
   encryptAccessToken,
   collectPlaidSyncPages,
@@ -6,6 +7,7 @@ import {
   getPlaidConfig,
   isSafeLocalDisconnectProviderFailure,
   normalizePlaidEnvironment,
+  monthlyEquivalentCents,
   plaidAccountToFinanceAccount,
   plaidSecretForEnvironment,
   providerAmountToCents,
@@ -257,6 +259,48 @@ export async function installPlaidSchema(pool) {
       UNIQUE(plaid_item_internal_id, plaid_stream_id)
     );
 
+    CREATE TABLE IF NOT EXISTS finance_recurring_candidates (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      merchant_normalized TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      direction TEXT NOT NULL CHECK (direction IN ('expense','income')),
+      candidate_type TEXT NOT NULL CHECK (candidate_type IN ('subscription','recurring_bill','recurring_expense','recurring_income','debt_payment','repeated_merchant')),
+      cadence TEXT NOT NULL CHECK (cadence IN ('weekly','biweekly','monthly','quarterly','yearly','irregular')),
+      average_amount_cents BIGINT NOT NULL DEFAULT 0,
+      median_amount_cents BIGINT NOT NULL DEFAULT 0,
+      min_amount_cents BIGINT NOT NULL DEFAULT 0,
+      max_amount_cents BIGINT NOT NULL DEFAULT 0,
+      variability TEXT NOT NULL DEFAULT 'fixed' CHECK (variability IN ('fixed','mostly_fixed','variable')),
+      variability_score_cents BIGINT NOT NULL DEFAULT 0,
+      first_seen_date DATE,
+      last_seen_date DATE,
+      next_expected_date DATE,
+      occurrence_count INTEGER NOT NULL DEFAULT 0,
+      confidence_score INTEGER NOT NULL DEFAULT 0,
+      confidence_label TEXT NOT NULL DEFAULT 'low' CHECK (confidence_label IN ('high','medium','low')),
+      source TEXT NOT NULL DEFAULT 'wolfcrm_inferred' CHECK (source IN ('wolfcrm_inferred','plaid_detected','both')),
+      status TEXT NOT NULL DEFAULT 'detected' CHECK (status IN ('detected','confirmed','ignored','ended')),
+      category TEXT,
+      account_id UUID REFERENCES finance_accounts(id) ON DELETE SET NULL,
+      linked_planned_item_id UUID REFERENCES finance_planned_items(id) ON DELETE SET NULL,
+      ignored_at TIMESTAMPTZ,
+      confirmed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, merchant_normalized, direction, cadence)
+    );
+    CREATE INDEX IF NOT EXISTS finance_recurring_candidates_company_status_idx
+      ON finance_recurring_candidates(company_id, status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS finance_recurring_candidate_transactions (
+      candidate_id UUID NOT NULL REFERENCES finance_recurring_candidates(id) ON DELETE CASCADE,
+      transaction_id UUID NOT NULL REFERENCES finance_transactions(id) ON DELETE CASCADE,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY(candidate_id, transaction_id)
+    );
+
     CREATE TABLE IF NOT EXISTS finance_plaid_item_events (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -354,6 +398,113 @@ function transactionPayload(row) {
     created_at: row.created_at,
     updated_at: row.updated_at
   };
+}
+
+function dateOnlyPayload(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+}
+
+function recurringCandidatePayload(row) {
+  const medianAmount = Number(row.median_amount_cents || 0);
+  const cadence = row.cadence || "irregular";
+  return {
+    id: row.id,
+    company_id: row.company_id,
+    merchant_normalized: row.merchant_normalized,
+    display_name: row.display_name,
+    direction: row.direction,
+    candidate_type: row.candidate_type,
+    cadence,
+    average_amount_cents: Number(row.average_amount_cents || 0),
+    median_amount_cents: medianAmount,
+    min_amount_cents: Number(row.min_amount_cents || 0),
+    max_amount_cents: Number(row.max_amount_cents || 0),
+    variability: row.variability,
+    variability_score_cents: Number(row.variability_score_cents || 0),
+    first_seen_date: dateOnlyPayload(row.first_seen_date),
+    last_seen_date: dateOnlyPayload(row.last_seen_date),
+    next_expected_date: dateOnlyPayload(row.next_expected_date),
+    occurrence_count: Number(row.occurrence_count || 0),
+    confidence_score: Number(row.confidence_score || 0),
+    confidence_label: row.confidence_label || "low",
+    source: row.source || "wolfcrm_inferred",
+    status: row.status || "detected",
+    category: row.category || null,
+    account_id: row.account_id || null,
+    account_name: row.account_name || null,
+    linked_planned_item_id: row.linked_planned_item_id || null,
+    ignored_at: row.ignored_at || null,
+    confirmed_at: row.confirmed_at || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    monthly_equivalent_cents: monthlyEquivalentCents(medianAmount, cadence)
+  };
+}
+
+function recurringCandidateSummary(candidates) {
+  return candidates.reduce((summary, candidate) => {
+    if (candidate.status !== "confirmed") return summary;
+    const monthly = candidate.monthly_equivalent_cents || monthlyEquivalentCents(candidate.median_amount_cents || 0, candidate.cadence);
+    if (candidate.direction === "income") {
+      summary.confirmed_monthly_income_cents += monthly;
+    } else {
+      summary.confirmed_monthly_expense_cents += monthly;
+    }
+    summary.confirmed_count += 1;
+    summary.net_monthly_cents = summary.confirmed_monthly_income_cents - summary.confirmed_monthly_expense_cents;
+    return summary;
+  }, {
+    confirmed_monthly_expense_cents: 0,
+    confirmed_monthly_income_cents: 0,
+    net_monthly_cents: 0,
+    confirmed_count: 0
+  });
+}
+
+async function loadRecurringCandidates(pool, companyId, includeIgnored = false) {
+  const { rows } = await pool.query(
+    `SELECT c.*, a.name AS account_name
+       FROM finance_recurring_candidates c
+       LEFT JOIN finance_accounts a ON a.id = c.account_id AND a.company_id = c.company_id
+      WHERE c.company_id = $1
+        AND ($2::boolean OR c.status <> 'ignored')
+      ORDER BY
+        CASE c.status WHEN 'confirmed' THEN 0 WHEN 'detected' THEN 1 WHEN 'ended' THEN 2 ELSE 3 END,
+        c.confidence_score DESC,
+        c.next_expected_date ASC NULLS LAST,
+        c.updated_at DESC`,
+    [companyId, includeIgnored]
+  );
+  return rows.map(recurringCandidatePayload);
+}
+
+async function findMatchingPlannedItem(client, companyId, candidate) {
+  const { rows } = await client.query(
+    `SELECT *
+       FROM finance_planned_items
+      WHERE company_id = $1
+        AND archived_at IS NULL
+        AND direction = $2
+        AND recurrence = $3
+        AND (
+          lower(title) = lower($4)
+          OR lower(title) LIKE lower($5)
+          OR lower($4) LIKE '%' || lower(title) || '%'
+        )
+      ORDER BY abs(amount_cents - $6) ASC, created_at DESC
+      LIMIT 1`,
+    [
+      companyId,
+      candidate.direction,
+      candidate.cadence,
+      candidate.display_name,
+      `%${candidate.display_name}%`,
+      Number(candidate.median_amount_cents || 0)
+    ]
+  );
+  return rows[0] || null;
 }
 
 async function getPlaidItem(pool, companyId, id) {
@@ -1094,6 +1245,223 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       })));
     } catch (error) {
       handlePlaidError(res, error, "finance_recurring_streams_failed");
+    }
+  });
+
+  app.get("/api/finance/recurring-candidates", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const candidates = await loadRecurringCandidates(pool, req.companyId, req.query.include_ignored === "true");
+      res.json({ candidates, summary: recurringCandidateSummary(candidates) });
+    } catch (error) {
+      handlePlaidError(res, error, "finance_recurring_candidates_failed");
+    }
+  });
+
+  app.post("/api/finance/recurring-candidates/analyze", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    const client = await pool.connect();
+    try {
+      const lookbackMonths = Math.min(12, Math.max(3, Number(req.body?.lookback_months || 6)));
+      const { rows: txRows } = await pool.query(
+        `SELECT t.*, a.name AS account_name
+           FROM finance_transactions t
+           JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
+          WHERE t.company_id = $1
+            AND t.status = 'posted'
+            AND t.pending = false
+            AND t.removed_at IS NULL
+            AND t.transaction_date >= (CURRENT_DATE - ($2::int || ' months')::interval)
+          ORDER BY t.transaction_date ASC`,
+        [req.companyId, lookbackMonths]
+      );
+      const detected = analyzeRecurringTransactionPatterns(txRows, { minimumConfidence: 35 });
+      const updatedRows = [];
+
+      await client.query("BEGIN");
+      for (const candidate of detected) {
+        const upsert = await client.query(
+          `INSERT INTO finance_recurring_candidates (
+             company_id, merchant_normalized, display_name, direction, candidate_type, cadence,
+             average_amount_cents, median_amount_cents, min_amount_cents, max_amount_cents,
+             variability, variability_score_cents, first_seen_date, last_seen_date, next_expected_date,
+             occurrence_count, confidence_score, confidence_label, source, status, category, account_id
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'detected',$20,$21)
+           ON CONFLICT (company_id, merchant_normalized, direction, cadence)
+           DO UPDATE SET
+             display_name = EXCLUDED.display_name,
+             candidate_type = EXCLUDED.candidate_type,
+             average_amount_cents = EXCLUDED.average_amount_cents,
+             median_amount_cents = EXCLUDED.median_amount_cents,
+             min_amount_cents = EXCLUDED.min_amount_cents,
+             max_amount_cents = EXCLUDED.max_amount_cents,
+             variability = EXCLUDED.variability,
+             variability_score_cents = EXCLUDED.variability_score_cents,
+             first_seen_date = EXCLUDED.first_seen_date,
+             last_seen_date = EXCLUDED.last_seen_date,
+             next_expected_date = EXCLUDED.next_expected_date,
+             occurrence_count = EXCLUDED.occurrence_count,
+             confidence_score = EXCLUDED.confidence_score,
+             confidence_label = EXCLUDED.confidence_label,
+             source = CASE WHEN finance_recurring_candidates.source = 'plaid_detected' THEN 'both' ELSE finance_recurring_candidates.source END,
+             category = EXCLUDED.category,
+             account_id = EXCLUDED.account_id,
+             status = CASE
+               WHEN finance_recurring_candidates.status IN ('confirmed','ignored') THEN finance_recurring_candidates.status
+               ELSE 'detected'
+             END,
+             updated_at = now()
+           RETURNING *`,
+          [
+            req.companyId,
+            candidate.merchant_normalized,
+            candidate.display_name,
+            candidate.direction,
+            candidate.candidate_type,
+            candidate.cadence,
+            candidate.average_amount_cents,
+            candidate.median_amount_cents,
+            candidate.min_amount_cents,
+            candidate.max_amount_cents,
+            candidate.variability,
+            candidate.variability_score_cents,
+            candidate.first_seen_date,
+            candidate.last_seen_date,
+            candidate.next_expected_date,
+            candidate.occurrence_count,
+            candidate.confidence_score,
+            candidate.confidence_label,
+            candidate.source,
+            candidate.category,
+            candidate.account_id
+          ]
+        );
+        const saved = upsert.rows[0];
+        updatedRows.push(saved);
+        await client.query(`DELETE FROM finance_recurring_candidate_transactions WHERE candidate_id = $1 AND company_id = $2`, [saved.id, req.companyId]);
+        for (const transactionId of candidate.source_transaction_ids || []) {
+          await client.query(
+            `INSERT INTO finance_recurring_candidate_transactions(candidate_id, transaction_id, company_id)
+             VALUES($1,$2,$3)
+             ON CONFLICT DO NOTHING`,
+            [saved.id, transactionId, req.companyId]
+          );
+        }
+      }
+      await client.query("COMMIT");
+
+      const candidates = await loadRecurringCandidates(pool, req.companyId, false);
+      res.json({
+        analyzed_transaction_count: txRows.length,
+        created_or_updated_count: updatedRows.length,
+        candidates,
+        summary: recurringCandidateSummary(candidates)
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      handlePlaidError(res, error, "finance_recurring_analysis_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post("/api/finance/recurring-candidates/:id/ignore", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_recurring_candidates
+            SET status = 'ignored',
+                ignored_at = COALESCE(ignored_at, now()),
+                updated_at = now()
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [req.params.id, req.companyId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "recurring_candidate_not_found", message: "Recurring item was not found." });
+      res.json(recurringCandidatePayload(rows[0]));
+    } catch (error) {
+      handlePlaidError(res, error, "finance_recurring_ignore_failed");
+    }
+  });
+
+  app.post("/api/finance/recurring-candidates/:id/confirm", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const existing = await client.query(
+        `SELECT c.*, a.name AS account_name
+           FROM finance_recurring_candidates c
+           LEFT JOIN finance_accounts a ON a.id = c.account_id AND a.company_id = c.company_id
+          WHERE c.id = $1 AND c.company_id = $2
+          FOR UPDATE`,
+        [req.params.id, req.companyId]
+      );
+      const candidate = existing.rows[0];
+      if (!candidate) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "recurring_candidate_not_found", message: "Recurring item was not found." });
+      }
+      if (candidate.status === "confirmed" && candidate.linked_planned_item_id) {
+        await client.query("COMMIT");
+        return res.json({ candidate: recurringCandidatePayload(candidate), planned_item_id: candidate.linked_planned_item_id, linked_existing: true });
+      }
+      if (candidate.candidate_type === "repeated_merchant" || candidate.cadence === "irregular") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "recurring_candidate_not_confirmable", message: "This looks like a repeated merchant, not a recurring bill or income source." });
+      }
+
+      let plannedItem = await findMatchingPlannedItem(client, req.companyId, candidate);
+      let linkedExisting = Boolean(plannedItem);
+      if (!plannedItem) {
+        const notes = [
+          "Created from WolfCRM recurring analysis.",
+          candidate.variability === "variable" ? "Amount is based on the median observed transaction amount." : null
+        ].filter(Boolean).join(" ");
+        const inserted = await client.query(
+          `INSERT INTO finance_planned_items (
+             company_id, account_id, title, direction, amount_cents, scheduled_date,
+             category, recurrence, recurrence_end_date, notes, created_by
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,$10)
+           RETURNING *`,
+          [
+            req.companyId,
+            candidate.account_id || null,
+            candidate.display_name,
+            candidate.direction,
+            Number(candidate.median_amount_cents || 0),
+            dateOnlyPayload(candidate.next_expected_date) || dateOnlyPayload(candidate.last_seen_date),
+            candidate.category || (candidate.direction === "income" ? "Other Income" : "Other"),
+            candidate.cadence,
+            notes,
+            req.userId
+          ]
+        );
+        plannedItem = inserted.rows[0];
+        linkedExisting = false;
+      }
+
+      const updated = await client.query(
+        `UPDATE finance_recurring_candidates
+            SET status = 'confirmed',
+                confirmed_at = COALESCE(confirmed_at, now()),
+                linked_planned_item_id = $3,
+                updated_at = now()
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [candidate.id, req.companyId, plannedItem.id]
+      );
+      await client.query("COMMIT");
+      res.json({
+        candidate: recurringCandidatePayload(updated.rows[0]),
+        planned_item_id: plannedItem.id,
+        linked_existing: linkedExisting
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      handlePlaidError(res, error, "finance_recurring_confirm_failed");
+    } finally {
+      client.release();
     }
   });
 

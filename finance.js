@@ -12,7 +12,7 @@ import { installFinanceAIRoutes, installFinanceAISchema } from "./finance-ai.js"
 const VALID_ACCOUNT_TYPES = new Set(["cash", "checking", "savings", "other"]);
 const VALID_CURRENCIES = new Set(["usd"]);
 const VALID_DIRECTIONS = new Set(["income", "expense"]);
-const VALID_RECURRENCES = new Set(["none", "weekly", "biweekly", "monthly", "yearly"]);
+const VALID_RECURRENCES = new Set(["none", "weekly", "biweekly", "monthly", "quarterly", "yearly"]);
 const VALID_DEBT_TYPES = new Set(["federal_tax", "state_tax", "local_tax", "credit_card", "personal_loan", "business_loan", "auto_loan", "medical", "other"]);
 const VALID_DEBT_PRIORITIES = new Set(["high", "normal", "low"]);
 const VALID_DEBT_STATUSES = new Set(["active", "paid"]);
@@ -352,7 +352,7 @@ async function installFinanceSchema(pool) {
       amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0),
       scheduled_date DATE NOT NULL,
       category TEXT NOT NULL DEFAULT 'Other',
-      recurrence TEXT NOT NULL DEFAULT 'none' CHECK (recurrence IN ('none','weekly','biweekly','monthly','yearly')),
+      recurrence TEXT NOT NULL DEFAULT 'none' CHECK (recurrence IN ('none','weekly','biweekly','monthly','quarterly','yearly')),
       recurrence_end_date DATE,
       notes TEXT,
       archived_at TIMESTAMPTZ,
@@ -472,6 +472,8 @@ async function installFinanceSchema(pool) {
     END $$;
   `);
   await pool.query(`ALTER TABLE finance_settings ADD COLUMN IF NOT EXISTS use_available_bank_balance BOOLEAN NOT NULL DEFAULT false`);
+  await pool.query(`ALTER TABLE finance_planned_items DROP CONSTRAINT IF EXISTS finance_planned_items_recurrence_check`);
+  await pool.query(`ALTER TABLE finance_planned_items ADD CONSTRAINT finance_planned_items_recurrence_check CHECK (recurrence IN ('none','weekly','biweekly','monthly','quarterly','yearly'))`);
   await installPlaidSchema(pool);
   await installReceiptSchema(pool);
   await installFinanceAISchema(pool);
@@ -543,6 +545,7 @@ function nextOccurrenceDate(dateString, recurrence) {
   case "weekly": return addDays(dateString, 7);
   case "biweekly": return addDays(dateString, 14);
   case "monthly": return addMonthsClamped(dateString, 1);
+  case "quarterly": return addMonthsClamped(dateString, 3);
   case "yearly": return addYearsClamped(dateString, 1);
   default: return null;
   }
