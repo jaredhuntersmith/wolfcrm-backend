@@ -706,8 +706,12 @@ export async function installFinanceAISchema(pool) {
 async function ensureConversation(pool, companyId, userId, conversationId, message) {
   if (conversationId) {
     const existing = await pool.query(
-      `SELECT * FROM finance_ai_conversations WHERE id = $1 AND company_id = $2 AND archived_at IS NULL`,
-      [conversationId, companyId]
+      `SELECT * FROM finance_ai_conversations
+        WHERE id = $1
+          AND company_id = $2
+          AND COALESCE(owner_user_id, created_by) = $3
+          AND archived_at IS NULL`,
+      [conversationId, companyId, userId]
     );
     if (existing.rows.length) return existing.rows[0];
     const error = new Error("Conversation was not found.");
@@ -715,10 +719,10 @@ async function ensureConversation(pool, companyId, userId, conversationId, messa
     error.code = "finance_ai_conversation_not_found";
     throw error;
   }
-  const title = cleanString(message, 60) || "AI Financial Assistant";
+  const title = cleanString(message, 60) || "New Chat";
   const { rows } = await pool.query(
-    `INSERT INTO finance_ai_conversations(id, company_id, title, created_by)
-     VALUES($1,$2,$3,$4)
+    `INSERT INTO finance_ai_conversations(id, company_id, title, owner_user_id, created_by, last_message_at)
+     VALUES($1,$2,$3,$4,$4,now())
      RETURNING *`,
     [randomUUID(), companyId, title, userId]
   );
@@ -732,7 +736,14 @@ async function addMessage(pool, companyId, conversationId, role, content, userId
      RETURNING *`,
     [companyId, conversationId, role, content, userId, JSON.stringify(toolActivity)]
   );
-  await pool.query(`UPDATE finance_ai_conversations SET updated_at = now() WHERE id = $1 AND company_id = $2`, [conversationId, companyId]);
+  await pool.query(
+    `UPDATE finance_ai_conversations
+        SET updated_at = now(),
+            last_message_at = now(),
+            owner_user_id = COALESCE(owner_user_id, $3)
+      WHERE id = $1 AND company_id = $2`,
+    [conversationId, companyId, userId]
+  );
   return rows[0];
 }
 
@@ -747,6 +758,18 @@ async function recentMessages(pool, companyId, conversationId) {
     [companyId, conversationId, MAX_CONTEXT_MESSAGES]
   );
   return rows.reverse();
+}
+
+async function getConversationForOwner(pool, companyId, userId, conversationId) {
+  const { rows } = await pool.query(
+    `SELECT * FROM finance_ai_conversations
+      WHERE id = $1
+        AND company_id = $2
+        AND COALESCE(owner_user_id, created_by) = $3
+        AND archived_at IS NULL`,
+    [conversationId, companyId, userId]
+  );
+  return rows[0] || null;
 }
 
 function rateLimitAllows(companyId, userId) {
@@ -1128,86 +1151,112 @@ async function auditAction(pool, ctx, toolName, args, status, resultSummary = nu
   ).catch(() => {});
 }
 
+function proposalSummary(toolName, args) {
+  switch (toolName) {
+  case "create_planned_expense": return `Add planned expense: ${cleanString(args.title, 80) || "Expense"} for ${dollars(args.amount_cents)}`;
+  case "create_expected_income": return `Add expected income: ${cleanString(args.title, 80) || "Income"} for ${dollars(args.amount_cents)}`;
+  case "update_minimum_reserve": return `Set minimum cash reserve to ${dollars(args.minimum_cash_reserve_cents)}`;
+  case "create_goal": return `Create goal: ${cleanString(args.name, 80) || "Goal"} for ${dollars(args.target_amount_cents)}`;
+  case "create_budget": return `Create budget: ${cleanString(args.name, 80) || "Budget"} for ${dollars(args.limit_cents)}`;
+  case "update_debt_planned_payment": return `Update debt planned payment to ${dollars(args.planned_payment_cents)}`;
+  default: return cleanString(toolName, 80);
+  }
+}
+
+async function createActionProposal(pool, ctx, toolName, args) {
+  const payload = { tool_name: toolName, args: jsonSafe(args || {}) };
+  const { rows } = await pool.query(
+    `INSERT INTO finance_ai_action_proposals(company_id, owner_user_id, conversation_id, action_type, status, payload, summary, created_by, expires_at)
+     VALUES($1,$2,$3,$4,'proposed',$5,$6,$2,now() + interval '7 days')
+     RETURNING *`,
+    [
+      ctx.companyId,
+      ctx.userId,
+      ctx.conversationId || null,
+      toolName,
+      JSON.stringify(payload),
+      proposalSummary(toolName, args)
+    ]
+  );
+  if (Array.isArray(ctx.actionProposals)) ctx.actionProposals.push(actionProposalPayload(rows[0]));
+  await auditAction(pool, ctx, toolName, args, "succeeded", `proposal:${rows[0].id}`);
+  return { proposed_action: actionProposalPayload(rows[0]), requires_confirmation: true };
+}
+
+async function executeProposalPayload(pool, proposal) {
+  const toolName = proposal.payload?.tool_name || proposal.action_type;
+  const args = proposal.payload?.args || {};
+  const companyId = proposal.company_id;
+  if (toolName === "create_planned_expense" || toolName === "create_expected_income") {
+    const direction = toolName === "create_expected_income" ? "income" : "expense";
+    const { rows } = await pool.query(
+      `INSERT INTO finance_planned_items(company_id, title, direction, amount_cents, scheduled_date, category, recurrence, notes, created_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [
+        companyId,
+        cleanString(args.title, 140),
+        direction,
+        parseCents(args.amount_cents, "amount_cents"),
+        parseDateOnly(args.scheduled_date, "scheduled_date", { nullable: false }),
+        cleanString(args.category || "Other", 80) || "Other",
+        ["none", "weekly", "biweekly", "monthly", "yearly"].includes(args.recurrence) ? args.recurrence : "none",
+        cleanString(args.notes, 1000) || null,
+        proposal.owner_user_id
+      ]
+    );
+    return { created: { id: rows[0].id, title: rows[0].title, direction, amount_cents: Number(rows[0].amount_cents || 0), scheduled_date: dateOnlyFromDb(rows[0].scheduled_date) } };
+  }
+  if (toolName === "update_minimum_reserve") {
+    const reserve = parseCents(args.minimum_cash_reserve_cents, "minimum_cash_reserve_cents");
+    const { rows } = await pool.query(
+      `INSERT INTO finance_settings(company_id, minimum_cash_reserve_cents)
+       VALUES($1,$2)
+       ON CONFLICT (company_id) DO UPDATE SET minimum_cash_reserve_cents = EXCLUDED.minimum_cash_reserve_cents, updated_at = now()
+       RETURNING *`,
+      [companyId, reserve]
+    );
+    return { minimum_cash_reserve_cents: Number(rows[0].minimum_cash_reserve_cents || 0) };
+  }
+  if (toolName === "create_goal") {
+    const target = parseCents(args.target_amount_cents, "target_amount_cents");
+    const current = parseCents(args.current_amount_cents, "current_amount_cents");
+    const { rows } = await pool.query(
+      `INSERT INTO finance_goals(company_id, name, goal_type, target_amount_cents, current_amount_cents, target_date, status, notes, created_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [companyId, cleanString(args.name, 140), args.goal_type || "custom", target, current, parseDateOnly(args.target_date, "target_date"), current >= target && target > 0 ? "completed" : "active", cleanString(args.notes, 1000) || null, proposal.owner_user_id]
+    );
+    return { created: { id: rows[0].id, name: rows[0].name, target_amount_cents: Number(rows[0].target_amount_cents || 0), status: rows[0].status } };
+  }
+  if (toolName === "create_budget") {
+    const period = normalizePeriod(args.period);
+    const bounds = periodBounds(period);
+    const { rows } = await pool.query(
+      `INSERT INTO finance_budgets(company_id, name, category, limit_cents, period, start_date, created_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7)
+       RETURNING *`,
+      [companyId, cleanString(args.name, 140), cleanString(args.category, 80), parseCents(args.limit_cents, "limit_cents"), period, bounds.start_date, proposal.owner_user_id]
+    );
+    return { created: { id: rows[0].id, name: rows[0].name, category: rows[0].category, limit_cents: Number(rows[0].limit_cents || 0), period: rows[0].period } };
+  }
+  if (toolName === "update_debt_planned_payment") {
+    const debtId = cleanString(args.debt_id, 80);
+    const payment = parseCents(args.planned_payment_cents, "planned_payment_cents");
+    const existing = await pool.query(`SELECT * FROM finance_debts WHERE id = $1 AND company_id = $2 AND archived_at IS NULL`, [debtId, companyId]);
+    if (!existing.rows.length) throw Object.assign(new Error("Debt was not found."), { statusCode: 404, code: "finance_debt_not_found" });
+    const { rows } = await pool.query(
+      `UPDATE finance_debts SET planned_payment_cents = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`,
+      [debtId, companyId, payment]
+    );
+    return { debt: { id: rows[0].id, name: rows[0].name, planned_payment_cents: Number(rows[0].planned_payment_cents || 0) } };
+  }
+  throw Object.assign(new Error("Unsupported action proposal."), { statusCode: 400, code: "finance_ai_action_unsupported" });
+}
+
 async function executeWriteTool(pool, ctx, toolName, args) {
   enforceWriteIntent(ctx, toolName);
-  try {
-    let result;
-    if (toolName === "create_planned_expense" || toolName === "create_expected_income") {
-      const direction = toolName === "create_expected_income" ? "income" : "expense";
-      const { rows } = await pool.query(
-        `INSERT INTO finance_planned_items(company_id, title, direction, amount_cents, scheduled_date, category, recurrence, notes, created_by)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         RETURNING *`,
-        [
-          ctx.companyId,
-          cleanString(args.title, 140),
-          direction,
-          parseCents(args.amount_cents, "amount_cents"),
-          parseDateOnly(args.scheduled_date, "scheduled_date", { nullable: false }),
-          cleanString(args.category || "Other", 80) || "Other",
-          ["none", "weekly", "biweekly", "monthly", "yearly"].includes(args.recurrence) ? args.recurrence : "none",
-          cleanString(args.notes, 1000) || null,
-          ctx.userId
-        ]
-      );
-      result = { created: { id: rows[0].id, title: rows[0].title, direction, amount_cents: Number(rows[0].amount_cents || 0), scheduled_date: dateOnlyFromDb(rows[0].scheduled_date) } };
-    } else if (toolName === "update_minimum_reserve") {
-      const reserve = parseCents(args.minimum_cash_reserve_cents, "minimum_cash_reserve_cents");
-      const { rows } = await pool.query(
-        `INSERT INTO finance_settings(company_id, minimum_cash_reserve_cents)
-         VALUES($1,$2)
-         ON CONFLICT (company_id) DO UPDATE SET minimum_cash_reserve_cents = EXCLUDED.minimum_cash_reserve_cents, updated_at = now()
-         RETURNING *`,
-        [ctx.companyId, reserve]
-      );
-      result = { minimum_cash_reserve_cents: Number(rows[0].minimum_cash_reserve_cents || 0) };
-    } else if (toolName === "create_goal") {
-      const target = parseCents(args.target_amount_cents, "target_amount_cents");
-      const current = parseCents(args.current_amount_cents, "current_amount_cents");
-      const { rows } = await pool.query(
-        `INSERT INTO finance_goals(company_id, name, goal_type, target_amount_cents, current_amount_cents, target_date, status, notes, created_by)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         RETURNING *`,
-        [ctx.companyId, cleanString(args.name, 140), args.goal_type || "custom", target, current, parseDateOnly(args.target_date, "target_date"), current >= target && target > 0 ? "completed" : "active", cleanString(args.notes, 1000) || null, ctx.userId]
-      );
-      result = { created: { id: rows[0].id, name: rows[0].name, target_amount_cents: Number(rows[0].target_amount_cents || 0), status: rows[0].status } };
-    } else if (toolName === "create_budget") {
-      const period = normalizePeriod(args.period);
-      const bounds = periodBounds(period);
-      const { rows } = await pool.query(
-        `INSERT INTO finance_budgets(company_id, name, category, limit_cents, period, start_date, created_by)
-         VALUES($1,$2,$3,$4,$5,$6,$7)
-         RETURNING *`,
-        [ctx.companyId, cleanString(args.name, 140), cleanString(args.category, 80), parseCents(args.limit_cents, "limit_cents"), period, bounds.start_date, ctx.userId]
-      );
-      result = { created: { id: rows[0].id, name: rows[0].name, category: rows[0].category, limit_cents: Number(rows[0].limit_cents || 0), period: rows[0].period } };
-    } else if (toolName === "update_debt_planned_payment") {
-      const debtId = cleanString(args.debt_id, 80);
-      const payment = parseCents(args.planned_payment_cents, "planned_payment_cents");
-      const existing = await pool.query(`SELECT * FROM finance_debts WHERE id = $1 AND company_id = $2 AND archived_at IS NULL`, [debtId, ctx.companyId]);
-      if (!existing.rows.length) {
-        const error = new Error("Debt was not found.");
-        error.statusCode = 404;
-        error.code = "finance_debt_not_found";
-        throw error;
-      }
-      const { rows } = await pool.query(
-        `UPDATE finance_debts SET planned_payment_cents = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`,
-        [debtId, ctx.companyId, payment]
-      );
-      result = { debt: { id: rows[0].id, name: rows[0].name, planned_payment_cents: Number(rows[0].planned_payment_cents || 0) } };
-    } else {
-      const error = new Error("Unknown write tool.");
-      error.statusCode = 400;
-      error.code = "finance_ai_unknown_tool";
-      throw error;
-    }
-    await auditAction(pool, ctx, toolName, args, "succeeded", JSON.stringify(result).slice(0, 500));
-    return result;
-  } catch (error) {
-    await auditAction(pool, ctx, toolName, args, error.statusCode === 400 ? "rejected" : "failed", error.message);
-    throw error;
-  }
+  return createActionProposal(pool, ctx, toolName, args);
 }
 
 export async function executeFinanceAITool(pool, ctx, name, args = {}) {
@@ -1452,8 +1501,21 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     if (!requireCompany(req, res)) return;
     try {
       const { rows } = await pool.query(
-        `SELECT * FROM finance_ai_conversations WHERE company_id = $1 AND archived_at IS NULL ORDER BY updated_at DESC LIMIT 30`,
-        [req.companyId]
+        `SELECT c.*,
+                last_msg.content AS last_preview
+           FROM finance_ai_conversations c
+           LEFT JOIN LATERAL (
+             SELECT content FROM finance_ai_messages m
+              WHERE m.company_id = c.company_id AND m.conversation_id = c.id
+              ORDER BY m.created_at DESC
+              LIMIT 1
+           ) last_msg ON true
+          WHERE c.company_id = $1
+            AND COALESCE(c.owner_user_id, c.created_by) = $2
+            AND c.archived_at IS NULL
+          ORDER BY c.pinned_at DESC NULLS LAST, COALESCE(c.last_message_at, c.updated_at, c.created_at) DESC
+          LIMIT 50`,
+        [req.companyId, req.userId]
       );
       res.json(rows.map(conversationPayload));
     } catch (error) {
@@ -1464,13 +1526,13 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
   app.get("/api/finance/ai/conversations/:id", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
-      const conversation = await pool.query(`SELECT * FROM finance_ai_conversations WHERE id = $1 AND company_id = $2 AND archived_at IS NULL`, [req.params.id, req.companyId]);
-      if (!conversation.rows.length) return res.status(404).json({ error: "finance_ai_conversation_not_found", message: "Conversation was not found." });
+      const conversation = await getConversationForOwner(pool, req.companyId, req.userId, req.params.id);
+      if (!conversation) return res.status(404).json({ error: "finance_ai_conversation_not_found", message: "Conversation was not found." });
       const { rows } = await pool.query(
         `SELECT * FROM finance_ai_messages WHERE conversation_id = $1 AND company_id = $2 ORDER BY created_at ASC LIMIT 100`,
         [req.params.id, req.companyId]
       );
-      res.json({ conversation: conversationPayload(conversation.rows[0]), messages: rows.map(visibleMessagePayload) });
+      res.json({ conversation: conversationPayload(conversation), messages: rows.map(visibleMessagePayload) });
     } catch (error) {
       handleAIError(res, error, "finance_ai_conversation_failed");
     }
@@ -1483,6 +1545,227 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
       res.status(201).json(conversationPayload(conversation));
     } catch (error) {
       handleAIError(res, error, "finance_ai_conversation_create_failed");
+    }
+  });
+
+  app.patch("/api/finance/ai/conversations/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const title = cleanString(req.body?.title, 80);
+      if (!title) return res.status(400).json({ error: "finance_ai_title_required", message: "Conversation title is required." });
+      const { rows } = await pool.query(
+        `UPDATE finance_ai_conversations
+            SET title = $4, updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND COALESCE(owner_user_id, created_by) = $3 AND archived_at IS NULL
+          RETURNING *`,
+        [req.params.id, req.companyId, req.userId, title]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_ai_conversation_not_found", message: "Conversation was not found." });
+      res.json(conversationPayload(rows[0]));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_conversation_update_failed");
+    }
+  });
+
+  app.post("/api/finance/ai/conversations/:id/pin", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_ai_conversations
+            SET pinned_at = now(), updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND COALESCE(owner_user_id, created_by) = $3 AND archived_at IS NULL
+          RETURNING *`,
+        [req.params.id, req.companyId, req.userId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_ai_conversation_not_found", message: "Conversation was not found." });
+      res.json(conversationPayload(rows[0]));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_conversation_pin_failed");
+    }
+  });
+
+  app.post("/api/finance/ai/conversations/:id/unpin", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_ai_conversations
+            SET pinned_at = NULL, updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND COALESCE(owner_user_id, created_by) = $3 AND archived_at IS NULL
+          RETURNING *`,
+        [req.params.id, req.companyId, req.userId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_ai_conversation_not_found", message: "Conversation was not found." });
+      res.json(conversationPayload(rows[0]));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_conversation_unpin_failed");
+    }
+  });
+
+  app.post("/api/finance/ai/conversations/:id/archive", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_ai_conversations
+            SET archived_at = now(), updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND COALESCE(owner_user_id, created_by) = $3 AND archived_at IS NULL
+          RETURNING *`,
+        [req.params.id, req.companyId, req.userId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_ai_conversation_not_found", message: "Conversation was not found." });
+      res.json(conversationPayload(rows[0]));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_conversation_archive_failed");
+    }
+  });
+
+  app.get("/api/finance/ai/actions/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `SELECT * FROM finance_ai_action_proposals WHERE id = $1 AND company_id = $2 AND owner_user_id = $3`,
+        [req.params.id, req.companyId, req.userId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_ai_action_not_found", message: "Action proposal was not found." });
+      res.json(actionProposalPayload(rows[0]));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_action_failed");
+    }
+  });
+
+  app.patch("/api/finance/ai/actions/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const payload = req.body?.payload;
+      if (!payload || typeof payload !== "object") return res.status(400).json({ error: "finance_ai_action_payload_required", message: "Action payload is required." });
+      const summary = cleanString(req.body?.summary, 300);
+      const { rows } = await pool.query(
+        `UPDATE finance_ai_action_proposals
+            SET payload = $4, summary = COALESCE(NULLIF($5, ''), summary), updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status = 'proposed'
+          RETURNING *`,
+        [req.params.id, req.companyId, req.userId, JSON.stringify(payload), summary]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_ai_action_not_found", message: "Editable action proposal was not found." });
+      res.json(actionProposalPayload(rows[0]));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_action_update_failed");
+    }
+  });
+
+  app.post("/api/finance/ai/actions/:id/cancel", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_ai_action_proposals
+            SET status = 'cancelled', updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status = 'proposed'
+          RETURNING *`,
+        [req.params.id, req.companyId, req.userId]
+      );
+      if (!rows.length) {
+        const existing = await pool.query(`SELECT * FROM finance_ai_action_proposals WHERE id = $1 AND company_id = $2 AND owner_user_id = $3`, [req.params.id, req.companyId, req.userId]);
+        if (!existing.rows.length) return res.status(404).json({ error: "finance_ai_action_not_found", message: "Action proposal was not found." });
+        return res.json(actionProposalPayload(existing.rows[0]));
+      }
+      res.json(actionProposalPayload(rows[0]));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_action_cancel_failed");
+    }
+  });
+
+  app.post("/api/finance/ai/actions/:id/confirm", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      let proposalResult = await pool.query(
+        `UPDATE finance_ai_action_proposals
+            SET status = 'executing', confirmed_at = COALESCE(confirmed_at, now()), updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status = 'proposed'
+          RETURNING *`,
+        [req.params.id, req.companyId, req.userId]
+      );
+      if (!proposalResult.rows.length) {
+        const existing = await pool.query(`SELECT * FROM finance_ai_action_proposals WHERE id = $1 AND company_id = $2 AND owner_user_id = $3`, [req.params.id, req.companyId, req.userId]);
+        if (!existing.rows.length) return res.status(404).json({ error: "finance_ai_action_not_found", message: "Action proposal was not found." });
+        if (existing.rows[0].status === "completed") return res.json(actionProposalPayload(existing.rows[0]));
+        return res.status(409).json({ error: "finance_ai_action_not_confirmable", message: "Action proposal is not ready to confirm." });
+      }
+      const proposal = proposalResult.rows[0];
+      try {
+        const result = await executeProposalPayload(pool, proposal);
+        const completed = await pool.query(
+          `UPDATE finance_ai_action_proposals
+              SET status = 'completed', result = $4, executed_at = now(), updated_at = now()
+            WHERE id = $1 AND company_id = $2 AND owner_user_id = $3
+            RETURNING *`,
+          [proposal.id, req.companyId, req.userId, JSON.stringify(result)]
+        );
+        res.json(actionProposalPayload(completed.rows[0]));
+      } catch (error) {
+        const failed = await pool.query(
+          `UPDATE finance_ai_action_proposals
+              SET status = 'failed', error_message = $4, updated_at = now()
+            WHERE id = $1 AND company_id = $2 AND owner_user_id = $3
+            RETURNING *`,
+          [proposal.id, req.companyId, req.userId, cleanString(error.message, 500)]
+        );
+        res.status(error.statusCode || 500).json(actionProposalPayload(failed.rows[0]));
+      }
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_action_confirm_failed");
+    }
+  });
+
+  app.get("/api/finance/ai/memories", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `SELECT * FROM finance_ai_memories
+          WHERE company_id = $1
+            AND archived_at IS NULL
+            AND (memory_scope = 'company' OR owner_user_id = $2)
+          ORDER BY memory_scope ASC, updated_at DESC
+          LIMIT 100`,
+        [req.companyId, req.userId]
+      );
+      res.json(rows.map(memoryPayload));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_memories_failed");
+    }
+  });
+
+  app.patch("/api/finance/ai/memories/:id", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const content = cleanString(req.body?.content, 1000);
+      if (!content) return res.status(400).json({ error: "finance_ai_memory_content_required", message: "Memory content is required." });
+      const { rows } = await pool.query(
+        `UPDATE finance_ai_memories
+            SET content = $4, updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND (owner_user_id = $3 OR memory_scope = 'company') AND archived_at IS NULL
+          RETURNING *`,
+        [req.params.id, req.companyId, req.userId, content]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_ai_memory_not_found", message: "Memory was not found." });
+      res.json(memoryPayload(rows[0]));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_memory_update_failed");
+    }
+  });
+
+  app.post("/api/finance/ai/memories/:id/archive", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_ai_memories
+            SET archived_at = now(), updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND (owner_user_id = $3 OR memory_scope = 'company') AND archived_at IS NULL
+          RETURNING *`,
+        [req.params.id, req.companyId, req.userId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_ai_memory_not_found", message: "Memory was not found." });
+      res.json(memoryPayload(rows[0]));
+    } catch (error) {
+      handleAIError(res, error, "finance_ai_memory_archive_failed");
     }
   });
 
@@ -1504,7 +1787,7 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
       const input = history.map((item) => ({ role: item.role === "assistant" ? "assistant" : "user", content: item.content }));
       const client = await openAIClient();
       if (!client) return res.status(503).json({ error: "openai_not_configured", message: "AI Financial Assistant is not configured yet." });
-      const ctx = { companyId: req.companyId, userId: req.userId, conversationId: conversation.id, userMessage: message, requestId: randomUUID() };
+      const ctx = { companyId: req.companyId, userId: req.userId, conversationId: conversation.id, userMessage: message, requestId: randomUUID(), actionProposals: [] };
       const result = await runResponsesToolLoop({ pool, client, model: config.model, input, ctx });
       const assistant = await addMessage(pool, req.companyId, conversation.id, "assistant", result.text, req.userId, summarizeToolActivity(result.toolActivity));
       res.json({
@@ -1512,6 +1795,7 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
         message: visibleMessagePayload(assistant),
         assistant_message: result.text,
         tool_activity: summarizeToolActivity(result.toolActivity),
+        action_proposals: ctx.actionProposals,
         model: config.model
       });
     } catch (error) {
