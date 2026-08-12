@@ -1636,6 +1636,166 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     }
   });
 
+  app.get("/api/finance/recurring-candidates/:id/transactions", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const candidate = await pool.query(
+        `SELECT * FROM finance_recurring_candidates WHERE id = $1 AND company_id = $2 LIMIT 1`,
+        [req.params.id, req.companyId]
+      );
+      if (!candidate.rows.length) return res.status(404).json({ error: "recurring_candidate_not_found", message: "Recurring item was not found." });
+      let rows = (await pool.query(
+        `SELECT t.*, a.name AS account_name, a.institution_name,
+                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count
+           FROM finance_recurring_candidate_transactions ct
+           JOIN finance_transactions t ON t.id = ct.transaction_id AND t.company_id = ct.company_id
+           JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
+          WHERE ct.company_id = $1 AND ct.candidate_id = $2
+          ORDER BY t.transaction_date DESC, t.created_at DESC`,
+        [req.companyId, req.params.id]
+      )).rows;
+      if (!rows.length) {
+        rows = (await pool.query(
+          `SELECT t.*, a.name AS account_name, a.institution_name,
+                  (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count
+             FROM finance_transactions t
+             JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
+            WHERE t.company_id = $1
+              AND t.status = 'posted'
+              AND t.pending = false
+              AND t.removed_at IS NULL
+              AND (
+                lower(COALESCE(t.merchant_name, t.original_name, '')) LIKE lower($2)
+                OR lower(COALESCE(t.original_name, t.merchant_name, '')) LIKE lower($2)
+              )
+            ORDER BY t.transaction_date DESC, t.created_at DESC
+            LIMIT 50`,
+          [req.companyId, `%${candidate.rows[0].display_name}%`]
+        )).rows;
+      }
+      res.json(rows.map(transactionPayload));
+    } catch (error) {
+      handleFinanceDataError(res, error, "finance_recurring_transactions_failed");
+    }
+  });
+
+  app.post("/api/finance/recurring-candidates/:id/manual-subscription", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    const client = await pool.connect();
+    try {
+      const cadence = ["weekly", "biweekly", "monthly", "quarterly", "yearly"].includes(req.body?.cadence) ? req.body.cadence : "monthly";
+      const amountCents = Number(req.body?.amount_cents);
+      const title = cleanString(req.body?.title, 160);
+      const scheduledDate = dateOnlyPayload(req.body?.next_expected_date);
+      if (!title || !Number.isFinite(amountCents) || amountCents <= 0 || !scheduledDate) {
+        return res.status(400).json({ error: "invalid_manual_subscription", message: "Choose a transaction, amount, frequency, and next payment date." });
+      }
+      await client.query("BEGIN");
+      const candidateRow = await client.query(
+        `SELECT * FROM finance_recurring_candidates WHERE id = $1 AND company_id = $2 FOR UPDATE`,
+        [req.params.id, req.companyId]
+      );
+      const candidate = candidateRow.rows[0];
+      if (!candidate) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "recurring_candidate_not_found", message: "Recurring item was not found." });
+      }
+      if (candidate.status === "confirmed" && candidate.linked_planned_item_id) {
+        await client.query("COMMIT");
+        return res.json({ candidate: recurringCandidatePayload(candidate), planned_item_id: candidate.linked_planned_item_id, linked_existing: true });
+      }
+      const transactionRow = await client.query(
+        `SELECT * FROM finance_transactions
+          WHERE id = $1
+            AND company_id = $2
+            AND status = 'posted'
+            AND pending = false
+            AND removed_at IS NULL
+          LIMIT 1`,
+        [req.body.transaction_id, req.companyId]
+      );
+      const transaction = transactionRow.rows[0];
+      if (!transaction) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "finance_transaction_not_found", message: "Transaction was not found." });
+      }
+
+      const manualCandidate = {
+        ...candidate,
+        display_name: title,
+        candidate_type: "subscription",
+        cadence,
+        median_amount_cents: amountCents,
+        direction: transaction.direction || candidate.direction,
+        category: req.body.category || candidate.category,
+        account_id: transaction.account_id || candidate.account_id
+      };
+      let plannedItem = await findMatchingPlannedItem(client, req.companyId, manualCandidate);
+      let linkedExisting = Boolean(plannedItem);
+      if (!plannedItem) {
+        const inserted = await client.query(
+          `INSERT INTO finance_planned_items (
+             company_id, account_id, title, direction, amount_cents, scheduled_date,
+             category, recurrence, recurrence_end_date, notes, created_by
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,$10)
+           RETURNING *`,
+          [
+            req.companyId,
+            manualCandidate.account_id || null,
+            title,
+            manualCandidate.direction,
+            amountCents,
+            scheduledDate,
+            manualCandidate.category || (manualCandidate.direction === "income" ? "Other Income" : "Other"),
+            cadence,
+            `Manually confirmed as a subscription from transaction ${transaction.id}. Other merchant transactions remain ordinary transactions.`,
+            req.userId
+          ]
+        );
+        plannedItem = inserted.rows[0];
+        linkedExisting = false;
+      }
+      const updated = await client.query(
+        `UPDATE finance_recurring_candidates
+            SET status = 'confirmed',
+                candidate_type = 'subscription',
+                cadence = $3,
+                median_amount_cents = $4,
+                average_amount_cents = $4,
+                min_amount_cents = LEAST(min_amount_cents, $4),
+                max_amount_cents = GREATEST(max_amount_cents, $4),
+                next_expected_date = $5,
+                confirmed_at = COALESCE(confirmed_at, now()),
+                linked_planned_item_id = $6,
+                source = 'wolfcrm_inferred',
+                updated_at = now()
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [candidate.id, req.companyId, cadence, amountCents, scheduledDate, plannedItem.id]
+      );
+      await client.query(
+        `INSERT INTO finance_recurring_candidate_transactions(candidate_id, transaction_id, company_id)
+         VALUES($1,$2,$3)
+         ON CONFLICT DO NOTHING`,
+        [candidate.id, transaction.id, req.companyId]
+      );
+      const account = updated.rows[0]?.account_id
+        ? await client.query(`SELECT name AS account_name FROM finance_accounts WHERE id = $1 AND company_id = $2 LIMIT 1`, [updated.rows[0].account_id, req.companyId])
+        : { rows: [] };
+      await client.query("COMMIT");
+      res.json({
+        candidate: recurringCandidatePayload({ ...updated.rows[0], display_name: title, account_name: account.rows[0]?.account_name || null }),
+        planned_item_id: plannedItem.id,
+        linked_existing: linkedExisting
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      handleFinanceDataError(res, error, "finance_recurring_manual_subscription_failed");
+    } finally {
+      client.release();
+    }
+  });
+
   app.post("/api/finance/recurring-candidates/:id/confirm", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     const client = await pool.connect();
