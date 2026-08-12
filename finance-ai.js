@@ -162,6 +162,37 @@ function conversationPayload(row) {
   return {
     id: row.id,
     title: row.title,
+    pinned_at: row.pinned_at || null,
+    last_message_at: row.last_message_at || row.updated_at || null,
+    last_preview: row.last_preview || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function actionProposalPayload(row) {
+  return {
+    id: row.id,
+    conversation_id: row.conversation_id,
+    action_type: row.action_type,
+    status: row.status,
+    payload: row.payload || {},
+    summary: row.summary,
+    created_at: row.created_at,
+    confirmed_at: row.confirmed_at || null,
+    executed_at: row.executed_at || null,
+    result: row.result || null,
+    error_message: row.error_message || null
+  };
+}
+
+function memoryPayload(row) {
+  return {
+    id: row.id,
+    memory_scope: row.memory_scope,
+    memory_type: row.memory_type,
+    content: row.content,
+    structured_data: row.structured_data || null,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
