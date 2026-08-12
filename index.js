@@ -7429,13 +7429,14 @@ app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
               material_cost_cents, finished_at, sales_user_ids
          FROM schedule_events
         WHERE company_id = $1
-          AND finished_at >= $2
-          AND finished_at < $3
+          AND finished_at IS NOT NULL
+          AND start_at >= $2
+          AND start_at < $3
           AND (
             sales_user_ids ? $4
             OR (jsonb_array_length(sales_user_ids) = 0 AND created_by = $5)
           )
-        ORDER BY finished_at DESC`,
+        ORDER BY start_at DESC`,
       [req.companyId, range.start.toISOString(), range.end.toISOString(), userID, userID]
     );
     const jobs = rows.map((job) => {
