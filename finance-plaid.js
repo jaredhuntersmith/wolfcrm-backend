@@ -336,6 +336,7 @@ export async function installPlaidSchema(pool) {
   await pool.query(`ALTER TABLE finance_accounts ADD COLUMN IF NOT EXISTS iso_currency_code TEXT`);
   await pool.query(`ALTER TABLE finance_accounts ADD COLUMN IF NOT EXISTS include_in_liquid_cash BOOLEAN NOT NULL DEFAULT true`);
   await pool.query(`ALTER TABLE finance_accounts ADD COLUMN IF NOT EXISTS last_balance_update_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE finance_accounts ADD COLUMN IF NOT EXISTS transaction_history_removed_at TIMESTAMPTZ`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS finance_accounts_plaid_account_unique_idx ON finance_accounts(company_id, plaid_account_id) WHERE source = 'plaid' AND plaid_account_id IS NOT NULL`);
 }
 
@@ -360,6 +361,7 @@ export function plaidAccountPayload(row) {
     plaid_account_subtype: row.plaid_account_subtype,
     include_in_liquid_cash: row.include_in_liquid_cash,
     last_balance_update_at: row.last_balance_update_at,
+    transaction_history_removed_at: row.transaction_history_removed_at || null,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -505,6 +507,172 @@ async function findMatchingPlannedItem(client, companyId, candidate) {
     ]
   );
   return rows[0] || null;
+}
+
+function accountHistoryRemovalPayload(result) {
+  return {
+    scope: result.scope,
+    transaction_count: Number(result.transaction_count || 0),
+    receipt_count: Number(result.receipt_count || 0),
+    account_count: Number(result.account_count || 0),
+    accounts: result.accounts || [],
+    removed: Boolean(result.removed),
+    message: result.message || null
+  };
+}
+
+async function previewPlaidHistoryRemoval(pool, companyId, { accountId = null, itemId = null } = {}) {
+  const values = [companyId];
+  const accountFilter = accountId ? "AND a.id = $2" : itemId ? "AND a.plaid_item_internal_id = $2" : "";
+  if (accountId || itemId) values.push(accountId || itemId);
+  const { rows: accountRows } = await pool.query(
+    `SELECT a.id, a.name, a.mask, a.account_type, a.plaid_account_subtype,
+            a.transaction_history_removed_at,
+            pi.id AS plaid_item_internal_id,
+            pi.institution_name,
+            pi.status AS plaid_item_status,
+            pi.disconnected_at AS plaid_item_disconnected_at
+       FROM finance_accounts a
+       JOIN finance_plaid_items pi ON pi.id = a.plaid_item_internal_id AND pi.company_id = a.company_id
+      WHERE a.company_id = $1
+        AND a.source = 'plaid'
+        ${accountFilter}
+      ORDER BY a.name ASC`,
+    values
+  );
+  if (!accountRows.length) {
+    const error = new Error(accountId ? "finance_account_not_found" : "plaid_item_not_found");
+    error.statusCode = 404;
+    error.code = accountId ? "finance_account_not_found" : "plaid_item_not_found";
+    throw error;
+  }
+  const active = accountRows.find((account) => account.plaid_item_status !== "disconnected" && !account.plaid_item_disconnected_at);
+  if (active) {
+    const error = new Error("Disconnect this bank account before removing its history.");
+    error.statusCode = 409;
+    error.code = "finance_history_remove_requires_disconnect";
+    throw error;
+  }
+  const accountIds = accountRows.map((account) => account.id);
+  const stats = await pool.query(
+    `SELECT COUNT(*)::int AS transaction_count,
+            COUNT(DISTINCT r.id)::int AS receipt_count
+       FROM finance_transactions t
+       LEFT JOIN finance_receipts r ON r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL
+      WHERE t.company_id = $1
+        AND t.source = 'plaid'
+        AND t.account_id = ANY($2::uuid[])`,
+    [companyId, accountIds]
+  );
+  return {
+    scope: accountId ? "account" : "item",
+    account_count: accountRows.length,
+    transaction_count: stats.rows[0]?.transaction_count || 0,
+    receipt_count: stats.rows[0]?.receipt_count || 0,
+    accounts: accountRows.map((account) => ({
+      id: account.id,
+      plaid_item_internal_id: account.plaid_item_internal_id,
+      name: account.name,
+      mask: account.mask,
+      account_type: account.account_type,
+      plaid_account_subtype: account.plaid_account_subtype,
+      institution_name: account.institution_name,
+      transaction_history_removed_at: account.transaction_history_removed_at || null
+    }))
+  };
+}
+
+async function removePlaidTransactionHistory(pool, companyId, userId, { accountId = null, itemId = null } = {}) {
+  const preview = await previewPlaidHistoryRemoval(pool, companyId, { accountId, itemId });
+  const accountIds = preview.accounts.map((account) => account.id);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const txRows = await client.query(
+      `SELECT id FROM finance_transactions
+        WHERE company_id = $1
+          AND source = 'plaid'
+          AND account_id = ANY($2::uuid[])
+        FOR UPDATE`,
+      [companyId, accountIds]
+    );
+    const transactionIds = txRows.rows.map((row) => row.id);
+    let receiptCount = 0;
+    if (transactionIds.length) {
+      const receipts = await client.query(
+        `UPDATE finance_receipts
+            SET transaction_id = NULL,
+                status = 'unmatched',
+                match_method = NULL,
+                match_confidence = NULL,
+                matched_at = NULL,
+                updated_at = now()
+          WHERE company_id = $1
+            AND transaction_id = ANY($2::uuid[])
+          RETURNING id`,
+        [companyId, transactionIds]
+      );
+      receiptCount = receipts.rows.length;
+      await client.query(`DELETE FROM finance_receipt_matches WHERE company_id = $1 AND transaction_id = ANY($2::uuid[])`, [companyId, transactionIds]);
+      await client.query(`DELETE FROM finance_transaction_provider_refs WHERE company_id = $1 AND transaction_id = ANY($2::uuid[])`, [companyId, transactionIds]);
+      await client.query(`DELETE FROM finance_recurring_candidate_transactions WHERE company_id = $1 AND transaction_id = ANY($2::uuid[])`, [companyId, transactionIds]);
+      await client.query(`DELETE FROM finance_transactions WHERE company_id = $1 AND id = ANY($2::uuid[])`, [companyId, transactionIds]);
+      await client.query(
+        `UPDATE finance_recurring_candidates c
+            SET status = 'ended',
+                updated_at = now()
+          WHERE c.company_id = $1
+            AND c.status = 'detected'
+            AND NOT EXISTS (
+              SELECT 1 FROM finance_recurring_candidate_transactions r
+               WHERE r.company_id = c.company_id AND r.candidate_id = c.id
+            )`,
+        [companyId]
+      );
+    }
+    await client.query(
+      `UPDATE finance_accounts
+          SET transaction_history_removed_at = COALESCE(transaction_history_removed_at, now()),
+              updated_at = now()
+        WHERE company_id = $1
+          AND id = ANY($2::uuid[])`,
+      [companyId, accountIds]
+    );
+    const eventItemId = itemId || preview.accounts[0]?.plaid_item_internal_id || null;
+    if (eventItemId) {
+      await client.query(
+        `INSERT INTO finance_plaid_item_events(company_id, plaid_item_internal_id, event_type, event_status, metadata, created_by)
+         VALUES($1,$2,'remove_transaction_history','succeeded',$3,$4)`,
+        [
+          companyId,
+          eventItemId,
+          JSON.stringify({
+            scope: preview.scope,
+            account_ids: accountIds,
+            account_count: preview.account_count,
+            transaction_count: transactionIds.length,
+            receipt_count: receiptCount
+          }),
+          userId || null
+        ]
+      );
+    }
+    await client.query("COMMIT");
+    return accountHistoryRemovalPayload({
+      ...preview,
+      transaction_count: transactionIds.length,
+      receipt_count: receiptCount,
+      removed: true,
+      message: transactionIds.length
+        ? `Transaction history removed. ${transactionIds.length} transaction${transactionIds.length === 1 ? "" : "s"} removed. ${receiptCount} receipt${receiptCount === 1 ? "" : "s"} kept.`
+        : "Transaction history was already removed."
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function getPlaidItem(pool, companyId, id) {
@@ -1245,6 +1413,42 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       })));
     } catch (error) {
       handlePlaidError(res, error, "finance_recurring_streams_failed");
+    }
+  });
+
+  app.get("/api/finance/plaid/accounts/:id/history-removal-preview", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      res.json(accountHistoryRemovalPayload(await previewPlaidHistoryRemoval(pool, req.companyId, { accountId: req.params.id })));
+    } catch (error) {
+      handlePlaidError(res, error, "finance_history_removal_preview_failed");
+    }
+  });
+
+  app.post("/api/finance/plaid/accounts/:id/remove-history", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      res.json(await removePlaidTransactionHistory(pool, req.companyId, req.userId, { accountId: req.params.id }));
+    } catch (error) {
+      handlePlaidError(res, error, "finance_history_removal_failed");
+    }
+  });
+
+  app.get("/api/finance/plaid/items/:id/history-removal-preview", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      res.json(accountHistoryRemovalPayload(await previewPlaidHistoryRemoval(pool, req.companyId, { itemId: req.params.id })));
+    } catch (error) {
+      handlePlaidError(res, error, "finance_history_removal_preview_failed");
+    }
+  });
+
+  app.post("/api/finance/plaid/items/:id/remove-history", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      res.json(await removePlaidTransactionHistory(pool, req.companyId, req.userId, { itemId: req.params.id }));
+    } catch (error) {
+      handlePlaidError(res, error, "finance_history_removal_failed");
     }
   });
 

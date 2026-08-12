@@ -149,6 +149,7 @@ function financeAccountPayload(row) {
     plaid_account_subtype: row.plaid_account_subtype || null,
     include_in_liquid_cash: row.include_in_liquid_cash === undefined ? true : row.include_in_liquid_cash,
     last_balance_update_at: row.last_balance_update_at || null,
+    transaction_history_removed_at: row.transaction_history_removed_at || null,
     archived_at: row.archived_at,
     created_at: row.created_at,
     updated_at: row.updated_at
