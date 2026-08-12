@@ -7954,7 +7954,7 @@ app.post("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
 });
 
 app.delete("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
-  const { type, source_id, fingerprint } = req.query || {};
+  const { type, source_id, fingerprint } = req.query?.type ? req.query : (req.body || {});
   if (!DASHBOARD_DISMISS_TYPES.has(type) || !source_id) return res.status(400).json({ error: "invalid_dashboard_item" });
   try {
     await pool.query(
