@@ -139,6 +139,9 @@ function financeAccountPayload(row) {
     current_balance_cents: Number(row.current_balance_cents || 0),
     available_balance_cents: row.available_balance_cents === null || row.available_balance_cents === undefined ? null : Number(row.available_balance_cents),
     currency: row.currency,
+    plaid_item_internal_id: row.plaid_item_internal_id || null,
+    plaid_item_status: row.plaid_item_status || null,
+    plaid_item_disconnected_at: row.plaid_item_disconnected_at || null,
     institution_name: row.institution_name || null,
     official_name: row.official_name || null,
     mask: row.mask || null,
@@ -507,7 +510,7 @@ function overviewFromAccounts(accounts) {
     .filter((account) => isLiquidFinanceAccount(account) && account.include_in_liquid_cash !== false)
     .reduce((sum, account) => sum + account.current_balance_cents, 0);
   const physicalCash = accounts
-    .filter((account) => account.account_type === "cash")
+    .filter((account) => account.source === "manual" && account.account_type === "cash" && account.include_in_liquid_cash !== false)
     .reduce((sum, account) => sum + account.current_balance_cents, 0);
   return {
     total_liquid_cash_cents: total,
@@ -979,11 +982,12 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
     try {
       const includeArchived = req.query.include_archived === "true";
       const { rows } = await pool.query(
-        `SELECT *
-           FROM finance_accounts
-          WHERE company_id = $1
-            AND ($2::boolean OR archived_at IS NULL)
-          ORDER BY archived_at NULLS FIRST, account_type ASC, name ASC`,
+        `SELECT a.*, pi.status AS plaid_item_status, pi.disconnected_at AS plaid_item_disconnected_at
+           FROM finance_accounts a
+           LEFT JOIN finance_plaid_items pi ON pi.id = a.plaid_item_internal_id AND pi.company_id = a.company_id
+          WHERE a.company_id = $1
+            AND ($2::boolean OR a.archived_at IS NULL)
+          ORDER BY a.archived_at NULLS FIRST, a.account_type ASC, a.name ASC`,
         [req.companyId, includeArchived]
       );
       res.json(rows.map(financeAccountPayload));

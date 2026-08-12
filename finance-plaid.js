@@ -180,6 +180,19 @@ export async function installPlaidSchema(pool) {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(plaid_item_internal_id, plaid_stream_id)
     );
+
+    CREATE TABLE IF NOT EXISTS finance_plaid_item_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      plaid_item_internal_id UUID NOT NULL REFERENCES finance_plaid_items(id) ON DELETE RESTRICT,
+      event_type TEXT NOT NULL,
+      event_status TEXT NOT NULL,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS finance_plaid_item_events_company_idx
+      ON finance_plaid_item_events(company_id, plaid_item_internal_id, created_at DESC);
   `);
 
   await pool.query(`ALTER TABLE finance_accounts ADD COLUMN IF NOT EXISTS plaid_item_internal_id UUID REFERENCES finance_plaid_items(id) ON DELETE SET NULL`);
@@ -206,6 +219,9 @@ export function plaidAccountPayload(row) {
     current_balance_cents: Number(row.current_balance_cents || 0),
     available_balance_cents: row.available_balance_cents === null || row.available_balance_cents === undefined ? null : Number(row.available_balance_cents),
     currency: row.currency,
+    plaid_item_internal_id: row.plaid_item_internal_id || null,
+    plaid_item_status: row.plaid_item_status || null,
+    plaid_item_disconnected_at: row.plaid_item_disconnected_at || null,
     archived_at: row.archived_at,
     institution_name: row.institution_name,
     official_name: row.official_name,
@@ -260,6 +276,72 @@ async function getPlaidItem(pool, companyId, id) {
     [id, companyId]
   );
   return rows[0] || null;
+}
+
+async function getPlaidItemIncludingDisconnected(pool, companyId, id) {
+  const { rows } = await pool.query(
+    `SELECT * FROM finance_plaid_items WHERE id = $1 AND company_id = $2`,
+    [id, companyId]
+  );
+  return rows[0] || null;
+}
+
+async function accountsForPlaidItem(pool, companyId, itemId) {
+  const { rows } = await pool.query(
+    `SELECT a.*, pi.status AS plaid_item_status, pi.disconnected_at AS plaid_item_disconnected_at
+       FROM finance_accounts a
+       JOIN finance_plaid_items pi ON pi.id = a.plaid_item_internal_id AND pi.company_id = a.company_id
+      WHERE a.company_id = $1
+        AND a.plaid_item_internal_id = $2
+      ORDER BY a.archived_at NULLS FIRST, a.account_type ASC, a.name ASC`,
+    [companyId, itemId]
+  );
+  return rows.map(plaidAccountPayload);
+}
+
+async function markPlaidItemDisconnected(pool, companyId, item, userId, reason = "user_disconnect") {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const updated = await client.query(
+      `UPDATE finance_plaid_items
+          SET status = 'disconnected',
+              disconnected_at = COALESCE(disconnected_at, now()),
+              error_code = NULL,
+              error_message = NULL,
+              updated_at = now()
+        WHERE id = $1 AND company_id = $2
+        RETURNING *`,
+      [item.id, companyId]
+    );
+    await client.query(
+      `UPDATE finance_accounts
+          SET include_in_liquid_cash = false,
+              updated_at = now()
+        WHERE plaid_item_internal_id = $1 AND company_id = $2 AND source = 'plaid'`,
+      [item.id, companyId]
+    );
+    await client.query(
+      `UPDATE finance_plaid_recurring_streams
+          SET is_active = false,
+              status = COALESCE(status, 'disconnected'),
+              updated_at = now()
+        WHERE plaid_item_internal_id = $1 AND company_id = $2`,
+      [item.id, companyId]
+    );
+    await client.query(
+      `INSERT INTO finance_plaid_item_events(company_id, plaid_item_internal_id, event_type, event_status, metadata, created_by)
+       VALUES($1,$2,'disconnect_plaid_item','succeeded',$3,$4)`,
+      [companyId, item.id, JSON.stringify({ institution_name: item.institution_name || null, reason }), userId || null]
+    );
+    await client.query("COMMIT");
+    return updated.rows[0] || { ...item, status: "disconnected", disconnected_at: item.disconnected_at || new Date().toISOString() };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function decryptItemToken(item) {
@@ -449,6 +531,9 @@ async function markRemovedTransaction(client, companyId, providerTransactionId) 
 }
 
 export async function syncPlaidTransactions({ pool, plaid, item }) {
+  if (item.status === "disconnected" || item.disconnected_at) {
+    return { skipped: true, reason: "disconnected", added: 0, modified: 0, removed: 0, next_cursor: item.transactions_cursor || null };
+  }
   const accessToken = await decryptItemToken(item);
   const originalCursor = item.transactions_cursor || null;
   const collected = await collectPlaidSyncPages(async (cursor) => {
@@ -507,6 +592,9 @@ export async function syncPlaidTransactions({ pool, plaid, item }) {
 }
 
 async function refreshBalances(pool, plaid, item) {
+  if (item.status === "disconnected" || item.disconnected_at) {
+    return [];
+  }
   const accessToken = await decryptItemToken(item);
   const response = await plaid.accountsBalanceGet({ access_token: accessToken });
   const client = await pool.connect();
@@ -525,6 +613,9 @@ async function refreshBalances(pool, plaid, item) {
 }
 
 async function syncRecurring(pool, plaid, item) {
+  if (item.status === "disconnected" || item.disconnected_at) {
+    return 0;
+  }
   const accessToken = await decryptItemToken(item);
   const response = await plaid.transactionsRecurringGet({ access_token: accessToken });
   const streams = [
@@ -763,22 +854,39 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
 
   app.post("/api/finance/plaid/items/:id/disconnect", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
-    if (!requirePlaidConfigured(res)) return;
     try {
-      const item = await getPlaidItem(pool, req.companyId, req.params.id);
+      const item = await getPlaidItemIncludingDisconnected(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
-      await (await plaidClient()).itemRemove({ access_token: await decryptItemToken(item) }).catch((error) => {
-        if (error?.response?.data?.error_code !== "ITEM_NOT_FOUND") throw error;
+      if (item.status !== "disconnected" && !item.disconnected_at) {
+        if (!requirePlaidConfigured(res)) return;
+        await (await plaidClient()).itemRemove({ access_token: await decryptItemToken(item) }).catch((error) => {
+          const code = error?.response?.data?.error_code;
+          if (code !== "ITEM_NOT_FOUND") throw error;
+        });
+      }
+      const updated = item.status === "disconnected" || item.disconnected_at
+        ? item
+        : await markPlaidItemDisconnected(pool, req.companyId, item, req.userId);
+      if (item.status === "disconnected" || item.disconnected_at) {
+        await pool.query(
+          `UPDATE finance_accounts SET include_in_liquid_cash = false, updated_at = now() WHERE plaid_item_internal_id = $1 AND company_id = $2 AND source = 'plaid'`,
+          [item.id, req.companyId]
+        );
+        await pool.query(
+          `UPDATE finance_plaid_recurring_streams SET is_active = false, status = COALESCE(status, 'disconnected'), updated_at = now() WHERE plaid_item_internal_id = $1 AND company_id = $2`,
+          [item.id, req.companyId]
+        );
+      }
+      const accounts = item.status === "disconnected" || item.disconnected_at
+        ? await accountsForPlaidItem(pool, req.companyId, item.id)
+        : await accountsForPlaidItem(pool, req.companyId, updated.id);
+      res.json({
+        disconnected: true,
+        already_disconnected: Boolean(item.status === "disconnected" || item.disconnected_at),
+        item: safePlaidItemPayload(updated),
+        accounts,
+        message: `${updated.institution_name || "Bank"} disconnected. Historical transactions were kept.`
       });
-      await pool.query(
-        `UPDATE finance_plaid_items SET status = 'disconnected', disconnected_at = COALESCE(disconnected_at, now()), updated_at = now() WHERE id = $1 AND company_id = $2`,
-        [item.id, req.companyId]
-      );
-      await pool.query(
-        `UPDATE finance_accounts SET archived_at = COALESCE(archived_at, now()), updated_at = now() WHERE plaid_item_internal_id = $1 AND company_id = $2`,
-        [item.id, req.companyId]
-      );
-      res.json({ disconnected: true });
     } catch (error) {
       handlePlaidError(res, error, "plaid_disconnect_failed");
     }
