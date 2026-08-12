@@ -344,6 +344,114 @@ function toolResultCount(result) {
   return null;
 }
 
+function sortedSpendingGroups(result) {
+  return [...(result?.groups || [])]
+    .map((group) => ({
+      label: cleanString(group.label || "Unknown", 120) || "Unknown",
+      transaction_count: Number(group.transaction_count || 0),
+      posted_cents: Number(group.posted_cents || 0),
+      pending_cents: Number(group.pending_cents || 0),
+      total_cents: Number(group.total_cents ?? group.posted_cents ?? 0)
+    }))
+    .sort((a, b) => (b.posted_cents || b.total_cents) - (a.posted_cents || a.total_cents));
+}
+
+function classifySpendingCategory(label) {
+  const value = cleanString(label, 120).toLowerCase();
+  if (/\b(rent|mortgage|insurance|utilities?|electric|water|gas bill|internet|phone|tax|taxes|irs|debt|loan|payroll|wages|salary|lease)\b/.test(value)) {
+    return "necessary";
+  }
+  if (/\b(food|dining|restaurant|coffee|cafe|bar|entertainment|subscription|subscriptions|shopping|retail|convenience|personal|delivery|takeout|fast food|alcohol|streaming|amazon)\b/.test(value)) {
+    return "discretionary";
+  }
+  return "unclear";
+}
+
+function formatSpendingList(groups, limit = 5) {
+  return groups.slice(0, limit).map((group, index) => `${index + 1}. ${group.label} - ${dollars(group.posted_cents || group.total_cents)} (${group.transaction_count} transaction${group.transaction_count === 1 ? "" : "s"})`);
+}
+
+function periodLabel(result) {
+  const period = result?.period || {};
+  if (period.key === "last_month") return "last month";
+  if (period.key === "this_month") return "this month";
+  if (period.key === "last_30_days") return "the last 30 days";
+  if (period.start_date && period.end_date) return `${period.start_date} to ${period.end_date}`;
+  return "that period";
+}
+
+function buildDeterministicSpendingFallback(successfulToolResults, userMessage = "") {
+  const summaries = successfulToolResults
+    .filter((item) => item.name === "get_spending_summary" && item.result?.groups)
+    .map((item) => item.result);
+  if (!summaries.length) return null;
+
+  const categorySummary = summaries.find((item) => item.group_by === "category") || null;
+  const merchantSummary = summaries.find((item) => item.group_by === "merchant") || null;
+  const anySummary = categorySummary || merchantSummary || summaries[0];
+  const period = periodLabel(anySummary);
+  const categoryGroups = sortedSpendingGroups(categorySummary);
+  const merchantGroups = sortedSpendingGroups(merchantSummary);
+  const totalPosted = Number(anySummary?.posted_spending_cents ?? anySummary?.total_spending_cents ?? 0);
+  const totalTransactions = Number(anySummary?.transaction_count || 0);
+  if (totalTransactions === 0 || (totalPosted === 0 && !categoryGroups.some((group) => group.posted_cents > 0) && !merchantGroups.some((group) => group.posted_cents > 0))) {
+    return { type: "spending_zero_data", text: `No posted expenses were found for ${period}.` };
+  }
+
+  const prompt = cleanString(userMessage, 500).toLowerCase();
+  const wantsDiscretionary = /\b(unnecessary|discretionary|waste|wasteful|cut back|cutback|save money)\b/.test(prompt);
+  const wantsMerchants = /\bmerchant|vendor|where did i spend|spent at\b/.test(prompt);
+  const wantsFood = /\bfood|dining|restaurant|eat|eating out\b/.test(prompt);
+
+  if (wantsDiscretionary && categoryGroups.length) {
+    const discretionary = categoryGroups.filter((group) => classifySpendingCategory(group.label) === "discretionary");
+    const unclear = categoryGroups.filter((group) => classifySpendingCategory(group.label) === "unclear");
+    const primary = discretionary.length ? discretionary : unclear;
+    const lines = [
+      `Based on common budgeting heuristics, these look like the most discretionary categories for ${period}:`,
+      "",
+      ...formatSpendingList(primary, 5)
+    ];
+    if (merchantGroups.length) {
+      lines.push("", "Top merchants from the same period:", ...merchantGroups.slice(0, 5).map((group) => `- ${group.label} - ${dollars(group.posted_cents || group.total_cents)} (${group.transaction_count} transaction${group.transaction_count === 1 ? "" : "s"})`));
+    }
+    lines.push("", "These classifications are heuristic, not objective necessities. I treated fixed obligations like rent, insurance, utilities, taxes, and debt payments as generally necessary when category labels were clear.");
+    return { type: merchantGroups.length ? "spending_discretionary_combined" : "spending_discretionary_categories", text: lines.join("\n") };
+  }
+
+  if ((wantsMerchants || (!categoryGroups.length && merchantGroups.length)) && merchantGroups.length) {
+    return {
+      type: "spending_merchants",
+      text: [`Your top merchants for ${period} were:`, "", ...merchantGroups.slice(0, 10).map((group, index) => `${index + 1}. ${group.label} - ${dollars(group.posted_cents || group.total_cents)} (${group.transaction_count} transaction${group.transaction_count === 1 ? "" : "s"})`)].join("\n")
+    };
+  }
+
+  if (wantsFood && categoryGroups.length) {
+    const foodGroups = categoryGroups.filter((group) => /\b(food|dining|restaurant|coffee|cafe|takeout|delivery|fast food)\b/i.test(group.label));
+    const groups = foodGroups.length ? foodGroups : categoryGroups;
+    return {
+      type: "spending_food",
+      text: [`For ${period}, the closest food/dining spending categories I found were:`, "", ...formatSpendingList(groups, 5)].join("\n")
+    };
+  }
+
+  if (categoryGroups.length) {
+    return {
+      type: "spending_categories",
+      text: [`Your posted expenses for ${period} were concentrated in these categories:`, "", ...formatSpendingList(categoryGroups, 10)].join("\n")
+    };
+  }
+
+  if (merchantGroups.length) {
+    return {
+      type: "spending_merchants",
+      text: [`Your posted expenses for ${period} were concentrated at these merchants:`, "", ...formatSpendingList(merchantGroups, 10)].join("\n")
+    };
+  }
+
+  return null;
+}
+
 function financeAIToolError(toolName, error) {
   const code = cleanString(error?.code || "finance_ai_tool_failed", 100) || "finance_ai_tool_failed";
   if (code.includes("invalid")) {
@@ -1116,6 +1224,7 @@ export async function executeFinanceAITool(pool, ctx, name, args = {}) {
 
 async function runResponsesToolLoop({ pool, client, model, input, ctx, executeTool = executeFinanceAITool }) {
   const toolActivity = [];
+  const successfulToolResults = [];
   const requestId = ctx.requestId || randomUUID();
   const startedAt = Date.now();
   let modelMs = 0;
@@ -1138,6 +1247,11 @@ async function runResponsesToolLoop({ pool, client, model, input, ctx, executeTo
     const text = extractVisibleAssistantText(synthesisResponse);
     if (!text) {
       financeAIWarn("final_synthesis_failed", { requestId, iteration, reason, tool_count: toolCount, model_ms: modelMs });
+      const fallback = buildDeterministicSpendingFallback(successfulToolResults, ctx.userMessage);
+      if (fallback) {
+        financeAILog("deterministic_fallback_used", { requestId, fallback_type: fallback.type, tool_count: toolCount });
+        return { text: fallback.text, toolActivity: [...toolActivity, { name: "deterministic_spending_fallback", status: "succeeded" }] };
+      }
       throw Object.assign(new Error("The Finance Assistant didn't produce a usable answer. Please try again."), {
         statusCode: 502,
         code: "finance_ai_empty_response"
@@ -1178,6 +1292,11 @@ async function runResponsesToolLoop({ pool, client, model, input, ctx, executeTo
             return recovered;
           } catch (error) {
             financeAIWarn("empty_final_recovery_failed", { requestId, iteration, tool_count: toolCount, model_ms: modelMs });
+            const fallback = buildDeterministicSpendingFallback(successfulToolResults, ctx.userMessage);
+            if (fallback) {
+              financeAILog("deterministic_fallback_used", { requestId, fallback_type: fallback.type, tool_count: toolCount });
+              return { text: fallback.text, toolActivity: [...toolActivity, { name: "deterministic_spending_fallback", status: "succeeded" }] };
+            }
             throw error;
           }
         }
@@ -1222,6 +1341,7 @@ async function runResponsesToolLoop({ pool, client, model, input, ctx, executeTo
           toolPromiseCache.set(cacheKey, executeTool(pool, ctx, call.name, normalizedArgs));
         }
         const result = cacheKey ? await toolPromiseCache.get(cacheKey) : await executeTool(pool, ctx, call.name, normalizedArgs);
+        successfulToolResults.push({ name: call.name, args: normalizedArgs, result: jsonSafe(result) });
         financeAILog("tool_succeeded", {
           requestId,
           tool: call.name,
@@ -1283,6 +1403,11 @@ async function runResponsesToolLoop({ pool, client, model, input, ctx, executeTo
     }
   }
   financeAIWarn("tool_loop_limit", { requestId, model_ms: modelMs, tools_ms: toolsMs, total_ms: Date.now() - startedAt, tool_count: toolCount });
+  const fallback = buildDeterministicSpendingFallback(successfulToolResults, ctx.userMessage);
+  if (fallback) {
+    financeAILog("deterministic_fallback_used", { requestId, fallback_type: fallback.type, tool_count: toolCount });
+    return { text: fallback.text, toolActivity: [...toolActivity, { name: "deterministic_spending_fallback", status: "succeeded" }] };
+  }
   throw Object.assign(new Error("Finance AI reached the tool-call limit. Try a narrower question."), { statusCode: 429, code: "finance_ai_tool_loop_limit" });
 }
 

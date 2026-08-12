@@ -406,7 +406,7 @@ test("real discretionary-spend failure shape forces final synthesis with tools d
   assert.match(result.text, /discretionary-looking/);
 });
 
-test("empty final recovery fails with finance_ai_empty_response when still empty", async () => {
+test("category spending data falls back deterministically when final text is empty", async () => {
   let createCount = 0;
   const client = {
     responses: {
@@ -427,17 +427,203 @@ test("empty final recovery fails with finance_ai_empty_response when still empty
       }
     }
   };
+  const result = await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "What were my biggest unnecessary expenses?" }],
+    ctx,
+    executeTool: async () => ({
+      period: { key: "last_month", start_date: "2026-07-01", end_date: "2026-07-31" },
+      group_by: "category",
+      direction: "expense",
+      posted_spending_cents: 71000,
+      transaction_count: 5,
+      groups: [
+        { label: "Dining", transaction_count: 3, posted_cents: 42000, pending_cents: 0, total_cents: 42000 },
+        { label: "Rent", transaction_count: 1, posted_cents: 200000, pending_cents: 0, total_cents: 200000 },
+        { label: "Subscriptions", transaction_count: 2, posted_cents: 29000, pending_cents: 0, total_cents: 29000 }
+      ]
+    })
+  });
+  assert.equal(createCount, 3);
+  assert.match(result.text, /common budgeting heuristics/);
+  assert.match(result.text, /Dining/);
+  assert.match(result.text, /Subscriptions/);
+});
+
+test("merchant spending data falls back deterministically when final text is empty", async () => {
+  let createCount = 0;
+  const client = {
+    responses: {
+      create: async () => {
+        createCount += 1;
+        if (createCount === 1) {
+          return {
+            output_text: "",
+            output: [{
+              type: "function_call",
+              name: "get_spending_summary",
+              call_id: "merchant_call",
+              arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "merchant", direction: "expense", account_id: null, category: null, merchant_query: null, limit: 10 })
+            }]
+          };
+        }
+        return { output_text: "", output: [] };
+      }
+    }
+  };
+  const result = await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "Which merchants did I spend the most at?" }],
+    ctx,
+    executeTool: async () => ({
+      period: { key: "last_month", start_date: "2026-07-01", end_date: "2026-07-31" },
+      group_by: "merchant",
+      direction: "expense",
+      posted_spending_cents: 34000,
+      transaction_count: 3,
+      groups: [
+        { label: "Amazon", transaction_count: 2, posted_cents: 22000, pending_cents: 0, total_cents: 22000 },
+        { label: "Netflix", transaction_count: 1, posted_cents: 12000, pending_cents: 0, total_cents: 12000 }
+      ]
+    })
+  });
+  assert.match(result.text, /top merchants/i);
+  assert.match(result.text, /Amazon/);
+});
+
+test("combined category and merchant spending data falls back deterministically", async () => {
+  let createCount = 0;
+  const client = {
+    responses: {
+      create: async () => {
+        createCount += 1;
+        if (createCount === 1) {
+          return {
+            output_text: "",
+            output: [
+              { type: "function_call", name: "get_spending_summary", call_id: "category_call", arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "category", direction: "expense", account_id: null, category: null, merchant_query: null, limit: 10 }) },
+              { type: "function_call", name: "get_spending_summary", call_id: "merchant_call", arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "merchant", direction: "expense", account_id: null, category: null, merchant_query: null, limit: 10 }) }
+            ]
+          };
+        }
+        return { output_text: "", output: [] };
+      }
+    }
+  };
+  const result = await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "What unnecessary expenses did I make last month?" }],
+    ctx,
+    executeTool: async (_pool, _ctx, _name, args) => args.group_by === "merchant"
+      ? {
+        period: { key: "last_month" },
+        group_by: "merchant",
+        direction: "expense",
+        posted_spending_cents: 24000,
+        transaction_count: 2,
+        groups: [{ label: "McDonald's", transaction_count: 2, posted_cents: 24000, pending_cents: 0, total_cents: 24000 }]
+      }
+      : {
+        period: { key: "last_month" },
+        group_by: "category",
+        direction: "expense",
+        posted_spending_cents: 42000,
+        transaction_count: 3,
+        groups: [{ label: "Dining", transaction_count: 3, posted_cents: 42000, pending_cents: 0, total_cents: 42000 }]
+      }
+  });
+  assert.match(result.text, /Dining/);
+  assert.match(result.text, /Top merchants/);
+  assert.match(result.text, /McDonald's/);
+});
+
+test("zero spending data fallback reports no posted expenses", async () => {
+  let createCount = 0;
+  const client = {
+    responses: {
+      create: async () => {
+        createCount += 1;
+        if (createCount === 1) {
+          return {
+            output_text: "",
+            output: [{ type: "function_call", name: "get_spending_summary", call_id: "category_call", arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "category", direction: "expense", account_id: null, category: null, merchant_query: null, limit: 10 }) }]
+          };
+        }
+        return { output_text: "", output: [] };
+      }
+    }
+  };
+  const result = await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "Where did my money go last month?" }],
+    ctx,
+    executeTool: async () => ({ period: { key: "last_month" }, group_by: "category", direction: "expense", posted_spending_cents: 0, transaction_count: 0, groups: [] })
+  });
+  assert.match(result.text, /No posted expenses/);
+});
+
+test("normal model final skips deterministic fallback", async () => {
+  let createCount = 0;
+  const client = {
+    responses: {
+      create: async () => {
+        createCount += 1;
+        if (createCount === 1) {
+          return {
+            output_text: "",
+            output: [{ type: "function_call", name: "get_spending_summary", call_id: "category_call", arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "category", direction: "expense", account_id: null, category: null, merchant_query: null, limit: 10 }) }]
+          };
+        }
+        return { output_text: "The model answered normally.", output: [] };
+      }
+    }
+  };
+  const result = await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "Where did my money go last month?" }],
+    ctx
+  });
+  assert.equal(createCount, 2);
+  assert.equal(result.text, "The model answered normally.");
+  assert.equal(result.toolActivity.some((item) => item.name === "deterministic_spending_fallback"), false);
+});
+
+test("tool failure does not use deterministic spending fallback", async () => {
+  let createCount = 0;
+  const client = {
+    responses: {
+      create: async () => {
+        createCount += 1;
+        if (createCount === 1) {
+          return {
+            output_text: "",
+            output: [{ type: "function_call", name: "get_spending_summary", call_id: "bad_call", arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "not_real", direction: "expense", account_id: null, category: null, merchant_query: null, limit: 10 }) }]
+          };
+        }
+        return { output_text: "", output: [] };
+      }
+    }
+  };
   await assert.rejects(
     () => financeAIInternals.runResponsesToolLoop({
       pool: new FakePool(),
       client,
       model: "test-model",
-      input: [{ role: "user", content: "What were my biggest unnecessary expenses?" }],
+      input: [{ role: "user", content: "Where did my money go last month?" }],
       ctx
     }),
     (error) => error.code === "finance_ai_empty_response"
   );
-  assert.equal(createCount, 3);
 });
 
 test("duplicate identical tool calls execute once and return both call IDs", async () => {
