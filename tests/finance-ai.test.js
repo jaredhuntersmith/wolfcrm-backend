@@ -247,6 +247,127 @@ test("tool loop rejects genuinely empty final output", async () => {
   );
 });
 
+test("empty final response after successful tools gets one recovery pass", async () => {
+  let createCount = 0;
+  const client = {
+    responses: {
+      create: async () => {
+        createCount += 1;
+        if (createCount === 1) {
+          return {
+            output_text: "",
+            output: [
+              {
+                type: "function_call",
+                name: "get_spending_summary",
+                call_id: "category_call",
+                arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "category", account_id: null, category: null, merchant_query: null, limit: 10 })
+              },
+              {
+                type: "function_call",
+                name: "get_spending_summary",
+                call_id: "merchant_call",
+                arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "merchant", account_id: null, category: null, merchant_query: null, limit: 20 })
+              }
+            ]
+          };
+        }
+        if (createCount === 2) return { output_text: "", output: [] };
+        return { output_text: "Your biggest discretionary-looking expenses were dining and shopping.", output: [] };
+      }
+    }
+  };
+  const result = await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "What were my biggest unnecessary expenses?" }],
+    ctx
+  });
+  assert.equal(createCount, 3);
+  assert.match(result.text, /discretionary-looking/);
+});
+
+test("empty final recovery fails with finance_ai_empty_response when still empty", async () => {
+  let createCount = 0;
+  const client = {
+    responses: {
+      create: async () => {
+        createCount += 1;
+        if (createCount === 1) {
+          return {
+            output_text: "",
+            output: [{
+              type: "function_call",
+              name: "get_spending_summary",
+              call_id: "category_call",
+              arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "category", account_id: null, category: null, merchant_query: null, limit: 10 })
+            }]
+          };
+        }
+        return { output_text: "", output: [] };
+      }
+    }
+  };
+  await assert.rejects(
+    () => financeAIInternals.runResponsesToolLoop({
+      pool: new FakePool(),
+      client,
+      model: "test-model",
+      input: [{ role: "user", content: "What were my biggest unnecessary expenses?" }],
+      ctx
+    }),
+    (error) => error.code === "finance_ai_empty_response"
+  );
+  assert.equal(createCount, 3);
+});
+
+test("duplicate identical tool calls execute once and return both call IDs", async () => {
+  const createdInputs = [];
+  const toolArgs = { period: "last_month", start_date: null, end_date: null, group_by: "category", account_id: null, category: null, merchant_query: null, limit: 10 };
+  const client = {
+    responses: {
+      create: async ({ input }) => {
+        createdInputs.push(input);
+        if (createdInputs.length === 1) {
+          return {
+            output_text: "",
+            output: [
+              { type: "function_call", name: "get_spending_summary", call_id: "A", arguments: JSON.stringify(toolArgs) },
+              { type: "function_call", name: "get_spending_summary", call_id: "B", arguments: JSON.stringify(toolArgs) }
+            ]
+          };
+        }
+        return { output_text: "Here are the categories.", output: [] };
+      }
+    }
+  };
+  let executions = 0;
+  await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "Where did my money go last month?" }],
+    ctx,
+    executeTool: async () => {
+      executions += 1;
+      return { groups: [{ label: "Dining", total_cents: 1000 }] };
+    }
+  });
+  const outputs = createdInputs[1].filter((item) => item.type === "function_call_output");
+  assert.equal(executions, 1);
+  assert.equal(outputs.length, 2);
+  assert.equal(Boolean(outputs.find((item) => item.call_id === "A")), true);
+  assert.equal(Boolean(outputs.find((item) => item.call_id === "B")), true);
+});
+
+test("visible assistant text extraction handles common response shapes", () => {
+  assert.equal(financeAIInternals.extractVisibleAssistantText({ output_text: "hello", output: [] }), "hello");
+  assert.equal(financeAIInternals.extractVisibleAssistantText({ output_text: "", output: [{ type: "function_call", call_id: "A" }] }), "");
+  assert.equal(financeAIInternals.extractVisibleAssistantText({ output: [{ type: "message", content: [{ type: "output_text", text: "block one" }, { type: "output_text", text: " block two" }] }] }), "block one block two");
+  assert.equal(financeAIInternals.extractVisibleAssistantText({ output: [] }), "");
+});
+
 test("tool output serializer handles BigInt and undefined", () => {
   const output = JSON.parse(financeAIInternals.safeToolOutputString({ amount_cents: 123n, missing: undefined }));
   assert.equal(output.amount_cents, 123);
