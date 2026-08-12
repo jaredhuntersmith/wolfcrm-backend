@@ -7456,6 +7456,8 @@ app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
 // ---------- DASHBOARD COMMAND CENTER ----------
 const DASHBOARD_DISMISS_TYPES = new Set([
   "scheduled_job",
+  "upcoming_job",
+  "unfinished_job",
   "job_missing_price",
   "todo",
   "routine",
@@ -7478,6 +7480,36 @@ function dashboardMoney(cents) {
   return Number.isFinite(Number(cents)) ? Number(cents) : null;
 }
 
+function dashboardRequestId(req) {
+  return req.headers["x-request-id"] || req.headers["x-railway-request-id"] || `dashboard-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function dashboardSource(requestId, source, fn, fallback, critical = false) {
+  const started = Date.now();
+  try {
+    const value = await fn();
+    console.info("[dashboard] source_ok", { requestId, source, duration_ms: Date.now() - started });
+    return { value, failed: false };
+  } catch (error) {
+    console.warn("[dashboard] source_failed", {
+      requestId,
+      source,
+      duration_ms: Date.now() - started,
+      code: error?.code || error?.name || null,
+      message: error?.message || String(error)
+    });
+    if (critical) throw error;
+    return { value: fallback, failed: true, source };
+  }
+}
+
+function isInformationalJobNotification(row) {
+  const kind = String(row.kind || "").toLowerCase();
+  const title = String(row.title || "").trim().toLowerCase();
+  if (kind === "job_scheduled" || kind === "scheduled_job_created") return true;
+  return ["new job scheduled", "job scheduled"].includes(title);
+}
+
 function dashboardServiceTitle(row) {
   const items = Array.isArray(row.service_items) ? row.service_items : [];
   const names = items.map((item) => String(item?.name || "").trim()).filter(Boolean);
@@ -7487,15 +7519,15 @@ function dashboardServiceTitle(row) {
   return row.title || "Scheduled job";
 }
 
-function buildDashboardJobItem(row, section, priority = "normal") {
+function buildDashboardJobItem(row, section, priority = "normal", type = "scheduled_job") {
   const serviceTitle = dashboardServiceTitle(row);
   const price = dashboardMoney(row.price_cents);
   const subtitleParts = [];
   if (serviceTitle && serviceTitle !== row.title) subtitleParts.push(serviceTitle);
   if (row.contact_address) subtitleParts.push(row.contact_address);
   return {
-    id: `scheduled_job:${row.id}`,
-    type: "scheduled_job",
+    id: `${type}:${row.id}`,
+    type,
     source_type: "scheduled_job",
     source_id: String(row.id),
     fingerprint: String(row.updated_at || row.start || ""),
@@ -7506,7 +7538,7 @@ function buildDashboardJobItem(row, section, priority = "normal") {
     amount_cents: price,
     due_at: row.start,
     system_image: "calendar",
-    tint: "blue",
+    tint: type === "unfinished_job" ? "red" : "blue",
     completable: false,
     dismissible: true,
     destination: { type: "scheduled_job", id: String(row.id) }
@@ -7595,7 +7627,9 @@ function filterDashboardDismissed(items, dismissals) {
 
 app.get("/api/dashboard/summary", authRequired, async (req, res) => {
   try {
+    const requestId = dashboardRequestId(req);
     const now = new Date();
+    const currentAt = parseDashboardDate(req.query.now, now);
     const todayStart = parseDashboardDate(req.query.today_start, new Date(now.getFullYear(), now.getMonth(), now.getDate()));
     const todayEnd = parseDashboardDate(req.query.today_end, new Date(todayStart.getTime() + 86400000));
     const weekStart = parseDashboardDate(req.query.week_start, todayStart);
@@ -7603,7 +7637,10 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
     const monthStart = parseDashboardDate(req.query.month_start, new Date(now.getFullYear(), now.getMonth(), 1));
     const monthEnd = parseDashboardDate(req.query.month_end, new Date(now.getFullYear(), now.getMonth() + 1, 1));
     const upcomingEnd = parseDashboardDate(req.query.upcoming_end, new Date(todayStart.getTime() + 8 * 86400000));
+    const jobsPastStart = parseDashboardDate(req.query.jobs_past_start, new Date(currentAt.getTime() - 120 * 86400000));
+    const jobsUpcomingEnd = parseDashboardDate(req.query.jobs_upcoming_end, new Date(currentAt.getTime() + 30 * 86400000));
     const employer = req.role === "employer";
+    const failedSources = [];
     const jobScope = employer
       ? { sql: "se.company_id = $1", values: [req.companyId] }
       : {
@@ -7615,7 +7652,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           values: [req.companyId, req.userId, String(req.userId)]
         };
 
-    const jobsResult = req.companyId ? await pool.query(
+    const jobsSource = await dashboardSource(requestId, "jobs", () => req.companyId ? pool.query(
       `SELECT se.id, se.title, se.start_at AS start, se.end_at AS "end", se.contact_id,
               se.services, se.service_items, se.price_cents, se.finished_at, se.updated_at,
               c.name AS contact_name, c.address AS contact_address
@@ -7626,10 +7663,12 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           AND se.start_at < $${jobScope.values.length + 2}
         ORDER BY se.start_at ASC
         LIMIT 80`,
-      [...jobScope.values, todayStart.toISOString(), upcomingEnd.toISOString()]
-    ) : { rows: [] };
+      [...jobScope.values, jobsPastStart.toISOString(), jobsUpcomingEnd.toISOString()]
+    ) : Promise.resolve({ rows: [] }), { rows: [] });
+    if (jobsSource.failed) failedSources.push(jobsSource.source);
+    const jobsResult = jobsSource.value;
 
-    const revenueResult = employer && req.companyId ? await pool.query(
+    const revenueSource = await dashboardSource(requestId, "metrics", () => employer && req.companyId ? pool.query(
       `SELECT
           COALESCE(SUM(price_cents) FILTER (WHERE start_at >= $2 AND start_at < $3), 0)::int AS today,
           COALESCE(SUM(price_cents) FILTER (WHERE start_at >= $4 AND start_at < $5), 0)::int AS week,
@@ -7640,10 +7679,12 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           AND start_at >= LEAST($2::timestamptz, $4::timestamptz, $6::timestamptz)
           AND start_at < GREATEST($3::timestamptz, $5::timestamptz, $7::timestamptz)`,
       [req.companyId, todayStart.toISOString(), todayEnd.toISOString(), weekStart.toISOString(), weekEnd.toISOString(), monthStart.toISOString(), monthEnd.toISOString()]
-    ) : { rows: [{ today: 0, week: 0, month: 0, missing_today: 0 }] };
+    ) : Promise.resolve({ rows: [{ today: 0, week: 0, month: 0, missing_today: 0 }] }), { rows: [{ today: 0, week: 0, month: 0, missing_today: 0 }] });
+    if (revenueSource.failed) failedSources.push(revenueSource.source);
+    const revenueResult = revenueSource.value;
 
-    const [tasksResult, taskStatsResult, customerResult, customerStatsResult, routinesResult, doneResult, notificationsResult, dismissalsResult] = await Promise.all([
-      pool.query(
+    const [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource] = await Promise.all([
+      dashboardSource(requestId, "todos", () => pool.query(
         `SELECT id, title, due_date, completed, updated_at
            FROM todo_tasks
           WHERE user_id = $1
@@ -7653,8 +7694,8 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           ORDER BY due_date ASC
           LIMIT 40`,
         [req.userId, upcomingEnd.toISOString()]
-      ),
-      pool.query(
+      ), { rows: [] }),
+      dashboardSource(requestId, "todo_stats", () => pool.query(
         `SELECT
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3)::int AS total_today,
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3 AND completed = true)::int AS completed_today
@@ -7662,8 +7703,8 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           WHERE user_id = $1
             AND due_date IS NOT NULL`,
         [req.userId, todayStart.toISOString(), todayEnd.toISOString()]
-      ),
-      pool.query(
+      ), { rows: [{ total_today: 0, completed_today: 0 }] }),
+      dashboardSource(requestId, "customer_reminders", () => pool.query(
         `SELECT id, title, contact_id, contact_name, due_date, completed, updated_at
            FROM todo_customer_reminders
           WHERE user_id = $1
@@ -7673,8 +7714,8 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           ORDER BY due_date ASC
           LIMIT 40`,
         [req.userId, upcomingEnd.toISOString()]
-      ),
-      pool.query(
+      ), { rows: [] }),
+      dashboardSource(requestId, "customer_reminder_stats", () => pool.query(
         `SELECT
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3)::int AS total_today,
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3 AND completed = true)::int AS completed_today
@@ -7682,8 +7723,8 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           WHERE user_id = $1
             AND due_date IS NOT NULL`,
         [req.userId, todayStart.toISOString(), todayEnd.toISOString()]
-      ),
-      pool.query(
+      ), { rows: [{ total_today: 0, completed_today: 0 }] }),
+      dashboardSource(requestId, "routines", () => pool.query(
         `SELECT id, title, time, weekdays, updated_at
            FROM todo_routines
           WHERE user_id = $1
@@ -7691,14 +7732,14 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           ORDER BY updated_at DESC
           LIMIT 80`,
         [req.userId]
-      ),
-      pool.query(
+      ), { rows: [] }),
+      dashboardSource(requestId, "routine_done", () => pool.query(
         `SELECT routine_id, day_key
            FROM todo_routine_done
           WHERE user_id = $1`,
         [req.userId]
-      ),
-      pool.query(
+      ), { rows: [] }),
+      dashboardSource(requestId, "notifications", () => pool.query(
         `SELECT id, kind, title, body, data, created_at
            FROM notifications
           WHERE user_id = $1
@@ -7706,22 +7747,41 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           ORDER BY created_at DESC
           LIMIT 12`,
         [req.userId]
-      ),
-      pool.query(
+      ), { rows: [] }),
+      dashboardSource(requestId, "dismissals", () => pool.query(
         `SELECT item_type, source_id, fingerprint
            FROM dashboard_dismissals
           WHERE user_id = $1
             AND (expires_at IS NULL OR expires_at > now())`,
         [req.userId]
-      )
+      ), { rows: [] })
     ]);
+    for (const source of [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource]) {
+      if (source.failed) failedSources.push(source.source);
+    }
+    const tasksResult = tasksSource.value;
+    const taskStatsResult = taskStatsSource.value;
+    const customerResult = customerSource.value;
+    const customerStatsResult = customerStatsSource.value;
+    const routinesResult = routinesSource.value;
+    const doneResult = doneSource.value;
+    const notificationsResult = notificationsSource.value;
+    const dismissalsResult = dismissalsSource.value;
 
     const items = [];
     const jobsToday = jobsResult.rows.filter((row) => new Date(row.start) >= todayStart && new Date(row.start) < todayEnd);
     const activeJobsToday = jobsToday.filter((row) => !row.finished_at);
     const completedJobsToday = jobsToday.length - activeJobsToday.length;
-    for (const row of activeJobsToday.slice(0, 10)) {
-      items.push(buildDashboardJobItem(row, "today", "normal"));
+    const openJobs = jobsResult.rows.filter((row) => !row.finished_at);
+    const unfinishedJobs = openJobs.filter((row) => new Date(row.start) < currentAt).sort((a, b) => new Date(a.start) - new Date(b.start));
+    const upcomingJobs = openJobs.filter((row) => new Date(row.start) >= currentAt).sort((a, b) => new Date(a.start) - new Date(b.start));
+    for (const row of unfinishedJobs.slice(0, 20)) {
+      items.push(buildDashboardJobItem(row, "unfinished_jobs", "high", "unfinished_job"));
+    }
+    for (const row of upcomingJobs.slice(0, 20)) {
+      items.push(buildDashboardJobItem(row, "upcoming_jobs", "normal", "upcoming_job"));
+    }
+    for (const row of activeJobsToday) {
       if (row.price_cents == null) {
         items.push({
           id: `job_missing_price:${row.id}`,
@@ -7742,9 +7802,6 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           destination: { type: "scheduled_job", id: String(row.id) }
         });
       }
-    }
-    for (const row of jobsResult.rows.filter((job) => new Date(job.start) >= todayEnd).slice(0, 8)) {
-      items.push(buildDashboardJobItem(row, "upcoming", "low"));
     }
 
     for (const row of tasksResult.rows) {
@@ -7787,6 +7844,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
     }
 
     for (const row of notificationsResult.rows) {
+      if (isInformationalJobNotification(row)) continue;
       items.push({
         id: `notification:${row.id}`,
         type: "notification",
@@ -7808,8 +7866,12 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
     }
 
     if (employer && req.companyId) {
-      try {
+      const financeSource = await dashboardSource(requestId, "finance_upcoming", async () => {
         const projection = await loadProjection(pool, req.companyId, 7);
+        return projection;
+      }, { events: [] });
+      if (financeSource.failed) failedSources.push(financeSource.source);
+      const projection = financeSource.value;
         for (const event of (projection.events || []).slice(0, 8)) {
           const occurrenceAt = `${event.occurrence_date}T12:00:00.000Z`;
           items.push({
@@ -7831,13 +7893,10 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
             destination: { type: "finance_upcoming", id: String(event.planned_item_id) }
           });
         }
-      } catch (financeError) {
-        console.warn("[dashboard] finance projection skipped", { message: financeError?.message || String(financeError) });
-      }
     }
 
     const priorityRank = { critical: 0, high: 1, normal: 2, low: 3 };
-    const sectionRank = { attention: 0, today: 1, upcoming: 2 };
+    const sectionRank = { unfinished_jobs: 0, attention: 1, today: 2, upcoming_jobs: 3, upcoming: 4 };
     const visibleItems = filterDashboardDismissed(dedupeDashboardItems(items), dismissalsResult.rows)
       .sort((a, b) => {
         if (sectionRank[a.section] !== sectionRank[b.section]) return sectionRank[a.section] - sectionRank[b.section];
@@ -7856,6 +7915,8 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
         jobs_today: jobsToday.length,
         jobs_today_completed: completedJobsToday,
         jobs_today_remaining: activeJobsToday.length,
+        unfinished_jobs_count: unfinishedJobs.length,
+        upcoming_jobs_count: upcomingJobs.length,
         tasks_today_total: tasksTodayTotal,
         tasks_today_completed: tasksTodayCompleted,
         revenue_today_cents: Number(revenue.today || 0),
@@ -7864,7 +7925,9 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
         jobs_missing_prices_today: Number(revenue.missing_today || 0),
         revenue_visible: employer
       },
-      items: visibleItems.slice(0, 30)
+      partial: failedSources.length > 0,
+      failed_sources: failedSources,
+      items: visibleItems.slice(0, 60)
     });
   } catch (e) {
     console.error("[dashboard] summary failed:", e);
