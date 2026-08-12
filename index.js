@@ -7767,6 +7767,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
       try {
         const projection = await loadProjection(pool, req.companyId, 7);
         for (const event of (projection.events || []).slice(0, 8)) {
+          const occurrenceAt = `${event.occurrence_date}T12:00:00.000Z`;
           items.push({
             id: `finance_upcoming:${event.planned_item_id}:${event.occurrence_date}`,
             type: "finance_upcoming",
@@ -7778,7 +7779,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
             title: event.title,
             subtitle: event.direction === "income" ? "Expected income" : (event.recurrence === "none" ? "Planned expense" : "Recurring"),
             amount_cents: Number(event.signed_amount_cents || 0),
-            due_at: event.occurrence_date,
+            due_at: occurrenceAt,
             system_image: event.direction === "income" ? "arrow.down.circle.fill" : "calendar.badge.clock",
             tint: event.direction === "income" ? "green" : "red",
             completable: false,
