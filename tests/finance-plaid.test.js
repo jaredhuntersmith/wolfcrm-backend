@@ -3,6 +3,7 @@ import {
   collectPlaidSyncPages,
   decryptAccessToken,
   encryptAccessToken,
+  effectiveFinanceAccountBalanceCents,
   getPlaidConfig,
   getPlaidEnvironmentConfig,
   isLiquidFinanceAccount,
@@ -11,7 +12,8 @@ import {
   plaidAccountToFinanceAccount,
   plaidSecretForEnvironment,
   providerAmountToCents,
-  reconcileTransactionRefs
+  reconcileTransactionRefs,
+  totalEffectiveLiquidCashCents
 } from "../finance-plaid-helpers.js";
 
 const keyA = "0123456789abcdef0123456789abcdef";
@@ -125,7 +127,7 @@ await run("Plaid expense/income normalization", () => {
   assert.deepEqual(normalizePlaidTransactionAmount(-1500), { direction: "income", amount_cents: 150000 });
 });
 
-await run("Plaid depository balance uses available after pending when present", () => {
+await run("Plaid depository stores provider current and available separately", () => {
   const mapped = plaidAccountToFinanceAccount({
     account_id: "acc_checking",
     name: "Checking",
@@ -137,7 +139,7 @@ await run("Plaid depository balance uses available after pending when present", 
       iso_currency_code: "USD"
     }
   }, { id: "item_1", institution_name: "Bank" });
-  assert.equal(mapped.current_balance_cents, 87500);
+  assert.equal(mapped.current_balance_cents, 100000);
   assert.equal(mapped.available_balance_cents, 87500);
   assert.equal(mapped.include_in_liquid_cash, true);
 });
@@ -157,6 +159,44 @@ await run("Plaid credit balance keeps current instead of available credit", () =
   assert.equal(mapped.current_balance_cents, 30000);
   assert.equal(mapped.available_balance_cents, 470000);
   assert.equal(mapped.include_in_liquid_cash, false);
+});
+
+await run("effective balance uses available when setting is on", () => {
+  const account = { source: "plaid", account_type: "checking", current_balance_cents: 100000, available_balance_cents: 87500, plaid_account_type: "depository", plaid_account_subtype: "checking" };
+  assert.equal(effectiveFinanceAccountBalanceCents(account, { use_available_bank_balance: true }), 87500);
+});
+
+await run("effective balance falls back to current when available is null", () => {
+  const account = { source: "plaid", account_type: "checking", current_balance_cents: 100000, available_balance_cents: null, plaid_account_type: "depository", plaid_account_subtype: "checking" };
+  assert.equal(effectiveFinanceAccountBalanceCents(account, { use_available_bank_balance: true }), 100000);
+});
+
+await run("effective balance uses current when setting is off", () => {
+  const account = { source: "plaid", account_type: "checking", current_balance_cents: 100000, available_balance_cents: 87500, plaid_account_type: "depository", plaid_account_subtype: "checking" };
+  assert.equal(effectiveFinanceAccountBalanceCents(account, { use_available_bank_balance: false }), 100000);
+});
+
+await run("manual effective balance is unaffected by available balance setting", () => {
+  const account = { source: "manual", account_type: "cash", current_balance_cents: 50000 };
+  assert.equal(effectiveFinanceAccountBalanceCents(account, { use_available_bank_balance: true }), 50000);
+});
+
+await run("credit loan disconnected and archived accounts are excluded from effective cash", () => {
+  assert.equal(effectiveFinanceAccountBalanceCents({ source: "plaid", plaid_account_type: "credit", plaid_account_subtype: "credit card", current_balance_cents: 30000, available_balance_cents: 470000 }, { use_available_bank_balance: true }), 0);
+  assert.equal(effectiveFinanceAccountBalanceCents({ source: "plaid", plaid_account_type: "loan", plaid_account_subtype: "student", current_balance_cents: 30000 }, { use_available_bank_balance: true }), 0);
+  assert.equal(effectiveFinanceAccountBalanceCents({ source: "plaid", plaid_account_type: "depository", plaid_account_subtype: "checking", current_balance_cents: 30000, plaid_item_status: "disconnected" }, { use_available_bank_balance: true }), 0);
+  assert.equal(effectiveFinanceAccountBalanceCents({ source: "plaid", plaid_account_type: "depository", plaid_account_subtype: "checking", current_balance_cents: 30000, archived_at: "2026-08-12" }, { use_available_bank_balance: true }), 0);
+});
+
+await run("total effective liquid cash sums exact cents", () => {
+  const accounts = [
+    { source: "plaid", account_type: "checking", current_balance_cents: 40103, available_balance_cents: 19686, plaid_account_type: "depository", plaid_account_subtype: "checking" },
+    { source: "plaid", account_type: "checking", current_balance_cents: 13751, available_balance_cents: 1506, plaid_account_type: "depository", plaid_account_subtype: "checking" },
+    { source: "manual", account_type: "cash", current_balance_cents: 5000 },
+    { source: "plaid", plaid_account_type: "credit", plaid_account_subtype: "credit card", current_balance_cents: 19167, available_balance_cents: 30410 }
+  ];
+  assert.equal(totalEffectiveLiquidCashCents(accounts, { use_available_bank_balance: true }), 26192);
+  assert.equal(totalEffectiveLiquidCashCents(accounts, { use_available_bank_balance: false }), 58854);
 });
 
 await run("liquid account rules", () => {

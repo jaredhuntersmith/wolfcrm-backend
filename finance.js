@@ -5,7 +5,7 @@ import {
   goalMetrics
 } from "./finance-calculations.js";
 import { installPlaidRoutes, installPlaidSchema } from "./finance-plaid.js";
-import { isLiquidFinanceAccount, totalEffectiveLiquidCashCents } from "./finance-plaid-helpers.js";
+import { totalEffectiveLiquidCashCents } from "./finance-plaid-helpers.js";
 import { installReceiptRoutes, installReceiptSchema } from "./finance-receipts.js";
 import { installFinanceAIRoutes, installFinanceAISchema } from "./finance-ai.js";
 
