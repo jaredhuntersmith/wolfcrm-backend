@@ -24,6 +24,7 @@ class FakePool {
     if (sql.includes("FROM finance_debts")) return { rows: [
       row({ name: "IRS", debt_type: "federal_tax", current_balance_cents: 840000, original_balance_cents: 840000, minimum_payment_cents: 50000, planned_payment_cents: 100000, apr_basis_points: 0, next_due_date: "2026-08-15", status: "active", priority: "high" })
     ] };
+    if (sql.includes("FROM finance_goals") && sql.includes("lower(name)")) return { rows: [] };
     if (sql.includes("FROM finance_goals")) return { rows: [
       row({ name: "Emergency Fund", goal_type: "emergency_fund", target_amount_cents: 1000000, current_amount_cents: 250000, target_date: "2026-12-31", status: "active" })
     ] };

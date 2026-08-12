@@ -450,6 +450,42 @@ function dollars(cents) {
   return `$${(Number(cents || 0) / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+function friendlyDate(value) {
+  if (value instanceof Date) return friendlyDate(value.toISOString().slice(0, 10));
+  const raw = cleanString(value, 20);
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return raw;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12));
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(date);
+}
+
+function friendlyEnum(value) {
+  const raw = cleanString(value, 120);
+  const labels = {
+    general_savings: "General Savings",
+    emergency_fund: "Emergency Fund",
+    tax_payoff: "Tax Payoff",
+    equipment_purchase: "Equipment Purchase",
+    vehicle_purchase: "Vehicle Purchase",
+    moving_fund: "Moving Fund",
+    one_time: "One Time",
+    none: "One Time",
+    weekly: "Weekly",
+    biweekly: "Every 2 Weeks",
+    monthly: "Monthly",
+    yearly: "Yearly",
+    business: "Business",
+    personal: "Personal",
+    income: "Income",
+    expense: "Expense",
+    subscription_likely: "High-confidence subscription",
+    recurring_expense_likely: "Likely recurring expense",
+    recurring_income_likely: "Likely recurring income",
+    repeated_merchant_only: "Repeated merchant"
+  };
+  return labels[raw] || raw.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
 function summarizeToolActivity(calls) {
   return calls.map((call) => ({ name: call.name, status: call.status }));
 }
@@ -784,7 +820,7 @@ function buildDebtFallback(result) {
 function buildGoalFallback(result) {
   const goals = Array.isArray(result) ? result : result?.goals ? result.goals : result?.goal ? [result.goal] : [];
   if (!goals.length) return "No active goals were found.";
-  return ["Here are your active goals:", "", ...formatRows(goals, (goal) => `${goal.name || "Goal"} - ${dollars(goal.current_amount_cents)} of ${dollars(goal.target_amount_cents)}${goal.target_date ? ` by ${goal.target_date}` : ""}`, "No active goals were found.")].join("\n");
+  return ["Here are your active goals:", "", ...formatRows(goals, (goal) => `${goal.name || "Goal"} - ${dollars(goal.current_amount_cents)} of ${dollars(goal.target_amount_cents)}${goal.target_date ? ` by ${friendlyDate(goal.target_date)}` : ""}`, "No active goals were found.")].join("\n");
 }
 
 function buildReceiptFallback(result) {
@@ -800,7 +836,7 @@ function buildReceiptFallback(result) {
 function buildPlannedFallback(result) {
   const items = Array.isArray(result) ? result : result?.items;
   if (!Array.isArray(items) || !items.length) return "No matching planned items were found.";
-  return ["Here are the matching planned items:", "", ...formatRows(items, (item) => `${item.title || "Planned item"} - ${dollars(item.amount_cents)} ${item.direction || ""}${item.scheduled_date ? ` on ${item.scheduled_date}` : ""}${item.recurrence && item.recurrence !== "none" ? `, ${item.recurrence}` : ""}`, "No matching planned items were found.")].join("\n");
+  return ["Here are the matching planned items:", "", ...formatRows(items, (item) => `${item.title || "Planned item"} - ${dollars(item.amount_cents)} ${friendlyEnum(item.direction || "")}${item.scheduled_date ? ` on ${friendlyDate(item.scheduled_date)}` : ""}${item.recurrence && item.recurrence !== "none" ? `, ${friendlyEnum(item.recurrence)}` : ""}`, "No matching planned items were found.")].join("\n");
 }
 
 function buildRecurringFallback(result) {
@@ -815,7 +851,7 @@ function buildRecurringFallback(result) {
   return [
     heading,
     "",
-    ...formatRows(rows, (item) => `${item.merchant_name || item.description || "Recurring item"} - ${dollars(item.average_amount_cents ?? item.last_amount_cents)} ${item.cadence || item.frequency || ""}${item.classification ? ` (${item.classification.replace(/_/g, " ")}, confidence ${Math.round(Number(item.confidence || 0) * 100)}%)` : ""}`, "No recurring items were found.", 10),
+    ...formatRows(rows, (item) => `${item.merchant_name || item.description || "Recurring item"} - ${dollars(item.average_amount_cents ?? item.last_amount_cents)} ${friendlyEnum(item.cadence || item.frequency || "")}${item.classification ? ` (${friendlyEnum(item.classification)}, ${Number(item.confidence || 0) >= 0.85 ? "high" : "medium"} confidence)` : ""}`, "No recurring items were found.", 10),
     "",
     result?.patterns ? "This is pattern analysis from your posted transactions, not a bank-confirmed subscription list." : "Provider-detected streams come from stored bank data and are not automatically added to your Finance plan."
   ].join("\n");
@@ -2323,12 +2359,12 @@ function proposalSummary(toolName, args) {
   case "update_manual_account_type": return `Change manual account type to ${cleanString(args.account_type, 40) || "new type"}`;
   case "archive_manual_account": return "Archive manual account";
   case "set_manual_account_balance": return `Set manual account balance to ${dollars(args.new_balance_cents)}`;
-  case "create_planned_expense": return `Add planned expense: ${cleanString(args.title, 80) || "Expense"} for ${dollars(args.amount_cents)}`;
-  case "create_expected_income": return `Add expected income: ${cleanString(args.title, 80) || "Income"} for ${dollars(args.amount_cents)}`;
+  case "create_planned_expense": return `Plan ${dollars(args.amount_cents)} for ${cleanString(args.title, 80) || "an expense"}${args.scheduled_date ? ` on ${friendlyDate(args.scheduled_date)}` : ""}`;
+  case "create_expected_income": return `Plan ${dollars(args.amount_cents)} of income from ${cleanString(args.title, 80) || "income"}${args.scheduled_date ? ` on ${friendlyDate(args.scheduled_date)}` : ""}`;
   case "update_planned_item": return `Update planned item: ${cleanString(args.title, 80) || cleanString(args.planned_item_id, 80)}`;
   case "archive_planned_item": return "Archive planned item";
   case "update_minimum_reserve": return `Set minimum cash reserve to ${dollars(args.minimum_cash_reserve_cents)}`;
-  case "create_goal": return `Create goal: ${cleanString(args.name, 80) || "Goal"} for ${dollars(args.target_amount_cents)}`;
+  case "create_goal": return `Save ${dollars(args.target_amount_cents)} for ${cleanString(args.name, 80) || "this goal"}${args.target_date ? ` by ${friendlyDate(args.target_date)}` : ""}`;
   case "update_goal": return `Update goal: ${cleanString(args.name, 80) || cleanString(args.goal_id, 80)}`;
   case "add_goal_contribution": return `Record goal contribution of ${dollars(args.amount_cents)}`;
   case "complete_goal": return "Mark goal complete";
@@ -3319,8 +3355,92 @@ async function activeCollectingDraft(pool, ctx) {
   return rows[0] || null;
 }
 
+async function activeOpenProposal(pool, ctx) {
+  if (!ctx.conversationId) return null;
+  const { rows } = await pool.query(
+    `SELECT *
+       FROM finance_ai_action_proposals
+      WHERE company_id = $1
+        AND owner_user_id = $2
+        AND conversation_id = $3
+        AND status IN ('collecting','proposed')
+        AND updated_at > now() - interval '7 days'
+      ORDER BY updated_at DESC
+      LIMIT 1`,
+    [ctx.companyId, ctx.userId, ctx.conversationId]
+  );
+  return rows[0] || null;
+}
+
+async function cancelOpenProposal(pool, ctx, proposal) {
+  const { rows } = await pool.query(
+    `UPDATE finance_ai_action_proposals
+        SET status = 'cancelled', updated_at = now()
+      WHERE id = $1
+        AND company_id = $2
+        AND owner_user_id = $3
+        AND status IN ('collecting','proposed')
+      RETURNING *`,
+    [proposal.id, ctx.companyId, ctx.userId]
+  );
+  if (rows.length && Array.isArray(ctx.actionProposals)) ctx.actionProposals.push(actionProposalPayload(rows[0]));
+  return { handled: true, responseType: "proposal", text: "Cancelled.", toolActivity: [{ name: "deterministic_cancel", status: "succeeded" }] };
+}
+
+async function updateOpenProposalAmount(pool, ctx, proposal, amountCents) {
+  const args = proposal.payload?.args && typeof proposal.payload.args === "object" ? { ...proposal.payload.args } : {};
+  const amountKey = args.target_amount_cents !== undefined ? "target_amount_cents"
+    : args.amount_cents !== undefined ? "amount_cents"
+    : args.limit_cents !== undefined ? "limit_cents"
+    : null;
+  if (!amountKey || !amountCents || amountCents <= 0) return { handled: false };
+  args[amountKey] = amountCents;
+  await validateActionEntityReferences(pool, ctx.companyId, proposal.action_type, args);
+  const missing = missingRequiredFields(proposal.action_type, args);
+  if (missing.length) return { handled: false };
+  const payload = { tool_name: proposal.action_type, args: jsonSafe(args) };
+  const { rows } = await pool.query(
+    `UPDATE finance_ai_action_proposals
+        SET payload = $4, summary = $5, updated_at = now()
+      WHERE id = $1
+        AND company_id = $2
+        AND owner_user_id = $3
+        AND status = 'proposed'
+      RETURNING *`,
+    [proposal.id, ctx.companyId, ctx.userId, JSON.stringify(payload), proposalSummary(proposal.action_type, args)]
+  );
+  if (!rows.length) return { handled: false };
+  if (Array.isArray(ctx.actionProposals)) ctx.actionProposals.push(actionProposalPayload(rows[0]));
+  return {
+    handled: true,
+    responseType: "proposal",
+    text: `Updated the proposal to ${dollars(amountCents)}. Tap Confirm when it looks right.`,
+    toolActivity: [{ name: "deterministic_proposal_update", status: "succeeded" }]
+  };
+}
+
 async function proposalFromDeterministicAction(pool, ctx, actionType, fields, source) {
   requireFinanceCapabilities(ctx, ACTION_PERMISSIONS[actionType] || ["finance.ai.use"]);
+  if (actionType === "create_goal" && fields?.name && fields?.target_amount_cents) {
+    const duplicate = await pool.query(
+      `SELECT id, name, target_amount_cents, current_amount_cents, target_date
+         FROM finance_goals
+        WHERE company_id = $1
+          AND archived_at IS NULL
+          AND lower(name) = lower($2)
+        LIMIT 1`,
+      [ctx.companyId, cleanString(fields.name, 140)]
+    ).catch(() => ({ rows: [] }));
+    if (duplicate.rows.length) {
+      const goal = duplicate.rows[0];
+      return {
+        handled: true,
+        responseType: "clarification",
+        text: `There's already a ${goal.name} goal for ${dollars(goal.target_amount_cents)}${goal.target_date ? ` by ${friendlyDate(goal.target_date)}` : ""}. Do you want to update that goal or create a separate one?`,
+        toolActivity: [{ name: `deterministic_${source}`, status: "duplicate_detected" }]
+      };
+    }
+  }
   const result = await createActionProposal(pool, ctx, actionType, fields);
   if (result?.needs_follow_up) {
     return {
@@ -3354,6 +3474,23 @@ function detectMemoryRequest(message) {
 
 async function handleDeterministicFinanceTurn(pool, ctx, message) {
   const prompt = cleanString(message, 1000).toLowerCase();
+  const openProposal = await activeOpenProposal(pool, ctx);
+  if (openProposal && /\b(never mind|nevermind|cancel that|forget it)\b/i.test(message)) {
+    return cancelOpenProposal(pool, ctx, openProposal);
+  }
+  if (openProposal?.status === "proposed" && /^\s*(yes|yeah|yep|do it|confirm|looks good|go ahead)\s*[.!]*\s*$/i.test(message)) {
+    return {
+      handled: true,
+      responseType: "proposal",
+      text: "Tap Confirm on the proposal card to apply it. I won't make Finance changes from a chat reply alone.",
+      toolActivity: [{ name: "deterministic_confirmation_guard", status: "succeeded" }]
+    };
+  }
+  if (openProposal?.status === "proposed" && /\b(actually|change that|make it|update it)\b/i.test(message)) {
+    const amount = parseMoneyText(message);
+    const updated = await updateOpenProposalAmount(pool, ctx, openProposal, amount);
+    if (updated.handled) return updated;
+  }
   const draft = await activeCollectingDraft(pool, ctx);
   if (draft?.action_type === "create_goal" && /\b(goal|saving|xbox|\$|saved|december|target|name)\b/i.test(message)) {
     const existing = draft.payload?.args && typeof draft.payload.args === "object" ? draft.payload.args : {};
