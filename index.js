@@ -713,6 +713,27 @@ async function bootstrap() {
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
       can_delete_contacts BOOLEAN NOT NULL DEFAULT false,
+      can_view_finance BOOLEAN NOT NULL DEFAULT false,
+      can_use_finance_ai BOOLEAN NOT NULL DEFAULT false,
+      can_view_finance_transactions BOOLEAN NOT NULL DEFAULT false,
+      can_edit_finance_transactions BOOLEAN NOT NULL DEFAULT false,
+      can_view_finance_accounts BOOLEAN NOT NULL DEFAULT false,
+      can_create_finance_accounts BOOLEAN NOT NULL DEFAULT false,
+      can_edit_finance_accounts BOOLEAN NOT NULL DEFAULT false,
+      can_adjust_finance_account_balances BOOLEAN NOT NULL DEFAULT false,
+      can_view_finance_receipts BOOLEAN NOT NULL DEFAULT false,
+      can_edit_finance_receipts BOOLEAN NOT NULL DEFAULT false,
+      can_view_finance_planning BOOLEAN NOT NULL DEFAULT false,
+      can_edit_finance_planning BOOLEAN NOT NULL DEFAULT false,
+      can_view_finance_budgets BOOLEAN NOT NULL DEFAULT false,
+      can_edit_finance_budgets BOOLEAN NOT NULL DEFAULT false,
+      can_view_finance_goals BOOLEAN NOT NULL DEFAULT false,
+      can_edit_finance_goals BOOLEAN NOT NULL DEFAULT false,
+      can_view_finance_debts BOOLEAN NOT NULL DEFAULT false,
+      can_edit_finance_debts BOOLEAN NOT NULL DEFAULT false,
+      can_view_finance_settings BOOLEAN NOT NULL DEFAULT false,
+      can_edit_finance_settings BOOLEAN NOT NULL DEFAULT false,
+      can_manage_company_finance_ai_memories BOOLEAN NOT NULL DEFAULT false,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
@@ -1289,6 +1310,27 @@ async function bootstrap() {
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_days JSONB NOT NULL DEFAULT '[1,2,3,4,5]'::jsonb;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_open_time TEXT NOT NULL DEFAULT '09:00';
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_close_time TEXT NOT NULL DEFAULT '17:00';
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_use_finance_ai BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_transactions BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_transactions BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_accounts BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_create_finance_accounts BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_accounts BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_adjust_finance_account_balances BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_receipts BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_receipts BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_planning BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_planning BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_budgets BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_budgets BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_goals BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_goals BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_debts BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_debts BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_settings BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_settings BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_manage_company_finance_ai_memories BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS service_items JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
@@ -1503,7 +1545,29 @@ async function authRequired(req, res, next) {
        FROM users u
        LEFT JOIN employee_permissions p ON p.user_id = u.id
       WHERE s.token = $1 AND u.id = s.user_id AND u.deleted_at IS NULL
-      RETURNING s.user_id, u.email, u.role, u.company_id, COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts`,
+      RETURNING s.user_id, u.email, u.role, u.company_id,
+                COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts,
+                COALESCE(p.can_view_finance, u.role = 'employer') AS can_view_finance,
+                COALESCE(p.can_use_finance_ai, u.role = 'employer') AS can_use_finance_ai,
+                COALESCE(p.can_view_finance_transactions, u.role = 'employer') AS can_view_finance_transactions,
+                COALESCE(p.can_edit_finance_transactions, u.role = 'employer') AS can_edit_finance_transactions,
+                COALESCE(p.can_view_finance_accounts, u.role = 'employer') AS can_view_finance_accounts,
+                COALESCE(p.can_create_finance_accounts, u.role = 'employer') AS can_create_finance_accounts,
+                COALESCE(p.can_edit_finance_accounts, u.role = 'employer') AS can_edit_finance_accounts,
+                COALESCE(p.can_adjust_finance_account_balances, u.role = 'employer') AS can_adjust_finance_account_balances,
+                COALESCE(p.can_view_finance_receipts, u.role = 'employer') AS can_view_finance_receipts,
+                COALESCE(p.can_edit_finance_receipts, u.role = 'employer') AS can_edit_finance_receipts,
+                COALESCE(p.can_view_finance_planning, u.role = 'employer') AS can_view_finance_planning,
+                COALESCE(p.can_edit_finance_planning, u.role = 'employer') AS can_edit_finance_planning,
+                COALESCE(p.can_view_finance_budgets, u.role = 'employer') AS can_view_finance_budgets,
+                COALESCE(p.can_edit_finance_budgets, u.role = 'employer') AS can_edit_finance_budgets,
+                COALESCE(p.can_view_finance_goals, u.role = 'employer') AS can_view_finance_goals,
+                COALESCE(p.can_edit_finance_goals, u.role = 'employer') AS can_edit_finance_goals,
+                COALESCE(p.can_view_finance_debts, u.role = 'employer') AS can_view_finance_debts,
+                COALESCE(p.can_edit_finance_debts, u.role = 'employer') AS can_edit_finance_debts,
+                COALESCE(p.can_view_finance_settings, u.role = 'employer') AS can_view_finance_settings,
+                COALESCE(p.can_edit_finance_settings, u.role = 'employer') AS can_edit_finance_settings,
+                COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories`,
     [token]
   );
   if (!rows.length) return res.status(401).json({ error: "unauthorized" });
@@ -1511,7 +1575,30 @@ async function authRequired(req, res, next) {
   req.userEmail = rows[0].email;
   req.role = rows[0].role;
   req.companyId = rows[0].company_id;
-  req.permissions = { canDeleteContacts: !!rows[0].can_delete_contacts };
+  req.permissions = {
+    canDeleteContacts: !!rows[0].can_delete_contacts,
+    canViewFinance: !!rows[0].can_view_finance,
+    canUseFinanceAi: !!rows[0].can_use_finance_ai,
+    canViewFinanceTransactions: !!rows[0].can_view_finance_transactions,
+    canEditFinanceTransactions: !!rows[0].can_edit_finance_transactions,
+    canViewFinanceAccounts: !!rows[0].can_view_finance_accounts,
+    canCreateFinanceAccounts: !!rows[0].can_create_finance_accounts,
+    canEditFinanceAccounts: !!rows[0].can_edit_finance_accounts,
+    canAdjustFinanceAccountBalances: !!rows[0].can_adjust_finance_account_balances,
+    canViewFinanceReceipts: !!rows[0].can_view_finance_receipts,
+    canEditFinanceReceipts: !!rows[0].can_edit_finance_receipts,
+    canViewFinancePlanning: !!rows[0].can_view_finance_planning,
+    canEditFinancePlanning: !!rows[0].can_edit_finance_planning,
+    canViewFinanceBudgets: !!rows[0].can_view_finance_budgets,
+    canEditFinanceBudgets: !!rows[0].can_edit_finance_budgets,
+    canViewFinanceGoals: !!rows[0].can_view_finance_goals,
+    canEditFinanceGoals: !!rows[0].can_edit_finance_goals,
+    canViewFinanceDebts: !!rows[0].can_view_finance_debts,
+    canEditFinanceDebts: !!rows[0].can_edit_finance_debts,
+    canViewFinanceSettings: !!rows[0].can_view_finance_settings,
+    canEditFinanceSettings: !!rows[0].can_edit_finance_settings,
+    canManageCompanyFinanceAiMemories: !!rows[0].can_manage_company_finance_ai_memories
+  };
   req.sessionToken = token;
   next();
 }
@@ -1712,6 +1799,33 @@ function userPayload(user, permissions = null, company = null) {
     photo_url: user.photo_url,
     company,
     permissions: permissions || { can_delete_contacts: user.role === "employer" }
+  };
+}
+
+function employeePermissionPayload(row = {}) {
+  return {
+    can_delete_contacts: !!row.can_delete_contacts,
+    can_view_finance: !!row.can_view_finance,
+    can_use_finance_ai: !!row.can_use_finance_ai,
+    can_view_finance_transactions: !!row.can_view_finance_transactions,
+    can_edit_finance_transactions: !!row.can_edit_finance_transactions,
+    can_view_finance_accounts: !!row.can_view_finance_accounts,
+    can_create_finance_accounts: !!row.can_create_finance_accounts,
+    can_edit_finance_accounts: !!row.can_edit_finance_accounts,
+    can_adjust_finance_account_balances: !!row.can_adjust_finance_account_balances,
+    can_view_finance_receipts: !!row.can_view_finance_receipts,
+    can_edit_finance_receipts: !!row.can_edit_finance_receipts,
+    can_view_finance_planning: !!row.can_view_finance_planning,
+    can_edit_finance_planning: !!row.can_edit_finance_planning,
+    can_view_finance_budgets: !!row.can_view_finance_budgets,
+    can_edit_finance_budgets: !!row.can_edit_finance_budgets,
+    can_view_finance_goals: !!row.can_view_finance_goals,
+    can_edit_finance_goals: !!row.can_edit_finance_goals,
+    can_view_finance_debts: !!row.can_view_finance_debts,
+    can_edit_finance_debts: !!row.can_edit_finance_debts,
+    can_view_finance_settings: !!row.can_view_finance_settings,
+    can_edit_finance_settings: !!row.can_edit_finance_settings,
+    can_manage_company_finance_ai_memories: !!row.can_manage_company_finance_ai_memories
   };
 }
 
@@ -2031,7 +2145,28 @@ app.get("/me", authRequired, async (req, res) => {
     `SELECT u.id, u.email, u.role, u.company_id, u.created_at,
             u.display_name, u.photo_url,
             c.name AS company_name, c.join_code,
-            COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts
+            COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts,
+            COALESCE(p.can_view_finance, u.role = 'employer') AS can_view_finance,
+            COALESCE(p.can_use_finance_ai, u.role = 'employer') AS can_use_finance_ai,
+            COALESCE(p.can_view_finance_transactions, u.role = 'employer') AS can_view_finance_transactions,
+            COALESCE(p.can_edit_finance_transactions, u.role = 'employer') AS can_edit_finance_transactions,
+            COALESCE(p.can_view_finance_accounts, u.role = 'employer') AS can_view_finance_accounts,
+            COALESCE(p.can_create_finance_accounts, u.role = 'employer') AS can_create_finance_accounts,
+            COALESCE(p.can_edit_finance_accounts, u.role = 'employer') AS can_edit_finance_accounts,
+            COALESCE(p.can_adjust_finance_account_balances, u.role = 'employer') AS can_adjust_finance_account_balances,
+            COALESCE(p.can_view_finance_receipts, u.role = 'employer') AS can_view_finance_receipts,
+            COALESCE(p.can_edit_finance_receipts, u.role = 'employer') AS can_edit_finance_receipts,
+            COALESCE(p.can_view_finance_planning, u.role = 'employer') AS can_view_finance_planning,
+            COALESCE(p.can_edit_finance_planning, u.role = 'employer') AS can_edit_finance_planning,
+            COALESCE(p.can_view_finance_budgets, u.role = 'employer') AS can_view_finance_budgets,
+            COALESCE(p.can_edit_finance_budgets, u.role = 'employer') AS can_edit_finance_budgets,
+            COALESCE(p.can_view_finance_goals, u.role = 'employer') AS can_view_finance_goals,
+            COALESCE(p.can_edit_finance_goals, u.role = 'employer') AS can_edit_finance_goals,
+            COALESCE(p.can_view_finance_debts, u.role = 'employer') AS can_view_finance_debts,
+            COALESCE(p.can_edit_finance_debts, u.role = 'employer') AS can_edit_finance_debts,
+            COALESCE(p.can_view_finance_settings, u.role = 'employer') AS can_view_finance_settings,
+            COALESCE(p.can_edit_finance_settings, u.role = 'employer') AS can_edit_finance_settings,
+            COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories
        FROM users u
        LEFT JOIN companies c ON c.id = u.company_id
        LEFT JOIN employee_permissions p ON p.user_id = u.id
@@ -2042,7 +2177,7 @@ app.get("/me", authRequired, async (req, res) => {
   res.json({
     user: userPayload(
       u,
-      { can_delete_contacts: !!u.can_delete_contacts },
+      employeePermissionPayload(u),
       u.company_id ? { id: u.company_id, name: u.company_name, join_code: u.join_code } : null
     )
   });
@@ -3980,7 +4115,28 @@ app.get("/api/company/settings", authRequired, requireEmployer, async (req, res)
               u.photo_url,
               u.deleted_at,
               COALESCE(u.pre_delete_email, u.email) AS original_email,
-              COALESCE(p.can_delete_contacts,false) AS can_delete_contacts
+              COALESCE(p.can_delete_contacts,false) AS can_delete_contacts,
+              COALESCE(p.can_view_finance,false) AS can_view_finance,
+              COALESCE(p.can_use_finance_ai,false) AS can_use_finance_ai,
+              COALESCE(p.can_view_finance_transactions,false) AS can_view_finance_transactions,
+              COALESCE(p.can_edit_finance_transactions,false) AS can_edit_finance_transactions,
+              COALESCE(p.can_view_finance_accounts,false) AS can_view_finance_accounts,
+              COALESCE(p.can_create_finance_accounts,false) AS can_create_finance_accounts,
+              COALESCE(p.can_edit_finance_accounts,false) AS can_edit_finance_accounts,
+              COALESCE(p.can_adjust_finance_account_balances,false) AS can_adjust_finance_account_balances,
+              COALESCE(p.can_view_finance_receipts,false) AS can_view_finance_receipts,
+              COALESCE(p.can_edit_finance_receipts,false) AS can_edit_finance_receipts,
+              COALESCE(p.can_view_finance_planning,false) AS can_view_finance_planning,
+              COALESCE(p.can_edit_finance_planning,false) AS can_edit_finance_planning,
+              COALESCE(p.can_view_finance_budgets,false) AS can_view_finance_budgets,
+              COALESCE(p.can_edit_finance_budgets,false) AS can_edit_finance_budgets,
+              COALESCE(p.can_view_finance_goals,false) AS can_view_finance_goals,
+              COALESCE(p.can_edit_finance_goals,false) AS can_edit_finance_goals,
+              COALESCE(p.can_view_finance_debts,false) AS can_view_finance_debts,
+              COALESCE(p.can_edit_finance_debts,false) AS can_edit_finance_debts,
+              COALESCE(p.can_view_finance_settings,false) AS can_view_finance_settings,
+              COALESCE(p.can_edit_finance_settings,false) AS can_edit_finance_settings,
+              COALESCE(p.can_manage_company_finance_ai_memories,false) AS can_manage_company_finance_ai_memories
          FROM users u
          LEFT JOIN employee_permissions p ON p.user_id = u.id
         WHERE u.company_id = $1 AND u.role = 'employee'
@@ -4191,19 +4347,97 @@ app.post("/api/company/employees/:id/restore", authRequired, requireEmployer, as
 app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer, async (req, res) => {
   try {
     const canDelete = !!req.body.can_delete_contacts;
+    const financePermissions = {
+      can_view_finance: !!req.body.can_view_finance,
+      can_use_finance_ai: !!req.body.can_use_finance_ai,
+      can_view_finance_transactions: !!req.body.can_view_finance_transactions,
+      can_edit_finance_transactions: !!req.body.can_edit_finance_transactions,
+      can_view_finance_accounts: !!req.body.can_view_finance_accounts,
+      can_create_finance_accounts: !!req.body.can_create_finance_accounts,
+      can_edit_finance_accounts: !!req.body.can_edit_finance_accounts,
+      can_adjust_finance_account_balances: !!req.body.can_adjust_finance_account_balances,
+      can_view_finance_receipts: !!req.body.can_view_finance_receipts,
+      can_edit_finance_receipts: !!req.body.can_edit_finance_receipts,
+      can_view_finance_planning: !!req.body.can_view_finance_planning,
+      can_edit_finance_planning: !!req.body.can_edit_finance_planning,
+      can_view_finance_budgets: !!req.body.can_view_finance_budgets,
+      can_edit_finance_budgets: !!req.body.can_edit_finance_budgets,
+      can_view_finance_goals: !!req.body.can_view_finance_goals,
+      can_edit_finance_goals: !!req.body.can_edit_finance_goals,
+      can_view_finance_debts: !!req.body.can_view_finance_debts,
+      can_edit_finance_debts: !!req.body.can_edit_finance_debts,
+      can_view_finance_settings: !!req.body.can_view_finance_settings,
+      can_edit_finance_settings: !!req.body.can_edit_finance_settings,
+      can_manage_company_finance_ai_memories: !!req.body.can_manage_company_finance_ai_memories
+    };
     const employee = await pool.query(
       `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND role = 'employee'`,
       [req.params.id, req.companyId]
     );
     if (!employee.rowCount) return res.status(404).json({ error: "employee_not_found" });
     const { rows } = await pool.query(
-      `INSERT INTO employee_permissions(user_id, company_id, can_delete_contacts)
-       VALUES($1,$2,$3)
+      `INSERT INTO employee_permissions(
+         user_id, company_id, can_delete_contacts,
+         can_view_finance, can_use_finance_ai,
+         can_view_finance_transactions, can_edit_finance_transactions,
+         can_view_finance_accounts, can_create_finance_accounts, can_edit_finance_accounts, can_adjust_finance_account_balances,
+         can_view_finance_receipts, can_edit_finance_receipts,
+         can_view_finance_planning, can_edit_finance_planning,
+         can_view_finance_budgets, can_edit_finance_budgets,
+         can_view_finance_goals, can_edit_finance_goals,
+         can_view_finance_debts, can_edit_finance_debts,
+         can_view_finance_settings, can_edit_finance_settings,
+         can_manage_company_finance_ai_memories
+       )
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
        ON CONFLICT(user_id) DO UPDATE
          SET can_delete_contacts = EXCLUDED.can_delete_contacts,
+             can_view_finance = EXCLUDED.can_view_finance,
+             can_use_finance_ai = EXCLUDED.can_use_finance_ai,
+             can_view_finance_transactions = EXCLUDED.can_view_finance_transactions,
+             can_edit_finance_transactions = EXCLUDED.can_edit_finance_transactions,
+             can_view_finance_accounts = EXCLUDED.can_view_finance_accounts,
+             can_create_finance_accounts = EXCLUDED.can_create_finance_accounts,
+             can_edit_finance_accounts = EXCLUDED.can_edit_finance_accounts,
+             can_adjust_finance_account_balances = EXCLUDED.can_adjust_finance_account_balances,
+             can_view_finance_receipts = EXCLUDED.can_view_finance_receipts,
+             can_edit_finance_receipts = EXCLUDED.can_edit_finance_receipts,
+             can_view_finance_planning = EXCLUDED.can_view_finance_planning,
+             can_edit_finance_planning = EXCLUDED.can_edit_finance_planning,
+             can_view_finance_budgets = EXCLUDED.can_view_finance_budgets,
+             can_edit_finance_budgets = EXCLUDED.can_edit_finance_budgets,
+             can_view_finance_goals = EXCLUDED.can_view_finance_goals,
+             can_edit_finance_goals = EXCLUDED.can_edit_finance_goals,
+             can_view_finance_debts = EXCLUDED.can_view_finance_debts,
+             can_edit_finance_debts = EXCLUDED.can_edit_finance_debts,
+             can_view_finance_settings = EXCLUDED.can_view_finance_settings,
+             can_edit_finance_settings = EXCLUDED.can_edit_finance_settings,
+             can_manage_company_finance_ai_memories = EXCLUDED.can_manage_company_finance_ai_memories,
              updated_at = now()
-      RETURNING user_id AS id, can_delete_contacts`,
-      [req.params.id, req.companyId, canDelete]
+      RETURNING user_id AS id, can_delete_contacts,
+                can_view_finance, can_use_finance_ai,
+                can_view_finance_transactions, can_edit_finance_transactions,
+                can_view_finance_accounts, can_create_finance_accounts, can_edit_finance_accounts, can_adjust_finance_account_balances,
+                can_view_finance_receipts, can_edit_finance_receipts,
+                can_view_finance_planning, can_edit_finance_planning,
+                can_view_finance_budgets, can_edit_finance_budgets,
+                can_view_finance_goals, can_edit_finance_goals,
+                can_view_finance_debts, can_edit_finance_debts,
+                can_view_finance_settings, can_edit_finance_settings,
+                can_manage_company_finance_ai_memories`,
+      [
+        req.params.id, req.companyId, canDelete,
+        financePermissions.can_view_finance, financePermissions.can_use_finance_ai,
+        financePermissions.can_view_finance_transactions, financePermissions.can_edit_finance_transactions,
+        financePermissions.can_view_finance_accounts, financePermissions.can_create_finance_accounts, financePermissions.can_edit_finance_accounts, financePermissions.can_adjust_finance_account_balances,
+        financePermissions.can_view_finance_receipts, financePermissions.can_edit_finance_receipts,
+        financePermissions.can_view_finance_planning, financePermissions.can_edit_finance_planning,
+        financePermissions.can_view_finance_budgets, financePermissions.can_edit_finance_budgets,
+        financePermissions.can_view_finance_goals, financePermissions.can_edit_finance_goals,
+        financePermissions.can_view_finance_debts, financePermissions.can_edit_finance_debts,
+        financePermissions.can_view_finance_settings, financePermissions.can_edit_finance_settings,
+        financePermissions.can_manage_company_finance_ai_memories
+      ]
     );
     try {
       await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.permission_changed", subjectType: "employee", subjectId: req.params.id, actorUserId: req.userId, source: "ios", payload: { employee_id: req.params.id, permission: "can_delete_contacts", new_value: canDelete } });

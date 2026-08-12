@@ -48,7 +48,7 @@ class FakePool {
   }
 }
 
-const ctx = { companyId: "company_1", userId: "user_1", conversationId: "conv_1", userMessage: "Can I afford this?" };
+const ctx = { companyId: "company_1", userId: "user_1", role: "employer", permissions: {}, conversationId: "conv_1", userMessage: "Can I afford this?" };
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
@@ -682,6 +682,79 @@ test("tool output serializer handles BigInt and undefined", () => {
   const output = JSON.parse(financeAIInternals.safeToolOutputString({ amount_cents: 123n, missing: undefined }));
   assert.equal(output.amount_cents, 123);
   assert.equal(output.missing, null);
+});
+
+test("employee without Finance AI permission cannot use read tools", async () => {
+  await assert.rejects(
+    () => executeFinanceAITool(new FakePool(), { ...ctx, role: "employee", permissions: {} }, "get_accounts", {}),
+    (error) => error.code === "finance_permission_denied"
+  );
+});
+
+test("employee with read permission can use matching read tool", async () => {
+  const result = await executeFinanceAITool(
+    new FakePool(),
+    { ...ctx, role: "employee", permissions: { canUseFinanceAi: true, canViewFinanceAccounts: true } },
+    "get_accounts",
+    {}
+  );
+  assert.equal(result.length, 2);
+});
+
+test("employee with read permission cannot create mutation proposal", async () => {
+  await assert.rejects(
+    () => executeFinanceAITool(
+      new FakePool(),
+      { ...ctx, role: "employee", permissions: { canUseFinanceAi: true, canViewFinanceBudgets: true }, userMessage: "Create budget" },
+      "create_budget",
+      { name: "Ads", category: "Advertising", limit_cents: 100000, period: "monthly", notes: null }
+    ),
+    (error) => error.code === "finance_permission_denied"
+  );
+});
+
+test("required-field engine blocks incomplete action proposal", async () => {
+  const pool = new FakePool();
+  const result = await executeFinanceAITool(
+    pool,
+    { ...ctx, userMessage: "Create a savings goal", actionProposals: [] },
+    "create_goal",
+    { name: "Savings", goal_type: null, target_amount_cents: null, current_amount_cents: null, target_date: null, notes: null }
+  );
+  assert.equal(result.needs_follow_up, true);
+  assert.deepEqual(result.missing_fields, ["target_amount_cents"]);
+});
+
+test("resolver returns ambiguous for two similar transactions", async () => {
+  const pool = new FakePool();
+  pool.query = async (sql, values = []) => {
+    pool.queries.push({ sql, values });
+    if (sql.includes("entity_context")) return { rows: [{ entity_context: [] }] };
+    if (sql.includes("UPDATE finance_ai_conversations")) return { rows: [] };
+    if (sql.includes("FROM finance_transactions")) return { rows: [
+      { id: "tx_1", label: "Home Depot", amount_cents: 18742, date: "2026-08-10", category: "Other", direction: "expense" },
+      { id: "tx_2", label: "Home Depot", amount_cents: 6319, date: "2026-08-06", category: "Other", direction: "expense" }
+    ] };
+    return FakePool.prototype.query.call(pool, sql, values);
+  };
+  const result = await financeAIInternals.resolveFinanceEntity(pool, ctx, { entity_type: "transaction", query: "Home Depot", amount_cents: null, date: null, category: null, direction: "expense", ordinal: null });
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.candidates.length, 2);
+});
+
+test("resolver ordinal uses recent candidate context", async () => {
+  const pool = new FakePool();
+  pool.query = async (sql, values = []) => {
+    pool.queries.push({ sql, values });
+    if (sql.includes("entity_context")) return { rows: [{ entity_context: [
+      { type: "transaction", id: "tx_1", display: "Home Depot $187.42 Aug 10", amount_cents: 18742 },
+      { type: "transaction", id: "tx_2", display: "Home Depot $63.19 Aug 6", amount_cents: 6319 }
+    ] }] };
+    return FakePool.prototype.query.call(pool, sql, values);
+  };
+  const result = await financeAIInternals.resolveFinanceEntity(pool, ctx, { entity_type: "transaction", query: "first one", amount_cents: null, date: null, category: null, direction: null, ordinal: 1 });
+  assert.equal(result.status, "exact_match");
+  assert.equal(result.entity.id, "tx_1");
 });
 
 let passed = 0;

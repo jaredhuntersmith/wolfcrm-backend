@@ -24,6 +24,52 @@ const rateBuckets = new Map();
 const COMMON_DATE_PERIODS = new Set(["custom", "this_month", "last_month", "last_30_days", "this_year", "last_year"]);
 const SPENDING_GROUP_BY_VALUES = new Set(["category", "merchant", "account", "none"]);
 const SPENDING_DIRECTION_VALUES = new Set(["expense", "income", "all"]);
+const FINANCE_CAPABILITIES = [
+  "finance.view",
+  "finance.ai.use",
+  "finance.transactions.view",
+  "finance.transactions.edit",
+  "finance.accounts.view",
+  "finance.accounts.create",
+  "finance.accounts.edit",
+  "finance.accounts.adjust_balance",
+  "finance.receipts.view",
+  "finance.receipts.edit",
+  "finance.planning.view",
+  "finance.planning.edit",
+  "finance.budgets.view",
+  "finance.budgets.edit",
+  "finance.goals.view",
+  "finance.goals.edit",
+  "finance.debts.view",
+  "finance.debts.edit",
+  "finance.settings.view",
+  "finance.settings.edit",
+  "finance.memories.manage_company"
+];
+const PERMISSION_COLUMNS = {
+  "finance.view": "can_view_finance",
+  "finance.ai.use": "can_use_finance_ai",
+  "finance.transactions.view": "can_view_finance_transactions",
+  "finance.transactions.edit": "can_edit_finance_transactions",
+  "finance.accounts.view": "can_view_finance_accounts",
+  "finance.accounts.create": "can_create_finance_accounts",
+  "finance.accounts.edit": "can_edit_finance_accounts",
+  "finance.accounts.adjust_balance": "can_adjust_finance_account_balances",
+  "finance.receipts.view": "can_view_finance_receipts",
+  "finance.receipts.edit": "can_edit_finance_receipts",
+  "finance.planning.view": "can_view_finance_planning",
+  "finance.planning.edit": "can_edit_finance_planning",
+  "finance.budgets.view": "can_view_finance_budgets",
+  "finance.budgets.edit": "can_edit_finance_budgets",
+  "finance.goals.view": "can_view_finance_goals",
+  "finance.goals.edit": "can_edit_finance_goals",
+  "finance.debts.view": "can_view_finance_debts",
+  "finance.debts.edit": "can_edit_finance_debts",
+  "finance.settings.view": "can_view_finance_settings",
+  "finance.settings.edit": "can_edit_finance_settings",
+  "finance.memories.manage_company": "can_manage_company_finance_ai_memories"
+};
 const WRITE_TOOL_NAMES = new Set([
   "create_manual_account",
   "rename_manual_account",
@@ -61,6 +107,71 @@ const WRITE_TOOL_NAMES = new Set([
   "propose_finance_ai_memory",
   "archive_finance_ai_memory"
 ]);
+const TOOL_PERMISSIONS = {
+  get_finance_overview: ["finance.ai.use", "finance.view"],
+  get_finance_settings: ["finance.ai.use", "finance.settings.view"],
+  get_accounts: ["finance.ai.use", "finance.accounts.view"],
+  get_account_detail: ["finance.ai.use", "finance.accounts.view"],
+  get_transactions: ["finance.ai.use", "finance.transactions.view"],
+  get_transaction_detail: ["finance.ai.use", "finance.transactions.view"],
+  get_spending_summary: ["finance.ai.use", "finance.transactions.view"],
+  get_cash_flow_projection: ["finance.ai.use", "finance.planning.view"],
+  get_budgets: ["finance.ai.use", "finance.budgets.view"],
+  get_budget_status: ["finance.ai.use", "finance.budgets.view"],
+  get_debts: ["finance.ai.use", "finance.debts.view"],
+  get_debt_detail: ["finance.ai.use", "finance.debts.view"],
+  get_debt_payoff: ["finance.ai.use", "finance.debts.view"],
+  get_goals: ["finance.ai.use", "finance.goals.view"],
+  get_goal_detail: ["finance.ai.use", "finance.goals.view"],
+  get_planned_items: ["finance.ai.use", "finance.planning.view"],
+  get_upcoming_financial_items: ["finance.ai.use", "finance.planning.view"],
+  get_detected_recurring_streams: ["finance.ai.use", "finance.transactions.view"],
+  get_detected_recurring_stream_detail: ["finance.ai.use", "finance.transactions.view"],
+  get_receipt_status_summary: ["finance.ai.use", "finance.receipts.view"],
+  get_receipts: ["finance.ai.use", "finance.receipts.view"],
+  get_receipt_detail: ["finance.ai.use", "finance.receipts.view"],
+  preview_purchase_impact: ["finance.ai.use", "finance.planning.view"],
+  preview_income_change: ["finance.ai.use", "finance.planning.view"],
+  preview_debt_payment: ["finance.ai.use", "finance.debts.view"],
+  resolve_finance_entity: ["finance.ai.use", "finance.view"]
+};
+const ACTION_PERMISSIONS = {
+  create_manual_account: ["finance.ai.use", "finance.accounts.create"],
+  rename_manual_account: ["finance.ai.use", "finance.accounts.edit"],
+  update_manual_account_type: ["finance.ai.use", "finance.accounts.edit"],
+  archive_manual_account: ["finance.ai.use", "finance.accounts.edit"],
+  set_manual_account_balance: ["finance.ai.use", "finance.accounts.adjust_balance"],
+  create_planned_expense: ["finance.ai.use", "finance.planning.edit"],
+  create_expected_income: ["finance.ai.use", "finance.planning.edit"],
+  update_planned_item: ["finance.ai.use", "finance.planning.edit"],
+  archive_planned_item: ["finance.ai.use", "finance.planning.edit"],
+  update_minimum_reserve: ["finance.ai.use", "finance.settings.edit"],
+  create_goal: ["finance.ai.use", "finance.goals.edit"],
+  update_goal: ["finance.ai.use", "finance.goals.edit"],
+  add_goal_contribution: ["finance.ai.use", "finance.goals.edit"],
+  complete_goal: ["finance.ai.use", "finance.goals.edit"],
+  archive_goal: ["finance.ai.use", "finance.goals.edit"],
+  create_budget: ["finance.ai.use", "finance.budgets.edit"],
+  update_budget: ["finance.ai.use", "finance.budgets.edit"],
+  archive_budget: ["finance.ai.use", "finance.budgets.edit"],
+  create_debt: ["finance.ai.use", "finance.debts.edit"],
+  update_debt: ["finance.ai.use", "finance.debts.edit"],
+  update_debt_planned_payment: ["finance.ai.use", "finance.debts.edit"],
+  record_debt_payment: ["finance.ai.use", "finance.debts.edit"],
+  update_debt_target_payoff_date: ["finance.ai.use", "finance.debts.edit"],
+  mark_debt_paid: ["finance.ai.use", "finance.debts.edit"],
+  archive_debt: ["finance.ai.use", "finance.debts.edit"],
+  update_receipt_metadata: ["finance.ai.use", "finance.receipts.edit"],
+  match_receipt_to_transaction: ["finance.ai.use", "finance.receipts.edit"],
+  unmatch_receipt: ["finance.ai.use", "finance.receipts.edit"],
+  classify_receipt_business_personal: ["finance.ai.use", "finance.receipts.edit"],
+  mark_receipt_as_cash_purchase: ["finance.ai.use", "finance.receipts.edit", "finance.accounts.adjust_balance", "finance.transactions.edit"],
+  archive_receipt: ["finance.ai.use", "finance.receipts.edit"],
+  update_transaction_category_override: ["finance.ai.use", "finance.transactions.edit"],
+  convert_detected_recurring_to_planned_item: ["finance.ai.use", "finance.planning.edit", "finance.transactions.view"],
+  propose_finance_ai_memory: ["finance.ai.use"],
+  archive_finance_ai_memory: ["finance.ai.use"]
+};
 
 const ACTION_DEFINITIONS = {
   create_manual_account: { requiredFields: ["name", "account_type", "starting_balance_cents"], risk: "normal" },
@@ -98,6 +209,43 @@ const ACTION_DEFINITIONS = {
   convert_detected_recurring_to_planned_item: { requiredFields: ["stream_id"], risk: "normal" },
   propose_finance_ai_memory: { requiredFields: ["content", "memory_scope", "memory_type"], risk: "low" },
   archive_finance_ai_memory: { requiredFields: ["memory_id"], risk: "normal" }
+};
+const ACTION_ALLOWED_FIELDS = {
+  create_manual_account: new Set(["name", "account_type", "starting_balance_cents", "currency", "notes"]),
+  rename_manual_account: new Set(["account_id", "name", "notes"]),
+  update_manual_account_type: new Set(["account_id", "account_type", "notes"]),
+  archive_manual_account: new Set(["account_id", "notes"]),
+  set_manual_account_balance: new Set(["account_id", "new_balance_cents", "notes"]),
+  create_planned_expense: new Set(["title", "amount_cents", "scheduled_date", "category", "recurrence", "account_id", "recurrence_end_date", "notes"]),
+  create_expected_income: new Set(["title", "amount_cents", "scheduled_date", "category", "recurrence", "account_id", "recurrence_end_date", "notes"]),
+  update_planned_item: new Set(["planned_item_id", "title", "direction", "amount_cents", "scheduled_date", "category", "recurrence", "account_id", "recurrence_end_date", "notes"]),
+  archive_planned_item: new Set(["planned_item_id", "notes"]),
+  update_minimum_reserve: new Set(["minimum_cash_reserve_cents", "notes"]),
+  create_goal: new Set(["name", "goal_type", "target_amount_cents", "current_amount_cents", "target_date", "notes"]),
+  update_goal: new Set(["goal_id", "name", "goal_type", "target_amount_cents", "current_amount_cents", "target_date", "status", "notes"]),
+  add_goal_contribution: new Set(["goal_id", "amount_cents", "contribution_date", "notes"]),
+  complete_goal: new Set(["goal_id", "notes"]),
+  archive_goal: new Set(["goal_id", "notes"]),
+  create_budget: new Set(["name", "category", "limit_cents", "period", "start_date", "end_date", "notes"]),
+  update_budget: new Set(["budget_id", "name", "category", "limit_cents", "period", "start_date", "end_date", "notes"]),
+  archive_budget: new Set(["budget_id", "notes"]),
+  create_debt: new Set(["name", "debt_type", "current_balance_cents", "original_balance_cents", "minimum_payment_cents", "planned_payment_cents", "apr_basis_points", "next_due_date", "target_payoff_date", "priority", "notes"]),
+  update_debt: new Set(["debt_id", "name", "debt_type", "current_balance_cents", "original_balance_cents", "minimum_payment_cents", "planned_payment_cents", "apr_basis_points", "next_due_date", "target_payoff_date", "priority", "notes"]),
+  update_debt_planned_payment: new Set(["debt_id", "planned_payment_cents", "notes"]),
+  record_debt_payment: new Set(["debt_id", "amount_cents", "payment_date", "finance_account_id", "notes"]),
+  update_debt_target_payoff_date: new Set(["debt_id", "target_payoff_date", "notes"]),
+  mark_debt_paid: new Set(["debt_id", "notes"]),
+  archive_debt: new Set(["debt_id", "notes"]),
+  update_receipt_metadata: new Set(["receipt_id", "merchant_name", "purchase_date", "amount_cents", "finance_category", "business_use", "notes"]),
+  match_receipt_to_transaction: new Set(["receipt_id", "transaction_id", "notes"]),
+  unmatch_receipt: new Set(["receipt_id", "notes"]),
+  classify_receipt_business_personal: new Set(["receipt_id", "business_use", "notes"]),
+  mark_receipt_as_cash_purchase: new Set(["receipt_id", "account_id", "amount_cents", "finance_category", "notes"]),
+  archive_receipt: new Set(["receipt_id", "notes"]),
+  update_transaction_category_override: new Set(["transaction_id", "category", "notes"]),
+  convert_detected_recurring_to_planned_item: new Set(["stream_id", "title", "category", "scheduled_date", "recurrence", "notes"]),
+  propose_finance_ai_memory: new Set(["content", "memory_scope", "memory_type", "notes"]),
+  archive_finance_ai_memory: new Set(["memory_id", "notes"])
 };
 
 function cleanString(value, maxLength = 300) {
@@ -178,6 +326,36 @@ function requireCompany(req, res) {
     return false;
   }
   return true;
+}
+
+function financePermissionError(capability) {
+  const error = new Error("You do not have permission to use this Finance capability.");
+  error.statusCode = 403;
+  error.code = "finance_permission_denied";
+  error.capability = capability;
+  return error;
+}
+
+function permissionKeyForCapability(capability) {
+  const column = PERMISSION_COLUMNS[capability];
+  if (!column) return null;
+  return column.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+function canUseFinanceCapability(ctxOrReq, capability) {
+  if (!capability) return true;
+  if (ctxOrReq?.role === "employer") return true;
+  const permissions = ctxOrReq?.permissions || {};
+  const camel = permissionKeyForCapability(capability);
+  return Boolean((camel && permissions[camel]) || permissions[capability] || permissions[PERMISSION_COLUMNS[capability]]);
+}
+
+function requireFinanceCapability(ctxOrReq, capability) {
+  if (!canUseFinanceCapability(ctxOrReq, capability)) throw financePermissionError(capability);
+}
+
+function requireFinanceCapabilities(ctxOrReq, capabilities = []) {
+  for (const capability of capabilities) requireFinanceCapability(ctxOrReq, capability);
 }
 
 function handleAIError(res, error, fallback) {
@@ -711,6 +889,15 @@ export const financeAITools = [
   strictTool("get_receipt_detail", "Get one receipt's safe structured metadata without image URLs or full OCR text.", {
     receipt_id: { type: "string", maxLength: 80 }
   }),
+  strictTool("resolve_finance_entity", "Deterministically resolve a Finance entity reference. Return exact, ambiguous, or not_found; never invent IDs.", {
+    entity_type: { type: "string", enum: ["account", "transaction", "receipt", "planned_item", "budget", "debt", "goal", "detected_recurring_stream"] },
+    query: nullableString("Name, merchant, or phrase to resolve", 160),
+    amount_cents: nullableInteger("Optional amount clue", 0, 100_000_000),
+    date: nullableString("Optional YYYY-MM-DD date clue", 20),
+    category: nullableString("Optional category clue", 80),
+    direction: { anyOf: [{ type: "string", enum: ["income", "expense"] }, { type: "null" }] },
+    ordinal: nullableInteger("Optional 1-based ordinal from prior candidate list", 1, 20)
+  }),
   strictTool("preview_purchase_impact", "Deterministically preview an unsaved purchase against safe-to-spend and reserve.", {
     amount_cents: { type: "integer", minimum: 1, maximum: 100_000_000 },
     purchase_date: nullableString("YYYY-MM-DD hypothetical purchase date", 20),
@@ -994,7 +1181,7 @@ export async function installFinanceAISchema(pool) {
       owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       conversation_id UUID REFERENCES finance_ai_conversations(id) ON DELETE CASCADE,
       action_type TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('draft','proposed','confirmed','executing','completed','failed','cancelled','expired')),
+      status TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('collecting','ready','draft','proposed','confirmed','executing','completed','failed','cancelled','expired')),
       payload JSONB NOT NULL DEFAULT '{}'::jsonb,
       summary TEXT NOT NULL,
       risk_level TEXT NOT NULL DEFAULT 'normal' CHECK (risk_level IN ('low','normal','high')),
@@ -1030,6 +1217,7 @@ export async function installFinanceAISchema(pool) {
   await pool.query(`ALTER TABLE finance_ai_conversations ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE finance_ai_conversations ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE finance_ai_conversations ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE finance_ai_conversations ADD COLUMN IF NOT EXISTS entity_context JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'proposed'`);
   await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb`);
@@ -1041,7 +1229,7 @@ export async function installFinanceAISchema(pool) {
   await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS result JSONB`);
   await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS error_message TEXT`);
   await pool.query(`ALTER TABLE finance_ai_action_proposals DROP CONSTRAINT IF EXISTS finance_ai_action_proposals_status_check`);
-  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD CONSTRAINT finance_ai_action_proposals_status_check CHECK (status IN ('draft','proposed','confirmed','executing','completed','failed','cancelled','expired'))`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD CONSTRAINT finance_ai_action_proposals_status_check CHECK (status IN ('collecting','ready','draft','proposed','confirmed','executing','completed','failed','cancelled','expired'))`);
   await pool.query(`ALTER TABLE finance_ai_action_proposals DROP CONSTRAINT IF EXISTS finance_ai_action_proposals_risk_level_check`);
   await pool.query(`ALTER TABLE finance_ai_action_proposals ADD CONSTRAINT finance_ai_action_proposals_risk_level_check CHECK (risk_level IN ('low','normal','high'))`);
   await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
@@ -1050,6 +1238,9 @@ export async function installFinanceAISchema(pool) {
   await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS structured_data JSONB`);
   await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS source_conversation_id UUID REFERENCES finance_ai_conversations(id) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`);
+  for (const column of Object.values(PERMISSION_COLUMNS)) {
+    await pool.query(`ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS ${column} BOOLEAN NOT NULL DEFAULT false`);
+  }
 }
 
 async function ensureConversation(pool, companyId, userId, conversationId, message) {
@@ -1583,6 +1774,137 @@ async function toolDetectedRecurringStreams(pool, companyId, args) {
   }));
 }
 
+function normalizeSearchText(value) {
+  return cleanString(value, 200).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function entityDisplay(entity) {
+  const amount = entity.amount_cents === null || entity.amount_cents === undefined ? "" : ` ${dollars(entity.amount_cents)}`;
+  const date = entity.date ? ` ${entity.date}` : "";
+  return cleanString(`${entity.label || entity.name || entity.merchant_name || entity.title || entity.id}${amount}${date}`, 180);
+}
+
+function scoreEntityCandidate(candidate, args) {
+  let score = 0;
+  const query = normalizeSearchText(args.query);
+  const label = normalizeSearchText(candidate.label || candidate.name || candidate.merchant_name || candidate.title || candidate.description || "");
+  if (query && label) {
+    if (label === query) score += 70;
+    else if (label.includes(query) || query.includes(label)) score += 45;
+    else {
+      const tokens = query.split(" ").filter(Boolean);
+      const matched = tokens.filter((token) => label.includes(token)).length;
+      score += matched * 12;
+    }
+  }
+  if (args.amount_cents !== null && args.amount_cents !== undefined && candidate.amount_cents !== null && candidate.amount_cents !== undefined) {
+    const delta = Math.abs(Number(candidate.amount_cents) - Number(args.amount_cents));
+    if (delta === 0) score += 35;
+    else if (delta <= 100) score += 18;
+  }
+  if (args.date && candidate.date) {
+    if (candidate.date === args.date) score += 25;
+    else {
+      const a = new Date(`${candidate.date}T00:00:00Z`).getTime();
+      const b = new Date(`${args.date}T00:00:00Z`).getTime();
+      if (Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= 3 * 86400000) score += 12;
+    }
+  }
+  if (args.category && candidate.category && normalizeSearchText(args.category) === normalizeSearchText(candidate.category)) score += 15;
+  if (args.direction && candidate.direction === args.direction) score += 10;
+  return score;
+}
+
+async function recentEntityContext(pool, companyId, conversationId) {
+  if (!conversationId) return [];
+  const { rows } = await pool.query(`SELECT entity_context FROM finance_ai_conversations WHERE id = $1 AND company_id = $2 LIMIT 1`, [conversationId, companyId]);
+  return Array.isArray(rows[0]?.entity_context) ? rows[0].entity_context : [];
+}
+
+async function saveEntityContext(pool, ctx, entities) {
+  if (!ctx.conversationId || !entities.length) return;
+  const previous = await recentEntityContext(pool, ctx.companyId, ctx.conversationId);
+  const next = [...entities, ...previous]
+    .filter((item, index, array) => array.findIndex((other) => other.type === item.type && other.id === item.id) === index)
+    .slice(0, 20);
+  await pool.query(`UPDATE finance_ai_conversations SET entity_context = $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [ctx.conversationId, ctx.companyId, JSON.stringify(next)]).catch(() => {});
+}
+
+async function resolverCandidates(pool, companyId, args) {
+  const type = args.entity_type;
+  const q = `%${normalizeSearchText(args.query).replace(/\s+/g, "%")}%`;
+  const limit = 12;
+  if (type === "transaction") {
+    const values = [companyId];
+    const conditions = ["t.company_id = $1", "t.removed_at IS NULL"];
+    if (args.query) { values.push(q); conditions.push(`lower(COALESCE(t.merchant_name, t.original_name, '')) LIKE $${values.length}`); }
+    if (args.direction) { values.push(args.direction); conditions.push(`t.direction = $${values.length}`); }
+    values.push(limit);
+    const { rows } = await pool.query(
+      `SELECT t.id, COALESCE(t.merchant_name, t.original_name, 'Transaction') AS label, t.amount_cents, t.transaction_date AS date,
+              COALESCE(t.user_category_override, t.normalized_category, 'Other') AS category, t.direction
+         FROM finance_transactions t
+        WHERE ${conditions.join(" AND ")}
+        ORDER BY t.transaction_date DESC, t.created_at DESC
+        LIMIT $${values.length}`,
+      values
+    );
+    return rows.map((row) => ({ type, id: row.id, label: row.label, amount_cents: Number(row.amount_cents || 0), date: dateOnlyFromDb(row.date), category: row.category, direction: row.direction }));
+  }
+  const tableMap = {
+    account: { table: "finance_accounts", label: "name", amount: "current_balance_cents", date: "created_at", where: "archived_at IS NULL" },
+    receipt: { table: "finance_receipts", label: "merchant_name", amount: "amount_cents", date: "purchase_date", category: "finance_category", where: "archived_at IS NULL" },
+    planned_item: { table: "finance_planned_items", label: "title", amount: "amount_cents", date: "scheduled_date", category: "category", direction: "direction", where: "archived_at IS NULL" },
+    budget: { table: "finance_budgets", label: "name", amount: "limit_cents", date: "start_date", category: "category", where: "archived_at IS NULL" },
+    debt: { table: "finance_debts", label: "name", amount: "current_balance_cents", date: "next_due_date", category: "debt_type", where: "archived_at IS NULL" },
+    goal: { table: "finance_goals", label: "name", amount: "target_amount_cents", date: "target_date", category: "goal_type", where: "archived_at IS NULL" },
+    detected_recurring_stream: { table: "finance_plaid_recurring_streams", label: "COALESCE(merchant_name, description)", amount: "COALESCE(average_amount_cents, last_amount_cents)", date: "last_date", category: "category", direction: "direction", where: "is_active = true" }
+  };
+  const meta = tableMap[type];
+  if (!meta) return [];
+  const values = [companyId];
+  const conditions = [`company_id = $1`, meta.where];
+  if (args.query) { values.push(q); conditions.push(`lower(COALESCE(${meta.label}, '')) LIKE $${values.length}`); }
+  if (args.direction && meta.direction) { values.push(args.direction); conditions.push(`${meta.direction} = $${values.length}`); }
+  values.push(limit);
+  const categorySql = meta.category ? `${meta.category} AS category,` : `NULL AS category,`;
+  const directionSql = meta.direction ? `${meta.direction} AS direction,` : `NULL AS direction,`;
+  const { rows } = await pool.query(
+    `SELECT id, ${meta.label} AS label, ${meta.amount} AS amount_cents, ${meta.date} AS date, ${categorySql} ${directionSql} created_at
+       FROM ${meta.table}
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY ${meta.date} DESC NULLS LAST, created_at DESC
+      LIMIT $${values.length}`,
+    values
+  );
+  return rows.map((row) => ({ type, id: row.id, label: row.label || type, amount_cents: row.amount_cents === null ? null : Number(row.amount_cents), date: dateOnlyFromDb(row.date), category: row.category || null, direction: row.direction || null }));
+}
+
+async function resolveFinanceEntity(pool, ctx, args) {
+  requireFinanceCapabilities(ctx, TOOL_PERMISSIONS.resolve_finance_entity);
+  const type = cleanString(args.entity_type, 40);
+  const ordinal = args.ordinal === null || args.ordinal === undefined ? null : Number(args.ordinal);
+  const prior = await recentEntityContext(pool, ctx.companyId, ctx.conversationId);
+  const matchingPrior = prior.filter((item) => item.type === type);
+  if (ordinal && matchingPrior[ordinal - 1]) {
+    return { status: "exact_match", source: "recent_context", entity: matchingPrior[ordinal - 1], candidates: matchingPrior };
+  }
+  if (args.amount_cents !== null && args.amount_cents !== undefined) {
+    const amountMatch = matchingPrior.find((item) => Math.abs(Number(item.amount_cents || 0) - Number(args.amount_cents)) <= 100);
+    if (amountMatch) return { status: "exact_match", source: "recent_context", entity: amountMatch, candidates: matchingPrior };
+  }
+  const candidates = (await resolverCandidates(pool, ctx.companyId, args))
+    .map((candidate) => ({ ...candidate, display: entityDisplay(candidate), score: scoreEntityCandidate(candidate, args) }))
+    .sort((a, b) => b.score - a.score);
+  await saveEntityContext(pool, ctx, candidates.map(({ score, ...candidate }) => candidate));
+  if (!candidates.length) return { status: "not_found", entity_type: type, candidates: [] };
+  const [best, second] = candidates;
+  if (best.score >= 75 && best.score - (second?.score || 0) >= 15) {
+    return { status: "exact_match", entity_type: type, entity: best, candidates: candidates.slice(0, 5) };
+  }
+  return { status: "ambiguous", entity_type: type, candidates: candidates.slice(0, 5) };
+}
+
 async function previewPurchaseImpact(pool, companyId, args) {
   const amount = parseCents(args.amount_cents, "amount_cents", { min: 1 });
   const horizon = parseHorizon(args.projection_horizon_days);
@@ -1774,22 +2096,68 @@ function missingRequiredFields(toolName, args) {
 }
 
 async function saveActionDraft(pool, ctx, toolName, args, missingFields) {
+  const existing = await pool.query(
+    `SELECT * FROM finance_ai_action_proposals
+      WHERE company_id = $1
+        AND owner_user_id = $2
+        AND conversation_id = $3
+        AND action_type = $4
+        AND status = 'collecting'
+        AND updated_at > now() - interval '2 days'
+      ORDER BY updated_at DESC
+      LIMIT 1`,
+    [ctx.companyId, ctx.userId, ctx.conversationId || null, toolName]
+  );
+  const knownArgs = existing.rows[0]?.payload?.args && typeof existing.rows[0].payload.args === "object"
+    ? { ...existing.rows[0].payload.args, ...jsonSafe(args || {}) }
+    : jsonSafe(args || {});
+  const mergedMissing = missingRequiredFields(toolName, knownArgs);
+  if (existing.rows.length) {
+    await pool.query(
+      `UPDATE finance_ai_action_proposals
+          SET payload = $4, summary = $5, updated_at = now(), expires_at = now() + interval '2 days'
+        WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status = 'collecting'`,
+      [
+        existing.rows[0].id,
+        ctx.companyId,
+        ctx.userId,
+        JSON.stringify({ tool_name: toolName, args: knownArgs, missing_fields: mergedMissing, draft_state: mergedMissing.length ? "collecting" : "ready" }),
+        `Collecting ${proposalSummary(toolName, knownArgs)}`
+      ]
+    ).catch(() => {});
+    return;
+  }
   await pool.query(
     `INSERT INTO finance_ai_action_proposals(company_id, owner_user_id, conversation_id, action_type, status, payload, summary, risk_level, created_by, expires_at)
-     VALUES($1,$2,$3,$4,'draft',$5,$6,$7,$2,now() + interval '2 days')`,
+     VALUES($1,$2,$3,$4,'collecting',$5,$6,$7,$2,now() + interval '2 days')`,
     [
       ctx.companyId,
       ctx.userId,
       ctx.conversationId || null,
       toolName,
-      JSON.stringify({ tool_name: toolName, args: jsonSafe(args || {}), missing_fields: missingFields }),
-      `Draft ${proposalSummary(toolName, args)}`,
+      JSON.stringify({ tool_name: toolName, args: knownArgs, missing_fields: mergedMissing, draft_state: "collecting" }),
+      `Collecting ${proposalSummary(toolName, knownArgs)}`,
       ACTION_DEFINITIONS[toolName]?.risk || "normal"
     ]
   ).catch(() => {});
 }
 
 async function createActionProposal(pool, ctx, toolName, args) {
+  const activeDraft = ctx.conversationId ? await pool.query(
+    `SELECT * FROM finance_ai_action_proposals
+      WHERE company_id = $1
+        AND owner_user_id = $2
+        AND conversation_id = $3
+        AND action_type = $4
+        AND status = 'collecting'
+        AND updated_at > now() - interval '2 days'
+      ORDER BY updated_at DESC
+      LIMIT 1`,
+    [ctx.companyId, ctx.userId, ctx.conversationId, toolName]
+  ) : { rows: [] };
+  if (activeDraft.rows.length && activeDraft.rows[0].payload?.args && typeof activeDraft.rows[0].payload.args === "object") {
+    args = { ...activeDraft.rows[0].payload.args, ...jsonSafe(args || {}) };
+  }
   const missingFields = missingRequiredFields(toolName, args);
   if (missingFields.length) {
     await saveActionDraft(pool, ctx, toolName, args, missingFields);
@@ -1803,6 +2171,20 @@ async function createActionProposal(pool, ctx, toolName, args) {
   }
   const payload = { tool_name: toolName, args: jsonSafe(args || {}) };
   const riskLevel = ACTION_DEFINITIONS[toolName]?.risk || "normal";
+  if (activeDraft.rows.length) {
+    const { rows } = await pool.query(
+      `UPDATE finance_ai_action_proposals
+          SET status = 'proposed', payload = $4, summary = $5, risk_level = $6, updated_at = now(), expires_at = now() + interval '7 days'
+        WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status = 'collecting'
+        RETURNING *`,
+      [activeDraft.rows[0].id, ctx.companyId, ctx.userId, JSON.stringify(payload), proposalSummary(toolName, args), riskLevel]
+    );
+    if (rows.length) {
+      if (Array.isArray(ctx.actionProposals)) ctx.actionProposals.push(actionProposalPayload(rows[0]));
+      await auditAction(pool, ctx, toolName, args, "succeeded", `proposal:${rows[0].id}`);
+      return { proposed_action: actionProposalPayload(rows[0]), requires_confirmation: true };
+    }
+  }
   const { rows } = await pool.query(
     `INSERT INTO finance_ai_action_proposals(company_id, owner_user_id, conversation_id, action_type, status, payload, summary, risk_level, created_by, expires_at)
      VALUES($1,$2,$3,$4,'proposed',$5,$6,$7,$2,now() + interval '7 days')
@@ -1847,6 +2229,85 @@ async function assertReceipt(pool, companyId, receiptId) {
   const { rows } = await pool.query(`SELECT * FROM finance_receipts WHERE id = $1 AND company_id = $2 AND archived_at IS NULL LIMIT 1`, [cleanString(receiptId, 80), companyId]);
   if (!rows.length) throw Object.assign(new Error("Receipt was not found."), { statusCode: 404, code: "finance_receipt_not_found" });
   return rows[0];
+}
+
+async function validateActionEntityReferences(pool, companyId, toolName, args = {}) {
+  if (args.account_id) {
+    await assertAccount(pool, companyId, args.account_id, {
+      manualOnly: ["rename_manual_account", "update_manual_account_type", "archive_manual_account", "set_manual_account_balance", "mark_receipt_as_cash_purchase"].includes(toolName),
+      cashOnly: toolName === "mark_receipt_as_cash_purchase",
+      activeOnly: ["set_manual_account_balance", "mark_receipt_as_cash_purchase"].includes(toolName)
+    });
+  }
+  if (args.finance_account_id) await assertAccount(pool, companyId, args.finance_account_id);
+  if (args.transaction_id) await assertTransaction(pool, companyId, args.transaction_id);
+  if (args.receipt_id) await assertReceipt(pool, companyId, args.receipt_id);
+  if (args.planned_item_id) {
+    const { rows } = await pool.query(`SELECT id FROM finance_planned_items WHERE id = $1 AND company_id = $2 LIMIT 1`, [cleanString(args.planned_item_id, 80), companyId]);
+    if (!rows.length) throw Object.assign(new Error("Planned item was not found."), { statusCode: 404, code: "finance_planned_item_not_found" });
+  }
+  if (args.budget_id) {
+    const { rows } = await pool.query(`SELECT id FROM finance_budgets WHERE id = $1 AND company_id = $2 LIMIT 1`, [cleanString(args.budget_id, 80), companyId]);
+    if (!rows.length) throw Object.assign(new Error("Budget was not found."), { statusCode: 404, code: "finance_budget_not_found" });
+  }
+  if (args.debt_id) {
+    const { rows } = await pool.query(`SELECT id FROM finance_debts WHERE id = $1 AND company_id = $2 LIMIT 1`, [cleanString(args.debt_id, 80), companyId]);
+    if (!rows.length) throw Object.assign(new Error("Debt was not found."), { statusCode: 404, code: "finance_debt_not_found" });
+  }
+  if (args.goal_id) {
+    const { rows } = await pool.query(`SELECT id FROM finance_goals WHERE id = $1 AND company_id = $2 LIMIT 1`, [cleanString(args.goal_id, 80), companyId]);
+    if (!rows.length) throw Object.assign(new Error("Goal was not found."), { statusCode: 404, code: "finance_goal_not_found" });
+  }
+  if (args.stream_id) {
+    const { rows } = await pool.query(`SELECT id FROM finance_plaid_recurring_streams WHERE id = $1 AND company_id = $2 LIMIT 1`, [cleanString(args.stream_id, 80), companyId]);
+    if (!rows.length) throw Object.assign(new Error("Recurring stream was not found."), { statusCode: 404, code: "finance_recurring_stream_not_found" });
+  }
+  if (args.memory_id) {
+    const { rows } = await pool.query(`SELECT id FROM finance_ai_memories WHERE id = $1 AND company_id = $2 AND archived_at IS NULL LIMIT 1`, [cleanString(args.memory_id, 80), companyId]);
+    if (!rows.length) throw Object.assign(new Error("Memory was not found."), { statusCode: 404, code: "finance_ai_memory_not_found" });
+  }
+}
+
+async function actionAuditSnapshot(pool, companyId, toolName, args = {}) {
+  const keyMap = [
+    ["account_id", "finance_accounts"],
+    ["planned_item_id", "finance_planned_items"],
+    ["budget_id", "finance_budgets"],
+    ["debt_id", "finance_debts"],
+    ["goal_id", "finance_goals"],
+    ["receipt_id", "finance_receipts"],
+    ["transaction_id", "finance_transactions"],
+    ["memory_id", "finance_ai_memories"]
+  ];
+  const snapshots = {};
+  for (const [field, table] of keyMap) {
+    if (!args[field]) continue;
+    const { rows } = await pool.query(`SELECT * FROM ${table} WHERE id = $1 AND company_id = $2 LIMIT 1`, [cleanString(args[field], 80), companyId]);
+    snapshots[field] = jsonSafe(rows[0] || null);
+  }
+  return snapshots;
+}
+
+async function auditConfirmedAction(pool, req, proposal, status, beforeState, afterState, result) {
+  await pool.query(
+    `INSERT INTO finance_ai_actions(company_id, conversation_id, tool_name, sanitized_parameters, status, result_summary, created_by)
+     VALUES($1,$2,$3,$4,$5,$6,$7)`,
+    [
+      req.companyId,
+      proposal.conversation_id || null,
+      `confirm:${proposal.action_type}`,
+      JSON.stringify({
+        proposal_id: proposal.id,
+        action_type: proposal.action_type,
+        payload: proposal.payload || {},
+        before: beforeState,
+        after: afterState
+      }),
+      status,
+      JSON.stringify(jsonSafe(result || {})).slice(0, 1000),
+      req.userId
+    ]
+  );
 }
 
 async function executeProposalPayload(pool, proposal) {
@@ -2325,11 +2786,21 @@ async function executeProposalPayload(pool, proposal) {
 }
 
 async function executeWriteTool(pool, ctx, toolName, args) {
+  requireFinanceCapabilities(ctx, ACTION_PERMISSIONS[toolName] || ["finance.ai.use"]);
+  if (toolName === "propose_finance_ai_memory" && args.memory_scope === "company") {
+    requireFinanceCapability(ctx, "finance.memories.manage_company");
+  }
+  const allowed = ACTION_ALLOWED_FIELDS[toolName];
+  const unknownFields = allowed ? Object.keys(args || {}).filter((key) => !allowed.has(key)) : [];
+  if (!ACTION_DEFINITIONS[toolName] || unknownFields.length) {
+    throw Object.assign(new Error("Action proposal contains unsupported fields."), { statusCode: 400, code: "finance_ai_action_payload_invalid", invalid_fields: unknownFields });
+  }
   enforceWriteIntent(ctx, toolName);
   return createActionProposal(pool, ctx, toolName, args);
 }
 
 export async function executeFinanceAITool(pool, ctx, name, args = {}) {
+  if (!WRITE_TOOL_NAMES.has(name)) requireFinanceCapabilities(ctx, TOOL_PERMISSIONS[name] || ["finance.ai.use"]);
   switch (name) {
   case "get_finance_overview": return toolOverview(pool, ctx.companyId);
   case "get_finance_settings": return ensureFinanceSettings(pool, ctx.companyId);
@@ -2385,6 +2856,7 @@ export async function executeFinanceAITool(pool, ctx, name, args = {}) {
   case "get_receipt_status_summary": return toolReceiptStatusSummary(pool, ctx.companyId);
   case "get_receipts": return toolReceipts(pool, ctx.companyId, args);
   case "get_receipt_detail": return toolReceiptDetail(pool, ctx.companyId, args);
+  case "resolve_finance_entity": return resolveFinanceEntity(pool, ctx, args);
   case "preview_purchase_impact": return previewPurchaseImpact(pool, ctx.companyId, args);
   case "preview_income_change": return previewIncomeChange(pool, ctx.companyId, args);
   case "preview_debt_payment": return previewDebtPayment(pool, ctx.companyId, args);
@@ -2619,14 +3091,20 @@ async function runResponsesToolLoop({ pool, client, model, input, ctx, executeTo
 }
 
 export function installFinanceAIRoutes({ app, pool, authRequired, requireEmployer }) {
-  app.get("/api/finance/ai/status", authRequired, requireEmployer, async (req, res) => {
+  app.get("/api/finance/ai/status", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
+    try {
+      requireFinanceCapability(req, "finance.ai.use");
+    } catch (error) {
+      return handleAIError(res, error, "finance_ai_status_failed");
+    }
     res.json({ available: openAIConfig().configured, model: openAIConfig().model });
   });
 
-  app.get("/api/finance/ai/conversations", authRequired, requireEmployer, async (req, res) => {
+  app.get("/api/finance/ai/conversations", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const { rows } = await pool.query(
         `SELECT c.*,
                 last_msg.content AS last_preview
@@ -2650,9 +3128,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.get("/api/finance/ai/conversations/:id", authRequired, requireEmployer, async (req, res) => {
+  app.get("/api/finance/ai/conversations/:id", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const conversation = await getConversationForOwner(pool, req.companyId, req.userId, req.params.id);
       if (!conversation) return res.status(404).json({ error: "finance_ai_conversation_not_found", message: "Conversation was not found." });
       const { rows } = await pool.query(
@@ -2664,7 +3143,7 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
           WHERE conversation_id = $1
             AND company_id = $2
             AND owner_user_id = $3
-            AND status IN ('draft','proposed','executing','completed','failed','cancelled')
+            AND status IN ('collecting','ready','draft','proposed','executing','completed','failed','cancelled')
           ORDER BY created_at ASC
           LIMIT 50`,
         [req.params.id, req.companyId, req.userId]
@@ -2675,9 +3154,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.post("/api/finance/ai/conversations", authRequired, requireEmployer, async (req, res) => {
+  app.post("/api/finance/ai/conversations", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const conversation = await ensureConversation(pool, req.companyId, req.userId, null, cleanString(req.body?.title || "AI Financial Assistant", 80));
       res.status(201).json(conversationPayload(conversation));
     } catch (error) {
@@ -2685,9 +3165,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.patch("/api/finance/ai/conversations/:id", authRequired, requireEmployer, async (req, res) => {
+  app.patch("/api/finance/ai/conversations/:id", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const title = cleanString(req.body?.title, 80);
       if (!title) return res.status(400).json({ error: "finance_ai_title_required", message: "Conversation title is required." });
       const { rows } = await pool.query(
@@ -2704,9 +3185,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.post("/api/finance/ai/conversations/:id/pin", authRequired, requireEmployer, async (req, res) => {
+  app.post("/api/finance/ai/conversations/:id/pin", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const { rows } = await pool.query(
         `UPDATE finance_ai_conversations
             SET pinned_at = now(), updated_at = now()
@@ -2721,9 +3203,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.post("/api/finance/ai/conversations/:id/unpin", authRequired, requireEmployer, async (req, res) => {
+  app.post("/api/finance/ai/conversations/:id/unpin", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const { rows } = await pool.query(
         `UPDATE finance_ai_conversations
             SET pinned_at = NULL, updated_at = now()
@@ -2738,9 +3221,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.post("/api/finance/ai/conversations/:id/archive", authRequired, requireEmployer, async (req, res) => {
+  app.post("/api/finance/ai/conversations/:id/archive", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const { rows } = await pool.query(
         `UPDATE finance_ai_conversations
             SET archived_at = now(), updated_at = now()
@@ -2755,9 +3239,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.get("/api/finance/ai/actions/:id", authRequired, requireEmployer, async (req, res) => {
+  app.get("/api/finance/ai/actions/:id", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const { rows } = await pool.query(
         `SELECT * FROM finance_ai_action_proposals WHERE id = $1 AND company_id = $2 AND owner_user_id = $3`,
         [req.params.id, req.companyId, req.userId]
@@ -2769,20 +3254,37 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.patch("/api/finance/ai/actions/:id", authRequired, requireEmployer, async (req, res) => {
+  app.patch("/api/finance/ai/actions/:id", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const payload = req.body?.payload;
       if (!payload || typeof payload !== "object") return res.status(400).json({ error: "finance_ai_action_payload_required", message: "Action payload is required." });
       const toolName = cleanString(payload.tool_name || req.body?.action_type, 100);
       const args = payload.args && typeof payload.args === "object" ? payload.args : {};
+      requireFinanceCapabilities(req, ACTION_PERMISSIONS[toolName] || ["finance.ai.use"]);
+      if (toolName === "propose_finance_ai_memory" && args.memory_scope === "company") requireFinanceCapability(req, "finance.memories.manage_company");
+      const allowed = ACTION_ALLOWED_FIELDS[toolName];
+      const unknownFields = allowed ? Object.keys(args).filter((key) => !allowed.has(key)) : [];
+      if (!ACTION_DEFINITIONS[toolName] || unknownFields.length) {
+        return res.status(400).json({ error: "finance_ai_action_payload_invalid", message: "Action proposal contains fields this action does not support.", invalid_fields: unknownFields });
+      }
+      await validateActionEntityReferences(pool, req.companyId, toolName, args);
+      if (req.body?.updated_at) {
+        const current = await pool.query(`SELECT * FROM finance_ai_action_proposals WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 LIMIT 1`, [req.params.id, req.companyId, req.userId]);
+        const currentStamp = current.rows[0]?.updated_at ? new Date(current.rows[0].updated_at).toISOString() : null;
+        const clientStamp = new Date(req.body.updated_at).toISOString();
+        if (currentStamp && currentStamp !== clientStamp) {
+          return res.status(409).json({ error: "finance_ai_action_conflict", message: "Action proposal changed. Review the latest proposal before saving.", current: actionProposalPayload(current.rows[0]) });
+        }
+      }
       const missing = missingRequiredFields(toolName, args);
-      const nextStatus = missing.length ? "draft" : "proposed";
+      const nextStatus = missing.length ? "collecting" : "proposed";
       const summary = cleanString(req.body?.summary, 300) || proposalSummary(toolName, args);
       const { rows } = await pool.query(
         `UPDATE finance_ai_action_proposals
             SET payload = $4, summary = COALESCE(NULLIF($5, ''), summary), status = $6, risk_level = $7, updated_at = now()
-          WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status IN ('draft','proposed')
+          WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status IN ('collecting','draft','proposed')
           RETURNING *`,
         [req.params.id, req.companyId, req.userId, JSON.stringify({ ...payload, args, missing_fields: missing }), summary, nextStatus, ACTION_DEFINITIONS[toolName]?.risk || "normal"]
       );
@@ -2793,13 +3295,14 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.post("/api/finance/ai/actions/:id/cancel", authRequired, requireEmployer, async (req, res) => {
+  app.post("/api/finance/ai/actions/:id/cancel", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const { rows } = await pool.query(
         `UPDATE finance_ai_action_proposals
             SET status = 'cancelled', updated_at = now()
-          WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status = 'proposed'
+          WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status IN ('collecting','draft','proposed')
           RETURNING *`,
         [req.params.id, req.companyId, req.userId]
       );
@@ -2814,9 +3317,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.post("/api/finance/ai/actions/:id/confirm", authRequired, requireEmployer, async (req, res) => {
+  app.post("/api/finance/ai/actions/:id/confirm", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       let proposalResult = await pool.query(
         `UPDATE finance_ai_action_proposals
             SET status = 'executing', confirmed_at = COALESCE(confirmed_at, now()), updated_at = now()
@@ -2831,8 +3335,14 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
         return res.status(409).json({ error: "finance_ai_action_not_confirmable", message: "Action proposal is not ready to confirm." });
       }
       const proposal = proposalResult.rows[0];
+      requireFinanceCapabilities(req, ACTION_PERMISSIONS[proposal.action_type] || ["finance.ai.use"]);
+      if (proposal.action_type === "propose_finance_ai_memory" && proposal.payload?.args?.memory_scope === "company") requireFinanceCapability(req, "finance.memories.manage_company");
+      await validateActionEntityReferences(pool, req.companyId, proposal.action_type, proposal.payload?.args || {});
       try {
+        const before = await actionAuditSnapshot(pool, req.companyId, proposal.action_type, proposal.payload?.args || {});
         const result = await executeProposalPayload(pool, proposal);
+        const after = await actionAuditSnapshot(pool, req.companyId, proposal.action_type, proposal.payload?.args || {});
+        await auditConfirmedAction(pool, req, proposal, "succeeded", before, after, result);
         const completed = await pool.query(
           `UPDATE finance_ai_action_proposals
               SET status = 'completed', result = $4, executed_at = now(), updated_at = now()
@@ -2842,6 +3352,7 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
         );
         res.json(actionProposalPayload(completed.rows[0]));
       } catch (error) {
+        await auditConfirmedAction(pool, req, proposal, "failed", null, null, { error: error.code || error.message }).catch(() => {});
         const failed = await pool.query(
           `UPDATE finance_ai_action_proposals
               SET status = 'failed', error_message = $4, updated_at = now()
@@ -2856,9 +3367,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.get("/api/finance/ai/memories", authRequired, requireEmployer, async (req, res) => {
+  app.get("/api/finance/ai/memories", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const { rows } = await pool.query(
         `SELECT * FROM finance_ai_memories
           WHERE company_id = $1
@@ -2874,11 +3386,14 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.patch("/api/finance/ai/memories/:id", authRequired, requireEmployer, async (req, res) => {
+  app.patch("/api/finance/ai/memories/:id", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const content = cleanString(req.body?.content, 1000);
       if (!content) return res.status(400).json({ error: "finance_ai_memory_content_required", message: "Memory content is required." });
+      const existing = await pool.query(`SELECT memory_scope FROM finance_ai_memories WHERE id = $1 AND company_id = $2 LIMIT 1`, [req.params.id, req.companyId]);
+      if (existing.rows[0]?.memory_scope === "company") requireFinanceCapability(req, "finance.memories.manage_company");
       const { rows } = await pool.query(
         `UPDATE finance_ai_memories
             SET content = $4, updated_at = now()
@@ -2893,9 +3408,12 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.post("/api/finance/ai/memories/:id/archive", authRequired, requireEmployer, async (req, res) => {
+  app.post("/api/finance/ai/memories/:id/archive", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
+      const existing = await pool.query(`SELECT memory_scope FROM finance_ai_memories WHERE id = $1 AND company_id = $2 LIMIT 1`, [req.params.id, req.companyId]);
+      if (existing.rows[0]?.memory_scope === "company") requireFinanceCapability(req, "finance.memories.manage_company");
       const { rows } = await pool.query(
         `UPDATE finance_ai_memories
             SET archived_at = now(), updated_at = now()
@@ -2910,9 +3428,10 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     }
   });
 
-  app.post("/api/finance/ai/chat", authRequired, requireEmployer, async (req, res) => {
+  app.post("/api/finance/ai/chat", authRequired, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
+      requireFinanceCapability(req, "finance.ai.use");
       const config = openAIConfig();
       if (!config.configured) {
         return res.status(503).json({ error: "openai_not_configured", message: "AI Financial Assistant is not configured yet." });
@@ -2944,7 +3463,7 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
       }
       const client = await openAIClient();
       if (!client) return res.status(503).json({ error: "openai_not_configured", message: "AI Financial Assistant is not configured yet." });
-      const ctx = { companyId: req.companyId, userId: req.userId, conversationId: conversation.id, userMessage: message, requestId: randomUUID(), actionProposals: [] };
+      const ctx = { companyId: req.companyId, userId: req.userId, role: req.role, permissions: req.permissions, conversationId: conversation.id, userMessage: message, requestId: randomUUID(), actionProposals: [] };
       const result = await runResponsesToolLoop({ pool, client, model: config.model, input, ctx });
       const assistant = await addMessage(pool, req.companyId, conversation.id, "assistant", result.text, req.userId, summarizeToolActivity(result.toolActivity));
       res.json({
@@ -2984,5 +3503,8 @@ export const financeAIInternals = {
   openAIConfig,
   ACTION_DEFINITIONS,
   missingRequiredFields,
+  canUseFinanceCapability,
+  requireFinanceCapabilities,
+  resolveFinanceEntity,
   dollars
 };
