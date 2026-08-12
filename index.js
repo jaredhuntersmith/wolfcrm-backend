@@ -6828,12 +6828,93 @@ function computeQuoteTotalCents(lineItems) {
   }, 0);
 }
 
+function cleanQuoteString(value, maxLength = 1000) {
+  return (value || "").toString().trim().slice(0, maxLength);
+}
+
+function quoteSettingsPayload(row, company = {}) {
+  return {
+    tagline: row?.tagline || "Thank you for the opportunity to earn your business!",
+    phone: row?.phone || null,
+    email: row?.email || null,
+    website: row?.website || null,
+    notes: row?.notes || "This quote includes the services listed above.\nIf you have any questions or would like to move forward,\nwe're here to help!\n\nWe look forward to working with you.",
+    tax_enabled: Boolean(row?.tax_enabled),
+    tax_rate_basis_points: Number(row?.tax_rate_basis_points || 0),
+    valid_for_days: Number(row?.valid_for_days || 30),
+    company_name: company.name || "",
+    company_logo_data_url: company.logo_data_url || "",
+    company_phone: company.phone || "",
+    company_email: company.email || "",
+    company_website: company.website || "",
+    company_address: company.address || ""
+  };
+}
+
+async function getQuoteSettings(pool, companyId) {
+  const company = (await pool.query(
+    `SELECT name, logo_data_url, website, address, phone, email FROM companies WHERE id = $1`,
+    [companyId]
+  )).rows[0] || {};
+  const settings = (await pool.query(`SELECT * FROM quote_settings WHERE company_id = $1`, [companyId])).rows[0] || null;
+  return quoteSettingsPayload(settings, company);
+}
+
 function quoteScopeSQL(req, alias = "q") {
   const p = `${alias}.`;
   return req.companyId
     ? { sql: `(${p}company_id = $1 OR (${p}company_id IS NULL AND ${p}user_id = $2))`, values: [req.companyId, req.userId] }
     : { sql: `${p}user_id = $1`, values: [req.userId] };
 }
+
+app.get("/api/quotes/settings", authRequired, requireEmployer, async (req, res) => {
+  try {
+    if (!req.companyId) return res.status(400).json({ error: "company_required" });
+    res.json(await getQuoteSettings(pool, req.companyId));
+  } catch (e) {
+    console.error("[quotes] settings failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "quote_settings_failed" });
+  }
+});
+
+app.patch("/api/quotes/settings", authRequired, requireEmployer, async (req, res) => {
+  try {
+    if (!req.companyId) return res.status(400).json({ error: "company_required" });
+    const taxRate = Number(req.body?.tax_rate_basis_points || 0);
+    const validFor = Number(req.body?.valid_for_days || 30);
+    if (!Number.isInteger(taxRate) || taxRate < 0 || taxRate > 5000) return res.status(400).json({ error: "quote_tax_rate_invalid" });
+    if (!Number.isInteger(validFor) || validFor < 1 || validFor > 365) return res.status(400).json({ error: "quote_valid_for_invalid" });
+    await pool.query(
+      `INSERT INTO quote_settings(company_id, tagline, phone, email, website, notes, tax_enabled, tax_rate_basis_points, valid_for_days)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT(company_id) DO UPDATE SET
+         tagline = EXCLUDED.tagline,
+         phone = EXCLUDED.phone,
+         email = EXCLUDED.email,
+         website = EXCLUDED.website,
+         notes = EXCLUDED.notes,
+         tax_enabled = EXCLUDED.tax_enabled,
+         tax_rate_basis_points = EXCLUDED.tax_rate_basis_points,
+         valid_for_days = EXCLUDED.valid_for_days,
+         updated_at = now()`,
+      [
+        req.companyId,
+        cleanQuoteString(req.body?.tagline, 400) || null,
+        cleanQuoteString(req.body?.phone, 80) || null,
+        cleanQuoteString(req.body?.email, 160) || null,
+        cleanQuoteString(req.body?.website, 200) || null,
+        cleanQuoteString(req.body?.notes, 3000) || null,
+        Boolean(req.body?.tax_enabled),
+        taxRate,
+        validFor
+      ]
+    );
+    res.json(await getQuoteSettings(pool, req.companyId));
+  } catch (e) {
+    console.error("[quotes] settings update failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "quote_settings_update_failed" });
+  }
+});
 
 app.get("/api/quotes", authRequired, async (req, res) => {
   try {
