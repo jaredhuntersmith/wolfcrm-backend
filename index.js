@@ -829,6 +829,28 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS quotes_company_idx ON quotes(company_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS quotes_user_idx ON quotes(user_id, updated_at DESC);
 
+    CREATE TABLE IF NOT EXISTS quote_settings (
+      company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+      tagline TEXT,
+      phone TEXT,
+      email TEXT,
+      website TEXT,
+      notes TEXT,
+      tax_enabled BOOLEAN NOT NULL DEFAULT false,
+      tax_rate_basis_points INTEGER NOT NULL DEFAULT 0,
+      valid_for_days INTEGER NOT NULL DEFAULT 30,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS tagline TEXT;
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS phone TEXT;
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS email TEXT;
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS website TEXT;
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS tax_enabled BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS tax_rate_basis_points INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS valid_for_days INTEGER NOT NULL DEFAULT 30;
+
     -- APNs device tokens for real push notifications.
     CREATE TABLE IF NOT EXISTS device_tokens (
       token TEXT PRIMARY KEY,
