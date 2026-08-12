@@ -54,6 +54,17 @@ function handlePlaidError(res, error, fallback) {
   return res.status(500).json({ error: fallback, message: "Bank connection request failed." });
 }
 
+function handleFinanceDataError(res, error, fallback) {
+  if (error?.statusCode) {
+    return res.status(error.statusCode).json({
+      error: error.code || fallback,
+      message: error.message || "Finance request failed."
+    });
+  }
+  console.error("[finance]", fallback, { message: error?.message });
+  return res.status(500).json({ error: fallback, message: "Finance request failed." });
+}
+
 function plaidEnvironmentUnavailableError(environment) {
   const error = new Error("finance_plaid_environment_unavailable");
   error.statusCode = 503;
@@ -408,6 +419,32 @@ function dateOnlyPayload(value) {
   return String(value).slice(0, 10);
 }
 
+function addDaysDateOnly(dateString, days) {
+  const date = new Date(`${dateString}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function addMonthsDateOnly(dateString, months) {
+  const [year, month, day] = dateString.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1 + months, 1));
+  const maxDay = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
+  date.setUTCDate(Math.min(day, maxDay));
+  return date.toISOString().slice(0, 10);
+}
+
+function nextExpectedFromCadence(lastSeenDate, cadence) {
+  if (!lastSeenDate) return null;
+  switch (cadence) {
+  case "weekly": return addDaysDateOnly(lastSeenDate, 7);
+  case "biweekly": return addDaysDateOnly(lastSeenDate, 14);
+  case "monthly": return addMonthsDateOnly(lastSeenDate, 1);
+  case "quarterly": return addMonthsDateOnly(lastSeenDate, 3);
+  case "yearly": return addMonthsDateOnly(lastSeenDate, 12);
+  default: return null;
+  }
+}
+
 function recurringCandidatePayload(row) {
   const medianAmount = Number(row.median_amount_cents || 0);
   const cadence = row.cadence || "irregular";
@@ -471,7 +508,7 @@ async function loadRecurringCandidates(pool, companyId, includeIgnored = false) 
        FROM finance_recurring_candidates c
        LEFT JOIN finance_accounts a ON a.id = c.account_id AND a.company_id = c.company_id
       WHERE c.company_id = $1
-        AND ($2::boolean OR c.status <> 'ignored')
+        AND (c.status IN ('detected','confirmed') OR ($2::boolean AND c.status = 'ignored'))
       ORDER BY
         CASE c.status WHEN 'confirmed' THEN 0 WHEN 'detected' THEN 1 WHEN 'ended' THEN 2 ELSE 3 END,
         c.confidence_score DESC,
@@ -1458,7 +1495,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       const candidates = await loadRecurringCandidates(pool, req.companyId, req.query.include_ignored === "true");
       res.json({ candidates, summary: recurringCandidateSummary(candidates) });
     } catch (error) {
-      handlePlaidError(res, error, "finance_recurring_candidates_failed");
+      handleFinanceDataError(res, error, "finance_recurring_candidates_failed");
     }
   });
 
@@ -1483,6 +1520,14 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       const updatedRows = [];
 
       await client.query("BEGIN");
+      await client.query(
+        `UPDATE finance_recurring_candidates
+            SET status = 'ended',
+                updated_at = now()
+          WHERE company_id = $1
+            AND status <> 'confirmed'`,
+        [req.companyId]
+      );
       for (const candidate of detected) {
         const upsert = await client.query(
           `INSERT INTO finance_recurring_candidates (
@@ -1511,7 +1556,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
              category = EXCLUDED.category,
              account_id = EXCLUDED.account_id,
              status = CASE
-               WHEN finance_recurring_candidates.status IN ('confirmed','ignored') THEN finance_recurring_candidates.status
+               WHEN finance_recurring_candidates.status = 'confirmed' THEN finance_recurring_candidates.status
                ELSE 'detected'
              END,
              updated_at = now()
@@ -1563,7 +1608,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
-      handlePlaidError(res, error, "finance_recurring_analysis_failed");
+      handleFinanceDataError(res, error, "finance_recurring_analysis_failed");
     } finally {
       client.release();
     }
@@ -1584,7 +1629,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       if (!rows.length) return res.status(404).json({ error: "recurring_candidate_not_found", message: "Recurring item was not found." });
       res.json(recurringCandidatePayload(rows[0]));
     } catch (error) {
-      handlePlaidError(res, error, "finance_recurring_ignore_failed");
+      handleFinanceDataError(res, error, "finance_recurring_ignore_failed");
     }
   });
 
@@ -1614,10 +1659,26 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
         await client.query("ROLLBACK");
         return res.status(400).json({ error: "recurring_candidate_not_confirmable", message: "This looks like a repeated merchant, not a recurring bill or income source." });
       }
+      const evidence = await client.query(
+        `SELECT COUNT(*)::int AS evidence_count
+           FROM finance_recurring_candidate_transactions
+          WHERE company_id = $1 AND candidate_id = $2`,
+        [req.companyId, candidate.id]
+      );
+      if (Number(evidence.rows[0]?.evidence_count || 0) < 2) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "recurring_candidate_stale", message: "Run Analyze Recurring again before confirming this item." });
+      }
 
       let plannedItem = await findMatchingPlannedItem(client, req.companyId, candidate);
       let linkedExisting = Boolean(plannedItem);
       if (!plannedItem) {
+        const scheduledDate = dateOnlyPayload(candidate.next_expected_date)
+          || nextExpectedFromCadence(dateOnlyPayload(candidate.last_seen_date), candidate.cadence);
+        if (!scheduledDate) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "recurring_candidate_date_missing", message: "Run Analyze Recurring again before confirming this item." });
+        }
         const notes = [
           "Created from WolfCRM recurring analysis.",
           candidate.variability === "variable" ? "Amount is based on the median observed transaction amount." : null
@@ -1634,7 +1695,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
             candidate.display_name,
             candidate.direction,
             Number(candidate.median_amount_cents || 0),
-            dateOnlyPayload(candidate.next_expected_date) || dateOnlyPayload(candidate.last_seen_date) || new Date().toISOString().slice(0, 10),
+            scheduledDate,
             candidate.category || (candidate.direction === "income" ? "Other Income" : "Other"),
             candidate.cadence,
             notes,
@@ -1663,7 +1724,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
-      handlePlaidError(res, error, "finance_recurring_confirm_failed");
+      handleFinanceDataError(res, error, "finance_recurring_confirm_failed");
     } finally {
       client.release();
     }
