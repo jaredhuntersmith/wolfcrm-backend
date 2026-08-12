@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { executeFinanceAITool } from "../finance-ai.js";
+import { executeFinanceAITool, financeAIInternals } from "../finance-ai.js";
 
 function row(overrides = {}) {
   return { id: overrides.id || "id_1", company_id: "company_1", archived_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), ...overrides };
@@ -64,13 +64,33 @@ test("accounts tool returns safe account details only", async () => {
 
 test("transaction filters are company scoped", async () => {
   const pool = new FakePool();
-  await executeFinanceAITool(pool, ctx, "get_transactions", { start_date: null, end_date: null, direction: "expense", account_id: null, category: null, merchant_query: "home", status: "posted", limit: 10 });
+  await executeFinanceAITool(pool, ctx, "get_transactions", { period: "custom", start_date: null, end_date: null, direction: "expense", account_id: null, category: null, merchant_query: "home", status: "posted", limit: 10 });
   assert.equal(pool.queries.some((query) => query.values[0] === "company_1"), true);
 });
 
 test("spending summary aggregates backend-side", async () => {
-  const result = await executeFinanceAITool(new FakePool(), ctx, "get_spending_summary", { start_date: null, end_date: null, group_by: "category", account_id: null, category: null, merchant_query: null, limit: 10 });
-  assert.equal(result[0].total_cents, 130000);
+  const result = await executeFinanceAITool(new FakePool(), ctx, "get_spending_summary", { period: "custom", start_date: null, end_date: null, group_by: "category", account_id: null, category: null, merchant_query: null, limit: 10 });
+  assert.equal(result.groups[0].total_cents, 130000);
+  assert.equal(result.posted_spending_cents, 120000);
+  assert.equal(result.pending_spending_cents, 10000);
+});
+
+test("spending summary treats empty data as a zero result", async () => {
+  const pool = new FakePool();
+  pool.query = async (sql, values = []) => {
+    pool.queries.push({ sql, values });
+    if (sql.includes("FROM finance_transactions") && sql.includes("GROUP BY")) return { rows: [] };
+    return FakePool.prototype.query.call(pool, sql, values);
+  };
+  const result = await executeFinanceAITool(pool, ctx, "get_spending_summary", { period: "last_month", start_date: null, end_date: null, group_by: "category", account_id: null, category: null, merchant_query: null, limit: 10 });
+  assert.equal(result.total_spending_cents, 0);
+  assert.equal(result.transaction_count, 0);
+  assert.deepEqual(result.groups, []);
+});
+
+test("last month resolves to previous calendar month", () => {
+  const result = financeAIInternals.resolveDateRange("last_month", null, null, "2026-08-11");
+  assert.deepEqual(result, { key: "last_month", start_date: "2026-07-01", end_date: "2026-07-31" });
 });
 
 test("cash-flow projection tool returns projection", async () => {
@@ -138,6 +158,99 @@ test("explicit write creates audit record", async () => {
   const pool = new FakePool();
   await executeFinanceAITool(pool, { ...ctx, userMessage: "Create an ads budget" }, "create_budget", { name: "Ads", category: "Advertising", limit_cents: 100000, period: "monthly" });
   assert.equal(pool.queries.some((query) => query.sql.includes("INSERT INTO finance_ai_actions")), true);
+});
+
+test("tool loop completes spending-summary question with non-empty text", async () => {
+  const calls = [];
+  const client = {
+    responses: {
+      create: async ({ input }) => {
+        calls.push(input.map((item) => ({ type: item.type, call_id: item.call_id })));
+        if (calls.length === 1) {
+          return {
+            output_text: "",
+            output: [{
+              type: "function_call",
+              name: "get_spending_summary",
+              call_id: "call_spend",
+              arguments: JSON.stringify({ period: "last_month", start_date: null, end_date: null, group_by: "category", account_id: null, category: null, merchant_query: null, limit: 10 })
+            }]
+          };
+        }
+        return {
+          output_text: "I don't have any posted expense transactions for last month.",
+          output: []
+        };
+      }
+    }
+  };
+  const result = await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "Where did my money go last month?" }],
+    ctx
+  });
+  assert.match(result.text, /last month/);
+});
+
+test("concurrent tool loop preserves function call output IDs", async () => {
+  const createdInputs = [];
+  const client = {
+    responses: {
+      create: async ({ input }) => {
+        createdInputs.push(input);
+        if (createdInputs.length === 1) {
+          return {
+            output_text: "",
+            output: [
+              { type: "function_call", name: "get_finance_overview", call_id: "A", arguments: "{}" },
+              { type: "function_call", name: "get_debts", call_id: "B", arguments: "{}" },
+              { type: "function_call", name: "get_budget_status", call_id: "C", arguments: JSON.stringify({ period: "monthly", category: null }) }
+            ]
+          };
+        }
+        return { output_text: "Here is the summary.", output: [] };
+      }
+    }
+  };
+  const delays = { get_finance_overview: 30, get_debts: 20, get_budget_status: 10 };
+  await financeAIInternals.runResponsesToolLoop({
+    pool: new FakePool(),
+    client,
+    model: "test-model",
+    input: [{ role: "user", content: "Can I spend and still handle debt?" }],
+    ctx,
+    executeTool: async (_pool, _ctx, name) => {
+      await new Promise((resolve) => setTimeout(resolve, delays[name] || 1));
+      return { name };
+    }
+  });
+  const outputs = createdInputs[1].filter((item) => item.type === "function_call_output");
+  assert.equal(outputs.length, 3);
+  assert.equal(JSON.parse(outputs.find((item) => item.call_id === "A").output).data.name, "get_finance_overview");
+  assert.equal(JSON.parse(outputs.find((item) => item.call_id === "B").output).data.name, "get_debts");
+  assert.equal(JSON.parse(outputs.find((item) => item.call_id === "C").output).data.name, "get_budget_status");
+});
+
+test("tool loop rejects genuinely empty final output", async () => {
+  const client = { responses: { create: async () => ({ output_text: "", output: [] }) } };
+  await assert.rejects(
+    () => financeAIInternals.runResponsesToolLoop({
+      pool: new FakePool(),
+      client,
+      model: "test-model",
+      input: [{ role: "user", content: "hey" }],
+      ctx
+    }),
+    /usable answer/
+  );
+});
+
+test("tool output serializer handles BigInt and undefined", () => {
+  const output = JSON.parse(financeAIInternals.safeToolOutputString({ amount_cents: 123n, missing: undefined }));
+  assert.equal(output.amount_cents, 123);
+  assert.equal(output.missing, null);
 });
 
 let passed = 0;

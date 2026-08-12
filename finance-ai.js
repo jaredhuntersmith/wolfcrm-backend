@@ -552,8 +552,9 @@ async function toolOverview(pool, companyId) {
 async function toolTransactions(pool, companyId, args) {
   const values = [companyId];
   const conditions = ["t.company_id = $1", "t.removed_at IS NULL"];
-  const startDate = parseDateOnly(args.start_date, "start_date");
-  const endDate = parseDateOnly(args.end_date, "end_date");
+  const range = resolveDateRange(args.period, args.start_date, args.end_date);
+  const startDate = range.start_date;
+  const endDate = range.end_date;
   if (startDate) { values.push(startDate); conditions.push(`t.transaction_date >= $${values.length}`); }
   if (endDate) { values.push(endDate); conditions.push(`t.transaction_date <= $${values.length}`); }
   if (normalizeDirection(args.direction)) { values.push(args.direction); conditions.push(`t.direction = $${values.length}`); }
@@ -598,8 +599,9 @@ async function toolTransactions(pool, companyId, args) {
 async function toolSpendingSummary(pool, companyId, args) {
   const values = [companyId];
   const conditions = ["t.company_id = $1", "t.removed_at IS NULL", "t.direction = 'expense'"];
-  const startDate = parseDateOnly(args.start_date, "start_date");
-  const endDate = parseDateOnly(args.end_date, "end_date");
+  const range = resolveDateRange(args.period, args.start_date, args.end_date);
+  const startDate = range.start_date;
+  const endDate = range.end_date;
   if (startDate) { values.push(startDate); conditions.push(`t.transaction_date >= $${values.length}`); }
   if (endDate) { values.push(endDate); conditions.push(`t.transaction_date <= $${values.length}`); }
   if (args.account_id) { values.push(cleanString(args.account_id, 80)); conditions.push(`t.account_id = $${values.length}`); }
@@ -622,17 +624,32 @@ async function toolSpendingSummary(pool, companyId, args) {
        JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
       WHERE ${conditions.join(" AND ")}
       GROUP BY ${groupExpr}
-      ORDER BY total_cents DESC
+      ORDER BY posted_cents DESC, total_cents DESC
       LIMIT $${values.length}`,
     values
   );
-  return rows.map((row) => ({
+  const groups = rows.map((row) => ({
     label: row.label,
     transaction_count: Number(row.transaction_count || 0),
     posted_cents: Number(row.posted_cents || 0),
     pending_cents: Number(row.pending_cents || 0),
     total_cents: Number(row.total_cents || 0)
   }));
+  return {
+    period: range,
+    group_by: args.group_by,
+    filters: {
+      account_id: args.account_id || null,
+      category: args.category || null,
+      merchant_query: args.merchant_query || null
+    },
+    total_spending_cents: groups.reduce((sum, row) => sum + row.posted_cents, 0),
+    posted_spending_cents: groups.reduce((sum, row) => sum + row.posted_cents, 0),
+    pending_spending_cents: groups.reduce((sum, row) => sum + row.pending_cents, 0),
+    all_spending_cents: groups.reduce((sum, row) => sum + row.total_cents, 0),
+    transaction_count: groups.reduce((sum, row) => sum + row.transaction_count, 0),
+    groups
+  };
 }
 
 async function toolReceipts(pool, companyId, args) {
@@ -958,9 +975,15 @@ export async function executeFinanceAITool(pool, ctx, name, args = {}) {
   }
 }
 
-async function runResponsesToolLoop({ pool, client, model, input, ctx }) {
+async function runResponsesToolLoop({ pool, client, model, input, ctx, executeTool = executeFinanceAITool }) {
   const toolActivity = [];
+  const requestId = ctx.requestId || randomUUID();
+  const startedAt = Date.now();
+  let modelMs = 0;
+  let toolsMs = 0;
+  let toolCount = 0;
   for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
+    const modelStartedAt = Date.now();
     const response = await client.responses.create({
       model,
       instructions: SYSTEM_INSTRUCTIONS,
@@ -969,35 +992,87 @@ async function runResponsesToolLoop({ pool, client, model, input, ctx }) {
       store: false,
       max_output_tokens: 900
     });
+    modelMs += Date.now() - modelStartedAt;
     const functionCalls = (response.output || []).filter((item) => item.type === "function_call");
     if (!functionCalls.length) {
-      return { text: response.output_text || "I could not produce a response.", toolActivity };
+      const text = extractResponseText(response);
+      if (!text) {
+        financeAIWarn("empty_response", { requestId, iteration, model_ms: modelMs, tools_ms: toolsMs, tool_count: toolCount });
+        throw Object.assign(new Error("The Finance Assistant didn't produce a usable answer. Please try again."), {
+          statusCode: 502,
+          code: "finance_ai_empty_response"
+        });
+      }
+      financeAILog("request_succeeded", {
+        requestId,
+        iterations: iteration + 1,
+        model_ms: modelMs,
+        tools_ms: toolsMs,
+        total_ms: Date.now() - startedAt,
+        tool_count: toolCount
+      });
+      return { text, toolActivity };
     }
+    financeAILog("tools_requested", {
+      requestId,
+      iteration: iteration + 1,
+      tool_count: functionCalls.length,
+      tools: functionCalls.map((call) => call.name)
+    });
     input.push(...response.output);
     const runCall = async (call) => {
+      const toolStartedAt = Date.now();
       try {
-        const args = call.arguments ? JSON.parse(call.arguments) : {};
-        const result = await executeFinanceAITool(pool, ctx, call.name, args);
-        return { call, result, status: "succeeded" };
+        let args = {};
+        try {
+          args = call.arguments ? JSON.parse(call.arguments) : {};
+        } catch {
+          throw Object.assign(new Error("Invalid tool arguments."), { statusCode: 400, code: "finance_ai_invalid_tool_arguments" });
+        }
+        const result = await executeTool(pool, ctx, call.name, args);
+        financeAILog("tool_succeeded", {
+          requestId,
+          tool: call.name,
+          call_id: call.call_id,
+          duration_ms: Date.now() - toolStartedAt,
+          result_count: toolResultCount(result)
+        });
+        return { call, result: { ok: true, tool: call.name, data: jsonSafe(result) }, status: "succeeded" };
       } catch (error) {
-        return { call, result: { error: error.code || "tool_failed", message: error.message || "Tool failed." }, status: "failed" };
+        const result = financeAIToolError(call.name, error);
+        financeAIWarn("tool_failed", {
+          requestId,
+          stage: "tool_execution",
+          tool: call.name,
+          call_id: call.call_id,
+          duration_ms: Date.now() - toolStartedAt,
+          code: result.error_code,
+          message: result.message
+        });
+        return { call, result, status: "failed" };
       }
     };
+    const toolsStartedAt = Date.now();
     const callResults = functionCalls.some((call) => WRITE_TOOL_NAMES.has(call.name))
       ? []
       : await Promise.all(functionCalls.map(runCall));
     if (!callResults.length) {
       for (const call of functionCalls) callResults.push(await runCall(call));
     }
-    for (const { call, result, status } of callResults) {
+    toolsMs += Date.now() - toolsStartedAt;
+    toolCount += callResults.length;
+    const resultsByCallId = new Map(callResults.map((item) => [item.call.call_id, item]));
+    for (const call of functionCalls) {
+      const { result, status } = resultsByCallId.get(call.call_id);
       toolActivity.push({ name: call.name, status });
       input.push({
         type: "function_call_output",
         call_id: call.call_id,
-        output: JSON.stringify(result)
+        output: safeToolOutputString(result)
       });
     }
   }
+  financeAIWarn("tool_loop_limit", { requestId, model_ms: modelMs, tools_ms: toolsMs, total_ms: Date.now() - startedAt, tool_count: toolCount });
   throw Object.assign(new Error("Finance AI reached the tool-call limit. Try a narrower question."), { statusCode: 429, code: "finance_ai_tool_loop_limit" });
 }
 
@@ -1063,7 +1138,7 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
       const input = history.map((item) => ({ role: item.role === "assistant" ? "assistant" : "user", content: item.content }));
       const client = await openAIClient();
       if (!client) return res.status(503).json({ error: "openai_not_configured", message: "AI Financial Assistant is not configured yet." });
-      const ctx = { companyId: req.companyId, userId: req.userId, conversationId: conversation.id, userMessage: message };
+      const ctx = { companyId: req.companyId, userId: req.userId, conversationId: conversation.id, userMessage: message, requestId: randomUUID() };
       const result = await runResponsesToolLoop({ pool, client, model: config.model, input, ctx });
       const assistant = await addMessage(pool, req.companyId, conversation.id, "assistant", result.text, req.userId, summarizeToolActivity(result.toolActivity));
       res.json({
@@ -1086,6 +1161,11 @@ export const financeAIInternals = {
   toolTransactions,
   toolSpendingSummary,
   toolReceipts,
+  runResponsesToolLoop,
+  extractResponseText,
+  resolveDateRange,
+  jsonSafe,
+  safeToolOutputString,
   openAIConfig,
   dollars
 };
