@@ -1,14 +1,46 @@
 import crypto from "node:crypto";
 
 export function getPlaidConfig(env = process.env) {
-  const plaidEnv = (env.PLAID_ENV || "sandbox").toLowerCase();
-  const supported = plaidEnv === "sandbox" || plaidEnv === "production";
+  const plaidEnv = normalizePlaidEnvironment(env.PLAID_ENV || "sandbox");
+  const supported = Boolean(plaidEnv);
+  const environment = plaidEnv || "sandbox";
   return {
-    configured: Boolean(env.PLAID_CLIENT_ID && env.PLAID_SECRET && supported),
+    configured: Boolean(env.PLAID_CLIENT_ID && plaidSecretForEnvironment(environment, env) && supported),
     encryption_configured: Boolean(env.FINANCE_TOKEN_ENCRYPTION_KEY),
-    environment: supported ? plaidEnv : "sandbox",
+    environment,
     webhook_url: env.PLAID_WEBHOOK_URL || null,
     redirect_uri: env.PLAID_REDIRECT_URI || null
+  };
+}
+
+export function normalizePlaidEnvironment(value) {
+  const normalized = (value || "").toString().trim().toLowerCase();
+  if (normalized === "sandbox" || normalized === "development" || normalized === "production") return normalized;
+  return null;
+}
+
+export function plaidSecretForEnvironment(environment, env = process.env) {
+  const normalized = normalizePlaidEnvironment(environment);
+  if (normalized === "sandbox") {
+    return env.PLAID_SANDBOX_SECRET || (normalizePlaidEnvironment(env.PLAID_ENV) === "sandbox" ? env.PLAID_SECRET : null);
+  }
+  if (normalized === "development") {
+    return env.PLAID_DEVELOPMENT_SECRET || (normalizePlaidEnvironment(env.PLAID_ENV) === "development" ? env.PLAID_SECRET : null);
+  }
+  if (normalized === "production") {
+    return env.PLAID_PRODUCTION_SECRET || (normalizePlaidEnvironment(env.PLAID_ENV) === "production" ? env.PLAID_SECRET : null);
+  }
+  return null;
+}
+
+export function getPlaidEnvironmentConfig(environment, env = process.env) {
+  const normalized = normalizePlaidEnvironment(environment);
+  const secret = plaidSecretForEnvironment(normalized, env);
+  return {
+    configured: Boolean(env.PLAID_CLIENT_ID && secret && normalized),
+    client_id: env.PLAID_CLIENT_ID || null,
+    environment: normalized,
+    secret_available: Boolean(secret)
   };
 }
 

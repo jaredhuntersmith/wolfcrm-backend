@@ -2,19 +2,38 @@ import {
   decryptAccessToken,
   encryptAccessToken,
   collectPlaidSyncPages,
+  getPlaidEnvironmentConfig,
   getPlaidConfig,
+  normalizePlaidEnvironment,
   plaidAccountToFinanceAccount,
+  plaidSecretForEnvironment,
   providerAmountToCents,
   safePlaidItemPayload,
   transactionPayloadFromPlaid
 } from "./finance-plaid-helpers.js";
 import { matchUnmatchedReceiptsForTransactions } from "./finance-receipt-matching.js";
 
+const SANDBOX_INSTITUTION_IDS = new Set([
+  "ins_109508",
+  "ins_130016",
+  "ins_109509",
+  "ins_109510",
+  "ins_109511",
+  "ins_109512",
+  "ins_43"
+]);
+
 function cleanString(value, maxLength = 200) {
   return (value || "").toString().trim().slice(0, maxLength);
 }
 
 function handlePlaidError(res, error, fallback) {
+  if (error?.code === "finance_plaid_environment_unavailable") {
+    return res.status(503).json({
+      error: "finance_plaid_environment_unavailable",
+      message: "This bank connection was created in a different Plaid environment and that environment is not configured."
+    });
+  }
   if (error?.statusCode) {
     return res.status(error.statusCode).json({ error: error.code || fallback, message: error.message || "Plaid request failed." });
   }
@@ -30,6 +49,27 @@ function handlePlaidError(res, error, fallback) {
     request_id: plaidError?.request_id
   });
   return res.status(500).json({ error: fallback, message: "Bank connection request failed." });
+}
+
+function plaidEnvironmentUnavailableError(environment) {
+  const error = new Error("finance_plaid_environment_unavailable");
+  error.statusCode = 503;
+  error.code = "finance_plaid_environment_unavailable";
+  error.environment = normalizePlaidEnvironment(environment) || "unknown";
+  return error;
+}
+
+function safePlaidFailureLog(label, error, extra = {}) {
+  const plaidError = error?.response?.data || {};
+  console.error("[finance-plaid]", label, {
+    request_id: plaidError.request_id || extra.request_id || null,
+    plaid_item_internal_id: extra.plaid_item_internal_id || null,
+    item_environment: extra.item_environment || null,
+    plaid_error_type: plaidError.error_type || null,
+    plaid_error_code: plaidError.error_code || error?.code || null,
+    http_status: error?.response?.status || error?.statusCode || null,
+    message: error?.message
+  });
 }
 
 function safePlaidMessage(plaidError) {
@@ -63,19 +103,54 @@ function requirePlaidConfigured(res) {
   return status;
 }
 
-async function plaidClient() {
+function requirePlaidEnvironmentConfigured(res, environment) {
+  const config = getPlaidEnvironmentConfig(environment);
+  if (!config.configured) {
+    res.status(503).json({
+      error: "finance_plaid_environment_unavailable",
+      message: "This bank connection was created in a different Plaid environment and that environment is not configured."
+    });
+    return null;
+  }
+  const status = getPlaidConfig();
+  if (!status.encryption_configured) {
+    res.status(503).json({ error: "finance_token_encryption_key_missing", message: "Finance token encryption is not configured." });
+    return null;
+  }
+  return config;
+}
+
+function plaidBasePath(PlaidEnvironments, environment) {
+  if (environment === "production") return PlaidEnvironments.production;
+  if (environment === "development") return PlaidEnvironments.development;
+  return PlaidEnvironments.sandbox;
+}
+
+export async function plaidClientForEnvironment(environment) {
+  const normalized = normalizePlaidEnvironment(environment);
+  const secret = plaidSecretForEnvironment(normalized);
+  if (!normalized || !process.env.PLAID_CLIENT_ID || !secret) {
+    throw plaidEnvironmentUnavailableError(environment);
+  }
   const { Configuration, PlaidApi, PlaidEnvironments } = await import("plaid");
-  const config = getPlaidConfig();
   const configuration = new Configuration({
-    basePath: config.environment === "production" ? PlaidEnvironments.production : PlaidEnvironments.sandbox,
+    basePath: plaidBasePath(PlaidEnvironments, normalized),
     baseOptions: {
       headers: {
         "PLAID-CLIENT-ID": process.env.PLAID_CLIENT_ID,
-        "PLAID-SECRET": process.env.PLAID_SECRET
+        "PLAID-SECRET": secret
       }
     }
   });
   return new PlaidApi(configuration);
+}
+
+async function plaidClient() {
+  return plaidClientForEnvironment(getPlaidConfig().environment);
+}
+
+async function plaidClientForItem(item) {
+  return plaidClientForEnvironment(item.environment || getPlaidConfig().environment);
 }
 
 export async function installPlaidSchema(pool) {
@@ -90,7 +165,7 @@ export async function installPlaidSchema(pool) {
       access_token_iv TEXT NOT NULL,
       access_token_auth_tag TEXT NOT NULL,
       token_encryption_version INTEGER NOT NULL DEFAULT 1,
-      environment TEXT NOT NULL CHECK (environment IN ('sandbox','production')),
+      environment TEXT NOT NULL CHECK (environment IN ('sandbox','development','production')),
       status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','login_required','error','syncing','disconnected')),
       transactions_cursor TEXT,
       last_successful_sync_at TIMESTAMPTZ,
@@ -195,6 +270,16 @@ export async function installPlaidSchema(pool) {
       ON finance_plaid_item_events(company_id, plaid_item_internal_id, created_at DESC);
   `);
 
+  await pool.query(`ALTER TABLE finance_plaid_items ADD COLUMN IF NOT EXISTS environment TEXT`);
+  await pool.query(
+    `UPDATE finance_plaid_items
+        SET environment = 'sandbox', updated_at = now()
+      WHERE environment IS NULL
+        AND institution_id = ANY($1::text[])`,
+    [[...SANDBOX_INSTITUTION_IDS]]
+  );
+  await pool.query(`ALTER TABLE finance_plaid_items DROP CONSTRAINT IF EXISTS finance_plaid_items_environment_check`);
+  await pool.query(`ALTER TABLE finance_plaid_items ADD CONSTRAINT finance_plaid_items_environment_check CHECK (environment IN ('sandbox','development','production'))`);
   await pool.query(`ALTER TABLE finance_accounts ADD COLUMN IF NOT EXISTS plaid_item_internal_id UUID REFERENCES finance_plaid_items(id) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE finance_accounts ADD COLUMN IF NOT EXISTS plaid_account_id TEXT`);
   await pool.query(`ALTER TABLE finance_accounts ADD COLUMN IF NOT EXISTS institution_name TEXT`);
@@ -534,11 +619,12 @@ export async function syncPlaidTransactions({ pool, plaid, item }) {
   if (item.status === "disconnected" || item.disconnected_at) {
     return { skipped: true, reason: "disconnected", added: 0, modified: 0, removed: 0, next_cursor: item.transactions_cursor || null };
   }
+  const plaidForItem = plaid || await plaidClientForItem(item);
   const accessToken = await decryptItemToken(item);
   const originalCursor = item.transactions_cursor || null;
   const collected = await collectPlaidSyncPages(async (cursor) => {
     try {
-      const response = await plaid.transactionsSync({ access_token: accessToken, cursor, count: 500 });
+      const response = await plaidForItem.transactionsSync({ access_token: accessToken, cursor, count: 500 });
       return response.data;
     } catch (error) {
       const code = error?.response?.data?.error_code;
@@ -595,8 +681,9 @@ async function refreshBalances(pool, plaid, item) {
   if (item.status === "disconnected" || item.disconnected_at) {
     return [];
   }
+  const plaidForItem = plaid || await plaidClientForItem(item);
   const accessToken = await decryptItemToken(item);
-  const response = await plaid.accountsBalanceGet({ access_token: accessToken });
+  const response = await plaidForItem.accountsBalanceGet({ access_token: accessToken });
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -616,8 +703,9 @@ async function syncRecurring(pool, plaid, item) {
   if (item.status === "disconnected" || item.disconnected_at) {
     return 0;
   }
+  const plaidForItem = plaid || await plaidClientForItem(item);
   const accessToken = await decryptItemToken(item);
-  const response = await plaid.transactionsRecurringGet({ access_token: accessToken });
+  const response = await plaidForItem.transactionsRecurringGet({ access_token: accessToken });
   const streams = [
     ...(response.data.inflow_streams || []).map((stream) => ({ ...stream, wolf_direction: "income" })),
     ...(response.data.outflow_streams || []).map((stream) => ({ ...stream, wolf_direction: "expense" }))
@@ -785,11 +873,11 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
 
   app.post("/api/finance/plaid/items/:id/refresh-balances", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
-    if (!requirePlaidConfigured(res)) return;
     try {
       const item = await getPlaidItem(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
-      res.json({ accounts: await refreshBalances(pool, await plaidClient(), item) });
+      if (!requirePlaidEnvironmentConfigured(res, item.environment)) return;
+      res.json({ accounts: await refreshBalances(pool, await plaidClientForItem(item), item) });
     } catch (error) {
       handlePlaidError(res, error, "plaid_balance_refresh_failed");
     }
@@ -797,11 +885,11 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
 
   app.post("/api/finance/plaid/items/:id/refresh-transactions", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
-    if (!requirePlaidConfigured(res)) return;
     try {
       const item = await getPlaidItem(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
-      const plaid = await plaidClient();
+      if (!requirePlaidEnvironmentConfigured(res, item.environment)) return;
+      const plaid = await plaidClientForItem(item);
       await plaid.transactionsRefresh({ access_token: await decryptItemToken(item) });
       await pool.query(`UPDATE finance_plaid_items SET last_transaction_refresh_at = now(), updated_at = now() WHERE id = $1`, [item.id]);
       const sync = await syncPlaidTransactions({ pool, plaid, item });
@@ -813,16 +901,27 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
 
   app.post("/api/finance/plaid/refresh-all", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
-    if (!requirePlaidConfigured(res)) return;
     try {
       const { rows } = await pool.query(`SELECT * FROM finance_plaid_items WHERE company_id = $1 AND status <> 'disconnected' AND disconnected_at IS NULL`, [req.companyId]);
-      const plaid = await plaidClient();
       const results = [];
       for (const item of rows) {
-        const accounts = await refreshBalances(pool, plaid, item);
-        await plaid.transactionsRefresh({ access_token: await decryptItemToken(item) }).catch(() => null);
-        const sync = await syncPlaidTransactions({ pool, plaid, item });
-        results.push({ item_id: item.id, account_count: accounts.length, sync });
+        try {
+          const plaid = await plaidClientForItem(item);
+          const accounts = await refreshBalances(pool, plaid, item);
+          await plaid.transactionsRefresh({ access_token: await decryptItemToken(item) }).catch(() => null);
+          const sync = await syncPlaidTransactions({ pool, plaid, item });
+          results.push({ item_id: item.id, environment: item.environment || null, account_count: accounts.length, sync });
+        } catch (error) {
+          safePlaidFailureLog("refresh_all_item_failed", error, {
+            plaid_item_internal_id: item.id,
+            item_environment: item.environment || null
+          });
+          results.push({
+            item_id: item.id,
+            environment: item.environment || null,
+            error: error?.code === "finance_plaid_environment_unavailable" ? "finance_plaid_environment_unavailable" : "plaid_provider_error"
+          });
+        }
       }
       res.json({ items: results });
     } catch (error) {
@@ -832,19 +931,19 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
 
   app.post("/api/finance/plaid/items/:id/update-link-token", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
-    const config = requirePlaidConfigured(res);
-    if (!config) return;
     try {
       const item = await getPlaidItem(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
-      const response = await (await plaidClient()).linkTokenCreate({
+      if (!requirePlaidEnvironmentConfigured(res, item.environment)) return;
+      const activeConfig = getPlaidConfig();
+      const response = await (await plaidClientForItem(item)).linkTokenCreate({
         user: { client_user_id: `company_${req.companyId}_user_${req.userId}` },
         client_name: "WolfCRM",
         country_codes: ["US"],
         language: "en",
         access_token: await decryptItemToken(item),
-        webhook: config.webhook_url || undefined,
-        redirect_uri: config.redirect_uri || undefined
+        webhook: activeConfig.webhook_url || undefined,
+        redirect_uri: activeConfig.redirect_uri || undefined
       });
       res.json({ link_token: response.data.link_token, expiration: response.data.expiration });
     } catch (error) {
@@ -854,12 +953,14 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
 
   app.post("/api/finance/plaid/items/:id/disconnect", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
+    let disconnectItemEnvironment = null;
     try {
       const item = await getPlaidItemIncludingDisconnected(pool, req.companyId, req.params.id);
       if (!item) return res.status(404).json({ error: "plaid_item_not_found", message: "Bank connection was not found." });
+      disconnectItemEnvironment = item.environment || null;
       if (item.status !== "disconnected" && !item.disconnected_at) {
-        if (!requirePlaidConfigured(res)) return;
-        await (await plaidClient()).itemRemove({ access_token: await decryptItemToken(item) }).catch((error) => {
+        if (!requirePlaidEnvironmentConfigured(res, item.environment)) return;
+        await (await plaidClientForItem(item)).itemRemove({ access_token: await decryptItemToken(item) }).catch((error) => {
           const code = error?.response?.data?.error_code;
           if (code !== "ITEM_NOT_FOUND") throw error;
         });
@@ -888,6 +989,10 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
         message: `${updated.institution_name || "Bank"} disconnected. Historical transactions were kept.`
       });
     } catch (error) {
+      safePlaidFailureLog("disconnect_failed", error, {
+        plaid_item_internal_id: req.params.id,
+        item_environment: disconnectItemEnvironment || error?.environment || null
+      });
       handlePlaidError(res, error, "plaid_disconnect_failed");
     }
   });
@@ -982,9 +1087,9 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       await pool.query(`UPDATE finance_plaid_items SET last_webhook_at = now(), updated_at = now() WHERE id = $1`, [item.id]);
       res.json({ ok: true });
       if (webhookCode === "SYNC_UPDATES_AVAILABLE") {
-        await syncPlaidTransactions({ pool, plaid: await plaidClient(), item }).catch((error) => console.error("[finance-plaid] webhook sync failed", { item_id: item.id, message: error?.message }));
+        await syncPlaidTransactions({ pool, plaid: await plaidClientForItem(item), item }).catch((error) => console.error("[finance-plaid] webhook sync failed", { item_id: item.id, environment: item.environment || null, message: error?.message }));
       } else if (webhookCode === "RECURRING_TRANSACTIONS_UPDATE") {
-        await syncRecurring(pool, await plaidClient(), item).catch((error) => console.error("[finance-plaid] recurring sync failed", { item_id: item.id, message: error?.message }));
+        await syncRecurring(pool, await plaidClientForItem(item), item).catch((error) => console.error("[finance-plaid] recurring sync failed", { item_id: item.id, environment: item.environment || null, message: error?.message }));
       } else if (webhookCode === "ITEM_LOGIN_REQUIRED" || req.body?.error?.error_code === "ITEM_LOGIN_REQUIRED") {
         await pool.query(`UPDATE finance_plaid_items SET status = 'login_required', error_code = 'ITEM_LOGIN_REQUIRED', updated_at = now() WHERE id = $1`, [item.id]);
       }

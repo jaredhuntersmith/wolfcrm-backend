@@ -3,8 +3,11 @@ import {
   collectPlaidSyncPages,
   decryptAccessToken,
   encryptAccessToken,
+  getPlaidConfig,
+  getPlaidEnvironmentConfig,
   isLiquidFinanceAccount,
   normalizePlaidTransactionAmount,
+  plaidSecretForEnvironment,
   providerAmountToCents,
   reconcileTransactionRefs
 } from "../finance-plaid-helpers.js";
@@ -51,6 +54,42 @@ await run("modified ciphertext fails authentication", () => {
 
 await run("missing key handled safely", () => {
   assert.throws(() => encryptAccessToken("token", {}), /finance_token_encryption_key_missing/);
+});
+
+await run("Plaid active config uses environment-specific secret", () => {
+  const env = {
+    PLAID_ENV: "production",
+    PLAID_CLIENT_ID: "client",
+    PLAID_SECRET: "legacy-production-secret",
+    PLAID_SANDBOX_SECRET: "sandbox-secret",
+    FINANCE_TOKEN_ENCRYPTION_KEY: keyA
+  };
+  const config = getPlaidConfig(env);
+  assert.equal(config.configured, true);
+  assert.equal(config.environment, "production");
+  assert.equal(plaidSecretForEnvironment("sandbox", env), "sandbox-secret");
+  assert.equal(plaidSecretForEnvironment("production", env), "legacy-production-secret");
+});
+
+await run("sandbox Item can be configured while global environment is production", () => {
+  const env = {
+    PLAID_ENV: "production",
+    PLAID_CLIENT_ID: "client",
+    PLAID_SECRET: "production-secret",
+    PLAID_SANDBOX_SECRET: "sandbox-secret"
+  };
+  assert.equal(getPlaidEnvironmentConfig("sandbox", env).configured, true);
+  assert.equal(plaidSecretForEnvironment("sandbox", env), "sandbox-secret");
+});
+
+await run("missing sandbox secret is a clear environment config failure", () => {
+  const env = {
+    PLAID_ENV: "production",
+    PLAID_CLIENT_ID: "client",
+    PLAID_SECRET: "production-secret"
+  };
+  assert.equal(getPlaidEnvironmentConfig("sandbox", env).configured, false);
+  assert.equal(plaidSecretForEnvironment("sandbox", env), null);
 });
 
 await run("provider amount to cents", () => {
