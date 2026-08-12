@@ -7571,10 +7571,21 @@ function buildDashboardRoutineItem(row, dayKey, dueAt, section, priority) {
     due_at: dueAt,
     system_image: "repeat",
     tint: "orange",
-    completable: false,
+    completable: true,
     dismissible: true,
     destination: { type: "todo", id: String(row.id) }
   };
+}
+
+function dedupeDashboardItems(items) {
+  const seen = new Set();
+  const deduped = [];
+  for (const item of items) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    deduped.push(item);
+  }
+  return deduped;
 }
 
 function filterDashboardDismissed(items, dismissals) {
@@ -7631,7 +7642,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
       [req.companyId, todayStart.toISOString(), todayEnd.toISOString(), weekStart.toISOString(), weekEnd.toISOString(), monthStart.toISOString(), monthEnd.toISOString()]
     ) : { rows: [{ today: 0, week: 0, month: 0, missing_today: 0 }] };
 
-    const [tasksResult, customerResult, routinesResult, doneResult, notificationsResult, dismissalsResult] = await Promise.all([
+    const [tasksResult, taskStatsResult, customerResult, customerStatsResult, routinesResult, doneResult, notificationsResult, dismissalsResult] = await Promise.all([
       pool.query(
         `SELECT id, title, due_date, completed, updated_at
            FROM todo_tasks
@@ -7644,6 +7655,15 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
         [req.userId, upcomingEnd.toISOString()]
       ),
       pool.query(
+        `SELECT
+            COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3)::int AS total_today,
+            COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3 AND completed = true)::int AS completed_today
+           FROM todo_tasks
+          WHERE user_id = $1
+            AND due_date IS NOT NULL`,
+        [req.userId, todayStart.toISOString(), todayEnd.toISOString()]
+      ),
+      pool.query(
         `SELECT id, title, contact_id, contact_name, due_date, completed, updated_at
            FROM todo_customer_reminders
           WHERE user_id = $1
@@ -7653,6 +7673,15 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           ORDER BY due_date ASC
           LIMIT 40`,
         [req.userId, upcomingEnd.toISOString()]
+      ),
+      pool.query(
+        `SELECT
+            COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3)::int AS total_today,
+            COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3 AND completed = true)::int AS completed_today
+           FROM todo_customer_reminders
+          WHERE user_id = $1
+            AND due_date IS NOT NULL`,
+        [req.userId, todayStart.toISOString(), todayEnd.toISOString()]
       ),
       pool.query(
         `SELECT id, title, time, weekdays, updated_at
@@ -7689,7 +7718,9 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
 
     const items = [];
     const jobsToday = jobsResult.rows.filter((row) => new Date(row.start) >= todayStart && new Date(row.start) < todayEnd);
-    for (const row of jobsToday.slice(0, 10)) {
+    const activeJobsToday = jobsToday.filter((row) => !row.finished_at);
+    const completedJobsToday = jobsToday.length - activeJobsToday.length;
+    for (const row of activeJobsToday.slice(0, 10)) {
       items.push(buildDashboardJobItem(row, "today", "normal"));
       if (row.price_cents == null) {
         items.push({
@@ -7728,6 +7759,8 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
     }
 
     const doneKeys = new Set(doneResult.rows.map((row) => `${row.routine_id}:${row.day_key}`));
+    let routineTotalToday = 0;
+    let routineCompletedToday = 0;
     for (let day = new Date(todayStart); day < upcomingEnd; day = new Date(day.getTime() + 86400000)) {
       const jsDay = day.getDay();
       const weekday = jsDay === 0 ? 1 : jsDay + 1;
@@ -7735,7 +7768,12 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
       for (const row of routinesResult.rows) {
         const weekdays = Array.isArray(row.weekdays) ? row.weekdays.map(Number) : [];
         if (!weekdays.includes(weekday)) continue;
-        if (doneKeys.has(`${row.id}:${dayKey}`)) continue;
+        const isToday = day >= todayStart && day < todayEnd;
+        if (isToday) routineTotalToday += 1;
+        if (doneKeys.has(`${row.id}:${dayKey}`)) {
+          if (isToday) routineCompletedToday += 1;
+          continue;
+        }
         const dueAt = new Date(day);
         if (row.time) {
           const time = new Date(row.time);
@@ -7800,7 +7838,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
 
     const priorityRank = { critical: 0, high: 1, normal: 2, low: 3 };
     const sectionRank = { attention: 0, today: 1, upcoming: 2 };
-    const visibleItems = filterDashboardDismissed(items, dismissalsResult.rows)
+    const visibleItems = filterDashboardDismissed(dedupeDashboardItems(items), dismissalsResult.rows)
       .sort((a, b) => {
         if (sectionRank[a.section] !== sectionRank[b.section]) return sectionRank[a.section] - sectionRank[b.section];
         if (a.section === "attention" && priorityRank[a.priority] !== priorityRank[b.priority]) return priorityRank[a.priority] - priorityRank[b.priority];
@@ -7808,10 +7846,18 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
       });
 
     const revenue = revenueResult.rows[0] || {};
+    const taskStats = taskStatsResult.rows[0] || {};
+    const customerStats = customerStatsResult.rows[0] || {};
+    const tasksTodayTotal = Number(taskStats.total_today || 0) + Number(customerStats.total_today || 0) + routineTotalToday;
+    const tasksTodayCompleted = Number(taskStats.completed_today || 0) + Number(customerStats.completed_today || 0) + routineCompletedToday;
     res.json({
       generated_at: new Date().toISOString(),
       metrics: {
         jobs_today: jobsToday.length,
+        jobs_today_completed: completedJobsToday,
+        jobs_today_remaining: activeJobsToday.length,
+        tasks_today_total: tasksTodayTotal,
+        tasks_today_completed: tasksTodayCompleted,
         revenue_today_cents: Number(revenue.today || 0),
         revenue_week_cents: Number(revenue.week || 0),
         revenue_month_cents: Number(revenue.month || 0),
