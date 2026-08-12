@@ -1030,7 +1030,26 @@ export async function installFinanceAISchema(pool) {
   await pool.query(`ALTER TABLE finance_ai_conversations ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE finance_ai_conversations ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE finance_ai_conversations ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'proposed'`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT 'Finance action'`);
   await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS risk_level TEXT NOT NULL DEFAULT 'normal'`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS executed_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS result JSONB`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD COLUMN IF NOT EXISTS error_message TEXT`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals DROP CONSTRAINT IF EXISTS finance_ai_action_proposals_status_check`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD CONSTRAINT finance_ai_action_proposals_status_check CHECK (status IN ('draft','proposed','confirmed','executing','completed','failed','cancelled','expired'))`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals DROP CONSTRAINT IF EXISTS finance_ai_action_proposals_risk_level_check`);
+  await pool.query(`ALTER TABLE finance_ai_action_proposals ADD CONSTRAINT finance_ai_action_proposals_risk_level_check CHECK (risk_level IN ('low','normal','high'))`);
+  await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS memory_scope TEXT NOT NULL DEFAULT 'user'`);
+  await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS memory_type TEXT NOT NULL DEFAULT 'preference'`);
+  await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS structured_data JSONB`);
+  await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS source_conversation_id UUID REFERENCES finance_ai_conversations(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE finance_ai_memories ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`);
 }
 
 async function ensureConversation(pool, companyId, userId, conversationId, message) {
@@ -2345,10 +2364,23 @@ export async function executeFinanceAITool(pool, ctx, name, args = {}) {
   }
   case "get_detected_recurring_streams": return toolDetectedRecurringStreams(pool, ctx.companyId, args);
   case "get_detected_recurring_stream_detail": {
-    const streams = await toolDetectedRecurringStreams(pool, ctx.companyId, { active_only: false, direction: "all", limit: 50 });
-    const stream = streams.find((item) => item.id === cleanString(args.stream_id, 80));
-    if (!stream) throw Object.assign(new Error("Recurring stream was not found."), { statusCode: 404, code: "finance_recurring_stream_not_found" });
-    return stream;
+    const { rows } = await pool.query(`SELECT * FROM finance_plaid_recurring_streams WHERE id = $1 AND company_id = $2 LIMIT 1`, [cleanString(args.stream_id, 80), ctx.companyId]);
+    if (!rows.length) throw Object.assign(new Error("Recurring stream was not found."), { statusCode: 404, code: "finance_recurring_stream_not_found" });
+    return {
+      id: rows[0].id,
+      merchant_name: rows[0].merchant_name,
+      description: rows[0].description,
+      direction: rows[0].direction,
+      category: rows[0].category,
+      frequency: rows[0].frequency,
+      last_amount_cents: rows[0].last_amount_cents === null ? null : Number(rows[0].last_amount_cents),
+      average_amount_cents: rows[0].average_amount_cents === null ? null : Number(rows[0].average_amount_cents),
+      first_date: dateOnlyFromDb(rows[0].first_date),
+      last_date: dateOnlyFromDb(rows[0].last_date),
+      is_active: rows[0].is_active,
+      status: rows[0].status,
+      confidence_level: rows[0].confidence_level
+    };
   }
   case "get_receipt_status_summary": return toolReceiptStatusSummary(pool, ctx.companyId);
   case "get_receipts": return toolReceipts(pool, ctx.companyId, args);
@@ -2936,11 +2968,21 @@ export const financeAIInternals = {
   toolTransactions,
   toolSpendingSummary,
   toolReceipts,
+  toolAccountDetail,
+  toolTransactionDetail,
+  toolReceiptDetail,
+  toolBudgets,
+  toolDebtDetail,
+  toolGoalDetail,
+  toolPlannedItems,
+  toolDetectedRecurringStreams,
   runResponsesToolLoop,
   extractVisibleAssistantText,
   resolveDateRange,
   jsonSafe,
   safeToolOutputString,
   openAIConfig,
+  ACTION_DEFINITIONS,
+  missingRequiredFields,
   dollars
 };
