@@ -1350,6 +1350,7 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS inventory_transactions_item_idx ON inventory_transactions(company_id, item_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS inventory_transactions_job_idx ON inventory_transactions(company_id, job_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_idempotency_idx ON inventory_transactions(company_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS equipment_requests (
       id TEXT PRIMARY KEY,
