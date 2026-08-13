@@ -1152,6 +1152,8 @@ async function bootstrap() {
       created_by UUID,
       sales_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
       worker_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      started_at TIMESTAMPTZ,
+      started_by UUID,
       finished_at TIMESTAMPTZ,
       finished_by UUID,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -1249,6 +1251,176 @@ async function bootstrap() {
       note TEXT
     );
     CREATE INDEX IF NOT EXISTS todo_logs_user_ts_idx ON todo_logs(user_id, ts DESC);
+
+    CREATE TABLE IF NOT EXISTS job_workflow_templates (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      scope TEXT NOT NULL DEFAULT 'company_default',
+      service_type TEXT,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      sections JSONB NOT NULL DEFAULT '[]'::jsonb,
+      archived_at TIMESTAMPTZ,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS job_workflow_templates_company_idx ON job_workflow_templates(company_id, archived_at, enabled);
+
+    CREATE TABLE IF NOT EXISTS job_workflow_runs (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      job_id TEXT NOT NULL REFERENCES schedule_events(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'in_progress',
+      started_at TIMESTAMPTZ,
+      started_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      completed_at TIMESTAMPTZ,
+      completed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      override_reason TEXT,
+      snapshot JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, job_id)
+    );
+    CREATE INDEX IF NOT EXISTS job_workflow_runs_job_idx ON job_workflow_runs(company_id, job_id);
+
+    CREATE TABLE IF NOT EXISTS job_photos (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      job_id TEXT NOT NULL REFERENCES schedule_events(id) ON DELETE CASCADE,
+      contact_id TEXT,
+      category TEXT NOT NULL DEFAULT 'general',
+      caption TEXT,
+      object_key TEXT NOT NULL,
+      thumbnail_key TEXT,
+      workflow_item_id TEXT,
+      uploaded_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS job_photos_job_idx ON job_photos(company_id, job_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS inventory_locations (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'other',
+      active BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS inventory_locations_company_idx ON inventory_locations(company_id, active);
+
+    CREATE TABLE IF NOT EXISTS inventory_items (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      item_type TEXT NOT NULL DEFAULT 'material',
+      tracking_mode TEXT NOT NULL DEFAULT 'quantity',
+      category TEXT,
+      unit TEXT NOT NULL DEFAULT 'each',
+      quantity_on_hand NUMERIC NOT NULL DEFAULT 0,
+      reorder_point NUMERIC,
+      cost_per_unit_cents INTEGER,
+      status TEXT NOT NULL DEFAULT 'available',
+      location_id TEXT,
+      assigned_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS inventory_items_company_idx ON inventory_items(company_id, item_type, status);
+
+    CREATE TABLE IF NOT EXISTS inventory_transactions (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+      transaction_type TEXT NOT NULL,
+      quantity NUMERIC NOT NULL,
+      from_location_id TEXT,
+      to_location_id TEXT,
+      job_id TEXT,
+      employee_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      note TEXT,
+      cost_snapshot_cents INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS inventory_transactions_item_idx ON inventory_transactions(company_id, item_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS inventory_transactions_job_idx ON inventory_transactions(company_id, job_id);
+
+    CREATE TABLE IF NOT EXISTS equipment_requests (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      request_type TEXT NOT NULL,
+      item_id TEXT,
+      item_name TEXT,
+      quantity NUMERIC,
+      urgency TEXT NOT NULL DEFAULT 'normal',
+      explanation TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      requester_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      owner_response TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS equipment_requests_company_idx ON equipment_requests(company_id, status, created_at);
+
+    CREATE TABLE IF NOT EXISTS mileage_company_settings (
+      company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      default_rate_cents_per_mile INTEGER NOT NULL DEFAULT 67,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS mileage_employee_settings (
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      employee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      rate_cents_per_mile INTEGER,
+      start_rule TEXT NOT NULL DEFAULT 'company_location',
+      end_rule TEXT NOT NULL DEFAULT 'last_completed_job',
+      start_location_id TEXT,
+      end_location_id TEXT,
+      vehicle_type TEXT NOT NULL DEFAULT 'not_specified',
+      effective_date DATE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY(company_id, employee_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS mileage_company_locations (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      address TEXT NOT NULL,
+      lat DOUBLE PRECISION,
+      lng DOUBLE PRECISION,
+      active BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS mileage_daily_logs (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      employee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      service_date DATE NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft',
+      total_miles NUMERIC NOT NULL DEFAULT 0,
+      rate_cents_per_mile INTEGER NOT NULL DEFAULT 0,
+      reimbursement_cents INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, employee_id, service_date)
+    );
+
+    CREATE TABLE IF NOT EXISTS mileage_legs (
+      id TEXT PRIMARY KEY,
+      log_id TEXT NOT NULL REFERENCES mileage_daily_logs(id) ON DELETE CASCADE,
+      sequence INTEGER NOT NULL,
+      from_label TEXT NOT NULL,
+      to_label TEXT NOT NULL,
+      distance_miles NUMERIC NOT NULL DEFAULT 0,
+      job_id TEXT
+    );
 
     CREATE TABLE IF NOT EXISTS time_clock_settings (
       company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
@@ -1416,8 +1588,21 @@ async function bootstrap() {
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS created_by UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS sales_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS worker_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS started_by UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS finished_by UUID;
+
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS detail TEXT;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS creator_id UUID;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS assignee_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal';
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_contact_id TEXT;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_job_id TEXT;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_equipment_id TEXT;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS completed_by UUID;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS completion_note TEXT;
     ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
     ALTER TABLE measurements ADD COLUMN IF NOT EXISTS linked_contact_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE measurements ADD COLUMN IF NOT EXISTS units TEXT NOT NULL DEFAULT 'feet';
@@ -7565,7 +7750,7 @@ app.get("/api/schedule", authRequired, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, title, start_at AS start, end_at AS "end", color, notes,
               contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
-              company_id, created_by, sales_user_ids, worker_user_ids, finished_at, finished_by
+              company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by
        FROM schedule_events WHERE ${where.sql} ORDER BY start_at ASC`,
       where.values
     );
@@ -7576,7 +7761,7 @@ app.get("/api/schedule", authRequired, async (req, res) => {
 app.put("/api/schedule/:id", authRequired, async (req, res) => {
   const {
     title, start, end, color, notes, contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
-    sales_user_ids, worker_user_ids, finished_at, finished_by
+    sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by
   } = req.body || {};
   if (!title || !start || !end) return res.status(400).json({ error: "missing_params" });
   const salesIDs = Array.isArray(sales_user_ids) ? sales_user_ids.slice(0, 2) : [req.userId];
@@ -7593,8 +7778,8 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
     const r = await pool.query(
       `INSERT INTO schedule_events
         (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id,
-         reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, finished_at, finished_by)
-       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14, $15::jsonb, $16::jsonb, $17, $18)
+         reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by)
+       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14, $15::jsonb, $16::jsonb, $17, $18, $19, $20)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              start_at = EXCLUDED.start_at,
@@ -7610,13 +7795,15 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
              company_id = EXCLUDED.company_id,
              sales_user_ids = EXCLUDED.sales_user_ids,
              worker_user_ids = EXCLUDED.worker_user_ids,
+             started_at = EXCLUDED.started_at,
+             started_by = EXCLUDED.started_by,
              finished_at = EXCLUDED.finished_at,
              finished_by = EXCLUDED.finished_by,
              updated_at = now()
        WHERE schedule_events.user_id = $2 OR schedule_events.company_id = $3
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
                  contact_id, reminder_minutes, services, price_cents, material_cost_cents,
-                 service_items, company_id, created_by, sales_user_ids, worker_user_ids, finished_at, finished_by`,
+                 service_items, company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by`,
       [
         req.params.id, req.userId, req.companyId, title, start, end,
         color || '#3478F6', notes || null, contact_id || null,
@@ -7627,6 +7814,8 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
         Number.isFinite(Number(material_cost_cents)) ? Number(material_cost_cents) : null,
         JSON.stringify(salesIDs),
         JSON.stringify(workerIDs),
+        started_at || null,
+        started_by || null,
         finished_at || null,
         finished_by || null
       ]
@@ -8522,39 +8711,77 @@ app.delete("/api/measurements/:id", authRequired, async (req, res) => {
 // ---------- TO-DO: TASKS ----------
 app.get("/api/todo/tasks", authRequired, async (req, res) => {
   try {
+    const companyUsers = req.companyId
+      ? (await pool.query(`SELECT id FROM users WHERE company_id = $1`, [req.companyId])).rows.map((r) => r.id)
+      : [req.userId];
     const { rows } = await pool.query(
-      `SELECT id, title, due_date, reminders, subtasks, completed, completed_at, color_hex
-       FROM todo_tasks WHERE user_id = $1 ORDER BY due_date NULLS LAST, updated_at DESC`,
-      [req.userId]
+      `SELECT id, title, detail, creator_id, assignee_ids, due_date, priority, status,
+              linked_contact_id, linked_job_id, linked_equipment_id,
+              reminders, subtasks, completed, completed_at, completed_by, completion_note, color_hex
+       FROM todo_tasks
+       WHERE user_id = $1
+          OR ($2::uuid IS NOT NULL AND user_id = ANY($3::uuid[]))
+          OR (assignee_ids ? $1::text)
+       ORDER BY due_date NULLS LAST, updated_at DESC`,
+      [req.userId, req.companyId, companyUsers]
     );
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_tasks" }); }
 });
 
 app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
-  const { title, due_date, reminders, subtasks, completed, completed_at, color_hex } = req.body || {};
+  const {
+    title, detail, creator_id, assignee_ids, due_date, priority, status,
+    linked_contact_id, linked_job_id, linked_equipment_id,
+    reminders, subtasks, completed, completed_at, completed_by, completion_note, color_hex
+  } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
+  const assignees = Array.isArray(assignee_ids) ? assignee_ids.filter((id) => typeof id === "string").slice(0, 20) : [];
   try {
-    const previous = await pool.query(`SELECT * FROM todo_tasks WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    const previous = await pool.query(
+      `SELECT * FROM todo_tasks WHERE id = $1 AND (user_id = $2 OR ($3::uuid IS NOT NULL AND user_id IN (SELECT id FROM users WHERE company_id = $3)) OR assignee_ids ? $2::text)`,
+      [req.params.id, req.userId, req.companyId]
+    );
+    const ownerUserId = previous.rows[0]?.user_id || creator_id || req.userId;
     const r = await pool.query(
       `INSERT INTO todo_tasks
-        (id, user_id, title, due_date, reminders, subtasks, completed, completed_at, color_hex)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9)
+        (id, user_id, title, detail, creator_id, assignee_ids, due_date, priority, status,
+         linked_contact_id, linked_job_id, linked_equipment_id, reminders, subtasks,
+         completed, completed_at, completed_by, completion_note, color_hex)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, $16, $17, $18, $19)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
+             detail = EXCLUDED.detail,
+             creator_id = COALESCE(todo_tasks.creator_id, EXCLUDED.creator_id),
+             assignee_ids = EXCLUDED.assignee_ids,
              due_date = EXCLUDED.due_date,
+             priority = EXCLUDED.priority,
+             status = EXCLUDED.status,
+             linked_contact_id = EXCLUDED.linked_contact_id,
+             linked_job_id = EXCLUDED.linked_job_id,
+             linked_equipment_id = EXCLUDED.linked_equipment_id,
              reminders = EXCLUDED.reminders,
              subtasks = EXCLUDED.subtasks,
              completed = EXCLUDED.completed,
              completed_at = EXCLUDED.completed_at,
+             completed_by = EXCLUDED.completed_by,
+             completion_note = EXCLUDED.completion_note,
              color_hex = EXCLUDED.color_hex,
              updated_at = now()
        WHERE todo_tasks.user_id = $2
-       RETURNING id, title, due_date, reminders, subtasks, completed, completed_at, color_hex`,
+          OR ($20::uuid IS NOT NULL AND todo_tasks.user_id IN (SELECT id FROM users WHERE company_id = $20))
+          OR todo_tasks.assignee_ids ? $21::text
+       RETURNING id, title, detail, creator_id, assignee_ids, due_date, priority, status,
+                 linked_contact_id, linked_job_id, linked_equipment_id,
+                 reminders, subtasks, completed, completed_at, completed_by, completion_note, color_hex`,
       [
-        req.params.id, req.userId, title, due_date || null,
+        req.params.id, ownerUserId, title, detail || null, creator_id || req.userId, JSON.stringify(assignees), due_date || null,
+        priority || "normal", completed ? "completed" : (status || "open"),
+        linked_contact_id || null, linked_job_id || null, linked_equipment_id || null,
         JSON.stringify(reminders || []), JSON.stringify(subtasks || []),
-        toBool(completed), completed_at || null, color_hex || null
+        toBool(completed), completed_at || (completed ? new Date() : null),
+        completed_by || (completed ? req.userId : null), completion_note || null, color_hex || null,
+        req.companyId, req.userId
       ]
     );
     if (req.companyId) {
