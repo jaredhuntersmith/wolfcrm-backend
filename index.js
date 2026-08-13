@@ -366,6 +366,7 @@ app.use(cors());
 // raw bytes aren't consumed. The handler is defined further down but the
 // raw-body middleware for that exact path lives here.
 app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }));
+app.use("/stripe/connect-webhook", express.raw({ type: "application/json", limit: "2mb" }));
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: false, limit: "2mb" }));
@@ -2246,6 +2247,113 @@ function mapStripeSubscriptionStatus(s) {
     default:
       return null;
   }
+}
+
+function localPaymentStatusFromStripePaymentIntent(pi) {
+  switch (pi && pi.status) {
+    case "succeeded":
+      return "succeeded";
+    case "processing":
+      return "pending";
+    case "canceled":
+      return "canceled";
+    case "requires_payment_method":
+      return pi.last_payment_error ? "failed" : "pending";
+    case "requires_action":
+    case "requires_capture":
+    case "requires_confirmation":
+    default:
+      return "pending";
+  }
+}
+
+function automationEventForPaymentStatus(status) {
+  switch (status) {
+    case "succeeded": return "payment.succeeded";
+    case "failed": return "payment.failed";
+    case "canceled": return "payment.canceled";
+    default: return null;
+  }
+}
+
+async function applyStripePaymentIntentStatus({
+  paymentIntent,
+  connectedAccountId = null,
+  paymentRecordId = null,
+  source = "stripe.reconcile",
+  stripeEventId = null
+}) {
+  if (!paymentIntent || !paymentIntent.id) return [];
+  const localStatus = localPaymentStatusFromStripePaymentIntent(paymentIntent);
+  const params = [paymentIntent.id, localStatus, connectedAccountId];
+  let idClause = "";
+  if (paymentRecordId) {
+    params.push(paymentRecordId);
+    idClause = ` AND id = $4`;
+  }
+  const { rows } = await pool.query(
+    `UPDATE payment_records
+        SET status = $2,
+            updated_at = now()
+      WHERE stripe_payment_intent_id = $1
+        AND ($3::text IS NULL OR stripe_connected_account_id = $3)
+        ${idClause}
+      RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency, status, stripe_connected_account_id`,
+    params
+  );
+  const eventType = automationEventForPaymentStatus(localStatus);
+  if (eventType) {
+    for (const rec of rows) {
+      await emitAutomationEvent({
+        companyId: rec.company_id,
+        eventType,
+        subjectType: "payment",
+        subjectId: rec.id,
+        source,
+        dedupeKey: `${eventType}:${stripeEventId || paymentIntent.id}:${rec.id}`,
+        payload: {
+          payment_id: rec.id,
+          contact_id: rec.contact_id,
+          service_plan_id: rec.service_plan_id,
+          amount_cents: rec.amount_cents,
+          currency: rec.currency,
+          stripe_event_id: stripeEventId || null,
+          stripe_payment_intent_id: paymentIntent.id,
+          stripe_payment_intent_status: paymentIntent.status,
+          local_status: localStatus
+        }
+      });
+    }
+  }
+  console.log("[stripe] payment intent reconciled", {
+    source,
+    stripe_event_id: stripeEventId || null,
+    connected_account_id: connectedAccountId,
+    payment_intent_id: paymentIntent.id,
+    stripe_status: paymentIntent.status,
+    local_status: localStatus,
+    matched_records: rows.length
+  });
+  return rows;
+}
+
+async function reconcilePaymentRecordFromStripe(record, { source = "stripe.reconcile" } = {}) {
+  const stripe = getStripe();
+  if (!stripe) throw new Error("stripe_not_configured");
+  if (!record || !record.stripe_payment_intent_id) return record;
+  if (!record.stripe_connected_account_id) throw new Error("stripe_connected_account_missing");
+  const pi = await stripe.paymentIntents.retrieve(
+    record.stripe_payment_intent_id,
+    {},
+    { stripeAccount: record.stripe_connected_account_id }
+  );
+  const rows = await applyStripePaymentIntentStatus({
+    paymentIntent: pi,
+    connectedAccountId: record.stripe_connected_account_id,
+    paymentRecordId: record.id,
+    source
+  });
+  return rows[0] || record;
 }
 
 function serviceIntervalDays(interval, count) {
@@ -11361,6 +11469,34 @@ app.get("/api/contacts/:contactId/payments", authRequired, async (req, res) => {
     const c = await pool.query(`SELECT id FROM contacts WHERE id = $1 AND user_id = $2`,
       [req.params.contactId, employerId]);
     if (!c.rows.length) return res.status(404).json({ error: "contact_not_found" });
+    if (req.query.reconcile_pending === "true") {
+      const limit = Math.min(Math.max(Number(req.query.reconcile_limit || 20), 1), 25);
+      const pending = await pool.query(
+        `SELECT * FROM payment_records
+          WHERE user_id = $1
+            AND contact_id::text = $2
+            AND status = 'pending'
+            AND stripe_payment_intent_id IS NOT NULL
+            AND stripe_connected_account_id IS NOT NULL
+            AND created_at > now() - interval '14 days'
+            AND ($3 = 'employer' OR created_by_user_id = $4)
+          ORDER BY created_at DESC
+          LIMIT $5`,
+        [employerId, req.params.contactId, req.role, req.userId, limit]
+      );
+      for (const rec of pending.rows) {
+        try {
+          await reconcilePaymentRecordFromStripe(rec, { source: "stripe.history_reconcile" });
+        } catch (err) {
+          console.warn("[stripe] pending payment reconcile skipped", {
+            payment_record_id: rec.id,
+            payment_intent_id: rec.stripe_payment_intent_id,
+            connected_account_id: rec.stripe_connected_account_id,
+            message: err.message
+          });
+        }
+      }
+    }
     if (req.role === "employer") {
       const { rows } = await pool.query(
         `SELECT * FROM payment_records
@@ -11408,6 +11544,31 @@ app.get("/api/payments", authRequired, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "list_payments_failed" });
+  }
+});
+
+app.post("/api/payments/:id/reconcile", authRequired, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `SELECT * FROM payment_records WHERE id = $1 AND user_id = $2`,
+      [req.params.id, employerId]
+    );
+    const rec = rows[0];
+    if (!rec) return res.status(404).json({ error: "payment_not_found" });
+    if (req.role !== "employer" && rec.created_by_user_id !== req.userId) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    const updated = await reconcilePaymentRecordFromStripe(rec, { source: "stripe.client_reconcile" });
+    res.json(sanitizePaymentRecord(updated, { employeeSafe: req.role !== "employer" }));
+  } catch (e) {
+    console.error("payment reconcile failed:", {
+      message: e.message,
+      type: e.type,
+      code: e.code,
+      requestId: e.requestId
+    });
+    res.status(500).json({ error: "payment_reconcile_failed", detail: e.message });
   }
 });
 
@@ -11466,24 +11627,58 @@ app.get("/api/payments/:id", authRequired, async (req, res) => {
 // The raw body middleware is registered near the top of the file. Here we
 // verify the signature and update local state to match Stripe's authoritative
 // view of the world.
-app.post("/stripe/webhook", async (req, res) => {
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+function verifyStripeWebhookEvent(req, stripe) {
+  const secrets = [
+    ["STRIPE_WEBHOOK_SECRET", process.env.STRIPE_WEBHOOK_SECRET],
+    ["STRIPE_CONNECT_WEBHOOK_SECRET", process.env.STRIPE_CONNECT_WEBHOOK_SECRET]
+  ].filter(([, value]) => value);
+  if (!secrets.length) {
+    const err = new Error("stripe_webhook_secret_missing");
+    err.statusCode = 503;
+    throw err;
+  }
+  let lastError = null;
+  for (const [name, secret] of secrets) {
+    try {
+      const event = stripe.webhooks.constructEvent(
+        req.body,
+        req.headers["stripe-signature"],
+        secret
+      );
+      return { event, secretName: name };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  const err = new Error(lastError?.message || "invalid_stripe_webhook_signature");
+  err.statusCode = 400;
+  throw err;
+}
+
+async function handleStripeWebhook(req, res) {
   const stripe = getStripe();
-  if (!secret || !stripe) return res.status(503).send("stripe_not_configured");
+  if (!stripe) return res.status(503).send("stripe_not_configured");
 
   let event;
+  let verifiedWith = null;
   try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      req.headers["stripe-signature"],
-      secret
-    );
+    const verified = verifyStripeWebhookEvent(req, stripe);
+    event = verified.event;
+    verifiedWith = verified.secretName;
   } catch (err) {
     console.error("webhook signature failed:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    return res.status(err.statusCode || 400).send(`Webhook Error: ${err.message}`);
   }
 
   const connectedAccountId = event.account || null;
+  console.log("[stripe] webhook received", {
+    event_id: event.id,
+    event_type: event.type,
+    connected_account_id: connectedAccountId,
+    livemode: event.livemode,
+    signature_verified: true,
+    verified_with: verifiedWith
+  });
 
   try {
     // Duplicate protection: check if we've already recorded this stripe_event_id.
@@ -11491,7 +11686,14 @@ app.post("/stripe/webhook", async (req, res) => {
       `SELECT id FROM service_plan_events WHERE stripe_event_id = $1 LIMIT 1`,
       [event.id]
     );
-    if (dupe.rows.length) return res.json({ received: true, duplicate: true });
+    if (dupe.rows.length) {
+      console.log("[stripe] webhook duplicate ignored", {
+        event_id: event.id,
+        event_type: event.type,
+        connected_account_id: connectedAccountId
+      });
+      return res.json({ received: true, duplicate: true });
+    }
 
     async function markServicePlanEvent(planId, contactId, employerId, companyId, type, notes = null) {
       if (!planId) return;
@@ -11557,10 +11759,10 @@ app.post("/stripe/webhook", async (req, res) => {
         const paidRecords = await pool.query(
           `UPDATE payment_records
               SET status = 'succeeded', updated_at = now()
-            WHERE stripe_invoice_id = $1
-               OR stripe_subscription_id = $2
+            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
+              AND ($3::text IS NULL OR stripe_connected_account_id = $3)
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [invoice.id, invoice.subscription || null]
+          [invoice.id, invoice.subscription || null, connectedAccountId]
         );
         for (const rec of paidRecords.rows) {
           await emitAutomationEvent({
@@ -11608,10 +11810,10 @@ app.post("/stripe/webhook", async (req, res) => {
         const failedRecords = await pool.query(
           `UPDATE payment_records
               SET status = 'failed', updated_at = now()
-            WHERE stripe_invoice_id = $1
-               OR stripe_subscription_id = $2
+            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
+              AND ($3::text IS NULL OR stripe_connected_account_id = $3)
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [invoice.id, invoice.subscription || null]
+          [invoice.id, invoice.subscription || null, connectedAccountId]
         );
         for (const rec of failedRecords.rows) {
           await emitAutomationEvent({
@@ -11649,49 +11851,16 @@ app.post("/stripe/webhook", async (req, res) => {
         break;
       }
 
-      case "payment_intent.succeeded": {
-        const pi = event.data.object;
-        const paidRecords = await pool.query(
-          `UPDATE payment_records
-              SET status = 'succeeded', updated_at = now()
-            WHERE stripe_payment_intent_id = $1
-            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [pi.id]
-        );
-        for (const rec of paidRecords.rows) {
-          await emitAutomationEvent({
-            companyId: rec.company_id,
-            eventType: "payment.succeeded",
-            subjectType: "payment",
-            subjectId: rec.id,
-            source: "stripe.webhook",
-            dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
-            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
-          });
-        }
-        break;
-      }
-
+      case "payment_intent.succeeded":
+      case "payment_intent.processing":
       case "payment_intent.payment_failed": {
         const pi = event.data.object;
-        const failedRecords = await pool.query(
-          `UPDATE payment_records
-              SET status = 'failed', updated_at = now()
-            WHERE stripe_payment_intent_id = $1
-            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [pi.id]
-        );
-        for (const rec of failedRecords.rows) {
-          await emitAutomationEvent({
-            companyId: rec.company_id,
-            eventType: "payment.failed",
-            subjectType: "payment",
-            subjectId: rec.id,
-            source: "stripe.webhook",
-            dedupeKey: `payment.failed:${event.id}:${rec.id}`,
-            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
-          });
-        }
+        await applyStripePaymentIntentStatus({
+          paymentIntent: pi,
+          connectedAccountId,
+          source: "stripe.webhook",
+          stripeEventId: event.id
+        });
         break;
       }
 
@@ -11781,7 +11950,10 @@ app.post("/stripe/webhook", async (req, res) => {
     console.error("webhook handling error:", e);
     res.status(500).json({ error: "webhook_handler_failed" });
   }
-});
+}
+
+app.post("/stripe/webhook", handleStripeWebhook);
+app.post("/stripe/connect-webhook", handleStripeWebhook);
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
 
