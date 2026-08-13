@@ -16,7 +16,9 @@ import twilio from "twilio";
 import { calculateStripeConnectReadiness } from "./stripe-connect-status.js";
 import {
   mapStripePaymentIntentStatus,
-  mapStripeSubscriptionStatus as mapStripeSubscriptionStatusValue
+  mapStripeSubscriptionStatus as mapStripeSubscriptionStatusValue,
+  subscriptionBlocksNewStart,
+  subscriptionCanResumePayment
 } from "./stripe-payment-sync.js";
 import {
   installAutomationSystem,
@@ -2441,6 +2443,64 @@ async function reconcileServicePlanFromStripe(plan, { source = "stripe.service_p
     source
   });
   return rows[0] || plan;
+}
+
+async function buildExistingSubscriptionPaymentSheetResponse({ plan, subscription, connectedAccountId, publishableKey, actorUserId }) {
+  const stripe = getStripe();
+  const invoice = subscription.latest_invoice && typeof subscription.latest_invoice === "object"
+    ? subscription.latest_invoice
+    : null;
+  const pi = stripeInvoicePaymentIntent(invoice);
+  if (!subscriptionCanResumePayment(subscription) || !invoice || !pi) return null;
+  const customerId = typeof subscription.customer === "string" ? subscription.customer : subscription.customer?.id;
+  if (!customerId) return null;
+  const ephemeralKey = await stripe.ephemeralKeys.create(
+    { customer: customerId },
+    { apiVersion: STRIPE_MOBILE_EPHEMERAL_KEY_API_VERSION, stripeAccount: connectedAccountId }
+  );
+  const paymentRecord = await pool.query(
+    `UPDATE payment_records
+        SET stripe_customer_id = COALESCE(stripe_customer_id, $4),
+            stripe_invoice_id = COALESCE(stripe_invoice_id, $5),
+            stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, $6),
+            updated_at = now()
+      WHERE service_plan_id = $1
+        AND stripe_subscription_id = $2
+        AND user_id = $3
+      RETURNING *`,
+    [plan.id, subscription.id, plan.user_id, customerId, invoice.id, pi.id]
+  );
+  let rec = paymentRecord.rows[0];
+  if (!rec) {
+    const inserted = await pool.query(
+      `INSERT INTO payment_records (
+         user_id, company_id, created_by_user_id, contact_id, service_plan_id,
+         payment_type, status, amount_cents, currency, description,
+         stripe_connected_account_id, stripe_customer_id, stripe_payment_intent_id,
+         stripe_invoice_id, stripe_subscription_id
+       ) VALUES ($1,$2,$3,$4,$5,'service_plan_first_payment','pending',$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      [
+        plan.user_id, plan.company_id || null, actorUserId || plan.created_by_user_id || null,
+        plan.contact_id, plan.id,
+        plan.price_cents, (plan.currency || "usd").toLowerCase(),
+        `Initial payment for ${plan.plan_name}`,
+        connectedAccountId, customerId, pi.id, invoice.id, subscription.id
+      ]
+    );
+    rec = inserted.rows[0];
+  }
+  return {
+    publishable_key: publishableKey,
+    connected_account_id: connectedAccountId,
+    customer_id: customerId,
+    ephemeral_key_secret: ephemeralKey.secret,
+    payment_intent_client_secret: pi.client_secret,
+    subscription_id: subscription.id,
+    service_plan_id: plan.id,
+    payment_record_id: rec.id,
+    reused_existing_subscription: true
+  };
 }
 
 function serviceIntervalDays(interval, count) {
@@ -11148,6 +11208,64 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
     const connectedAccountId = settings.stripe_account_id;
     const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
     if (!publishableKey) return res.status(503).json({ error: "publishable_key_missing" });
+
+    if (plan.stripe_subscription_id) {
+      const existingConnectedAccountId = plan.stripe_connected_account_id || connectedAccountId;
+      let subscription;
+      try {
+        subscription = await stripe.subscriptions.retrieve(
+          plan.stripe_subscription_id,
+          { expand: ["latest_invoice.payment_intent"] },
+          { stripeAccount: existingConnectedAccountId }
+        );
+      } catch (err) {
+        console.error("[stripe] existing subscription retrieve failed before start", {
+          service_plan_id: plan.id,
+          subscription_id: plan.stripe_subscription_id,
+          connected_account_id: existingConnectedAccountId,
+          message: err.message,
+          type: err.type,
+          code: err.code,
+          requestId: err.requestId
+        });
+        return res.status(409).json({
+          error: "existing_subscription_unavailable",
+          message: "This plan already has a Stripe subscription. Refresh the plan or review it in Stripe before starting another payment."
+        });
+      }
+      await applyStripeSubscriptionStatus({
+        subscription,
+        connectedAccountId: existingConnectedAccountId,
+        servicePlanId: plan.id,
+        source: "stripe.start_existing_subscription_guard"
+      });
+      const resume = await buildExistingSubscriptionPaymentSheetResponse({
+        plan,
+        subscription,
+        connectedAccountId: existingConnectedAccountId,
+        publishableKey,
+        actorUserId: req.userId
+      });
+      console.warn("[stripe] blocked duplicate subscription start", {
+        service_plan_id: plan.id,
+        existing_subscription_id: subscription.id,
+        connected_account_id: existingConnectedAccountId,
+        stripe_subscription_status: subscription.status,
+        returned_existing_payment_intent: Boolean(resume)
+      });
+      if (resume) return res.json(resume);
+      const localStatus = mapStripeSubscriptionStatus(subscription.status) || plan.status;
+      const error = subscriptionBlocksNewStart(subscription.status)
+        ? "stripe_subscription_already_exists"
+        : "stripe_subscription_restart_required";
+      return res.status(409).json({
+        error,
+        message: "This service plan already has a Stripe subscription. Refresh the plan instead of starting another payment.",
+        subscription_id: subscription.id,
+        stripe_subscription_status: subscription.status,
+        status: localStatus
+      });
+    }
 
     // Create or reuse the Stripe customer ON THE CONNECTED ACCOUNT.
     let customerId = plan.stripe_customer_id;

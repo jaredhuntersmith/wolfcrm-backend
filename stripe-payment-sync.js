@@ -36,3 +36,19 @@ export function mapStripePaymentIntentStatus(paymentIntent) {
       return "pending";
   }
 }
+
+export function subscriptionBlocksNewStart(status) {
+  return Boolean(status);
+}
+
+export function subscriptionCanResumePayment(subscription) {
+  const status = subscription && subscription.status;
+  if (!["incomplete", "past_due", "unpaid"].includes(status)) return false;
+  const invoice = subscription.latest_invoice && typeof subscription.latest_invoice === "object"
+    ? subscription.latest_invoice
+    : null;
+  const paymentIntent = invoice?.payment_intent && typeof invoice.payment_intent === "object"
+    ? invoice.payment_intent
+    : null;
+  return Boolean(paymentIntent?.client_secret && paymentIntent.status !== "succeeded" && paymentIntent.status !== "canceled");
+}

@@ -1,7 +1,9 @@
 import assert from "assert";
 import {
   mapStripePaymentIntentStatus,
-  mapStripeSubscriptionStatus
+  mapStripeSubscriptionStatus,
+  subscriptionBlocksNewStart,
+  subscriptionCanResumePayment
 } from "../stripe-payment-sync.js";
 
 function test(name, fn) {
@@ -51,4 +53,43 @@ test("Stripe PaymentIntent failed attempt maps to failed", () => {
 
 test("Stripe PaymentIntent canceled maps to canceled", () => {
   assert.equal(mapStripePaymentIntentStatus({ status: "canceled" }), "canceled");
+});
+
+test("existing active subscription blocks creating another subscription", () => {
+  assert.equal(subscriptionBlocksNewStart("active"), true);
+});
+
+test("existing incomplete subscription blocks duplicate creation and can resume unpaid intent", () => {
+  const subscription = {
+    status: "incomplete",
+    latest_invoice: {
+      payment_intent: {
+        status: "requires_payment_method",
+        client_secret: "pi_test_secret"
+      }
+    }
+  };
+  assert.equal(subscriptionBlocksNewStart(subscription.status), true);
+  assert.equal(subscriptionCanResumePayment(subscription), true);
+});
+
+test("existing past due subscription blocks duplicate creation", () => {
+  assert.equal(subscriptionBlocksNewStart("past_due"), true);
+});
+
+test("existing canceled subscription still requires explicit restart flow", () => {
+  assert.equal(subscriptionBlocksNewStart("canceled"), true);
+});
+
+test("subscription with succeeded payment intent is not resumed through PaymentSheet", () => {
+  const subscription = {
+    status: "active",
+    latest_invoice: {
+      payment_intent: {
+        status: "succeeded",
+        client_secret: "pi_test_secret"
+      }
+    }
+  };
+  assert.equal(subscriptionCanResumePayment(subscription), false);
 });
