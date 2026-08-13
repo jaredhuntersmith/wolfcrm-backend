@@ -7879,6 +7879,364 @@ app.delete("/api/schedule/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_schedule" }); }
 });
 
+// ---------- OPERATIONS: JOB WORKFLOWS ----------
+function defaultWorkflowSections() {
+  return [
+    { id: randomUUID(), title: "Before Starting", instructions: "Confirm scope and document the property before work begins.", items: [
+      { id: randomUUID(), kind: "acknowledgment", label: "Confirm arrival at the correct property", detail: null, required: true, response: null, completed: false, minPhotos: null },
+      { id: randomUUID(), kind: "acknowledgment", label: "Review customer notes and job instructions", detail: null, required: true, response: null, completed: false, minPhotos: null },
+      { id: randomUUID(), kind: "before_photo", label: "Take required before photos", detail: null, required: true, response: null, completed: false, minPhotos: 1 }
+    ] },
+    { id: randomUUID(), title: "Work Checklist", instructions: null, items: [
+      { id: randomUUID(), kind: "checkbox", label: "Complete scheduled service scope", detail: null, required: true, response: null, completed: false, minPhotos: null },
+      { id: randomUUID(), kind: "employee_note", label: "Record employee notes or exceptions", detail: null, required: false, response: null, completed: false, minPhotos: null }
+    ] },
+    { id: randomUUID(), title: "Quality Check", instructions: "Inspect the work before leaving.", items: [
+      { id: randomUUID(), kind: "checkbox", label: "Inspect completed work", detail: null, required: true, response: null, completed: false, minPhotos: null },
+      { id: randomUUID(), kind: "after_photo", label: "Take required after photos", detail: null, required: true, response: null, completed: false, minPhotos: 1 },
+      { id: randomUUID(), kind: "acknowledgment", label: "Confirm tools, hoses, gates, and doors are secured", detail: null, required: true, response: null, completed: false, minPhotos: null }
+    ] },
+    { id: randomUUID(), title: "Customer Completion", instructions: null, items: [
+      { id: randomUUID(), kind: "checkbox", label: "Customer walkthrough completed or unavailable noted", detail: null, required: true, response: null, completed: false, minPhotos: null },
+      { id: randomUUID(), kind: "long_text", label: "Final employee notes", detail: null, required: false, response: null, completed: false, minPhotos: null }
+    ] }
+  ];
+}
+
+async function resolvedWorkflowSections(companyId, job) {
+  const services = Array.isArray(job.services) ? job.services : [];
+  const { rows } = await pool.query(
+    `SELECT sections FROM job_workflow_templates
+     WHERE company_id = $1 AND enabled = true AND archived_at IS NULL
+       AND (scope = 'company_default' OR (scope = 'service_type' AND service_type = ANY($2::text[])))
+     ORDER BY CASE WHEN scope = 'company_default' THEN 0 ELSE 1 END, updated_at ASC`,
+    [companyId, services]
+  );
+  const merged = rows.flatMap((r) => Array.isArray(r.sections) ? r.sections : []);
+  return merged.length ? merged : defaultWorkflowSections();
+}
+
+function workflowMissingRequired(snapshot) {
+  return (Array.isArray(snapshot) ? snapshot : []).flatMap((section) => Array.isArray(section.items) ? section.items : []).filter((item) => {
+    if (!item.required) return false;
+    if (["short_text", "long_text", "employee_note", "customer_signature"].includes(item.kind)) {
+      return !(item.response || "").toString().trim();
+    }
+    return !item.completed;
+  });
+}
+
+function workflowRunPayload(row) {
+  return {
+    id: row.id, job_id: row.job_id, status: row.status,
+    started_at: row.started_at, started_by: row.started_by,
+    completed_at: row.completed_at, completed_by: row.completed_by,
+    override_reason: row.override_reason,
+    snapshot: Array.isArray(row.snapshot) ? row.snapshot : []
+  };
+}
+
+app.post("/api/jobs/:id/workflow/start", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const job = (await client.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
+    if (!job) { await client.query("ROLLBACK"); return res.status(404).json({ error: "job_not_found" }); }
+    const now = new Date();
+    const snapshot = await resolvedWorkflowSections(req.companyId, job);
+    await client.query(`UPDATE schedule_events SET started_at = COALESCE(started_at, $3), started_by = COALESCE(started_by, $4), updated_at = now() WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId, now, req.userId]);
+    const run = (await client.query(
+      `INSERT INTO job_workflow_runs(id, company_id, job_id, status, started_at, started_by, snapshot)
+       VALUES($1, $2, $3, 'in_progress', $4, $5, $6::jsonb)
+       ON CONFLICT(company_id, job_id) DO UPDATE
+         SET started_at = COALESCE(job_workflow_runs.started_at, EXCLUDED.started_at),
+             started_by = COALESCE(job_workflow_runs.started_by, EXCLUDED.started_by),
+             status = CASE WHEN job_workflow_runs.status = 'completed' THEN 'completed' ELSE 'in_progress' END,
+             updated_at = now()
+       RETURNING *`,
+      [randomUUID(), req.companyId, req.params.id, now, req.userId, JSON.stringify(snapshot)]
+    )).rows[0];
+    await emitAutomationEvent({ companyId: req.companyId, eventType: "job.started", subjectType: "job", subjectId: req.params.id, actorUserId: req.userId, source: "job.workflow", dedupeKey: `job.started:${req.params.id}`, payload: { job_id: req.params.id, started_at: now } });
+    await client.query("COMMIT");
+    res.json(workflowRunPayload(run));
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("[operations] workflow start failed:", e);
+    res.status(500).json({ error: "job_workflow_start_failed" });
+  } finally { client.release(); }
+});
+
+app.get("/api/jobs/:id/workflow", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const row = (await pool.query(`SELECT * FROM job_workflow_runs WHERE company_id = $1 AND job_id = $2`, [req.companyId, req.params.id])).rows[0];
+    if (!row) return res.status(404).json({ error: "workflow_not_found" });
+    res.json(workflowRunPayload(row));
+  } catch (e) { console.error(e); res.status(500).json({ error: "job_workflow_load_failed" }); }
+});
+
+app.put("/api/jobs/:id/workflow", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const snapshot = Array.isArray(req.body?.snapshot) ? req.body.snapshot : [];
+  try {
+    const row = (await pool.query(`UPDATE job_workflow_runs SET snapshot = $3::jsonb, updated_at = now() WHERE company_id = $1 AND job_id = $2 AND status <> 'completed' RETURNING *`, [req.companyId, req.params.id, JSON.stringify(snapshot)])).rows[0];
+    if (!row) return res.status(404).json({ error: "workflow_not_found" });
+    res.json(workflowRunPayload(row));
+  } catch (e) { console.error(e); res.status(500).json({ error: "job_workflow_update_failed" }); }
+});
+
+app.post("/api/jobs/:id/workflow/complete", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const snapshot = Array.isArray(req.body?.snapshot) ? req.body.snapshot : [];
+  const overrideReason = (req.body?.override_reason || "").toString().trim() || null;
+  const missing = workflowMissingRequired(snapshot);
+  if (missing.length && !overrideReason) return res.status(422).json({ error: "workflow_required_items_missing", missing });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const job = (await client.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
+    if (!job) { await client.query("ROLLBACK"); return res.status(404).json({ error: "job_not_found" }); }
+    const now = new Date();
+    await client.query(
+      `INSERT INTO job_workflow_runs(id, company_id, job_id, status, started_at, started_by, completed_at, completed_by, override_reason, snapshot)
+       VALUES($1, $2, $3, 'completed', COALESCE($4, now()), $5, $4, $5, $6, $7::jsonb)
+       ON CONFLICT(company_id, job_id) DO UPDATE
+         SET status = 'completed', completed_at = COALESCE(job_workflow_runs.completed_at, EXCLUDED.completed_at),
+             completed_by = COALESCE(job_workflow_runs.completed_by, EXCLUDED.completed_by),
+             override_reason = EXCLUDED.override_reason, snapshot = EXCLUDED.snapshot, updated_at = now()`,
+      [randomUUID(), req.companyId, req.params.id, now, req.userId, overrideReason, JSON.stringify(snapshot)]
+    );
+    const updated = (await client.query(
+      `UPDATE schedule_events SET started_at = COALESCE(started_at, $3), started_by = COALESCE(started_by, $4),
+              finished_at = COALESCE(finished_at, $3), finished_by = COALESCE(finished_by, $4), updated_at = now()
+       WHERE id = $1 AND company_id = $2
+       RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
+                 contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
+                 company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by`,
+      [req.params.id, req.companyId, now, req.userId]
+    )).rows[0];
+    await emitAutomationEvent({ companyId: req.companyId, eventType: "job.completed", subjectType: "job", subjectId: req.params.id, actorUserId: req.userId, source: "job.workflow", dedupeKey: `job.completed:${req.params.id}:${updated.finished_at}`, payload: { job_id: req.params.id, finished_at: updated.finished_at, override: !!overrideReason } });
+    await syncAutomationSchedulesForJob(req.companyId, updated);
+    await client.query("COMMIT");
+    res.json(updated);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("[operations] workflow complete failed:", e);
+    res.status(500).json({ error: "job_workflow_complete_failed" });
+  } finally { client.release(); }
+});
+
+app.get("/api/job-workflow-templates", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT id, name, scope, service_type, enabled, archived_at, sections FROM job_workflow_templates WHERE company_id = $1 AND archived_at IS NULL ORDER BY updated_at DESC`, [req.companyId]);
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "workflow_templates_failed" }); }
+});
+
+app.put("/api/job-workflow-templates/:id", authRequired, requireEmployer, async (req, res) => {
+  const { name, scope, service_type, enabled, sections } = req.body || {};
+  if (!name) return res.status(400).json({ error: "name_required" });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO job_workflow_templates(id, company_id, name, scope, service_type, enabled, sections, created_by)
+       VALUES($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+       ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, scope = EXCLUDED.scope, service_type = EXCLUDED.service_type, enabled = EXCLUDED.enabled, sections = EXCLUDED.sections, updated_at = now()
+       WHERE job_workflow_templates.company_id = $2
+       RETURNING id, name, scope, service_type, enabled, archived_at, sections`,
+      [req.params.id, req.companyId, name, scope || "company_default", service_type || null, toBool(enabled, true), JSON.stringify(Array.isArray(sections) ? sections : []), req.userId]
+    );
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "workflow_template_save_failed" }); }
+});
+
+app.delete("/api/job-workflow-templates/:id", authRequired, requireEmployer, async (req, res) => {
+  try {
+    await pool.query(`UPDATE job_workflow_templates SET archived_at = now(), updated_at = now() WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+    res.status(204).end();
+  } catch (e) { console.error(e); res.status(500).json({ error: "workflow_template_archive_failed" }); }
+});
+
+app.get("/api/jobs/:id/photos", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const allowed = (await pool.query(`SELECT contact_id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
+    if (!allowed) return res.status(404).json({ error: "job_not_found" });
+    const { rows } = await pool.query(`SELECT id, job_id, contact_id, category, caption, object_key, thumbnail_key, uploaded_by, created_at FROM job_photos WHERE company_id = $1 AND job_id = $2 ORDER BY created_at DESC`, [req.companyId, req.params.id]);
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "job_photos_failed" }); }
+});
+
+app.post("/api/jobs/:id/photos", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const { category, caption, object_key, thumbnail_key, workflow_item_id } = req.body || {};
+  if (!object_key) return res.status(400).json({ error: "object_key_required" });
+  try {
+    const job = (await pool.query(`SELECT contact_id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
+    if (!job) return res.status(404).json({ error: "job_not_found" });
+    if (!object_key.toString().startsWith(`${req.companyId}/`)) return res.status(403).json({ error: "media_forbidden" });
+    const { rows } = await pool.query(
+      `INSERT INTO job_photos(id, company_id, job_id, contact_id, category, caption, object_key, thumbnail_key, workflow_item_id, uploaded_by)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING id, job_id, contact_id, category, caption, object_key, thumbnail_key, uploaded_by, created_at`,
+      [randomUUID(), req.companyId, req.params.id, job.contact_id || null, category || "general", caption || null, object_key, thumbnail_key || null, workflow_item_id || null, req.userId]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "job_photo_save_failed" }); }
+});
+
+// ---------- OPERATIONS: EQUIPMENT & MATERIALS ----------
+app.get("/api/operations/inventory/locations", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    await pool.query(`INSERT INTO inventory_locations(id, company_id, name, kind) VALUES($1, $2, 'Shop', 'shop') ON CONFLICT(id) DO NOTHING`, [`${req.companyId}:shop`, req.companyId]);
+    const { rows } = await pool.query(`SELECT id, name, kind, active FROM inventory_locations WHERE company_id = $1 ORDER BY active DESC, name`, [req.companyId]);
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "inventory_locations_failed" }); }
+});
+
+app.get("/api/operations/inventory/items", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const { rows } = await pool.query(`SELECT id, name, item_type, tracking_mode, category, unit, quantity_on_hand::float8 AS quantity_on_hand, reorder_point::float8 AS reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes FROM inventory_items WHERE company_id = $1 ORDER BY updated_at DESC`, [req.companyId]);
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "inventory_items_failed" }); }
+});
+
+app.put("/api/operations/inventory/items/:id", authRequired, requireEmployer, async (req, res) => {
+  const { name, item_type, tracking_mode, category, unit, reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes } = req.body || {};
+  if (!name) return res.status(400).json({ error: "name_required" });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO inventory_items(id, company_id, name, item_type, tracking_mode, category, unit, reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, item_type = EXCLUDED.item_type, tracking_mode = EXCLUDED.tracking_mode, category = EXCLUDED.category, unit = EXCLUDED.unit, reorder_point = EXCLUDED.reorder_point, cost_per_unit_cents = EXCLUDED.cost_per_unit_cents, status = EXCLUDED.status, location_id = EXCLUDED.location_id, assigned_user_id = EXCLUDED.assigned_user_id, notes = EXCLUDED.notes, updated_at = now()
+       WHERE inventory_items.company_id = $2
+       RETURNING id, name, item_type, tracking_mode, category, unit, quantity_on_hand::float8 AS quantity_on_hand, reorder_point::float8 AS reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes`,
+      [req.params.id, req.companyId, name, item_type || "material", tracking_mode || "quantity", category || null, unit || "each", reorder_point ?? null, cost_per_unit_cents ?? null, status || "available", location_id || null, assigned_user_id || null, notes || null]
+    );
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "inventory_item_save_failed" }); }
+});
+
+app.post("/api/operations/inventory/transactions", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const { item_id, transaction_type, quantity, from_location_id, to_location_id, job_id, note } = req.body || {};
+  const qty = Number(quantity);
+  if (!item_id || !transaction_type || !Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: "invalid_inventory_transaction" });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const item = (await client.query(`SELECT * FROM inventory_items WHERE id = $1 AND company_id = $2 FOR UPDATE`, [item_id, req.companyId])).rows[0];
+    if (!item) { await client.query("ROLLBACK"); return res.status(404).json({ error: "item_not_found" }); }
+    let delta = 0;
+    if (["received", "returned", "recount_correction"].includes(transaction_type)) delta = qty;
+    if (["used_on_job", "damaged", "lost", "disposed"].includes(transaction_type)) delta = -qty;
+    if (item.tracking_mode === "quantity" && Number(item.quantity_on_hand) + delta < 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "insufficient_inventory" });
+    }
+    const row = (await client.query(`INSERT INTO inventory_transactions(id, company_id, item_id, transaction_type, quantity, from_location_id, to_location_id, job_id, employee_id, note, cost_snapshot_cents) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id, item_id, transaction_type, quantity::float8 AS quantity, from_location_id, to_location_id, job_id, employee_id, note, cost_snapshot_cents, created_at`, [randomUUID(), req.companyId, item_id, transaction_type, qty, from_location_id || null, to_location_id || null, job_id || null, req.userId, note || null, item.cost_per_unit_cents || null])).rows[0];
+    if (delta !== 0) await client.query(`UPDATE inventory_items SET quantity_on_hand = quantity_on_hand + $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [item_id, req.companyId, delta]);
+    if (job_id && transaction_type === "used_on_job" && item.cost_per_unit_cents) {
+      await client.query(`UPDATE schedule_events SET material_cost_cents = COALESCE(material_cost_cents, 0) + $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [job_id, req.companyId, Math.round(qty * Number(item.cost_per_unit_cents))]);
+    }
+    await client.query("COMMIT");
+    res.status(201).json(row);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("[operations] inventory transaction failed:", e);
+    res.status(500).json({ error: "inventory_transaction_failed" });
+  } finally { client.release(); }
+});
+
+app.get("/api/operations/requests", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const { rows } = await pool.query(`SELECT id, request_type, item_id, item_name, quantity::float8 AS quantity, urgency, explanation, status, requester_id, owner_response, created_at FROM equipment_requests WHERE company_id = $1 AND ($2 = true OR requester_id = $3) ORDER BY CASE urgency WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, created_at ASC`, [req.companyId, req.role === "employer", req.userId]);
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "equipment_requests_failed" }); }
+});
+
+app.post("/api/operations/requests", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const { request_type, item_id, item_name, quantity, urgency, explanation } = req.body || {};
+  if (!request_type || !explanation) return res.status(400).json({ error: "invalid_request" });
+  try {
+    const { rows } = await pool.query(`INSERT INTO equipment_requests(id, company_id, request_type, item_id, item_name, quantity, urgency, explanation, requester_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, request_type, item_id, item_name, quantity::float8 AS quantity, urgency, explanation, status, requester_id, owner_response, created_at`, [randomUUID(), req.companyId, request_type, item_id || null, item_name || null, quantity ?? null, urgency || "normal", explanation, req.userId]);
+    res.status(201).json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "equipment_request_failed" }); }
+});
+
+app.patch("/api/operations/requests/:id", authRequired, requireEmployer, async (req, res) => {
+  const { status, owner_response } = req.body || {};
+  try {
+    const { rows } = await pool.query(`UPDATE equipment_requests SET status = COALESCE($3, status), owner_response = COALESCE($4, owner_response), updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING id, request_type, item_id, item_name, quantity::float8 AS quantity, urgency, explanation, status, requester_id, owner_response, created_at`, [req.params.id, req.companyId, status || null, owner_response || null]);
+    if (!rows[0]) return res.status(404).json({ error: "request_not_found" });
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "equipment_request_update_failed" }); }
+});
+
+// ---------- OPERATIONS: MILEAGE ----------
+app.get("/api/operations/mileage", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    await pool.query(`INSERT INTO mileage_company_settings(company_id) VALUES($1) ON CONFLICT(company_id) DO NOTHING`, [req.companyId]);
+    if (req.role === "employer") await pool.query(`INSERT INTO mileage_employee_settings(company_id, employee_id) SELECT $1, id FROM users WHERE company_id = $1 ON CONFLICT(company_id, employee_id) DO NOTHING`, [req.companyId]);
+    else await pool.query(`INSERT INTO mileage_employee_settings(company_id, employee_id) VALUES($1,$2) ON CONFLICT(company_id, employee_id) DO NOTHING`, [req.companyId, req.userId]);
+    const settings = (await pool.query(`SELECT enabled, default_rate_cents_per_mile FROM mileage_company_settings WHERE company_id = $1`, [req.companyId])).rows[0];
+    const employeeSettings = await pool.query(`SELECT employee_id, enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date::text FROM mileage_employee_settings WHERE company_id = $1 AND ($2 = true OR employee_id = $3) ORDER BY employee_id`, [req.companyId, req.role === "employer", req.userId]);
+    const locations = await pool.query(`SELECT id, name, address, lat, lng, active FROM mileage_company_locations WHERE company_id = $1 ORDER BY active DESC, name`, [req.companyId]);
+    const logs = await pool.query(`SELECT ml.id, ml.employee_id, ml.service_date::text, ml.status, ml.total_miles::float8 AS total_miles, ml.rate_cents_per_mile, ml.reimbursement_cents, COALESCE(jsonb_agg(jsonb_build_object('id', l.id, 'sequence', l.sequence, 'from_label', l.from_label, 'to_label', l.to_label, 'distance_miles', l.distance_miles::float8, 'job_id', l.job_id) ORDER BY l.sequence) FILTER (WHERE l.id IS NOT NULL), '[]'::jsonb) AS legs FROM mileage_daily_logs ml LEFT JOIN mileage_legs l ON l.log_id = ml.id WHERE ml.company_id = $1 AND ($2 = true OR ml.employee_id = $3) GROUP BY ml.id ORDER BY ml.service_date DESC LIMIT 30`, [req.companyId, req.role === "employer", req.userId]);
+    res.json({ settings, employee_settings: employeeSettings.rows, locations: locations.rows, logs: logs.rows });
+  } catch (e) { console.error(e); res.status(500).json({ error: "mileage_load_failed" }); }
+});
+
+app.put("/api/operations/mileage/settings", authRequired, requireEmployer, async (req, res) => {
+  const { enabled, default_rate_cents_per_mile } = req.body || {};
+  try {
+    const { rows } = await pool.query(`INSERT INTO mileage_company_settings(company_id, enabled, default_rate_cents_per_mile) VALUES($1,$2,$3) ON CONFLICT(company_id) DO UPDATE SET enabled = EXCLUDED.enabled, default_rate_cents_per_mile = EXCLUDED.default_rate_cents_per_mile, updated_at = now() RETURNING enabled, default_rate_cents_per_mile`, [req.companyId, toBool(enabled), Number(default_rate_cents_per_mile) || 0]);
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "mileage_settings_failed" }); }
+});
+
+app.put("/api/operations/mileage/employees/:id", authRequired, requireEmployer, async (req, res) => {
+  const { enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date } = req.body || {};
+  try {
+    const { rows } = await pool.query(`INSERT INTO mileage_employee_settings(company_id, employee_id, enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(company_id, employee_id) DO UPDATE SET enabled = EXCLUDED.enabled, rate_cents_per_mile = EXCLUDED.rate_cents_per_mile, start_rule = EXCLUDED.start_rule, end_rule = EXCLUDED.end_rule, start_location_id = EXCLUDED.start_location_id, end_location_id = EXCLUDED.end_location_id, vehicle_type = EXCLUDED.vehicle_type, effective_date = EXCLUDED.effective_date, updated_at = now() RETURNING employee_id, enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date::text`, [req.companyId, req.params.id, toBool(enabled), rate_cents_per_mile ?? null, start_rule || "company_location", end_rule || "last_completed_job", start_location_id || null, end_location_id || null, vehicle_type || "not_specified", effective_date || null]);
+    res.json(rows[0]);
+  } catch (e) { console.error(e); res.status(500).json({ error: "mileage_employee_settings_failed" }); }
+});
+
+app.post("/api/operations/mileage/employees/:id/calculate", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const employeeId = req.role === "employer" ? req.params.id : req.userId;
+  const day = (req.body?.day || new Date().toISOString().slice(0, 10)).toString().slice(0, 10);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const settings = (await client.query(`SELECT mes.*, COALESCE(mes.rate_cents_per_mile, mcs.default_rate_cents_per_mile) AS rate FROM mileage_employee_settings mes JOIN mileage_company_settings mcs ON mcs.company_id = mes.company_id WHERE mes.company_id = $1 AND mes.employee_id = $2`, [req.companyId, employeeId])).rows[0];
+    if (!settings || !settings.enabled || settings.vehicle_type === "company") { await client.query("ROLLBACK"); return res.status(409).json({ error: "mileage_not_enabled" }); }
+    const jobs = (await client.query(`SELECT id, title, start_at, finished_at FROM schedule_events WHERE company_id = $1 AND finished_at IS NOT NULL AND worker_user_ids ? $2::text AND start_at::date = $3::date ORDER BY COALESCE(finished_at, start_at), start_at`, [req.companyId, employeeId, day])).rows;
+    const miles = Math.max(0, jobs.length - 1) * 5;
+    const reimbursement = Math.round(miles * Number(settings.rate || 0));
+    const logId = `${req.companyId}:${employeeId}:${day}`;
+    const log = (await client.query(`INSERT INTO mileage_daily_logs(id, company_id, employee_id, service_date, status, total_miles, rate_cents_per_mile, reimbursement_cents) VALUES($1,$2,$3,$4,'ready_for_review',$5,$6,$7) ON CONFLICT(company_id, employee_id, service_date) DO UPDATE SET status = CASE WHEN mileage_daily_logs.status IN ('approved','paid') THEN mileage_daily_logs.status ELSE 'ready_for_review' END, total_miles = EXCLUDED.total_miles, rate_cents_per_mile = EXCLUDED.rate_cents_per_mile, reimbursement_cents = EXCLUDED.reimbursement_cents, updated_at = now() RETURNING id, employee_id, service_date::text, status, total_miles::float8 AS total_miles, rate_cents_per_mile, reimbursement_cents`, [logId, req.companyId, employeeId, day, miles, Number(settings.rate || 0), reimbursement])).rows[0];
+    await client.query(`DELETE FROM mileage_legs WHERE log_id = $1`, [log.id]);
+    const legs = [];
+    for (let i = 1; i < jobs.length; i += 1) {
+      const row = (await client.query(`INSERT INTO mileage_legs(id, log_id, sequence, from_label, to_label, distance_miles, job_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id, sequence, from_label, to_label, distance_miles::float8 AS distance_miles, job_id`, [randomUUID(), log.id, i, jobs[i - 1].title, jobs[i].title, 5, jobs[i].id])).rows[0];
+      legs.push(row);
+    }
+    await client.query("COMMIT");
+    res.json({ ...log, legs });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("[operations] mileage calculate failed:", e);
+    res.status(500).json({ error: "mileage_calculate_failed" });
+  } finally { client.release(); }
+});
+
 app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
   try {
     const range = statsRange("week", req.query.date);
@@ -8149,15 +8507,15 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
     if (revenueSource.failed) failedSources.push(revenueSource.source);
     const revenueResult = revenueSource.value;
 
-    const [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource] = await Promise.all([
+    const [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource, equipmentRequestsSource, mileageApprovalsSource] = await Promise.all([
       dashboardSource(requestId, "todos", () => pool.query(
-        `SELECT id, title, due_date, completed, updated_at
+        `SELECT id, title, due_date, completed, updated_at, priority
            FROM todo_tasks
-          WHERE user_id = $1
+          WHERE (user_id = $1 OR assignee_ids ? $1::text)
             AND completed = false
             AND due_date IS NOT NULL
             AND due_date < $2
-          ORDER BY due_date ASC
+          ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, due_date ASC
           LIMIT 40`,
         [req.userId, upcomingEnd.toISOString()]
       ), { rows: [] }),
@@ -8166,7 +8524,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3)::int AS total_today,
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3 AND completed = true)::int AS completed_today
            FROM todo_tasks
-          WHERE user_id = $1
+          WHERE (user_id = $1 OR assignee_ids ? $1::text)
             AND due_date IS NOT NULL`,
         [req.userId, todayStart.toISOString(), todayEnd.toISOString()]
       ), { rows: [{ total_today: 0, completed_today: 0 }] }),
@@ -8220,9 +8578,25 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           WHERE user_id = $1
             AND (expires_at IS NULL OR expires_at > now())`,
         [req.userId]
-      ), { rows: [] })
+      ), { rows: [] }),
+      dashboardSource(requestId, "equipment_requests", () => employer && req.companyId ? pool.query(
+        `SELECT id, request_type, item_name, urgency, explanation, status, created_at
+           FROM equipment_requests
+          WHERE company_id = $1 AND status IN ('pending','under_review','approved','ordered','ready')
+          ORDER BY CASE urgency WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, created_at ASC
+          LIMIT 8`,
+        [req.companyId]
+      ) : Promise.resolve({ rows: [] }), { rows: [] }),
+      dashboardSource(requestId, "mileage_approvals", () => employer && req.companyId ? pool.query(
+        `SELECT id, employee_id, service_date, reimbursement_cents, status, updated_at
+           FROM mileage_daily_logs
+          WHERE company_id = $1 AND status IN ('ready_for_review','submitted')
+          ORDER BY service_date ASC
+          LIMIT 8`,
+        [req.companyId]
+      ) : Promise.resolve({ rows: [] }), { rows: [] })
     ]);
-    for (const source of [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource]) {
+    for (const source of [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource, equipmentRequestsSource, mileageApprovalsSource]) {
       if (source.failed) failedSources.push(source.source);
     }
     const tasksResult = tasksSource.value;
@@ -8233,6 +8607,8 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
     const doneResult = doneSource.value;
     const notificationsResult = notificationsSource.value;
     const dismissalsResult = dismissalsSource.value;
+    const equipmentRequestsResult = equipmentRequestsSource.value;
+    const mileageApprovalsResult = mileageApprovalsSource.value;
 
     const items = [];
     const jobsToday = jobsResult.rows.filter((row) => new Date(row.start) >= todayStart && new Date(row.start) < todayEnd);
@@ -8279,6 +8655,48 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
       const due = new Date(row.due_date);
       const section = due < todayStart ? "attention" : due < todayEnd ? "today" : "upcoming";
       items.push(buildDashboardCustomerReminderItem(row, section, section === "attention" ? "high" : "normal"));
+    }
+
+    for (const row of equipmentRequestsResult.rows) {
+      items.push({
+        id: `equipment_request:${row.id}`,
+        type: "equipment_request",
+        source_type: "equipment_request",
+        source_id: String(row.id),
+        fingerprint: String(row.status || row.created_at || ""),
+        section: "attention",
+        priority: row.urgency === "urgent" ? "high" : "normal",
+        title: row.item_name || row.request_type.replaceAll("_", " "),
+        subtitle: row.explanation || "Equipment/material request",
+        amount_cents: null,
+        due_at: row.created_at,
+        system_image: "wrench.and.screwdriver.fill",
+        tint: row.urgency === "urgent" ? "red" : "orange",
+        completable: false,
+        dismissible: true,
+        destination: { type: "equipment_request", id: String(row.id) }
+      });
+    }
+
+    for (const row of mileageApprovalsResult.rows) {
+      items.push({
+        id: `mileage_approval:${row.id}`,
+        type: "mileage_approval",
+        source_type: "mileage_log",
+        source_id: String(row.id),
+        fingerprint: String(row.status || row.updated_at || ""),
+        section: "attention",
+        priority: "normal",
+        title: "Mileage pending review",
+        subtitle: `${row.service_date} · ${dashboardMoney(row.reimbursement_cents || 0)}`,
+        amount_cents: row.reimbursement_cents || null,
+        due_at: row.service_date,
+        system_image: "car.fill",
+        tint: "teal",
+        completable: false,
+        dismissible: true,
+        destination: { type: "mileage", id: String(row.id) }
+      });
     }
 
     const doneKeys = new Set(doneResult.rows.map((row) => `${row.routine_id}:${row.day_key}`));
