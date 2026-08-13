@@ -13,6 +13,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Stripe from "stripe";
 import apn from "@parse/node-apn";
 import twilio from "twilio";
+import { calculateStripeConnectReadiness } from "./stripe-connect-status.js";
 import {
   installAutomationSystem,
   emitAutomationEvent,
@@ -1898,10 +1899,14 @@ async function bootstrap() {
       stripe_payouts_enabled BOOLEAN NOT NULL DEFAULT false,
       stripe_details_submitted BOOLEAN NOT NULL DEFAULT false,
       stripe_default_currency TEXT NOT NULL DEFAULT 'usd',
+      stripe_requirements JSONB NOT NULL DEFAULT '{}'::jsonb,
+      stripe_capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS company_id UUID;
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS stripe_requirements JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS stripe_capabilities JSONB NOT NULL DEFAULT '{}'::jsonb;
     CREATE INDEX IF NOT EXISTS business_settings_user_idx ON business_settings(user_id);
     CREATE INDEX IF NOT EXISTS business_settings_company_idx ON business_settings(company_id);
     CREATE INDEX IF NOT EXISTS business_settings_stripe_account_idx ON business_settings(stripe_account_id);
@@ -2147,8 +2152,76 @@ function sanitizeBusinessSettings(row) {
     stripe_payouts_enabled: row.stripe_payouts_enabled,
     stripe_details_submitted: row.stripe_details_submitted,
     stripe_default_currency: row.stripe_default_currency,
+    stripe_requirements: row.stripe_requirements || {},
+    stripe_capabilities: row.stripe_capabilities || {},
     created_at: row.created_at,
     updated_at: row.updated_at
+  };
+}
+
+async function persistStripeAccountReadiness(userId, account) {
+  const readiness = calculateStripeConnectReadiness(account);
+  const updated = await pool.query(
+    `UPDATE business_settings
+        SET stripe_charges_enabled = $2,
+            stripe_payouts_enabled = $3,
+            stripe_details_submitted = $4,
+            stripe_default_currency = COALESCE($5, stripe_default_currency),
+            stripe_connect_status = $6,
+            stripe_requirements = $7::jsonb,
+            stripe_capabilities = $8::jsonb,
+            updated_at = now()
+      WHERE user_id = $1
+      RETURNING *`,
+    [
+      userId,
+      readiness.stripe_charges_enabled,
+      readiness.stripe_payouts_enabled,
+      readiness.stripe_details_submitted,
+      readiness.stripe_default_currency,
+      readiness.stripe_connect_status,
+      JSON.stringify(readiness.stripe_requirements),
+      JSON.stringify(readiness.stripe_capabilities)
+    ]
+  );
+  return updated.rows[0];
+}
+
+async function persistStripeAccountReadinessByAccountId(account) {
+  const readiness = calculateStripeConnectReadiness(account);
+  await pool.query(
+    `UPDATE business_settings
+        SET stripe_charges_enabled = $2,
+            stripe_payouts_enabled = $3,
+            stripe_details_submitted = $4,
+            stripe_default_currency = COALESCE($5, stripe_default_currency),
+            stripe_connect_status = $6,
+            stripe_requirements = $7::jsonb,
+            stripe_capabilities = $8::jsonb,
+            updated_at = now()
+      WHERE stripe_account_id = $1`,
+    [
+      account.id,
+      readiness.stripe_charges_enabled,
+      readiness.stripe_payouts_enabled,
+      readiness.stripe_details_submitted,
+      readiness.stripe_default_currency,
+      readiness.stripe_connect_status,
+      JSON.stringify(readiness.stripe_requirements),
+      JSON.stringify(readiness.stripe_capabilities)
+    ]
+  );
+}
+
+function stripeChargesBlockedResponse(account) {
+  const readiness = calculateStripeConnectReadiness(account);
+  return {
+    error: readiness.stripe_connect_status === "action_required" ? "stripe_action_required" : "charges_not_enabled",
+    message: readiness.stripe_connect_status === "action_required"
+      ? "Stripe requires additional verification before you can accept payments."
+      : "Stripe is still reviewing your account before payments can be accepted.",
+    stripe_connect_status: readiness.stripe_connect_status,
+    stripe_requirements: readiness.stripe_requirements
   };
 }
 
@@ -10359,29 +10432,8 @@ app.get("/api/payments/connect/status", authRequired, requireEmployer, async (re
     if (settings.stripe_account_id && stripe) {
       try {
         const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
-        const status = acct.details_submitted
-          ? (acct.charges_enabled ? "ready" : "verification_pending")
-          : "setup_incomplete";
-        const updated = await pool.query(
-          `UPDATE business_settings
-              SET stripe_charges_enabled = $2,
-                  stripe_payouts_enabled = $3,
-                  stripe_details_submitted = $4,
-                  stripe_default_currency = COALESCE($5, stripe_default_currency),
-                  stripe_connect_status = $6,
-                  updated_at = now()
-            WHERE user_id = $1
-            RETURNING *`,
-          [
-            req.userId,
-            !!acct.charges_enabled,
-            !!acct.payouts_enabled,
-            !!acct.details_submitted,
-            acct.default_currency || null,
-            status
-          ]
-        );
-        return res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
+        const updated = await persistStripeAccountReadiness(req.userId, acct);
+        return res.json({ settings: sanitizeBusinessSettings(updated) });
       } catch (err) {
         console.error("stripe accounts.retrieve failed:", err.message);
       }
@@ -10467,29 +10519,8 @@ app.post("/api/payments/connect/refresh-status", authRequired, requireEmployer, 
       return res.json({ settings: sanitizeBusinessSettings(settings) });
     }
     const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
-    const status = acct.details_submitted
-      ? (acct.charges_enabled ? "ready" : "verification_pending")
-      : "setup_incomplete";
-    const updated = await pool.query(
-      `UPDATE business_settings
-          SET stripe_charges_enabled = $2,
-              stripe_payouts_enabled = $3,
-              stripe_details_submitted = $4,
-              stripe_default_currency = COALESCE($5, stripe_default_currency),
-              stripe_connect_status = $6,
-              updated_at = now()
-        WHERE user_id = $1
-        RETURNING *`,
-      [
-        req.userId,
-        !!acct.charges_enabled,
-        !!acct.payouts_enabled,
-        !!acct.details_submitted,
-        acct.default_currency || null,
-        status
-      ]
-    );
-    res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
+    const updated = await persistStripeAccountReadiness(req.userId, acct);
+    res.json({ settings: sanitizeBusinessSettings(updated) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "connect_refresh_failed", detail: e.message });
@@ -10863,16 +10894,8 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
     // Confirm the connected account can charge right now.
     const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
     if (!acct.charges_enabled) {
-      await pool.query(
-        `UPDATE business_settings
-            SET stripe_charges_enabled = $2,
-                stripe_payouts_enabled = $3,
-                stripe_details_submitted = $4,
-                updated_at = now()
-          WHERE user_id = $1`,
-        [employerId, !!acct.charges_enabled, !!acct.payouts_enabled, !!acct.details_submitted]
-      );
-      return res.status(400).json({ error: "charges_not_enabled" });
+      await persistStripeAccountReadiness(employerId, acct);
+      return res.status(400).json(stripeChargesBlockedResponse(acct));
     }
 
     const connectedAccountId = settings.stripe_account_id;
@@ -11200,7 +11223,10 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
     const settings = await ensureBusinessSettings(employerId, req.companyId);
     if (!settings.stripe_account_id) return res.status(400).json({ error: "stripe_not_connected" });
     const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
-    if (!acct.charges_enabled) return res.status(400).json({ error: "charges_not_enabled" });
+    if (!acct.charges_enabled) {
+      await persistStripeAccountReadiness(employerId, acct);
+      return res.status(400).json(stripeChargesBlockedResponse(acct));
+    }
 
     const amountInt = parseInt((req.body || {}).amount_cents, 10);
     if (!Number.isFinite(amountInt) || amountInt < 50) return res.status(400).json({ error: "invalid_amount" });
@@ -11413,21 +11439,7 @@ app.post("/stripe/webhook", async (req, res) => {
     switch (event.type) {
       case "account.updated": {
         const acct = event.data.object;
-        await pool.query(
-          `UPDATE business_settings
-              SET stripe_charges_enabled = $2,
-                  stripe_payouts_enabled = $3,
-                  stripe_details_submitted = $4,
-                  stripe_default_currency = COALESCE($5, stripe_default_currency),
-                  stripe_connect_status = CASE
-                    WHEN $4 = false THEN 'setup_incomplete'
-                    WHEN $2 = true THEN 'ready'
-                    ELSE 'verification_pending'
-                  END,
-                  updated_at = now()
-            WHERE stripe_account_id = $1`,
-          [acct.id, !!acct.charges_enabled, !!acct.payouts_enabled, !!acct.details_submitted, acct.default_currency || null]
-        );
+        await persistStripeAccountReadinessByAccountId(acct);
         break;
       }
 
