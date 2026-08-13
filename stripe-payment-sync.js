@@ -52,3 +52,27 @@ export function subscriptionCanResumePayment(subscription) {
     : null;
   return Boolean(paymentIntent?.client_secret && paymentIntent.status !== "succeeded" && paymentIntent.status !== "canceled");
 }
+
+export function stripeSubscriptionCustomerId(subscription) {
+  const customer = subscription && subscription.customer;
+  return typeof customer === "string" ? customer : customer?.id || null;
+}
+
+export function selectRecoverableSubscription(subscriptions, { planId, customerId = null } = {}) {
+  const exactMatches = (subscriptions || []).filter((subscription) => {
+    if (subscription?.metadata?.wolfcrm_plan_id !== planId) return false;
+    if (!customerId) return true;
+    return stripeSubscriptionCustomerId(subscription) === customerId;
+  });
+  const statuses = ["active", "trialing", "past_due", "unpaid", "incomplete"];
+  for (const status of statuses) {
+    const candidates = exactMatches.filter((subscription) => subscription.status === status);
+    if (candidates.length === 1) {
+      return { action: "adopt", subscription: candidates[0], reason: `single_${status}_metadata_match` };
+    }
+    if (status === "active" && candidates.length > 1) {
+      return { action: "conflict", subscriptions: candidates, reason: "multiple_active_metadata_matches" };
+    }
+  }
+  return { action: "none", subscriptions: exactMatches, reason: exactMatches.length ? "no_viable_metadata_match" : "no_metadata_match" };
+}

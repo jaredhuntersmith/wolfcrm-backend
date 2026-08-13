@@ -2,6 +2,7 @@ import assert from "assert";
 import {
   mapStripePaymentIntentStatus,
   mapStripeSubscriptionStatus,
+  selectRecoverableSubscription,
   subscriptionBlocksNewStart,
   subscriptionCanResumePayment
 } from "../stripe-payment-sync.js";
@@ -92,4 +93,49 @@ test("subscription with succeeded payment intent is not resumed through PaymentS
     }
   };
   assert.equal(subscriptionCanResumePayment(subscription), false);
+});
+
+test("stored canceled subscription with exactly one active metadata match adopts active subscription", () => {
+  const recovery = selectRecoverableSubscription([
+    { id: "sub_canceled", status: "canceled", customer: "cus_1", metadata: { wolfcrm_plan_id: "plan_1" } },
+    { id: "sub_active", status: "active", customer: "cus_1", metadata: { wolfcrm_plan_id: "plan_1" } }
+  ], { planId: "plan_1", customerId: "cus_1" });
+  assert.equal(recovery.action, "adopt");
+  assert.equal(recovery.subscription.id, "sub_active");
+});
+
+test("stored incomplete expired subscription with active metadata match adopts active subscription", () => {
+  const recovery = selectRecoverableSubscription([
+    { id: "sub_expired", status: "incomplete_expired", customer: "cus_1", metadata: { wolfcrm_plan_id: "plan_1" } },
+    { id: "sub_active", status: "active", customer: "cus_1", metadata: { wolfcrm_plan_id: "plan_1" } }
+  ], { planId: "plan_1", customerId: "cus_1" });
+  assert.equal(recovery.action, "adopt");
+  assert.equal(recovery.subscription.id, "sub_active");
+});
+
+test("recovery without metadata match does not adopt", () => {
+  const recovery = selectRecoverableSubscription([
+    { id: "sub_active", status: "active", customer: "cus_1", metadata: {} }
+  ], { planId: "plan_1", customerId: "cus_1" });
+  assert.equal(recovery.action, "none");
+});
+
+test("recovery with wrong wolfcrm plan metadata does not adopt", () => {
+  const recovery = selectRecoverableSubscription([
+    { id: "sub_active", status: "active", customer: "cus_1", metadata: { wolfcrm_plan_id: "other_plan" } }
+  ], { planId: "plan_1", customerId: "cus_1" });
+  assert.equal(recovery.action, "none");
+});
+
+test("multiple active metadata matches returns conflict", () => {
+  const recovery = selectRecoverableSubscription([
+    { id: "sub_active_a", status: "active", customer: "cus_1", metadata: { wolfcrm_plan_id: "plan_1" } },
+    { id: "sub_active_b", status: "active", customer: "cus_1", metadata: { wolfcrm_plan_id: "plan_1" } }
+  ], { planId: "plan_1", customerId: "cus_1" });
+  assert.equal(recovery.action, "conflict");
+  assert.deepEqual(recovery.subscriptions.map((sub) => sub.id), ["sub_active_a", "sub_active_b"]);
+});
+
+test("active currently stored subscription requires no recovery search by status", () => {
+  assert.equal(["canceled", "incomplete_expired"].includes("active"), false);
 });

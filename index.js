@@ -17,8 +17,10 @@ import { calculateStripeConnectReadiness } from "./stripe-connect-status.js";
 import {
   mapStripePaymentIntentStatus,
   mapStripeSubscriptionStatus as mapStripeSubscriptionStatusValue,
+  selectRecoverableSubscription,
   subscriptionBlocksNewStart,
-  subscriptionCanResumePayment
+  subscriptionCanResumePayment,
+  stripeSubscriptionCustomerId
 } from "./stripe-payment-sync.js";
 import {
   installAutomationSystem,
@@ -2431,11 +2433,14 @@ async function reconcileServicePlanFromStripe(plan, { source = "stripe.service_p
   if (!stripe) throw new Error("stripe_not_configured");
   if (!plan || !plan.stripe_subscription_id) throw new Error("stripe_subscription_missing");
   if (!plan.stripe_connected_account_id) throw new Error("stripe_connected_account_missing");
-  const subscription = await stripe.subscriptions.retrieve(
+  let subscription = await stripe.subscriptions.retrieve(
     plan.stripe_subscription_id,
     { expand: ["latest_invoice.payment_intent"] },
     { stripeAccount: plan.stripe_connected_account_id }
   );
+  if (["canceled", "incomplete_expired"].includes(subscription.status)) {
+    subscription = await recoverServicePlanSubscriptionFromStripe(plan, subscription, { source });
+  }
   const rows = await applyStripeSubscriptionStatus({
     subscription,
     connectedAccountId: plan.stripe_connected_account_id,
@@ -2443,6 +2448,99 @@ async function reconcileServicePlanFromStripe(plan, { source = "stripe.service_p
     source
   });
   return rows[0] || plan;
+}
+
+async function recoverServicePlanSubscriptionFromStripe(plan, storedSubscription, { source = "stripe.service_plan_recover" } = {}) {
+  const stripe = getStripe();
+  if (!plan.stripe_customer_id) {
+    console.warn("[stripe] subscription recovery skipped without customer", {
+      source,
+      service_plan_id: plan.id,
+      stored_subscription_id: storedSubscription.id,
+      stored_subscription_status: storedSubscription.status
+    });
+    return storedSubscription;
+  }
+  const listed = await stripe.subscriptions.list(
+    {
+      customer: plan.stripe_customer_id,
+      status: "all",
+      limit: 100,
+      expand: ["data.latest_invoice.payment_intent"]
+    },
+    { stripeAccount: plan.stripe_connected_account_id }
+  );
+  const recovery = selectRecoverableSubscription(listed.data || [], {
+    planId: plan.id,
+    customerId: plan.stripe_customer_id
+  });
+  if (recovery.action === "conflict") {
+    const err = new Error("multiple_active_matching_subscriptions");
+    err.statusCode = 409;
+    err.subscriptionIds = recovery.subscriptions.map((subscription) => subscription.id);
+    console.warn("[stripe] subscription recovery conflict", {
+      source,
+      service_plan_id: plan.id,
+      customer_id: plan.stripe_customer_id,
+      connected_account_id: plan.stripe_connected_account_id,
+      stored_subscription_id: storedSubscription.id,
+      matching_subscription_ids: err.subscriptionIds
+    });
+    throw err;
+  }
+  if (recovery.action !== "adopt") {
+    console.warn("[stripe] subscription recovery found no viable match", {
+      source,
+      service_plan_id: plan.id,
+      customer_id: plan.stripe_customer_id,
+      connected_account_id: plan.stripe_connected_account_id,
+      stored_subscription_id: storedSubscription.id,
+      stored_subscription_status: storedSubscription.status,
+      reason: recovery.reason
+    });
+    return storedSubscription;
+  }
+  const recovered = recovery.subscription;
+  const invoice = recovered.latest_invoice && typeof recovered.latest_invoice === "object"
+    ? recovered.latest_invoice
+    : null;
+  const pi = stripeInvoicePaymentIntent(invoice);
+  const customerId = stripeSubscriptionCustomerId(recovered) || plan.stripe_customer_id;
+  await pool.query(
+    `UPDATE service_plans
+        SET stripe_subscription_id = $2,
+            stripe_subscription_status = $3,
+            stripe_customer_id = COALESCE($4, stripe_customer_id),
+            stripe_latest_invoice_id = COALESCE($5, stripe_latest_invoice_id),
+            stripe_payment_intent_id = COALESCE($6, stripe_payment_intent_id),
+            updated_at = now()
+      WHERE id = $1`,
+    [plan.id, recovered.id, recovered.status, customerId, invoice?.id || null, pi?.id || null]
+  );
+  await pool.query(
+    `INSERT INTO service_plan_events (user_id, company_id, service_plan_id, contact_id, event_type, notes)
+     VALUES ($1,$2,$3,$4,'stripe_subscription_recovered',$5)
+     ON CONFLICT DO NOTHING`,
+    [
+      plan.user_id,
+      plan.company_id || null,
+      plan.id,
+      plan.contact_id || null,
+      `Recovered Stripe subscription ${recovered.id} (${recovered.status}) from stored subscription ${storedSubscription.id} (${storedSubscription.status})`
+    ]
+  );
+  console.warn("[stripe] subscription recovered from metadata", {
+    source,
+    service_plan_id: plan.id,
+    customer_id: customerId,
+    connected_account_id: plan.stripe_connected_account_id,
+    previous_subscription_id: storedSubscription.id,
+    previous_subscription_status: storedSubscription.status,
+    recovered_subscription_id: recovered.id,
+    recovered_subscription_status: recovered.status,
+    metadata_plan_id: recovered.metadata?.wolfcrm_plan_id || null
+  });
+  return recovered;
 }
 
 async function buildExistingSubscriptionPaymentSheetResponse({ plan, subscription, connectedAccountId, publishableKey, actorUserId }) {
@@ -10974,6 +11072,13 @@ app.post("/api/service-plans/:id/reconcile", authRequired, async (req, res) => {
       code: e.code,
       requestId: e.requestId
     });
+    if (e.statusCode === 409) {
+      return res.status(409).json({
+        error: e.message,
+        subscription_ids: e.subscriptionIds || [],
+        message: "Multiple active Stripe subscriptions match this WolfCRM plan. Review them in Stripe before adopting one."
+      });
+    }
     res.status(500).json({ error: "service_plan_reconcile_failed", detail: e.message });
   }
 });
