@@ -1269,6 +1269,19 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS job_workflow_templates_company_idx ON job_workflow_templates(company_id, archived_at, enabled);
 
+    CREATE TABLE IF NOT EXISTS job_workflow_job_additions (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      job_id TEXT NOT NULL REFERENCES schedule_events(id) ON DELETE CASCADE,
+      sections JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, job_id)
+    );
+    CREATE INDEX IF NOT EXISTS job_workflow_job_additions_job_idx ON job_workflow_job_additions(company_id, job_id);
+
     CREATE TABLE IF NOT EXISTS job_workflow_runs (
       id TEXT PRIMARY KEY,
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -8005,7 +8018,13 @@ async function resolvedWorkflowSections(companyId, job) {
     [companyId, services]
   );
   const merged = rows.flatMap((r) => Array.isArray(r.sections) ? r.sections : []);
-  return merged.length ? merged : defaultWorkflowSections();
+  const base = merged.length ? merged : defaultWorkflowSections();
+  const additions = (await pool.query(
+    `SELECT sections FROM job_workflow_job_additions WHERE company_id = $1 AND job_id = $2`,
+    [companyId, job.id]
+  )).rows[0];
+  const jobSections = additions && Array.isArray(additions.sections) ? additions.sections : [];
+  return jobSections.length ? base.concat(jobSections) : base;
 }
 
 function workflowMissingRequired(snapshot) {
@@ -8147,6 +8166,36 @@ app.delete("/api/job-workflow-templates/:id", authRequired, requireEmployer, asy
     await pool.query(`UPDATE job_workflow_templates SET archived_at = now(), updated_at = now() WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "workflow_template_archive_failed" }); }
+});
+
+app.get("/api/jobs/:id/workflow/additions", authRequired, requireEmployer, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const job = (await pool.query(`SELECT id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
+    if (!job) return res.status(404).json({ error: "job_not_found" });
+    const row = (await pool.query(`SELECT sections FROM job_workflow_job_additions WHERE company_id = $1 AND job_id = $2`, [req.companyId, req.params.id])).rows[0];
+    res.json({ sections: row && Array.isArray(row.sections) ? row.sections : [] });
+  } catch (e) { console.error(e); res.status(500).json({ error: "workflow_job_additions_failed" }); }
+});
+
+app.put("/api/jobs/:id/workflow/additions", authRequired, requireEmployer, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const sections = Array.isArray(req.body && req.body.sections) ? req.body.sections : [];
+  try {
+    const job = (await pool.query(`SELECT id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
+    if (!job) return res.status(404).json({ error: "job_not_found" });
+    const running = (await pool.query(`SELECT status FROM job_workflow_runs WHERE company_id = $1 AND job_id = $2`, [req.companyId, req.params.id])).rows[0];
+    if (running && running.status === "completed") return res.status(409).json({ error: "workflow_completed" });
+    const { rows } = await pool.query(
+      `INSERT INTO job_workflow_job_additions(id, company_id, job_id, sections, created_by, updated_by)
+       VALUES($1, $2, $3, $4::jsonb, $5, $5)
+       ON CONFLICT(company_id, job_id) DO UPDATE
+         SET sections = EXCLUDED.sections, updated_by = EXCLUDED.updated_by, updated_at = now()
+       RETURNING sections`,
+      [randomUUID(), req.companyId, req.params.id, JSON.stringify(sections), req.userId]
+    );
+    res.json({ sections: Array.isArray(rows[0].sections) ? rows[0].sections : [] });
+  } catch (e) { console.error(e); res.status(500).json({ error: "workflow_job_additions_save_failed" }); }
 });
 
 app.get("/api/jobs/:id/photos", authRequired, async (req, res) => {
@@ -8503,6 +8552,33 @@ app.post("/api/operations/mileage/logs/:id/review", authRequired, requireEmploye
     const legs = (await pool.query(`SELECT id, sequence, from_label, to_label, distance_miles::float8 AS distance_miles, duration_seconds::float8 AS duration_seconds, job_id, manual_trip_id, calculation_status, error_message FROM mileage_legs WHERE log_id = $1 ORDER BY sequence`, [req.params.id])).rows;
     res.json({ ...rows[0], legs });
   } catch (e) { console.error("[operations] mileage log review failed:", e); res.status(500).json({ error: "mileage_log_review_failed" }); }
+});
+
+app.post("/api/operations/mileage/logs/:id/problem", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const kind = cleanString(req.body?.kind, 80) || "other";
+  const explanation = cleanString(req.body?.explanation, 1500);
+  if (!explanation) return res.status(400).json({ error: "explanation_required" });
+  try {
+    const existing = (await pool.query(`SELECT employee_id, status, employee_notes FROM mileage_daily_logs WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
+    if (!existing) return res.status(404).json({ error: "mileage_log_not_found" });
+    if (req.role !== "employer" && existing.employee_id !== req.userId) return res.status(403).json({ error: "not_allowed" });
+    const prefix = `[${new Date().toISOString()}] ${kind}: ${explanation}`;
+    const previous = cleanString(existing.employee_notes, 3000);
+    const note = previous ? `${previous}\n${prefix}` : prefix;
+    const nextStatus = ["approved", "paid"].includes(existing.status) ? existing.status : "ready_for_review";
+    const { rows } = await pool.query(
+      `UPDATE mileage_daily_logs
+          SET employee_notes = $3, status = $4, updated_at = now()
+        WHERE id = $1 AND company_id = $2
+        RETURNING id, employee_id, service_date::text, status, start_rule, end_rule, start_label, start_lat, start_lng,
+          end_label, end_lat, end_lng, job_order_estimated, total_miles::float8 AS total_miles, rate_cents_per_mile,
+          reimbursement_cents, employee_notes, owner_notes, reviewed_by, reviewed_at, paid_at`,
+      [req.params.id, req.companyId, note, nextStatus]
+    );
+    const legs = (await pool.query(`SELECT id, sequence, from_label, to_label, distance_miles::float8 AS distance_miles, duration_seconds::float8 AS duration_seconds, job_id, manual_trip_id, calculation_status, error_message FROM mileage_legs WHERE log_id = $1 ORDER BY sequence`, [req.params.id])).rows;
+    res.json({ ...rows[0], legs });
+  } catch (e) { console.error("[operations] mileage problem failed:", e); res.status(500).json({ error: "mileage_problem_failed" }); }
 });
 
 app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
