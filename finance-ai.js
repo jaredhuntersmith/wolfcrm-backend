@@ -757,9 +757,14 @@ function buildDeterministicSpendingFallback(successfulToolResults, userMessage =
   }
 
   if (categoryGroups.length) {
+    const lines = [`Your posted expenses for ${period} were concentrated in these categories:`, "", ...formatSpendingList(categoryGroups, 10)];
+    if (merchantGroups.length) {
+      lines.push("", "Top merchants from the same period:", ...merchantGroups.slice(0, 5).map((group) => `- ${group.label} - ${dollars(group.posted_cents || group.total_cents)} (${group.transaction_count} transaction${group.transaction_count === 1 ? "" : "s"})`));
+    }
+    lines.push("", "Based on common budgeting heuristics, categories like dining and subscriptions may be more discretionary than fixed obligations when labels are clear.");
     return {
       type: "spending_categories",
-      text: [`Your posted expenses for ${period} were concentrated in these categories:`, "", ...formatSpendingList(categoryGroups, 10)].join("\n")
+      text: lines.join("\n")
     };
   }
 
@@ -3301,7 +3306,8 @@ function extractGoalActionFields(message) {
   if (named?.[1]) fields.name = titleCaseWords(named[1]);
   else if (/\bxbox savings\b/i.test(text)) fields.name = "Xbox Savings";
   else if (/\bemergency fund\b/i.test(text)) fields.name = "Emergency Fund";
-  const target = parseMoneyText(text);
+  const targetText = text.replace(/\b(nothing|none|zero|0)\s+saved(?:\s+yet)?\b/ig, " ");
+  const target = parseMoneyText(targetText);
   if (target !== null && target > 0) fields.target_amount_cents = target;
   const date = parseNaturalDateText(text);
   if (date) fields.target_date = date;

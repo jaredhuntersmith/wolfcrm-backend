@@ -1,4 +1,5 @@
 /* WolfCRM backend — email/password auth + user-scoped CRM data */
+/* Railway deploy smoke-test touch: 2026-08-12 */
 import express from "express";
 import cors from "cors";
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from "crypto";
@@ -1342,10 +1343,13 @@ async function bootstrap() {
       employee_id UUID REFERENCES users(id) ON DELETE SET NULL,
       note TEXT,
       cost_snapshot_cents INTEGER,
+      idempotency_key TEXT,
+      reverses_transaction_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS inventory_transactions_item_idx ON inventory_transactions(company_id, item_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS inventory_transactions_job_idx ON inventory_transactions(company_id, job_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_idempotency_idx ON inventory_transactions(company_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS equipment_requests (
       id TEXT PRIMARY KEY,
@@ -1404,9 +1408,23 @@ async function bootstrap() {
       employee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       service_date DATE NOT NULL,
       status TEXT NOT NULL DEFAULT 'draft',
+      start_rule TEXT,
+      end_rule TEXT,
+      start_label TEXT,
+      start_lat DOUBLE PRECISION,
+      start_lng DOUBLE PRECISION,
+      end_label TEXT,
+      end_lat DOUBLE PRECISION,
+      end_lng DOUBLE PRECISION,
+      job_order_estimated BOOLEAN NOT NULL DEFAULT false,
       total_miles NUMERIC NOT NULL DEFAULT 0,
       rate_cents_per_mile INTEGER NOT NULL DEFAULT 0,
       reimbursement_cents INTEGER NOT NULL DEFAULT 0,
+      employee_notes TEXT,
+      owner_notes TEXT,
+      reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      reviewed_at TIMESTAMPTZ,
+      paid_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(company_id, employee_id, service_date)
@@ -1419,8 +1437,58 @@ async function bootstrap() {
       from_label TEXT NOT NULL,
       to_label TEXT NOT NULL,
       distance_miles NUMERIC NOT NULL DEFAULT 0,
-      job_id TEXT
+      duration_seconds NUMERIC,
+      job_id TEXT,
+      manual_trip_id TEXT,
+      calculation_status TEXT NOT NULL DEFAULT 'calculated',
+      error_message TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS mileage_address_proposals (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      employee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL DEFAULT 'start',
+      label TEXT,
+      address TEXT NOT NULL,
+      lat DOUBLE PRECISION,
+      lng DOUBLE PRECISION,
+      explanation TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      reviewed_at TIMESTAMPTZ,
+      review_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS mileage_address_proposals_company_idx ON mileage_address_proposals(company_id, status, created_at);
+
+    CREATE TABLE IF NOT EXISTS mileage_manual_trips (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      employee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      service_date DATE NOT NULL,
+      purpose TEXT NOT NULL,
+      notes TEXT,
+      from_label TEXT NOT NULL,
+      from_address TEXT,
+      from_lat DOUBLE PRECISION NOT NULL,
+      from_lng DOUBLE PRECISION NOT NULL,
+      to_label TEXT NOT NULL,
+      to_address TEXT,
+      to_lat DOUBLE PRECISION NOT NULL,
+      to_lng DOUBLE PRECISION NOT NULL,
+      distance_miles NUMERIC,
+      duration_seconds NUMERIC,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      reviewed_at TIMESTAMPTZ,
+      review_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS mileage_manual_trips_company_idx ON mileage_manual_trips(company_id, employee_id, service_date);
 
     CREATE TABLE IF NOT EXISTS time_clock_settings (
       company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
@@ -1593,6 +1661,27 @@ async function bootstrap() {
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS finished_by UUID;
 
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS start_rule TEXT;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS end_rule TEXT;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS start_label TEXT;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS start_lat DOUBLE PRECISION;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS start_lng DOUBLE PRECISION;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS end_label TEXT;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS end_lat DOUBLE PRECISION;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS end_lng DOUBLE PRECISION;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS job_order_estimated BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS employee_notes TEXT;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS owner_notes TEXT;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+    ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+    ALTER TABLE mileage_legs ADD COLUMN IF NOT EXISTS duration_seconds NUMERIC;
+    ALTER TABLE mileage_legs ADD COLUMN IF NOT EXISTS manual_trip_id TEXT;
+    ALTER TABLE mileage_legs ADD COLUMN IF NOT EXISTS calculation_status TEXT NOT NULL DEFAULT 'calculated';
+    ALTER TABLE mileage_legs ADD COLUMN IF NOT EXISTS error_message TEXT;
+    ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+    ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS reverses_transaction_id TEXT;
+
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS detail TEXT;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS creator_id UUID;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS assignee_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
@@ -1603,6 +1692,7 @@ async function bootstrap() {
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_equipment_id TEXT;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS completed_by UUID;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS completion_note TEXT;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS completion_note_required BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE map_pins ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
     ALTER TABLE measurements ADD COLUMN IF NOT EXISTS linked_contact_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE measurements ADD COLUMN IF NOT EXISTS units TEXT NOT NULL DEFAULT 'feet';
@@ -1612,6 +1702,7 @@ async function bootstrap() {
   // Ensure user_id column exists
   await pool.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS user_id UUID;`);
   await pool.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS company_id UUID;`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_idempotency_idx ON inventory_transactions(company_id, idempotency_key) WHERE idempotency_key IS NOT NULL;`);
 
   // Ensure owner user exists (from env) and backfill any NULL user_id rows to this owner
   const ownerEmail = (process.env.OWNER_EMAIL || "").trim().toLowerCase();
@@ -8121,12 +8212,20 @@ app.put("/api/operations/inventory/items/:id", authRequired, requireEmployer, as
 
 app.post("/api/operations/inventory/transactions", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const { item_id, transaction_type, quantity, from_location_id, to_location_id, job_id, note } = req.body || {};
+  const { item_id, transaction_type, quantity, from_location_id, to_location_id, job_id, note, idempotency_key, reverses_transaction_id } = req.body || {};
   const qty = Number(quantity);
   if (!item_id || !transaction_type || !Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: "invalid_inventory_transaction" });
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const idempotencyKey = cleanString(idempotency_key, 160) || null;
+    if (idempotencyKey) {
+      const existing = (await client.query(`SELECT id, item_id, transaction_type, quantity::float8 AS quantity, from_location_id, to_location_id, job_id, employee_id, note, cost_snapshot_cents, created_at FROM inventory_transactions WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1`, [req.companyId, idempotencyKey])).rows[0];
+      if (existing) {
+        await client.query("COMMIT");
+        return res.json(existing);
+      }
+    }
     const item = (await client.query(`SELECT * FROM inventory_items WHERE id = $1 AND company_id = $2 FOR UPDATE`, [item_id, req.companyId])).rows[0];
     if (!item) { await client.query("ROLLBACK"); return res.status(404).json({ error: "item_not_found" }); }
     let delta = 0;
@@ -8136,7 +8235,7 @@ app.post("/api/operations/inventory/transactions", authRequired, async (req, res
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "insufficient_inventory" });
     }
-    const row = (await client.query(`INSERT INTO inventory_transactions(id, company_id, item_id, transaction_type, quantity, from_location_id, to_location_id, job_id, employee_id, note, cost_snapshot_cents) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id, item_id, transaction_type, quantity::float8 AS quantity, from_location_id, to_location_id, job_id, employee_id, note, cost_snapshot_cents, created_at`, [randomUUID(), req.companyId, item_id, transaction_type, qty, from_location_id || null, to_location_id || null, job_id || null, req.userId, note || null, item.cost_per_unit_cents || null])).rows[0];
+    const row = (await client.query(`INSERT INTO inventory_transactions(id, company_id, item_id, transaction_type, quantity, from_location_id, to_location_id, job_id, employee_id, note, cost_snapshot_cents, idempotency_key, reverses_transaction_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id, item_id, transaction_type, quantity::float8 AS quantity, from_location_id, to_location_id, job_id, employee_id, note, cost_snapshot_cents, created_at`, [randomUUID(), req.companyId, item_id, transaction_type, qty, from_location_id || null, to_location_id || null, job_id || null, req.userId, note || null, item.cost_per_unit_cents || null, idempotencyKey, reverses_transaction_id || null])).rows[0];
     if (delta !== 0) await client.query(`UPDATE inventory_items SET quantity_on_hand = quantity_on_hand + $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [item_id, req.companyId, delta]);
     if (job_id && transaction_type === "used_on_job" && item.cost_per_unit_cents) {
       await client.query(`UPDATE schedule_events SET material_cost_cents = COALESCE(material_cost_cents, 0) + $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [job_id, req.companyId, Math.round(qty * Number(item.cost_per_unit_cents))]);
@@ -8187,8 +8286,29 @@ app.get("/api/operations/mileage", authRequired, async (req, res) => {
     const settings = (await pool.query(`SELECT enabled, default_rate_cents_per_mile FROM mileage_company_settings WHERE company_id = $1`, [req.companyId])).rows[0];
     const employeeSettings = await pool.query(`SELECT employee_id, enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date::text FROM mileage_employee_settings WHERE company_id = $1 AND ($2 = true OR employee_id = $3) ORDER BY employee_id`, [req.companyId, req.role === "employer", req.userId]);
     const locations = await pool.query(`SELECT id, name, address, lat, lng, active FROM mileage_company_locations WHERE company_id = $1 ORDER BY active DESC, name`, [req.companyId]);
-    const logs = await pool.query(`SELECT ml.id, ml.employee_id, ml.service_date::text, ml.status, ml.total_miles::float8 AS total_miles, ml.rate_cents_per_mile, ml.reimbursement_cents, COALESCE(jsonb_agg(jsonb_build_object('id', l.id, 'sequence', l.sequence, 'from_label', l.from_label, 'to_label', l.to_label, 'distance_miles', l.distance_miles::float8, 'job_id', l.job_id) ORDER BY l.sequence) FILTER (WHERE l.id IS NOT NULL), '[]'::jsonb) AS legs FROM mileage_daily_logs ml LEFT JOIN mileage_legs l ON l.log_id = ml.id WHERE ml.company_id = $1 AND ($2 = true OR ml.employee_id = $3) GROUP BY ml.id ORDER BY ml.service_date DESC LIMIT 30`, [req.companyId, req.role === "employer", req.userId]);
-    res.json({ settings, employee_settings: employeeSettings.rows, locations: locations.rows, logs: logs.rows });
+    const logs = await pool.query(`SELECT ml.id, ml.employee_id, ml.service_date::text, ml.status,
+         ml.start_rule, ml.end_rule, ml.start_label, ml.start_lat, ml.start_lng, ml.end_label, ml.end_lat, ml.end_lng,
+         ml.job_order_estimated, ml.total_miles::float8 AS total_miles, ml.rate_cents_per_mile, ml.reimbursement_cents,
+         ml.employee_notes, ml.owner_notes, ml.reviewed_by, ml.reviewed_at, ml.paid_at,
+         COALESCE(jsonb_agg(jsonb_build_object('id', l.id, 'sequence', l.sequence, 'from_label', l.from_label, 'to_label', l.to_label,
+           'distance_miles', l.distance_miles::float8, 'duration_seconds', l.duration_seconds::float8, 'job_id', l.job_id,
+           'manual_trip_id', l.manual_trip_id, 'calculation_status', l.calculation_status, 'error_message', l.error_message) ORDER BY l.sequence) FILTER (WHERE l.id IS NOT NULL), '[]'::jsonb) AS legs
+       FROM mileage_daily_logs ml
+       LEFT JOIN mileage_legs l ON l.log_id = ml.id
+      WHERE ml.company_id = $1 AND ($2 = true OR ml.employee_id = $3)
+      GROUP BY ml.id
+      ORDER BY ml.service_date DESC LIMIT 60`, [req.companyId, req.role === "employer", req.userId]);
+    const proposals = await pool.query(`SELECT id, employee_id, kind, label, address, lat, lng, explanation, status, reviewed_by, reviewed_at, review_note, created_at
+       FROM mileage_address_proposals
+      WHERE company_id = $1 AND ($2 = true OR employee_id = $3)
+      ORDER BY created_at DESC LIMIT 50`, [req.companyId, req.role === "employer", req.userId]);
+    const manualTrips = await pool.query(`SELECT id, employee_id, service_date::text, purpose, notes, from_label, from_address, from_lat, from_lng,
+         to_label, to_address, to_lat, to_lng, distance_miles::float8 AS distance_miles, duration_seconds::float8 AS duration_seconds,
+         status, created_by, reviewed_by, reviewed_at, review_note, created_at
+       FROM mileage_manual_trips
+      WHERE company_id = $1 AND ($2 = true OR employee_id = $3)
+      ORDER BY service_date DESC, created_at DESC LIMIT 60`, [req.companyId, req.role === "employer", req.userId]);
+    res.json({ settings, employee_settings: employeeSettings.rows, locations: locations.rows, logs: logs.rows, address_proposals: proposals.rows, manual_trips: manualTrips.rows });
   } catch (e) { console.error(e); res.status(500).json({ error: "mileage_load_failed" }); }
 });
 
@@ -8217,15 +8337,59 @@ app.post("/api/operations/mileage/employees/:id/calculate", authRequired, async 
     await client.query("BEGIN");
     const settings = (await client.query(`SELECT mes.*, COALESCE(mes.rate_cents_per_mile, mcs.default_rate_cents_per_mile) AS rate FROM mileage_employee_settings mes JOIN mileage_company_settings mcs ON mcs.company_id = mes.company_id WHERE mes.company_id = $1 AND mes.employee_id = $2`, [req.companyId, employeeId])).rows[0];
     if (!settings || !settings.enabled || settings.vehicle_type === "company") { await client.query("ROLLBACK"); return res.status(409).json({ error: "mileage_not_enabled" }); }
-    const jobs = (await client.query(`SELECT id, title, start_at, finished_at FROM schedule_events WHERE company_id = $1 AND finished_at IS NOT NULL AND worker_user_ids ? $2::text AND start_at::date = $3::date ORDER BY COALESCE(finished_at, start_at), start_at`, [req.companyId, employeeId, day])).rows;
-    const miles = Math.max(0, jobs.length - 1) * 5;
+    const existing = (await client.query(`SELECT status FROM mileage_daily_logs WHERE company_id = $1 AND employee_id = $2 AND service_date = $3::date FOR UPDATE`, [req.companyId, employeeId, day])).rows[0];
+    if (existing && ["approved", "paid"].includes(existing.status)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "mileage_locked" });
+    }
+    const legsInput = Array.isArray(req.body?.legs) ? req.body.legs : [];
+    if (legsInput.some((leg) => leg?.calculation_status === "failed" || leg?.error_message)) {
+      await client.query("ROLLBACK");
+      return res.status(422).json({ error: "mileage_leg_failed" });
+    }
+    const miles = Math.round(legsInput.reduce((sum, leg) => sum + Math.max(0, Number(leg.distance_miles || 0)), 0) * 10) / 10;
     const reimbursement = Math.round(miles * Number(settings.rate || 0));
     const logId = `${req.companyId}:${employeeId}:${day}`;
-    const log = (await client.query(`INSERT INTO mileage_daily_logs(id, company_id, employee_id, service_date, status, total_miles, rate_cents_per_mile, reimbursement_cents) VALUES($1,$2,$3,$4,'ready_for_review',$5,$6,$7) ON CONFLICT(company_id, employee_id, service_date) DO UPDATE SET status = CASE WHEN mileage_daily_logs.status IN ('approved','paid') THEN mileage_daily_logs.status ELSE 'ready_for_review' END, total_miles = EXCLUDED.total_miles, rate_cents_per_mile = EXCLUDED.rate_cents_per_mile, reimbursement_cents = EXCLUDED.reimbursement_cents, updated_at = now() RETURNING id, employee_id, service_date::text, status, total_miles::float8 AS total_miles, rate_cents_per_mile, reimbursement_cents`, [logId, req.companyId, employeeId, day, miles, Number(settings.rate || 0), reimbursement])).rows[0];
+    const start = req.body?.start_location || {};
+    const end = req.body?.end_location || {};
+    const status = req.body?.submit ? "submitted" : "ready_for_review";
+    const log = (await client.query(`INSERT INTO mileage_daily_logs(
+      id, company_id, employee_id, service_date, status, start_rule, end_rule, start_label, start_lat, start_lng,
+      end_label, end_lat, end_lng, job_order_estimated, total_miles, rate_cents_per_mile, reimbursement_cents, employee_notes)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      ON CONFLICT(company_id, employee_id, service_date) DO UPDATE SET
+        status = EXCLUDED.status,
+        start_rule = EXCLUDED.start_rule,
+        end_rule = EXCLUDED.end_rule,
+        start_label = EXCLUDED.start_label,
+        start_lat = EXCLUDED.start_lat,
+        start_lng = EXCLUDED.start_lng,
+        end_label = EXCLUDED.end_label,
+        end_lat = EXCLUDED.end_lat,
+        end_lng = EXCLUDED.end_lng,
+        job_order_estimated = EXCLUDED.job_order_estimated,
+        total_miles = EXCLUDED.total_miles,
+        rate_cents_per_mile = EXCLUDED.rate_cents_per_mile,
+        reimbursement_cents = EXCLUDED.reimbursement_cents,
+        employee_notes = COALESCE(EXCLUDED.employee_notes, mileage_daily_logs.employee_notes),
+        updated_at = now()
+      RETURNING id, employee_id, service_date::text, status, start_rule, end_rule, start_label, start_lat, start_lng,
+        end_label, end_lat, end_lng, job_order_estimated, total_miles::float8 AS total_miles, rate_cents_per_mile, reimbursement_cents,
+        employee_notes, owner_notes, reviewed_by, reviewed_at, paid_at`,
+      [logId, req.companyId, employeeId, day, status, settings.start_rule, settings.end_rule,
+       cleanString(start.label, 160) || null, Number.isFinite(Number(start.lat)) ? Number(start.lat) : null, Number.isFinite(Number(start.lng)) ? Number(start.lng) : null,
+       cleanString(end.label, 160) || null, Number.isFinite(Number(end.lat)) ? Number(end.lat) : null, Number.isFinite(Number(end.lng)) ? Number(end.lng) : null,
+       toBool(req.body?.job_order_estimated), miles, Number(settings.rate || 0), reimbursement, cleanString(req.body?.employee_notes, 1000) || null])).rows[0];
     await client.query(`DELETE FROM mileage_legs WHERE log_id = $1`, [log.id]);
     const legs = [];
-    for (let i = 1; i < jobs.length; i += 1) {
-      const row = (await client.query(`INSERT INTO mileage_legs(id, log_id, sequence, from_label, to_label, distance_miles, job_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id, sequence, from_label, to_label, distance_miles::float8 AS distance_miles, job_id`, [randomUUID(), log.id, i, jobs[i - 1].title, jobs[i].title, 5, jobs[i].id])).rows[0];
+    for (let i = 0; i < legsInput.length; i += 1) {
+      const leg = legsInput[i] || {};
+      const row = (await client.query(`INSERT INTO mileage_legs(id, log_id, sequence, from_label, to_label, distance_miles, duration_seconds, job_id, manual_trip_id, calculation_status, error_message)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        RETURNING id, sequence, from_label, to_label, distance_miles::float8 AS distance_miles, duration_seconds::float8 AS duration_seconds, job_id, manual_trip_id, calculation_status, error_message`,
+        [randomUUID(), log.id, i + 1, cleanString(leg.from_label, 160) || "Start", cleanString(leg.to_label, 160) || "Stop",
+         Math.max(0, Number(leg.distance_miles || 0)), Number.isFinite(Number(leg.duration_seconds)) ? Number(leg.duration_seconds) : null,
+         leg.job_id || null, leg.manual_trip_id || null, leg.calculation_status || "calculated", leg.error_message || null])).rows[0];
       legs.push(row);
     }
     await client.query("COMMIT");
@@ -8235,6 +8399,109 @@ app.post("/api/operations/mileage/employees/:id/calculate", authRequired, async 
     console.error("[operations] mileage calculate failed:", e);
     res.status(500).json({ error: "mileage_calculate_failed" });
   } finally { client.release(); }
+});
+
+app.post("/api/operations/mileage/address-proposals", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const { kind, label, address, lat, lng, explanation } = req.body || {};
+  if (!address || !Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) return res.status(400).json({ error: "valid_address_required" });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO mileage_address_proposals(id, company_id, employee_id, kind, label, address, lat, lng, explanation, status)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
+       RETURNING id, employee_id, kind, label, address, lat, lng, explanation, status, reviewed_by, reviewed_at, review_note, created_at`,
+      [randomUUID(), req.companyId, req.userId, ["start", "end"].includes(kind) ? kind : "start", cleanString(label, 120) || null, cleanString(address, 500), Number(lat), Number(lng), cleanString(explanation, 1000) || null]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) { console.error("[operations] mileage address proposal failed:", e); res.status(500).json({ error: "mileage_address_proposal_failed" }); }
+});
+
+app.post("/api/operations/mileage/address-proposals/:id/review", authRequired, requireEmployer, async (req, res) => {
+  const action = req.body?.action === "approve" ? "approved" : req.body?.action === "reject" ? "rejected" : null;
+  if (!action) return res.status(400).json({ error: "invalid_action" });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const proposal = (await client.query(`SELECT * FROM mileage_address_proposals WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
+    if (!proposal) { await client.query("ROLLBACK"); return res.status(404).json({ error: "proposal_not_found" }); }
+    if (proposal.employee_id === req.userId) { await client.query("ROLLBACK"); return res.status(403).json({ error: "cannot_review_own_address" }); }
+    const { rows } = await client.query(
+      `UPDATE mileage_address_proposals
+          SET status = $3, reviewed_by = $4, reviewed_at = now(), review_note = $5, updated_at = now()
+        WHERE id = $1 AND company_id = $2
+        RETURNING id, employee_id, kind, label, address, lat, lng, explanation, status, reviewed_by, reviewed_at, review_note, created_at`,
+      [req.params.id, req.companyId, action, req.userId, cleanString(req.body?.note, 1000) || null]
+    );
+    await client.query("COMMIT");
+    res.json(rows[0]);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("[operations] mileage proposal review failed:", e);
+    res.status(500).json({ error: "mileage_proposal_review_failed" });
+  } finally { client.release(); }
+});
+
+app.post("/api/operations/mileage/manual-trips", authRequired, async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const employeeId = req.role === "employer" && req.body?.employee_id ? req.body.employee_id : req.userId;
+  const day = (req.body?.service_date || new Date().toISOString().slice(0, 10)).toString().slice(0, 10);
+  const distance = req.body?.distance_miles == null ? null : Math.max(0, Number(req.body.distance_miles));
+  if (!req.body?.purpose || !Number.isFinite(Number(req.body?.from_lat)) || !Number.isFinite(Number(req.body?.from_lng)) || !Number.isFinite(Number(req.body?.to_lat)) || !Number.isFinite(Number(req.body?.to_lng))) {
+    return res.status(400).json({ error: "manual_trip_fields_required" });
+  }
+  try {
+    const status = req.role === "employer" ? "approved" : "pending";
+    const { rows } = await pool.query(
+      `INSERT INTO mileage_manual_trips(id, company_id, employee_id, service_date, purpose, notes, from_label, from_address, from_lat, from_lng, to_label, to_address, to_lat, to_lng, distance_miles, duration_seconds, status, created_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+       RETURNING id, employee_id, service_date::text, purpose, notes, from_label, from_address, from_lat, from_lng, to_label, to_address, to_lat, to_lng, distance_miles::float8 AS distance_miles, duration_seconds::float8 AS duration_seconds, status, created_by, reviewed_by, reviewed_at, review_note, created_at`,
+      [randomUUID(), req.companyId, employeeId, day, cleanString(req.body.purpose, 200), cleanString(req.body.notes, 1000) || null,
+       cleanString(req.body.from_label, 160) || "From", cleanString(req.body.from_address, 500) || null, Number(req.body.from_lat), Number(req.body.from_lng),
+       cleanString(req.body.to_label, 160) || "To", cleanString(req.body.to_address, 500) || null, Number(req.body.to_lat), Number(req.body.to_lng),
+       distance, Number.isFinite(Number(req.body.duration_seconds)) ? Number(req.body.duration_seconds) : null, status, req.userId]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) { console.error("[operations] manual trip failed:", e); res.status(500).json({ error: "mileage_manual_trip_failed" }); }
+});
+
+app.post("/api/operations/mileage/manual-trips/:id/review", authRequired, requireEmployer, async (req, res) => {
+  const status = req.body?.action === "approve" ? "approved" : req.body?.action === "reject" ? "rejected" : null;
+  if (!status) return res.status(400).json({ error: "invalid_action" });
+  try {
+    const existing = (await pool.query(`SELECT employee_id FROM mileage_manual_trips WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
+    if (!existing) return res.status(404).json({ error: "manual_trip_not_found" });
+    if (existing.employee_id === req.userId) return res.status(403).json({ error: "cannot_review_own_trip" });
+    const { rows } = await pool.query(
+      `UPDATE mileage_manual_trips SET status = $3, reviewed_by = $4, reviewed_at = now(), review_note = $5, updated_at = now()
+        WHERE id = $1 AND company_id = $2
+        RETURNING id, employee_id, service_date::text, purpose, notes, from_label, from_address, from_lat, from_lng, to_label, to_address, to_lat, to_lng, distance_miles::float8 AS distance_miles, duration_seconds::float8 AS duration_seconds, status, created_by, reviewed_by, reviewed_at, review_note, created_at`,
+      [req.params.id, req.companyId, status, req.userId, cleanString(req.body?.note, 1000) || null]
+    );
+    res.json(rows[0]);
+  } catch (e) { console.error("[operations] manual trip review failed:", e); res.status(500).json({ error: "mileage_manual_trip_review_failed" }); }
+});
+
+app.post("/api/operations/mileage/logs/:id/review", authRequired, requireEmployer, async (req, res) => {
+  const action = cleanString(req.body?.action, 40);
+  const nextStatus = action === "approve" ? "approved" : action === "reject" ? "rejected" : action === "request_correction" ? "ready_for_review" : action === "mark_paid" ? "paid" : null;
+  if (!nextStatus) return res.status(400).json({ error: "invalid_action" });
+  try {
+    const existing = (await pool.query(`SELECT employee_id, status FROM mileage_daily_logs WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
+    if (!existing) return res.status(404).json({ error: "mileage_log_not_found" });
+    if (existing.employee_id === req.userId) return res.status(403).json({ error: "cannot_review_own_mileage" });
+    const paidAtSql = nextStatus === "paid" ? "paid_at = now()," : "";
+    const { rows } = await pool.query(
+      `UPDATE mileage_daily_logs
+          SET status = $3, owner_notes = $4, reviewed_by = $5, reviewed_at = now(), ${paidAtSql} updated_at = now()
+        WHERE id = $1 AND company_id = $2
+        RETURNING id, employee_id, service_date::text, status, start_rule, end_rule, start_label, start_lat, start_lng,
+          end_label, end_lat, end_lng, job_order_estimated, total_miles::float8 AS total_miles, rate_cents_per_mile,
+          reimbursement_cents, employee_notes, owner_notes, reviewed_by, reviewed_at, paid_at`,
+      [req.params.id, req.companyId, nextStatus, cleanString(req.body?.note, 1000) || null, req.userId]
+    );
+    const legs = (await pool.query(`SELECT id, sequence, from_label, to_label, distance_miles::float8 AS distance_miles, duration_seconds::float8 AS duration_seconds, job_id, manual_trip_id, calculation_status, error_message FROM mileage_legs WHERE log_id = $1 ORDER BY sequence`, [req.params.id])).rows;
+    res.json({ ...rows[0], legs });
+  } catch (e) { console.error("[operations] mileage log review failed:", e); res.status(500).json({ error: "mileage_log_review_failed" }); }
 });
 
 app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
@@ -8509,7 +8776,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
 
     const [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource, equipmentRequestsSource, mileageApprovalsSource] = await Promise.all([
       dashboardSource(requestId, "todos", () => pool.query(
-        `SELECT id, title, due_date, completed, updated_at, priority
+        `SELECT id, title, due_date, completed, updated_at, priority, assignee_ids
            FROM todo_tasks
           WHERE (user_id = $1 OR assignee_ids ? $1::text)
             AND completed = false
@@ -8648,8 +8915,10 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
 
     for (const row of tasksResult.rows) {
       const due = new Date(row.due_date);
-      const section = due < todayStart ? "attention" : due < todayEnd ? "today" : "upcoming";
-      items.push(buildDashboardTodoItem(row, section, section === "attention" ? "high" : "normal"));
+      const assignedToMe = Array.isArray(row.assignee_ids) && row.assignee_ids.includes(String(req.userId));
+      const section = assignedToMe ? "my_assignments" : (due < todayStart ? "attention" : due < todayEnd ? "today" : "upcoming");
+      const priority = due < todayStart || row.priority === "urgent" || row.priority === "high" ? "high" : "normal";
+      items.push(buildDashboardTodoItem(row, section, priority));
     }
     for (const row of customerResult.rows) {
       const due = new Date(row.due_date);
@@ -8664,7 +8933,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
         source_type: "equipment_request",
         source_id: String(row.id),
         fingerprint: String(row.status || row.created_at || ""),
-        section: "attention",
+        section: "equipment_requests",
         priority: row.urgency === "urgent" ? "high" : "normal",
         title: row.item_name || row.request_type.replaceAll("_", " "),
         subtitle: row.explanation || "Equipment/material request",
@@ -9135,7 +9404,7 @@ app.get("/api/todo/tasks", authRequired, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, title, detail, creator_id, assignee_ids, due_date, priority, status,
               linked_contact_id, linked_job_id, linked_equipment_id,
-              reminders, subtasks, completed, completed_at, completed_by, completion_note, color_hex
+              reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex
        FROM todo_tasks
        WHERE user_id = $1
           OR ($2::uuid IS NOT NULL AND user_id = ANY($3::uuid[]))
@@ -9151,7 +9420,7 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
   const {
     title, detail, creator_id, assignee_ids, due_date, priority, status,
     linked_contact_id, linked_job_id, linked_equipment_id,
-    reminders, subtasks, completed, completed_at, completed_by, completion_note, color_hex
+    reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex
   } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
   const assignees = Array.isArray(assignee_ids) ? assignee_ids.filter((id) => typeof id === "string").slice(0, 20) : [];
@@ -9165,8 +9434,8 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
       `INSERT INTO todo_tasks
         (id, user_id, title, detail, creator_id, assignee_ids, due_date, priority, status,
          linked_contact_id, linked_job_id, linked_equipment_id, reminders, subtasks,
-         completed, completed_at, completed_by, completion_note, color_hex)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, $16, $17, $18, $19)
+         completed, completed_at, completed_by, completion_note, completion_note_required, color_hex)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, $16, $17, $18, $19, $20)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              detail = EXCLUDED.detail,
@@ -9184,21 +9453,22 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
              completed_at = EXCLUDED.completed_at,
              completed_by = EXCLUDED.completed_by,
              completion_note = EXCLUDED.completion_note,
+             completion_note_required = EXCLUDED.completion_note_required,
              color_hex = EXCLUDED.color_hex,
              updated_at = now()
        WHERE todo_tasks.user_id = $2
-          OR ($20::uuid IS NOT NULL AND todo_tasks.user_id IN (SELECT id FROM users WHERE company_id = $20))
-          OR todo_tasks.assignee_ids ? $21::text
+          OR ($21::uuid IS NOT NULL AND todo_tasks.user_id IN (SELECT id FROM users WHERE company_id = $21))
+          OR todo_tasks.assignee_ids ? $22::text
        RETURNING id, title, detail, creator_id, assignee_ids, due_date, priority, status,
                  linked_contact_id, linked_job_id, linked_equipment_id,
-                 reminders, subtasks, completed, completed_at, completed_by, completion_note, color_hex`,
+                 reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex`,
       [
         req.params.id, ownerUserId, title, detail || null, creator_id || req.userId, JSON.stringify(assignees), due_date || null,
         priority || "normal", completed ? "completed" : (status || "open"),
         linked_contact_id || null, linked_job_id || null, linked_equipment_id || null,
         JSON.stringify(reminders || []), JSON.stringify(subtasks || []),
         toBool(completed), completed_at || (completed ? new Date() : null),
-        completed_by || (completed ? req.userId : null), completion_note || null, color_hex || null,
+        completed_by || (completed ? req.userId : null), completion_note || null, toBool(completion_note_required), color_hex || null,
         req.companyId, req.userId
       ]
     );

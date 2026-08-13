@@ -6,7 +6,7 @@ export function normalizeMerchantName(value) {
     .toUpperCase()
     .replace(/&/g, " AND ")
     .replace(/['’]/g, "")
-    .replace(/\b(THE|INC|LLC|LTD|CO|CORP|CORPORATION|STORE|RESTAURANT)\b/g, " ")
+    .replace(/\b(THE|INC|LLC|LTD|CO|CORP|CORPORATION|STORE)\b/g, " ")
     .replace(/#?\b\d{2,8}\b/g, " ")
     .replace(/[^A-Z0-9 ]+/g, " ")
     .replace(/\s+/g, " ")
