@@ -350,6 +350,10 @@ const STRIPE_PLATFORM_FEE_BPS = Math.max(
   0,
   Math.min(10000, parseInt(process.env.STRIPE_PLATFORM_FEE_BPS || "0", 10) || 0)
 );
+// Stripe iOS 26.6.0 still sends Stripe-Version 2020-08-27. PaymentSheet
+// consumes these ephemeral keys on-device, so mint them for the mobile SDK's
+// expected API version instead of the server client's newer API version.
+const STRIPE_MOBILE_EPHEMERAL_KEY_API_VERSION = "2020-08-27";
 const STRIPE_CONNECT_RETURN_URL = process.env.STRIPE_CONNECT_RETURN_URL
   || "https://wolfcrm-backend-production.up.railway.app/stripe/connect/return";
 const STRIPE_CONNECT_REFRESH_URL = process.env.STRIPE_CONNECT_REFRESH_URL
@@ -10921,7 +10925,7 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
     // Create ephemeral key so PaymentSheet can render the saved-cards flow.
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customerId },
-      { apiVersion: "2024-06-20", stripeAccount: connectedAccountId }
+      { apiVersion: STRIPE_MOBILE_EPHEMERAL_KEY_API_VERSION, stripeAccount: connectedAccountId }
     );
 
     // Product + price on the connected account.
@@ -11047,6 +11051,17 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
       });
       await syncAutomationSchedulesForServicePlan(req.companyId, { ...plan, status: "payment_pending", stripe_subscription_id: subscription.id, stripe_subscription_status: subscription.status });
     }
+    console.log("[stripe] connected subscription payment started", {
+      mode: publishableKey.startsWith("pk_test_") ? "test" : publishableKey.startsWith("pk_live_") ? "live" : "unknown",
+      connected_account_id: connectedAccountId,
+      customer_id: customerId,
+      payment_intent_id: pi.id,
+      subscription_id: subscription.id,
+      service_plan_id: plan.id,
+      payment_record_id: paymentRecord.rows[0]?.id || null,
+      amount_cents: plan.price_cents,
+      currency: (plan.currency || "usd").toLowerCase()
+    });
 
     res.json({
       publishable_key: publishableKey,
@@ -11059,7 +11074,13 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
       payment_record_id: paymentRecord.rows[0].id
     });
   } catch (e) {
-    console.error("start-connected-subscription:", e);
+    console.error("start-connected-subscription:", {
+      message: e.message,
+      type: e.type,
+      code: e.code,
+      decline_code: e.decline_code,
+      requestId: e.requestId
+    });
     res.status(500).json({ error: "start_subscription_failed", detail: e.message });
   }
 });
@@ -11249,7 +11270,7 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
     );
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
-      { apiVersion: "2024-06-20", stripeAccount: connectedAccountId }
+      { apiVersion: STRIPE_MOBILE_EPHEMERAL_KEY_API_VERSION, stripeAccount: connectedAccountId }
     );
 
     const piParams = {
@@ -11304,6 +11325,16 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
         payload: { payment_id: record.rows[0].id, contact_id: contact.id, amount_cents: amountInt, currency, status: "pending", stripe_payment_intent_id: intent.id }
       });
     }
+    console.log("[stripe] contact payment started", {
+      mode: publishableKey.startsWith("pk_test_") ? "test" : publishableKey.startsWith("pk_live_") ? "live" : "unknown",
+      connected_account_id: connectedAccountId,
+      customer_id: customer.id,
+      payment_intent_id: intent.id,
+      contact_id: contact.id,
+      payment_record_id: record.rows[0]?.id || null,
+      amount_cents: amountInt,
+      currency
+    });
     res.json({
       publishable_key: publishableKey,
       connected_account_id: connectedAccountId,
@@ -11313,7 +11344,13 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
       payment_record_id: record.rows[0].id
     });
   } catch (e) {
-    console.error("contact payment start:", e);
+    console.error("contact payment start:", {
+      message: e.message,
+      type: e.type,
+      code: e.code,
+      decline_code: e.decline_code,
+      requestId: e.requestId
+    });
     res.status(500).json({ error: "start_payment_failed", detail: e.message });
   }
 });
@@ -11371,6 +11408,36 @@ app.get("/api/payments", authRequired, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "list_payments_failed" });
+  }
+});
+
+app.post("/api/payments/:id/client-result", authRequired, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const status = req.body?.status === "canceled" ? "canceled" : req.body?.status === "failed" ? "failed" : null;
+    if (!status) return res.status(400).json({ error: "invalid_payment_client_status" });
+    const note = cleanString(req.body?.note, 500) || null;
+    const { rows } = await pool.query(
+      `UPDATE payment_records
+          SET status = $4,
+              description = COALESCE(description, $5),
+              updated_at = now()
+        WHERE id = $1
+          AND user_id = $2
+          AND status = 'pending'
+          AND ($3 = 'employer' OR created_by_user_id = $6)
+        RETURNING *`,
+      [req.params.id, employerId, req.role, status, note, req.userId]
+    );
+    if (!rows.length) {
+      const existing = await pool.query(`SELECT * FROM payment_records WHERE id = $1 AND user_id = $2`, [req.params.id, employerId]);
+      if (!existing.rows.length) return res.status(404).json({ error: "payment_not_found" });
+      return res.json(sanitizePaymentRecord(existing.rows[0], { employeeSafe: req.role !== "employer" }));
+    }
+    res.json(sanitizePaymentRecord(rows[0], { employeeSafe: req.role !== "employer" }));
+  } catch (e) {
+    console.error("payment client result failed:", e);
+    res.status(500).json({ error: "payment_client_result_failed" });
   }
 });
 
