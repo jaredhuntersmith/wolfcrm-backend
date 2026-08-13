@@ -2,6 +2,7 @@
 /* WolfCRM backend auto-sync verification */
 /* WolfCRM direct-repo auto-sync verification 1 */
 /* WolfCRM direct-repo auto-sync verification 2 */
+/* WolfCRM post-reload auto-sync verification */
 /* Railway deploy smoke-test touch: 2026-08-12 */
 import express from "express";
 import cors from "cors";
