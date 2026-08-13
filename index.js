@@ -1144,6 +1144,7 @@ async function bootstrap() {
       state TEXT NOT NULL,
       stage_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      stage_entered_at TIMESTAMPTZ DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE UNIQUE INDEX IF NOT EXISTS opportunities_user_contact_idx
@@ -1158,6 +1159,16 @@ async function bootstrap() {
         AND o.company_id IS NULL
         AND u.company_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS opportunities_company_idx ON opportunities(company_id);
+    ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ;
+    ALTER TABLE opportunities ALTER COLUMN stage_entered_at SET DEFAULT now();
+    UPDATE opportunities
+      SET stage_entered_at = COALESCE(created_at, now())
+      WHERE stage_entered_at IS NULL
+        AND state = 'stage';
+    UPDATE opportunities
+      SET stage_entered_at = COALESCE(created_at, now())
+      WHERE stage_entered_at IS NULL;
+    CREATE INDEX IF NOT EXISTS opportunities_company_stage_entered_idx ON opportunities(company_id, stage_id, stage_entered_at);
 
     CREATE TABLE IF NOT EXISTS schedule_events (
       id TEXT PRIMARY KEY,
@@ -1168,6 +1179,7 @@ async function bootstrap() {
       color TEXT NOT NULL DEFAULT '#3478F6',
       notes TEXT,
       contact_id TEXT,
+      quote_id UUID,
       reminder_minutes JSONB NOT NULL DEFAULT '[]'::jsonb,
       service_items JSONB NOT NULL DEFAULT '[]'::jsonb,
       company_id UUID,
@@ -1786,9 +1798,11 @@ async function bootstrap() {
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_settings BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_manage_company_finance_ai_memories BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS quote_id UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS service_items JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS material_cost_cents INTEGER;
+    CREATE INDEX IF NOT EXISTS schedule_events_quote_idx ON schedule_events(quote_id);
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS created_by UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS sales_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
@@ -8092,10 +8106,47 @@ app.get("/api/quotes/totals", authRequired, async (req, res) => {
   try {
     const scope = quoteScopeSQL(req);
     const { rows } = await pool.query(
-      `SELECT contact_id, SUM(total_cents)::int AS total_cents, COUNT(*)::int AS quote_count
-       FROM quotes q
-       WHERE ${scope.sql}
-       GROUP BY contact_id`,
+      `WITH scoped AS (
+         SELECT q.*
+         FROM quotes q
+         WHERE ${scope.sql}
+       ),
+       counts AS (
+         SELECT contact_id, COUNT(*)::int AS quote_count
+         FROM scoped
+         GROUP BY contact_id
+       ),
+       ranked AS (
+         SELECT id,
+                contact_id,
+                total_cents,
+                status,
+                updated_at,
+                ROW_NUMBER() OVER (
+                  PARTITION BY contact_id
+                  ORDER BY
+                    CASE COALESCE(status, 'draft')
+                      WHEN 'sent' THEN 1
+                      WHEN 'accepted' THEN 2
+                      WHEN 'draft' THEN 3
+                      WHEN 'converted' THEN 4
+                      ELSE 9
+                    END ASC,
+                    updated_at DESC,
+                    created_at DESC,
+                    id ASC
+                ) AS rn
+         FROM scoped
+         WHERE COALESCE(status, 'draft') NOT IN ('declined', 'expired', 'deleted', 'canceled', 'cancelled')
+       )
+       SELECT c.contact_id,
+              COALESCE(r.total_cents, 0)::int AS total_cents,
+              c.quote_count,
+              r.id AS quote_id,
+              r.status AS quote_status,
+              r.updated_at AS quote_updated_at
+       FROM counts c
+       LEFT JOIN ranked r ON r.contact_id = c.contact_id AND r.rn = 1`,
       scope.values
     );
     res.json(rows);
@@ -8324,13 +8375,13 @@ app.get("/api/opportunities", authRequired, async (req, res) => {
   try {
     const { rows } = req.companyId
       ? await pool.query(
-          `SELECT id, contact_id, state, stage_id, created_at
+          `SELECT id, contact_id, state, stage_id, created_at, stage_entered_at
            FROM opportunities
            WHERE company_id = $1 OR (company_id IS NULL AND user_id = $2)`,
           [req.companyId, req.userId]
         )
       : await pool.query(
-          `SELECT id, contact_id, state, stage_id, created_at
+          `SELECT id, contact_id, state, stage_id, created_at, stage_entered_at
            FROM opportunities WHERE user_id = $1`,
           [req.userId]
         );
@@ -8339,7 +8390,7 @@ app.get("/api/opportunities", authRequired, async (req, res) => {
 });
 
 app.put("/api/opportunities/:id", authRequired, async (req, res) => {
-  const { contact_id, state, stage_id, created_at } = req.body || {};
+  const { contact_id, state, stage_id, created_at, stage_entered_at } = req.body || {};
   if (!contact_id || !state) return res.status(400).json({ error: "missing_params" });
   try {
     const previous = await pool.query(
@@ -8348,15 +8399,21 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
     );
     const before = previous.rows[0] || null;
     const r = await pool.query(
-      `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
+      `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id, created_at, stage_entered_at)
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, $7, now()))
        ON CONFLICT (user_id, contact_id) DO UPDATE
          SET state = EXCLUDED.state,
              stage_id = EXCLUDED.stage_id,
+             stage_entered_at = CASE
+               WHEN opportunities.state IS DISTINCT FROM EXCLUDED.state
+                 OR opportunities.stage_id IS DISTINCT FROM EXCLUDED.stage_id
+               THEN now()
+               ELSE COALESCE(opportunities.stage_entered_at, opportunities.created_at, now())
+             END,
              company_id = COALESCE(EXCLUDED.company_id, opportunities.company_id),
              updated_at = now()
-       RETURNING id, contact_id, state, stage_id, created_at`,
-      [req.params.id, req.userId, req.companyId || null, contact_id, state, stage_id || null, created_at || null]
+       RETURNING id, contact_id, state, stage_id, created_at, stage_entered_at`,
+      [req.params.id, req.userId, req.companyId || null, contact_id, state, stage_id || null, created_at || null, stage_entered_at || null]
     );
     if (req.companyId) {
       const after = r.rows[0];
@@ -8415,7 +8472,7 @@ app.get("/api/schedule", authRequired, async (req, res) => {
       : { sql: `user_id = $1`, values: [req.userId] };
     const { rows } = await pool.query(
       `SELECT id, title, start_at AS start, end_at AS "end", color, notes,
-              contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
+              contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
               company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by
        FROM schedule_events WHERE ${where.sql} ORDER BY start_at ASC`,
       where.values
@@ -8426,7 +8483,7 @@ app.get("/api/schedule", authRequired, async (req, res) => {
 
 app.put("/api/schedule/:id", authRequired, async (req, res) => {
   const {
-    title, start, end, color, notes, contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
+    title, start, end, color, notes, contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
     sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by
   } = req.body || {};
   if (!title || !start || !end) return res.status(400).json({ error: "missing_params" });
@@ -8443,9 +8500,9 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
     const isNewJob = previous.rowCount === 0;
     const r = await pool.query(
       `INSERT INTO schedule_events
-        (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id,
+        (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, quote_id,
          reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by)
-       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14, $15::jsonb, $16::jsonb, $17, $18, $19, $20)
+       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $16::jsonb, $17::jsonb, $18, $19, $20, $21)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              start_at = EXCLUDED.start_at,
@@ -8453,6 +8510,7 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
              color = EXCLUDED.color,
              notes = EXCLUDED.notes,
              contact_id = EXCLUDED.contact_id,
+             quote_id = EXCLUDED.quote_id,
              reminder_minutes = EXCLUDED.reminder_minutes,
              services = EXCLUDED.services,
              service_items = EXCLUDED.service_items,
@@ -8468,11 +8526,11 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
              updated_at = now()
        WHERE schedule_events.user_id = $2 OR schedule_events.company_id = $3
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
-                 contact_id, reminder_minutes, services, price_cents, material_cost_cents,
+                 contact_id, quote_id, reminder_minutes, services, price_cents, material_cost_cents,
                  service_items, company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by`,
       [
         req.params.id, req.userId, req.companyId, title, start, end,
-        color || '#3478F6', notes || null, contact_id || null,
+        color || '#3478F6', notes || null, contact_id || null, quote_id || null,
         JSON.stringify(reminder_minutes || []),
         JSON.stringify(services || []),
         JSON.stringify(Array.isArray(service_items) ? service_items : []),
@@ -8684,7 +8742,7 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, async (req, res) => {
               finished_at = COALESCE(finished_at, $3), finished_by = COALESCE(finished_by, $4), updated_at = now()
        WHERE id = $1 AND company_id = $2
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
-                 contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
+                 contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
                  company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by`,
       [req.params.id, req.companyId, now, req.userId]
     )).rows[0];
