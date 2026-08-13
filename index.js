@@ -1,5 +1,6 @@
 /* WolfCRM backend — email/password auth + user-scoped CRM data */
 /* WolfCRM backend auto-sync verification */
+/* WolfCRM direct-repo auto-sync verification 1 */
 /* Railway deploy smoke-test touch: 2026-08-12 */
 import express from "express";
 import cors from "cors";
