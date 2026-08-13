@@ -11792,21 +11792,37 @@ app.post("/api/service-plans/:id/cancel", authRequired, requireEmployer, async (
     const plan = rows[0];
     if (!plan) return res.status(404).json({ error: "not_found" });
     const stripe = getStripe();
+    let updatedPlan = null;
     if (stripe && plan.stripe_subscription_id && plan.stripe_connected_account_id) {
       try {
-        await stripe.subscriptions.cancel(plan.stripe_subscription_id,
-          { stripeAccount: plan.stripe_connected_account_id });
+        const subscription = await stripe.subscriptions.cancel(
+          plan.stripe_subscription_id,
+          { expand: ["latest_invoice.payment_intent"] },
+          { stripeAccount: plan.stripe_connected_account_id }
+        );
+        const applied = await applyStripeSubscriptionStatus({
+          subscription,
+          connectedAccountId: plan.stripe_connected_account_id,
+          servicePlanId: plan.id,
+          source: "service_plans.api.cancel"
+        });
+        updatedPlan = applied[0] || null;
       } catch (err) {
         console.error("stripe cancel failed:", err.message);
       }
     }
-    const updated = await pool.query(
-      `UPDATE service_plans
-          SET status = 'canceled', updated_at = now()
-        WHERE id = $1
-        RETURNING *`,
-      [plan.id]
-    );
+    if (!updatedPlan) {
+      const updated = await pool.query(
+        `UPDATE service_plans
+            SET status = 'canceled',
+                stripe_payment_collection_paused = false,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING *`,
+        [plan.id]
+      );
+      updatedPlan = updated.rows[0];
+    }
     await pool.query(
       `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
        VALUES ($1,$2,$3,$4,$5,'canceled',$6)`,
@@ -11814,19 +11830,26 @@ app.post("/api/service-plans/:id/cancel", authRequired, requireEmployer, async (
        `Canceled by ${req.userEmail || req.userId}`]
     );
     if (req.companyId) {
-      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", updated.rows[0].id);
+      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", updatedPlan.id);
       await emitAutomationEvent({
         companyId: req.companyId,
         eventType: "service_plan.canceled",
         subjectType: "service_plan",
-        subjectId: updated.rows[0].id,
+        subjectId: updatedPlan.id,
         actorUserId: req.userId,
         source: "service_plans.api",
-        dedupeKey: `service_plan.canceled:${updated.rows[0].id}`,
-        payload: { service_plan_id: updated.rows[0].id, contact_id: updated.rows[0].contact_id, status: updated.rows[0].status, stripe_subscription_id: plan.stripe_subscription_id || null }
+        dedupeKey: `service_plan.canceled:${updatedPlan.id}`,
+        payload: {
+          service_plan_id: updatedPlan.id,
+          contact_id: updatedPlan.contact_id,
+          status: updatedPlan.status,
+          stripe_subscription_id: updatedPlan.stripe_subscription_id || plan.stripe_subscription_id || null,
+          stripe_subscription_status: updatedPlan.stripe_subscription_status || null,
+          stripe_payment_collection_paused: Boolean(updatedPlan.stripe_payment_collection_paused)
+        }
       });
     }
-    res.json(sanitizeServicePlan(updated.rows[0]));
+    res.json(sanitizeServicePlan(updatedPlan));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "cancel_failed" });
@@ -12158,6 +12181,11 @@ function verifyStripeWebhookEvent(req, stripe) {
 async function handleStripeWebhook(req, res) {
   const stripe = getStripe();
   if (!stripe) return res.status(503).send("stripe_not_configured");
+  console.log("[stripe] webhook endpoint entered", {
+    path: req.originalUrl || req.path,
+    timestamp: new Date().toISOString(),
+    stripe_signature_present: Boolean(req.headers["stripe-signature"])
+  });
 
   let event;
   let verifiedWith = null;
