@@ -19,6 +19,15 @@ export function mapStripeSubscriptionStatus(status) {
   }
 }
 
+export function isStripePaymentCollectionPaused(subscription) {
+  return Boolean(subscription?.pause_collection);
+}
+
+export function mapStripeSubscriptionToWolfCRMStatus(subscription) {
+  if (isStripePaymentCollectionPaused(subscription)) return "paused";
+  return mapStripeSubscriptionStatus(subscription?.status);
+}
+
 export function mapStripePaymentIntentStatus(paymentIntent) {
   switch (paymentIntent && paymentIntent.status) {
     case "succeeded":
@@ -35,6 +44,15 @@ export function mapStripePaymentIntentStatus(paymentIntent) {
     default:
       return "pending";
   }
+}
+
+export function nextServiceDateAfterResume(nextServiceDate, today = new Date()) {
+  if (!nextServiceDate) return null;
+  const todayIso = today.toISOString().slice(0, 10);
+  const nextIso = typeof nextServiceDate === "string"
+    ? nextServiceDate.slice(0, 10)
+    : new Date(nextServiceDate).toISOString().slice(0, 10);
+  return nextIso < todayIso ? todayIso : nextIso;
 }
 
 export function subscriptionBlocksNewStart(status) {

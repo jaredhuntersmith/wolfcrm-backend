@@ -1,7 +1,10 @@
 import assert from "assert";
 import {
+  isStripePaymentCollectionPaused,
   mapStripePaymentIntentStatus,
   mapStripeSubscriptionStatus,
+  mapStripeSubscriptionToWolfCRMStatus,
+  nextServiceDateAfterResume,
   selectRecoverableSubscription,
   subscriptionBlocksNewStart,
   subscriptionCanResumePayment
@@ -38,6 +41,32 @@ test("Stripe subscription canceled maps to canceled", () => {
 
 test("Stripe subscription paused maps to paused", () => {
   assert.equal(mapStripeSubscriptionStatus("paused"), "paused");
+});
+
+test("Stripe active subscription with pause collection maps to WolfCRM paused", () => {
+  const subscription = {
+    status: "active",
+    pause_collection: { behavior: "void" }
+  };
+  assert.equal(isStripePaymentCollectionPaused(subscription), true);
+  assert.equal(mapStripeSubscriptionToWolfCRMStatus(subscription), "paused");
+});
+
+test("Stripe active subscription without pause collection maps to WolfCRM active", () => {
+  const subscription = {
+    status: "active",
+    pause_collection: null
+  };
+  assert.equal(isStripePaymentCollectionPaused(subscription), false);
+  assert.equal(mapStripeSubscriptionToWolfCRMStatus(subscription), "active");
+});
+
+test("resume preserves future next service date", () => {
+  assert.equal(nextServiceDateAfterResume("2026-08-20", new Date("2026-08-13T12:00:00Z")), "2026-08-20");
+});
+
+test("resume moves past next service date to resume date", () => {
+  assert.equal(nextServiceDateAfterResume("2026-08-01", new Date("2026-08-13T12:00:00Z")), "2026-08-13");
 });
 
 test("Stripe PaymentIntent succeeded maps to succeeded", () => {

@@ -15,8 +15,11 @@ import apn from "@parse/node-apn";
 import twilio from "twilio";
 import { calculateStripeConnectReadiness } from "./stripe-connect-status.js";
 import {
+  isStripePaymentCollectionPaused,
   mapStripePaymentIntentStatus,
   mapStripeSubscriptionStatus as mapStripeSubscriptionStatusValue,
+  mapStripeSubscriptionToWolfCRMStatus,
+  nextServiceDateAfterResume,
   selectRecoverableSubscription,
   subscriptionBlocksNewStart,
   subscriptionCanResumePayment,
@@ -1951,9 +1954,11 @@ async function bootstrap() {
       stripe_payment_intent_id TEXT,
       stripe_subscription_status TEXT,
       stripe_latest_invoice_id TEXT,
+      stripe_payment_collection_paused BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE service_plans ADD COLUMN IF NOT EXISTS stripe_payment_collection_paused BOOLEAN NOT NULL DEFAULT false;
     CREATE INDEX IF NOT EXISTS service_plans_user_status_idx ON service_plans(user_id, status);
     CREATE INDEX IF NOT EXISTS service_plans_company_status_idx ON service_plans(company_id, status);
     CREATE INDEX IF NOT EXISTS service_plans_created_by_idx ON service_plans(created_by_user_id);
@@ -2353,19 +2358,21 @@ async function applyStripeSubscriptionStatus({
     ? subscription.latest_invoice
     : null;
   const pi = stripeInvoicePaymentIntent(invoice);
-  const localStatus = mapStripeSubscriptionStatus(subscription.status);
+  const paymentCollectionPaused = isStripePaymentCollectionPaused(subscription);
+  const localStatus = mapStripeSubscriptionToWolfCRMStatus(subscription);
   const params = [
     subscription.id,
     subscription.status,
     localStatus,
     invoice?.id || null,
     pi?.id || null,
-    connectedAccountId
+    connectedAccountId,
+    paymentCollectionPaused
   ];
   let idClause = "";
   if (servicePlanId) {
     params.push(servicePlanId);
-    idClause = ` AND id = $7`;
+    idClause = ` AND id = $8`;
   }
   const { rows } = await pool.query(
     `UPDATE service_plans
@@ -2373,6 +2380,7 @@ async function applyStripeSubscriptionStatus({
             status = COALESCE($3, status),
             stripe_latest_invoice_id = COALESCE($4, stripe_latest_invoice_id),
             stripe_payment_intent_id = COALESCE($5, stripe_payment_intent_id),
+            stripe_payment_collection_paused = $7,
             updated_at = now()
       WHERE stripe_subscription_id = $1
         AND ($6::text IS NULL OR stripe_connected_account_id = $6)
@@ -2382,9 +2390,15 @@ async function applyStripeSubscriptionStatus({
   );
   for (const plan of rows) {
     if (plan.company_id) {
-      const eventType = subscription.status === "active" || subscription.status === "trialing"
+      const eventType = localStatus === "active"
         ? "service_plan.subscription_active"
-        : ({ past_due: "service_plan.subscription_past_due", unpaid: "service_plan.subscription_unpaid", paused: "service_plan.subscription_paused", canceled: "service_plan.subscription_canceled" }[subscription.status] || "service_plan.updated");
+        : ({
+            past_due: "service_plan.subscription_past_due",
+            paused: "service_plan.subscription_paused",
+            canceled: "service_plan.subscription_canceled",
+            failed: "service_plan.subscription_failed",
+            payment_pending: "service_plan.subscription_payment_pending"
+          }[localStatus] || "service_plan.updated");
       await emitAutomationEvent({
         companyId: plan.company_id,
         eventType,
@@ -2400,10 +2414,15 @@ async function applyStripeSubscriptionStatus({
           stripe_invoice_id: invoice?.id || null,
           stripe_payment_intent_id: pi?.id || null,
           subscription_status: subscription.status,
+          stripe_payment_collection_paused: paymentCollectionPaused,
           status: plan.status
         }
       });
-      await syncAutomationSchedulesForServicePlan(plan.company_id, plan);
+      if (localStatus === "paused" || localStatus === "canceled") {
+        await cancelAutomationSchedulesForSubject(plan.company_id, "service_plan", plan.id);
+      } else {
+        await syncAutomationSchedulesForServicePlan(plan.company_id, plan);
+      }
     }
   }
   if (pi) {
@@ -2420,6 +2439,7 @@ async function applyStripeSubscriptionStatus({
     connected_account_id: connectedAccountId,
     subscription_id: subscription.id,
     stripe_subscription_status: subscription.status,
+    stripe_payment_collection_paused: paymentCollectionPaused,
     local_status: localStatus,
     latest_invoice_id: invoice?.id || null,
     payment_intent_id: pi?.id || null,
@@ -2646,6 +2666,7 @@ function sanitizeServicePlan(row, { employeeSafe = false } = {}) {
     included_services: row.included_services,
     notes: row.notes,
     stripe_subscription_status: row.stripe_subscription_status,
+    stripe_payment_collection_paused: Boolean(row.stripe_payment_collection_paused),
     created_at: row.created_at,
     updated_at: row.updated_at,
     // Contact info if joined
@@ -11359,7 +11380,7 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
         returned_existing_payment_intent: Boolean(resume)
       });
       if (resume) return res.json(resume);
-      const localStatus = mapStripeSubscriptionStatus(subscription.status) || plan.status;
+      const localStatus = mapStripeSubscriptionToWolfCRMStatus(subscription) || plan.status;
       const error = subscriptionBlocksNewStart(subscription.status)
         ? "stripe_subscription_already_exists"
         : "stripe_subscription_restart_required";
@@ -11460,6 +11481,7 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
               stripe_subscription_status = $7,
               stripe_payment_intent_id = $8,
               stripe_latest_invoice_id = $9,
+              stripe_payment_collection_paused = false,
               status = 'payment_pending',
               updated_at = now()
         WHERE id = $1`,
@@ -11603,40 +11625,160 @@ app.post("/api/service-plans/:id/mark-serviced", authRequired, requireEmployer, 
 app.post("/api/service-plans/:id/pause", authRequired, requireEmployer, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
-    const { rows } = await pool.query(
-      `UPDATE service_plans
-          SET status = 'paused', updated_at = now()
-        WHERE id = $1 AND user_id = $2
-        RETURNING *`,
+    const planResult = await pool.query(
+      `SELECT * FROM service_plans WHERE id = $1 AND user_id = $2`,
       [req.params.id, employerId]
     );
-    if (!rows.length) return res.status(404).json({ error: "not_found" });
+    const plan = planResult.rows[0];
+    if (!plan) return res.status(404).json({ error: "not_found" });
+
+    let updatedPlan = plan;
+    const stripe = getStripe();
+    if (stripe && plan.stripe_subscription_id) {
+      if (!plan.stripe_connected_account_id) {
+        return res.status(400).json({ error: "stripe_connected_account_missing" });
+      }
+      const subscription = await stripe.subscriptions.update(
+        plan.stripe_subscription_id,
+        { pause_collection: { behavior: "void" }, expand: ["latest_invoice.payment_intent"] },
+        { stripeAccount: plan.stripe_connected_account_id }
+      );
+      const applied = await applyStripeSubscriptionStatus({
+        subscription,
+        connectedAccountId: plan.stripe_connected_account_id,
+        servicePlanId: plan.id,
+        source: "service_plans.api.pause"
+      });
+      updatedPlan = applied[0] || plan;
+    } else {
+      const { rows } = await pool.query(
+        `UPDATE service_plans
+            SET status = 'paused',
+                stripe_payment_collection_paused = false,
+                updated_at = now()
+          WHERE id = $1 AND user_id = $2
+          RETURNING *`,
+        [req.params.id, employerId]
+      );
+      updatedPlan = rows[0];
+    }
+
     await pool.query(
       `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
        VALUES ($1,$2,$3,$4,$5,'paused',$6)`,
-      [employerId, req.companyId || null, req.userId, rows[0].id, rows[0].contact_id,
+      [employerId, req.companyId || null, req.userId, updatedPlan.id, updatedPlan.contact_id,
        `Paused by ${req.userEmail || req.userId}`]
     );
-    // TODO: also pause the Stripe subscription (`pause_collection`) when a
-    // clear resume UX exists — leaving local-only for now so we never
-    // accidentally break Stripe billing state.
     if (req.companyId) {
-      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", rows[0].id);
+      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", updatedPlan.id);
       await emitAutomationEvent({
         companyId: req.companyId,
         eventType: "service_plan.paused",
         subjectType: "service_plan",
-        subjectId: rows[0].id,
+        subjectId: updatedPlan.id,
         actorUserId: req.userId,
         source: "service_plans.api",
-        dedupeKey: `service_plan.paused:${rows[0].id}:${rows[0].updated_at?.toISOString?.() || Date.now()}`,
-        payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, status: rows[0].status }
+        dedupeKey: `service_plan.paused:${updatedPlan.id}:${updatedPlan.updated_at?.toISOString?.() || Date.now()}`,
+        payload: {
+          service_plan_id: updatedPlan.id,
+          contact_id: updatedPlan.contact_id,
+          status: updatedPlan.status,
+          stripe_subscription_id: updatedPlan.stripe_subscription_id || null,
+          stripe_payment_collection_paused: Boolean(updatedPlan.stripe_payment_collection_paused)
+        }
       });
     }
-    res.json(sanitizeServicePlan(rows[0]));
+    res.json(sanitizeServicePlan(updatedPlan));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "pause_failed" });
+  }
+});
+
+app.post("/api/service-plans/:id/resume", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const planResult = await pool.query(
+      `SELECT * FROM service_plans WHERE id = $1 AND user_id = $2`,
+      [req.params.id, employerId]
+    );
+    const plan = planResult.rows[0];
+    if (!plan) return res.status(404).json({ error: "not_found" });
+
+    let updatedPlan = plan;
+    const stripe = getStripe();
+    if (stripe && plan.stripe_subscription_id) {
+      if (!plan.stripe_connected_account_id) {
+        return res.status(400).json({ error: "stripe_connected_account_missing" });
+      }
+      const subscription = await stripe.subscriptions.update(
+        plan.stripe_subscription_id,
+        { pause_collection: "", expand: ["latest_invoice.payment_intent"] },
+        { stripeAccount: plan.stripe_connected_account_id }
+      );
+      const applied = await applyStripeSubscriptionStatus({
+        subscription,
+        connectedAccountId: plan.stripe_connected_account_id,
+        servicePlanId: plan.id,
+        source: "service_plans.api.resume"
+      });
+      updatedPlan = applied[0] || plan;
+    } else {
+      const { rows } = await pool.query(
+        `UPDATE service_plans
+            SET status = 'active',
+                stripe_payment_collection_paused = false,
+                updated_at = now()
+          WHERE id = $1 AND user_id = $2
+          RETURNING *`,
+        [req.params.id, employerId]
+      );
+      updatedPlan = rows[0];
+    }
+
+    const resumeNextDate = nextServiceDateAfterResume(updatedPlan.next_service_date);
+    if (resumeNextDate && String(updatedPlan.next_service_date).slice(0, 10) !== resumeNextDate) {
+      const shifted = await pool.query(
+        `UPDATE service_plans
+            SET next_service_date = $2::date,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING *`,
+        [updatedPlan.id, resumeNextDate]
+      );
+      updatedPlan = shifted.rows[0] || updatedPlan;
+    }
+
+    await pool.query(
+      `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
+       VALUES ($1,$2,$3,$4,$5,'resumed',$6)`,
+      [employerId, req.companyId || null, req.userId, updatedPlan.id, updatedPlan.contact_id,
+       `Resumed by ${req.userEmail || req.userId}`]
+    );
+    if (req.companyId) {
+      await syncAutomationSchedulesForServicePlan(req.companyId, updatedPlan);
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "service_plan.resumed",
+        subjectType: "service_plan",
+        subjectId: updatedPlan.id,
+        actorUserId: req.userId,
+        source: "service_plans.api",
+        dedupeKey: `service_plan.resumed:${updatedPlan.id}:${updatedPlan.updated_at?.toISOString?.() || Date.now()}`,
+        payload: {
+          service_plan_id: updatedPlan.id,
+          contact_id: updatedPlan.contact_id,
+          status: updatedPlan.status,
+          next_service_date: updatedPlan.next_service_date,
+          stripe_subscription_id: updatedPlan.stripe_subscription_id || null,
+          stripe_payment_collection_paused: Boolean(updatedPlan.stripe_payment_collection_paused)
+        }
+      });
+    }
+    res.json(sanitizeServicePlan(updatedPlan));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "resume_failed" });
   }
 });
 
