@@ -9,7 +9,7 @@
     "test": "npm run test:finance",
     "test:automation-core": "node tests/automation-core.integration.js",
     "test:automation": "npm run test:automation-core",
-    "test:finance": "node tests/finance-projection.test.js && node tests/finance-planning.test.js && node tests/finance-plaid.test.js && node tests/finance-receipts.test.js && node tests/finance-ai.test.js && node tests/stripe-connect-status.test.js"
+    "test:finance": "node tests/finance-projection.test.js && node tests/finance-planning.test.js && node tests/finance-plaid.test.js && node tests/finance-receipts.test.js && node tests/finance-ai.test.js && node tests/stripe-connect-status.test.js && node tests/stripe-payment-sync.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",

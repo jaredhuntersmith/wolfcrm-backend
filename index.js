@@ -15,6 +15,10 @@ import apn from "@parse/node-apn";
 import twilio from "twilio";
 import { calculateStripeConnectReadiness } from "./stripe-connect-status.js";
 import {
+  mapStripePaymentIntentStatus,
+  mapStripeSubscriptionStatus as mapStripeSubscriptionStatusValue
+} from "./stripe-payment-sync.js";
+import {
   installAutomationSystem,
   emitAutomationEvent,
   syncAutomationSchedulesForJob,
@@ -2231,40 +2235,11 @@ function stripeChargesBlockedResponse(account) {
 }
 
 function mapStripeSubscriptionStatus(s) {
-  switch (s) {
-    case "active":
-    case "trialing":
-      return "active";
-    case "incomplete":
-      return "payment_pending";
-    case "past_due":
-    case "unpaid":
-      return "past_due";
-    case "canceled":
-      return "canceled";
-    case "incomplete_expired":
-      return "failed";
-    default:
-      return null;
-  }
+  return mapStripeSubscriptionStatusValue(s);
 }
 
 function localPaymentStatusFromStripePaymentIntent(pi) {
-  switch (pi && pi.status) {
-    case "succeeded":
-      return "succeeded";
-    case "processing":
-      return "pending";
-    case "canceled":
-      return "canceled";
-    case "requires_payment_method":
-      return pi.last_payment_error ? "failed" : "pending";
-    case "requires_action":
-    case "requires_capture":
-    case "requires_confirmation":
-    default:
-      return "pending";
-  }
+  return mapStripePaymentIntentStatus(pi);
 }
 
 function automationEventForPaymentStatus(status) {
@@ -2354,6 +2329,118 @@ async function reconcilePaymentRecordFromStripe(record, { source = "stripe.recon
     source
   });
   return rows[0] || record;
+}
+
+function stripeInvoicePaymentIntent(invoice) {
+  if (!invoice) return null;
+  const pi = invoice.payment_intent || invoice.confirmation_secret?.payment_intent || null;
+  return pi && typeof pi === "object" ? pi : null;
+}
+
+async function applyStripeSubscriptionStatus({
+  subscription,
+  connectedAccountId,
+  servicePlanId = null,
+  source = "stripe.subscription_reconcile",
+  stripeEventId = null
+}) {
+  if (!subscription || !subscription.id) return [];
+  const invoice = subscription.latest_invoice && typeof subscription.latest_invoice === "object"
+    ? subscription.latest_invoice
+    : null;
+  const pi = stripeInvoicePaymentIntent(invoice);
+  const localStatus = mapStripeSubscriptionStatus(subscription.status);
+  const params = [
+    subscription.id,
+    subscription.status,
+    localStatus,
+    invoice?.id || null,
+    pi?.id || null,
+    connectedAccountId
+  ];
+  let idClause = "";
+  if (servicePlanId) {
+    params.push(servicePlanId);
+    idClause = ` AND id = $7`;
+  }
+  const { rows } = await pool.query(
+    `UPDATE service_plans
+        SET stripe_subscription_status = $2,
+            status = COALESCE($3, status),
+            stripe_latest_invoice_id = COALESCE($4, stripe_latest_invoice_id),
+            stripe_payment_intent_id = COALESCE($5, stripe_payment_intent_id),
+            updated_at = now()
+      WHERE stripe_subscription_id = $1
+        AND ($6::text IS NULL OR stripe_connected_account_id = $6)
+        ${idClause}
+      RETURNING *`,
+    params
+  );
+  for (const plan of rows) {
+    if (plan.company_id) {
+      const eventType = subscription.status === "active" || subscription.status === "trialing"
+        ? "service_plan.subscription_active"
+        : ({ past_due: "service_plan.subscription_past_due", unpaid: "service_plan.subscription_unpaid", paused: "service_plan.subscription_paused", canceled: "service_plan.subscription_canceled" }[subscription.status] || "service_plan.updated");
+      await emitAutomationEvent({
+        companyId: plan.company_id,
+        eventType,
+        subjectType: "service_plan",
+        subjectId: plan.id,
+        source,
+        dedupeKey: `${eventType}:${stripeEventId || subscription.id}:${plan.id}`,
+        payload: {
+          service_plan_id: plan.id,
+          contact_id: plan.contact_id,
+          stripe_event_id: stripeEventId || null,
+          stripe_subscription_id: subscription.id,
+          stripe_invoice_id: invoice?.id || null,
+          stripe_payment_intent_id: pi?.id || null,
+          subscription_status: subscription.status,
+          status: plan.status
+        }
+      });
+      await syncAutomationSchedulesForServicePlan(plan.company_id, plan);
+    }
+  }
+  if (pi) {
+    await applyStripePaymentIntentStatus({
+      paymentIntent: pi,
+      connectedAccountId,
+      source,
+      stripeEventId
+    });
+  }
+  console.log("[stripe] subscription reconciled", {
+    source,
+    stripe_event_id: stripeEventId || null,
+    connected_account_id: connectedAccountId,
+    subscription_id: subscription.id,
+    stripe_subscription_status: subscription.status,
+    local_status: localStatus,
+    latest_invoice_id: invoice?.id || null,
+    payment_intent_id: pi?.id || null,
+    matched_plans: rows.length
+  });
+  return rows;
+}
+
+async function reconcileServicePlanFromStripe(plan, { source = "stripe.service_plan_reconcile" } = {}) {
+  const stripe = getStripe();
+  if (!stripe) throw new Error("stripe_not_configured");
+  if (!plan || !plan.stripe_subscription_id) throw new Error("stripe_subscription_missing");
+  if (!plan.stripe_connected_account_id) throw new Error("stripe_connected_account_missing");
+  const subscription = await stripe.subscriptions.retrieve(
+    plan.stripe_subscription_id,
+    { expand: ["latest_invoice.payment_intent"] },
+    { stripeAccount: plan.stripe_connected_account_id }
+  );
+  const rows = await applyStripeSubscriptionStatus({
+    subscription,
+    connectedAccountId: plan.stripe_connected_account_id,
+    servicePlanId: plan.id,
+    source
+  });
+  return rows[0] || plan;
 }
 
 function serviceIntervalDays(interval, count) {
@@ -10783,6 +10870,54 @@ app.get("/api/service-plans/:id", authRequired, async (req, res) => {
   }
 });
 
+app.post("/api/service-plans/:id/reconcile", authRequired, async (req, res) => {
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const { rows } = await pool.query(
+      `SELECT sp.*, c.name AS contact_name, c.phone AS contact_phone,
+              c.email AS contact_email, c.address AS contact_address
+         FROM service_plans sp
+         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
+        WHERE sp.id = $1 AND sp.user_id = $2`,
+      [req.params.id, employerId]
+    );
+    const plan = rows[0];
+    if (!plan) return res.status(404).json({ error: "not_found" });
+    if (req.role !== "employer" && plan.created_by_user_id !== req.userId) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    const updated = await reconcileServicePlanFromStripe(plan, { source: "stripe.service_plan_client_reconcile" });
+    const joined = await pool.query(
+      `SELECT sp.*, c.name AS contact_name, c.phone AS contact_phone,
+              c.email AS contact_email, c.address AS contact_address
+         FROM service_plans sp
+         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
+        WHERE sp.id = $1`,
+      [updated.id]
+    );
+    const payment = await pool.query(
+      `SELECT *
+         FROM payment_records
+        WHERE service_plan_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [updated.id]
+    );
+    res.json({
+      plan: sanitizeServicePlan(joined.rows[0] || updated, { employeeSafe: req.role !== "employer" }),
+      payment: payment.rows[0] ? sanitizePaymentRecord(payment.rows[0], { employeeSafe: req.role !== "employer" }) : null
+    });
+  } catch (e) {
+    console.error("service plan reconcile failed:", {
+      message: e.message,
+      type: e.type,
+      code: e.code,
+      requestId: e.requestId
+    });
+    res.status(500).json({ error: "service_plan_reconcile_failed", detail: e.message });
+  }
+});
+
 app.get("/api/contacts/:contactId/service-plans", authRequired, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
@@ -11716,43 +11851,20 @@ async function handleStripeWebhook(req, res) {
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
         const sub = event.data.object;
-        const localStatus = event.type === "customer.subscription.deleted"
-          ? "canceled"
-          : (mapStripeSubscriptionStatus(sub.status) || null);
-        const { rows } = await pool.query(
-          `UPDATE service_plans
-              SET stripe_subscription_status = $2,
-                  status = COALESCE($3, status),
-                  updated_at = now()
-            WHERE stripe_subscription_id = $1
-              AND (stripe_connected_account_id = $4 OR $4 IS NULL)
-            RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
-          [sub.id, sub.status, localStatus, connectedAccountId]
-        );
+        const rows = await applyStripeSubscriptionStatus({
+          subscription: sub,
+          connectedAccountId,
+          source: "stripe.webhook",
+          stripeEventId: event.id
+        });
         if (rows.length) {
           await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
             `stripe_${event.type}`, `Subscription is ${sub.status}`);
-          const mappedEvent = event.type === "customer.subscription.created"
-            ? "service_plan.subscription_created"
-            : event.type === "customer.subscription.deleted"
-              ? "service_plan.subscription_canceled"
-              : ({ active: "service_plan.subscription_active", past_due: "service_plan.subscription_past_due", unpaid: "service_plan.subscription_unpaid", paused: "service_plan.subscription_paused" }[sub.status] || "service_plan.updated");
-          if (rows[0].company_id) {
-            await emitAutomationEvent({
-              companyId: rows[0].company_id,
-              eventType: mappedEvent,
-              subjectType: "service_plan",
-              subjectId: rows[0].id,
-              source: "stripe.webhook",
-              dedupeKey: `${mappedEvent}:${event.id}:${rows[0].id}`,
-              payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, stripe_event_id: event.id, stripe_subscription_id: sub.id, subscription_status: sub.status, status: rows[0].status }
-            });
-            await syncAutomationSchedulesForServicePlan(rows[0].company_id, rows[0]);
-          }
         }
         break;
       }
 
+      case "invoice.paid":
       case "invoice.payment_succeeded": {
         const invoice = event.data.object;
         // Update payment record.
@@ -11771,22 +11883,42 @@ async function handleStripeWebhook(req, res) {
             subjectType: "payment",
             subjectId: rec.id,
             source: "stripe.webhook",
-            dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
+            dedupeKey: `payment.succeeded:invoice:${invoice.id}:${rec.id}`,
             payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_invoice_id: invoice.id }
           });
         }
-        // If this is the initial invoice, mark plan active.
+        console.log("[stripe] invoice payment matched records", {
+          event_id: event.id,
+          event_type: event.type,
+          connected_account_id: connectedAccountId,
+          invoice_id: invoice.id,
+          subscription_id: invoice.subscription || null,
+          matched_payment_records: paidRecords.rows.length
+        });
+        // If this is a subscription invoice, reconcile the authoritative subscription status.
         if (invoice.subscription) {
-          const { rows } = await pool.query(
-            `UPDATE service_plans
-                SET status = 'active',
-                    stripe_subscription_status = 'active',
-                    updated_at = now()
-              WHERE stripe_subscription_id = $1
-                AND (stripe_connected_account_id = $2 OR $2 IS NULL)
-              RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
-            [invoice.subscription, connectedAccountId]
-          );
+          let rows = [];
+          try {
+            const subscription = await stripe.subscriptions.retrieve(
+              invoice.subscription,
+              { expand: ["latest_invoice.payment_intent"] },
+              connectedAccountId ? { stripeAccount: connectedAccountId } : undefined
+            );
+            rows = await applyStripeSubscriptionStatus({
+              subscription,
+              connectedAccountId,
+              source: "stripe.webhook",
+              stripeEventId: `invoice:${invoice.id}`
+            });
+          } catch (err) {
+            console.warn("[stripe] invoice subscription reconcile failed", {
+              event_id: event.id,
+              invoice_id: invoice.id,
+              subscription_id: invoice.subscription,
+              connected_account_id: connectedAccountId,
+              message: err.message
+            });
+          }
           if (rows.length) {
             await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
               "invoice_paid", `Invoice ${invoice.id} paid`);
@@ -11796,10 +11928,9 @@ async function handleStripeWebhook(req, res) {
               subjectType: "service_plan",
               subjectId: rows[0].id,
               source: "stripe.webhook",
-              dedupeKey: `service_plan.subscription_payment_succeeded:${event.id}:${rows[0].id}`,
+              dedupeKey: `service_plan.subscription_payment_succeeded:invoice:${invoice.id}:${rows[0].id}`,
               payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, stripe_event_id: event.id, stripe_invoice_id: invoice.id, stripe_subscription_id: invoice.subscription, subscription_status: "active" }
             });
-            await syncAutomationSchedulesForServicePlan(rows[0].company_id, rows[0]);
           }
         }
         break;
@@ -11827,13 +11958,28 @@ async function handleStripeWebhook(req, res) {
           });
         }
         if (invoice.subscription) {
-          const { rows } = await pool.query(
-            `UPDATE service_plans
-                SET status = 'past_due', updated_at = now()
-              WHERE stripe_subscription_id = $1
-              RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
-            [invoice.subscription]
-          );
+          let rows = [];
+          try {
+            const subscription = await stripe.subscriptions.retrieve(
+              invoice.subscription,
+              { expand: ["latest_invoice.payment_intent"] },
+              connectedAccountId ? { stripeAccount: connectedAccountId } : undefined
+            );
+            rows = await applyStripeSubscriptionStatus({
+              subscription,
+              connectedAccountId,
+              source: "stripe.webhook",
+              stripeEventId: event.id
+            });
+          } catch (err) {
+            console.warn("[stripe] failed-invoice subscription reconcile failed", {
+              event_id: event.id,
+              invoice_id: invoice.id,
+              subscription_id: invoice.subscription,
+              connected_account_id: connectedAccountId,
+              message: err.message
+            });
+          }
           if (rows.length) {
             await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
               "invoice_failed", `Invoice ${invoice.id} failed`);
