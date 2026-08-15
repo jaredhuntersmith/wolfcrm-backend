@@ -805,6 +805,9 @@ async function bootstrap() {
       start_longitude DOUBLE PRECISION,
       start_mode TEXT NOT NULL DEFAULT 'current_location',
       ending_behavior TEXT NOT NULL DEFAULT 'finish_at_final_stop',
+      end_label TEXT,
+      end_latitude DOUBLE PRECISION,
+      end_longitude DOUBLE PRECISION,
       distance_meters DOUBLE PRECISION,
       travel_time_seconds DOUBLE PRECISION,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -832,6 +835,9 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS crm_route_stops_route_order_idx ON crm_route_stops(route_id, stop_order);
     CREATE INDEX IF NOT EXISTS crm_route_stops_company_idx ON crm_route_stops(company_id);
     ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS start_mode TEXT NOT NULL DEFAULT 'current_location';
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_label TEXT;
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_latitude DOUBLE PRECISION;
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_longitude DOUBLE PRECISION;
     ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'contact';
 
     CREATE TABLE IF NOT EXISTS zapier_tokens (
@@ -5988,6 +5994,9 @@ function mapRouteRow(row, stops = []) {
     start_longitude: row.start_longitude,
     start_mode: row.start_mode || "current_location",
     ending_behavior: row.ending_behavior,
+    end_label: row.end_label,
+    end_latitude: row.end_latitude,
+    end_longitude: row.end_longitude,
     stop_count: Number(row.stop_count || stops.length || 0),
     distance_meters: row.distance_meters,
     travel_time_seconds: row.travel_time_seconds,
@@ -6103,9 +6112,9 @@ app.post("/api/routes", authRequired, async (req, res) => {
     await client.query(
       `INSERT INTO crm_routes(
          id, company_id, user_id, name, status, start_label, start_latitude, start_longitude,
-         start_mode, ending_behavior, distance_meters, travel_time_seconds
+         start_mode, ending_behavior, end_label, end_latitude, end_longitude, distance_meters, travel_time_seconds
        )
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
       [
         id,
         req.companyId || null,
@@ -6116,7 +6125,10 @@ app.post("/api/routes", authRequired, async (req, res) => {
         Number.isFinite(Number(req.body.start_latitude)) ? Number(req.body.start_latitude) : null,
         Number.isFinite(Number(req.body.start_longitude)) ? Number(req.body.start_longitude) : null,
         ["current_location", "custom_address"].includes(req.body.start_mode) ? req.body.start_mode : "current_location",
-        ["finish_at_final_stop", "return_to_start"].includes(req.body.ending_behavior) ? req.body.ending_behavior : "finish_at_final_stop",
+        ["finish_at_final_stop", "return_to_start", "custom_address"].includes(req.body.ending_behavior) ? req.body.ending_behavior : "finish_at_final_stop",
+        req.body.end_label || null,
+        Number.isFinite(Number(req.body.end_latitude)) ? Number(req.body.end_latitude) : null,
+        Number.isFinite(Number(req.body.end_longitude)) ? Number(req.body.end_longitude) : null,
         Number.isFinite(Number(req.body.distance_meters)) ? Number(req.body.distance_meters) : null,
         Number.isFinite(Number(req.body.travel_time_seconds)) ? Number(req.body.travel_time_seconds) : null
       ]
@@ -6152,8 +6164,11 @@ app.put("/api/routes/:id", authRequired, async (req, res) => {
               start_longitude = $6,
               start_mode = COALESCE($7, start_mode),
               ending_behavior = COALESCE($8, ending_behavior),
-              distance_meters = $9,
-              travel_time_seconds = $10,
+              end_label = $9,
+              end_latitude = $10,
+              end_longitude = $11,
+              distance_meters = $12,
+              travel_time_seconds = $13,
               updated_at = now()
         WHERE id = $1`,
       [
@@ -6164,7 +6179,10 @@ app.put("/api/routes/:id", authRequired, async (req, res) => {
         Number.isFinite(Number(req.body.start_latitude)) ? Number(req.body.start_latitude) : null,
         Number.isFinite(Number(req.body.start_longitude)) ? Number(req.body.start_longitude) : null,
         ["current_location", "custom_address"].includes(req.body.start_mode) ? req.body.start_mode : null,
-        ["finish_at_final_stop", "return_to_start"].includes(req.body.ending_behavior) ? req.body.ending_behavior : null,
+        ["finish_at_final_stop", "return_to_start", "custom_address"].includes(req.body.ending_behavior) ? req.body.ending_behavior : null,
+        req.body.end_label || null,
+        Number.isFinite(Number(req.body.end_latitude)) ? Number(req.body.end_latitude) : null,
+        Number.isFinite(Number(req.body.end_longitude)) ? Number(req.body.end_longitude) : null,
         Number.isFinite(Number(req.body.distance_meters)) ? Number(req.body.distance_meters) : null,
         Number.isFinite(Number(req.body.travel_time_seconds)) ? Number(req.body.travel_time_seconds) : null
       ]
