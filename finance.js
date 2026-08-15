@@ -199,6 +199,7 @@ function financePlannedItemPayload(row) {
     recurrence: row.recurrence,
     recurrence_end_date: row.recurrence_end_date instanceof Date ? row.recurrence_end_date.toISOString().slice(0, 10) : row.recurrence_end_date,
     notes: row.notes,
+    paused_at: row.paused_at,
     archived_at: row.archived_at,
     created_by: row.created_by,
     created_at: row.created_at,
@@ -356,6 +357,7 @@ async function installFinanceSchema(pool) {
       recurrence TEXT NOT NULL DEFAULT 'none' CHECK (recurrence IN ('none','weekly','biweekly','monthly','quarterly','yearly')),
       recurrence_end_date DATE,
       notes TEXT,
+      paused_at TIMESTAMPTZ,
       archived_at TIMESTAMPTZ,
       created_by UUID REFERENCES users(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -473,6 +475,7 @@ async function installFinanceSchema(pool) {
     END $$;
   `);
   await pool.query(`ALTER TABLE finance_settings ADD COLUMN IF NOT EXISTS use_available_bank_balance BOOLEAN NOT NULL DEFAULT false`);
+  await pool.query(`ALTER TABLE finance_planned_items ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE finance_planned_items DROP CONSTRAINT IF EXISTS finance_planned_items_recurrence_check`);
   await pool.query(`ALTER TABLE finance_planned_items ADD CONSTRAINT finance_planned_items_recurrence_check CHECK (recurrence IN ('none','weekly','biweekly','monthly','quarterly','yearly'))`);
   await installPlaidSchema(pool);
@@ -552,6 +555,21 @@ function nextOccurrenceDate(dateString, recurrence) {
   }
 }
 
+function nextActiveRecurringDate(row, fromDate = todayDateString()) {
+  const recurrence = normalizeRecurrence(row.recurrence || "none");
+  let occurrenceDate = dateOnlyFromDb(row.scheduled_date);
+  const recurrenceEnd = row.recurrence_end_date ? dateOnlyFromDb(row.recurrence_end_date) : null;
+  if (!recurrence || recurrence === "none" || !occurrenceDate || occurrenceDate >= fromDate) return occurrenceDate;
+
+  let guard = 0;
+  while (occurrenceDate && occurrenceDate < fromDate && guard < 500) {
+    occurrenceDate = nextOccurrenceDate(occurrenceDate, recurrence);
+    guard += 1;
+  }
+  if (recurrenceEnd && occurrenceDate > recurrenceEnd) return dateOnlyFromDb(row.scheduled_date);
+  return occurrenceDate || dateOnlyFromDb(row.scheduled_date);
+}
+
 export function expandPlannedItemOccurrences(item, startDate, endDate) {
   const occurrences = [];
   const recurrence = item.recurrence || "none";
@@ -592,7 +610,7 @@ function compareProjectionOccurrences(a, b) {
 
 export function buildProjection({ startingBalanceCents, minimumReserveCents, plannedItems, startDate, endDate }) {
   const occurrences = plannedItems
-    .filter((item) => !item.archived_at)
+    .filter((item) => !item.archived_at && !item.paused_at)
     .flatMap((item) => expandPlannedItemOccurrences(item, startDate, endDate))
     .sort(compareProjectionOccurrences);
 
@@ -642,6 +660,7 @@ export async function loadActivePlannedItems(pool, companyId) {
        LEFT JOIN finance_accounts a ON a.id = p.account_id AND a.company_id = p.company_id
       WHERE p.company_id = $1
         AND p.archived_at IS NULL
+        AND p.paused_at IS NULL
       ORDER BY p.scheduled_date ASC, p.created_at ASC`,
     [companyId]
   );
@@ -1316,6 +1335,57 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
       res.json(financePlannedItemPayload(rows[0]));
     } catch (error) {
       handleFinanceError(res, error, "finance_planned_item_archive_failed");
+    }
+  });
+
+  app.post("/api/finance/planned-items/:id/pause", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE finance_planned_items
+            SET paused_at = COALESCE(paused_at, now()),
+                updated_at = now()
+          WHERE id = $1
+            AND company_id = $2
+            AND archived_at IS NULL
+          RETURNING *`,
+        [req.params.id, req.companyId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "finance_planned_item_not_found", message: "Planned item was not found." });
+      res.json(financePlannedItemPayload(rows[0]));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_planned_item_pause_failed");
+    }
+  });
+
+  app.post("/api/finance/planned-items/:id/unpause", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const existing = await pool.query(
+        `SELECT *
+           FROM finance_planned_items
+          WHERE id = $1
+            AND company_id = $2
+            AND archived_at IS NULL
+          LIMIT 1`,
+        [req.params.id, req.companyId]
+      );
+      const item = existing.rows[0];
+      if (!item) return res.status(404).json({ error: "finance_planned_item_not_found", message: "Planned item was not found." });
+      const scheduledDate = nextActiveRecurringDate(item);
+      const { rows } = await pool.query(
+        `UPDATE finance_planned_items
+            SET paused_at = NULL,
+                scheduled_date = $3,
+                updated_at = now()
+          WHERE id = $1
+            AND company_id = $2
+          RETURNING *`,
+        [req.params.id, req.companyId, scheduledDate]
+      );
+      res.json(financePlannedItemPayload(rows[0]));
+    } catch (error) {
+      handleFinanceError(res, error, "finance_planned_item_unpause_failed");
     }
   });
 
