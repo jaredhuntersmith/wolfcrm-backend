@@ -5843,6 +5843,154 @@ function parseOptionalContactDate(value) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+function contactCreateBaseValues(req, body, id = randomUUID()) {
+  const {
+    name, phone, email, address,
+    value_cents, lat, lng, tags, job_type,
+    u1, u2, u3, u4, u5
+  } = body || {};
+  return [
+    id, req.userId, req.companyId, name || "", phone || "", email || "", address || "",
+    Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
+    lat ?? null, lng ?? null, Array.isArray(tags) ? tags.join(",") : (tags || ""), job_type || "",
+    u1 || "", u2 || "", u3 || "", u4 || "", u5 || ""
+  ];
+}
+
+function classifyContactCreateError(error) {
+  const code = error.code || "unknown_error";
+  const details = {};
+  if (error.column) details.column = String(error.column);
+  if (error.constraint) details.constraint = String(error.constraint);
+  if (error.table) details.table = String(error.table);
+  if (error.detail) details.detail = String(error.detail).slice(0, 240);
+
+  let message = "Contact could not be created.";
+  if (code === "42703") message = `Database is missing contact column '${error.column || "unknown"}'. Redeploy/run migrations.`;
+  else if (code === "23502") message = `Database rejected a required empty field${error.column ? `: ${error.column}` : ""}.`;
+  else if (code === "23503") message = "Database rejected the contact because a related company/user record was not found.";
+  else if (code === "22P02") message = "Database rejected an invalid value type, usually a UUID/date/number format.";
+  else if (code === "22007" || code === "22008") message = "Database rejected an invalid date/time value.";
+  else if (code === "23505") message = "Database rejected a duplicate unique value.";
+
+  return { code, message, details };
+}
+
+function contactInsertStatements(req, body) {
+  const createdAt = parseOptionalContactDate(body?.created_at);
+  const leadSubmittedAt = parseOptionalContactDate(body?.lead_submitted_at);
+  const baseValues = contactCreateBaseValues(req, body);
+  return [
+    {
+      name: "full_csv_payload",
+      sql: `
+        INSERT INTO contacts (
+          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info, source, lead_submitted_at, created_at
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, COALESCE($21, now())
+        ) RETURNING *;
+      `,
+      values: [
+        ...baseValues,
+        Array.isArray(body?.lead_info) ? JSON.stringify(body.lead_info) : null,
+        body?.source || "manual",
+        leadSubmittedAt,
+        createdAt
+      ]
+    },
+    {
+      name: "compatibility_payload",
+      sql: `
+        INSERT INTO contacts (
+          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+        ) RETURNING *;
+      `,
+      values: baseValues
+    },
+    {
+      name: "minimal_payload",
+      sql: `
+        INSERT INTO contacts (
+          id, user_id, company_id, name, phone, email, address, tags
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8
+        ) RETURNING *;
+      `,
+      values: [
+        randomUUID(), req.userId, req.companyId,
+        body?.name || "Unnamed",
+        body?.phone || "",
+        body?.email || "",
+        body?.address || "",
+        Array.isArray(body?.tags) ? body.tags.join(",") : (body?.tags || "lead")
+      ]
+    }
+  ];
+}
+
+function contactCreateRecommendation(checks) {
+  const firstFailed = checks.find((check) => !check.ok);
+  if (!firstFailed) return "Contact create payload passed all dry-run checks.";
+  if (firstFailed.column) return `Fix or migrate contact column '${firstFailed.column}'.`;
+  if (firstFailed.code === "23503") return "Check company/user foreign key data for this authenticated session.";
+  if (firstFailed.code === "23502") return "A required database column is receiving null or missing data.";
+  return "Check backend logs for the matching contact_create_failed entry.";
+}
+
+app.post("/api/contacts/create-diagnostics", authRequired, async (req, res) => {
+  const body = req.body || {};
+  if (!body.name) return res.status(400).json({
+    error: "name_required",
+    code: "name_required",
+    message: "Name is required before testing contact creation."
+  });
+
+  const client = await pool.connect();
+  const checks = [];
+  try {
+    await client.query("BEGIN");
+    for (const statement of contactInsertStatements(req, body)) {
+      const values = [...statement.values];
+      values[0] = randomUUID();
+      const savepoint = `contact_create_diag_${checks.length}`;
+      await client.query(`SAVEPOINT ${savepoint}`);
+      try {
+        await client.query(statement.sql, values);
+        checks.push({ name: statement.name, ok: true });
+      } catch (error) {
+        const classified = classifyContactCreateError(error);
+        checks.push({
+          name: statement.name,
+          ok: false,
+          code: classified.code,
+          message: classified.message,
+          ...classified.details
+        });
+        await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      }
+    }
+    await client.query("ROLLBACK");
+    res.json({
+      ok: checks.every((check) => check.ok),
+      checks,
+      recommendation: contactCreateRecommendation(checks)
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    const classified = classifyContactCreateError(error);
+    res.status(500).json({
+      error: "contact_create_diagnostics_failed",
+      code: classified.code,
+      message: classified.message,
+      details: classified.details
+    });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/api/contacts", authRequired, async (req, res) => {
   const {
     name, phone, email, address,
@@ -5853,49 +6001,20 @@ app.post("/api/contacts", authRequired, async (req, res) => {
   if (!name) return res.status(400).json({ error: "name_required" });
 
   const id = randomUUID();
-  const createdAt = parseOptionalContactDate(created_at);
-  const leadSubmittedAt = parseOptionalContactDate(lead_submitted_at);
   try {
-    const baseValues = [
-      id, req.userId, req.companyId, name || "", phone || "", email || "", address || "",
-      Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
-      lat ?? null, lng ?? null, Array.isArray(tags) ? tags.join(",") : (tags || ""), job_type || "",
-      u1 || "", u2 || "", u3 || "", u4 || "", u5 || ""
-    ];
+    const statements = contactInsertStatements(req, req.body || {});
+    statements[0].values[0] = id;
+    statements[1].values[0] = id;
     let r;
     try {
-      r = await pool.query(
-        `
-        INSERT INTO contacts (
-          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info, source, lead_submitted_at, created_at
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, COALESCE($21, now())
-        ) RETURNING *;
-        `,
-        [
-          ...baseValues,
-          Array.isArray(lead_info) ? JSON.stringify(lead_info) : null,
-          source || "manual",
-          leadSubmittedAt,
-          createdAt
-        ]
-      );
+      r = await pool.query(statements[0].sql, statements[0].values);
     } catch (insertError) {
       if (insertError.code !== "42703") throw insertError;
       console.warn("contacts_create_compat_insert", {
         companyId: req.companyId,
         missingColumn: insertError.column || null
       });
-      r = await pool.query(
-        `
-        INSERT INTO contacts (
-          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
-        ) RETURNING *;
-        `,
-        baseValues
-      );
+      r = await pool.query(statements[1].sql, statements[1].values);
     }
     if (req.companyId) {
       const createdContact = r.rows[0];
@@ -5945,8 +6064,19 @@ app.post("/api/contacts", authRequired, async (req, res) => {
     }
     res.status(201).json(r.rows[0]);
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "failed_create" });
+    const classified = classifyContactCreateError(e);
+    console.error("contact_create_failed", {
+      companyId: req.companyId,
+      userId: req.userId,
+      code: classified.code,
+      details: classified.details
+    });
+    res.status(500).json({
+      error: "failed_create",
+      code: classified.code,
+      message: classified.message,
+      details: classified.details
+    });
   }
 });
 
