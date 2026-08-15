@@ -5898,34 +5898,51 @@ app.post("/api/contacts", authRequired, async (req, res) => {
       );
     }
     if (req.companyId) {
+      const createdContact = r.rows[0];
       const origin = source || "manual";
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "contact.created",
-        subjectType: "contact",
-        subjectId: r.rows[0].id,
-        actorUserId: req.userId,
-        source: "contacts.api",
-        dedupeKey: `contact.created:${r.rows[0].id}`,
-        payload: { contact_id: r.rows[0].id, name: r.rows[0].name, source: origin }
-      });
-      const sourceEvent = origin === "csv" ? "contact.imported_csv"
-        : origin === "phone" ? "contact.imported_phone"
-          : origin === "map" ? "contact.converted_from_map_pin"
-            : origin === "schedule" ? "contact.created_from_schedule"
-              : "contact.created_manually";
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: sourceEvent,
-        subjectType: "contact",
-        subjectId: r.rows[0].id,
-        actorUserId: req.userId,
-        source: `contacts.${origin}`,
-        dedupeKey: `${sourceEvent}:${r.rows[0].id}`,
-        payload: { contact_id: r.rows[0].id, name: r.rows[0].name, source: origin }
-      });
+      try {
+        await emitAutomationEvent({
+          companyId: req.companyId,
+          eventType: "contact.created",
+          subjectType: "contact",
+          subjectId: createdContact.id,
+          actorUserId: req.userId,
+          source: "contacts.api",
+          dedupeKey: `contact.created:${createdContact.id}`,
+          payload: { contact_id: createdContact.id, name: createdContact.name, source: origin }
+        });
+        const sourceEvent = origin === "csv" ? "contact.imported_csv"
+          : origin === "phone" ? "contact.imported_phone"
+            : origin === "map" ? "contact.converted_from_map_pin"
+              : origin === "schedule" ? "contact.created_from_schedule"
+                : "contact.created_manually";
+        await emitAutomationEvent({
+          companyId: req.companyId,
+          eventType: sourceEvent,
+          subjectType: "contact",
+          subjectId: createdContact.id,
+          actorUserId: req.userId,
+          source: `contacts.${origin}`,
+          dedupeKey: `${sourceEvent}:${createdContact.id}`,
+          payload: { contact_id: createdContact.id, name: createdContact.name, source: origin }
+        });
+      } catch (eventError) {
+        console.warn("contact_create_automation_event_failed", {
+          companyId: req.companyId,
+          contactId: createdContact.id,
+          error: eventError.message
+        });
+      }
+      try {
+        await markGoogleSheetsContactDirty(pool, req.companyId, createdContact.id, "contact.created");
+      } catch (dirtyError) {
+        console.warn("contact_create_google_sheets_dirty_failed", {
+          companyId: req.companyId,
+          contactId: createdContact.id,
+          error: dirtyError.message
+        });
+      }
     }
-    if (req.companyId) await markGoogleSheetsContactDirty(pool, req.companyId, r.rows[0].id, "contact.created");
     res.status(201).json(r.rows[0]);
   } catch (e) {
     console.error(e);
