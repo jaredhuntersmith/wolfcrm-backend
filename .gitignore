@@ -3,12 +3,6 @@ node_modules/
 .env
 .env.*
 !.env.example
-*.pem
-*.key
-credentials.json
-credentials-*.json
-secrets.json
-secrets-*.json
 npm-debug.log*
 *.log
 tmp/

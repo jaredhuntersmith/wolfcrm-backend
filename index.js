@@ -1,8 +1,5 @@
 /* WolfCRM backend — email/password auth + user-scoped CRM data */
 /* WolfCRM backend auto-sync verification */
-/* WolfCRM direct-repo auto-sync verification 1 */
-/* WolfCRM direct-repo auto-sync verification 2 */
-/* WolfCRM post-reload auto-sync verification */
 /* Railway deploy smoke-test touch: 2026-08-12 */
 import express from "express";
 import cors from "cors";
@@ -13,18 +10,6 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Stripe from "stripe";
 import apn from "@parse/node-apn";
 import twilio from "twilio";
-import { calculateStripeConnectReadiness } from "./stripe-connect-status.js";
-import {
-  isStripePaymentCollectionPaused,
-  mapStripePaymentIntentStatus,
-  mapStripeSubscriptionStatus as mapStripeSubscriptionStatusValue,
-  mapStripeSubscriptionToWolfCRMStatus,
-  nextServiceDateAfterResume,
-  selectRecoverableSubscription,
-  subscriptionBlocksNewStart,
-  subscriptionCanResumePayment,
-  stripeSubscriptionCustomerId
-} from "./stripe-payment-sync.js";
 import {
   installAutomationSystem,
   emitAutomationEvent,
@@ -45,6 +30,12 @@ import {
   syncAutomationSchedulesForTimeEntry
 } from "./automations.js";
 import { installFinanceSystem, loadProjection } from "./finance.js";
+import {
+  installGoogleSheetsSchema,
+  installGoogleSheetsSystem,
+  markGoogleSheetsContactDirty,
+  startGoogleSheetsWorkers
+} from "./google-sheets.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -361,10 +352,6 @@ const STRIPE_PLATFORM_FEE_BPS = Math.max(
   0,
   Math.min(10000, parseInt(process.env.STRIPE_PLATFORM_FEE_BPS || "0", 10) || 0)
 );
-// Stripe iOS 26.6.0 still sends Stripe-Version 2020-08-27. PaymentSheet
-// consumes these ephemeral keys on-device, so mint them for the mobile SDK's
-// expected API version instead of the server client's newer API version.
-const STRIPE_MOBILE_EPHEMERAL_KEY_API_VERSION = "2020-08-27";
 const STRIPE_CONNECT_RETURN_URL = process.env.STRIPE_CONNECT_RETURN_URL
   || "https://wolfcrm-backend-production.up.railway.app/stripe/connect/return";
 const STRIPE_CONNECT_REFRESH_URL = process.env.STRIPE_CONNECT_REFRESH_URL
@@ -377,7 +364,6 @@ app.use(cors());
 // raw bytes aren't consumed. The handler is defined further down but the
 // raw-body middleware for that exact path lives here.
 app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }));
-app.use("/stripe/connect-webhook", express.raw({ type: "application/json", limit: "2mb" }));
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: false, limit: "2mb" }));
@@ -1144,7 +1130,7 @@ async function bootstrap() {
       state TEXT NOT NULL,
       stage_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      stage_entered_at TIMESTAMPTZ DEFAULT now(),
+      stage_entered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE UNIQUE INDEX IF NOT EXISTS opportunities_user_contact_idx
@@ -1152,6 +1138,11 @@ async function bootstrap() {
 
     -- Same for opportunities so auto-assigned webhook leads are visible company-wide.
     ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS company_id UUID;
+    ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ;
+    ALTER TABLE opportunities ALTER COLUMN stage_entered_at SET DEFAULT now();
+    UPDATE opportunities
+       SET stage_entered_at = COALESCE(created_at, now())
+     WHERE stage_entered_at IS NULL;
     UPDATE opportunities o
       SET company_id = u.company_id
       FROM users u
@@ -1159,16 +1150,6 @@ async function bootstrap() {
         AND o.company_id IS NULL
         AND u.company_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS opportunities_company_idx ON opportunities(company_id);
-    ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ;
-    ALTER TABLE opportunities ALTER COLUMN stage_entered_at SET DEFAULT now();
-    UPDATE opportunities
-      SET stage_entered_at = COALESCE(created_at, now())
-      WHERE stage_entered_at IS NULL
-        AND state = 'stage';
-    UPDATE opportunities
-      SET stage_entered_at = COALESCE(created_at, now())
-      WHERE stage_entered_at IS NULL;
-    CREATE INDEX IF NOT EXISTS opportunities_company_stage_entered_idx ON opportunities(company_id, stage_id, stage_entered_at);
 
     CREATE TABLE IF NOT EXISTS schedule_events (
       id TEXT PRIMARY KEY,
@@ -1194,6 +1175,8 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS schedule_user_start_idx
       ON schedule_events(user_id, start_at);
+    CREATE INDEX IF NOT EXISTS schedule_events_quote_idx
+      ON schedule_events(quote_id);
 
     CREATE TABLE IF NOT EXISTS map_pins (
       id TEXT PRIMARY KEY,
@@ -1301,19 +1284,6 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS job_workflow_templates_company_idx ON job_workflow_templates(company_id, archived_at, enabled);
 
-    CREATE TABLE IF NOT EXISTS job_workflow_job_additions (
-      id TEXT PRIMARY KEY,
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      job_id TEXT NOT NULL REFERENCES schedule_events(id) ON DELETE CASCADE,
-      sections JSONB NOT NULL DEFAULT '[]'::jsonb,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE(company_id, job_id)
-    );
-    CREATE INDEX IF NOT EXISTS job_workflow_job_additions_job_idx ON job_workflow_job_additions(company_id, job_id);
-
     CREATE TABLE IF NOT EXISTS job_workflow_runs (
       id TEXT PRIMARY KEY,
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -1395,6 +1365,7 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS inventory_transactions_item_idx ON inventory_transactions(company_id, item_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS inventory_transactions_job_idx ON inventory_transactions(company_id, job_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_idempotency_idx ON inventory_transactions(company_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS equipment_requests (
       id TEXT PRIMARY KEY,
@@ -1412,110 +1383,6 @@ async function bootstrap() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS equipment_requests_company_idx ON equipment_requests(company_id, status, created_at);
-
-    CREATE TABLE IF NOT EXISTS equipment_asset_history (
-      id TEXT PRIMARY KEY,
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
-      event_type TEXT NOT NULL,
-      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      summary TEXT NOT NULL,
-      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS equipment_asset_history_item_idx ON equipment_asset_history(company_id, item_id, created_at DESC);
-
-    CREATE TABLE IF NOT EXISTS equipment_repairs (
-      id TEXT PRIMARY KEY,
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
-      request_id TEXT REFERENCES equipment_requests(id) ON DELETE SET NULL,
-      reported_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      assigned_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      vendor TEXT,
-      problem TEXT NOT NULL,
-      diagnosis TEXT,
-      status TEXT NOT NULL DEFAULT 'reported',
-      priority TEXT NOT NULL DEFAULT 'normal',
-      estimated_cost_cents INTEGER,
-      actual_cost_cents INTEGER,
-      opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      scheduled_at TIMESTAMPTZ,
-      started_at TIMESTAMPTZ,
-      completed_at TIMESTAMPTZ,
-      resolution_notes TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS equipment_repairs_company_idx ON equipment_repairs(company_id, status, updated_at DESC);
-    CREATE INDEX IF NOT EXISTS equipment_repairs_item_idx ON equipment_repairs(company_id, item_id, updated_at DESC);
-
-    CREATE TABLE IF NOT EXISTS material_usages (
-      id TEXT PRIMARY KEY,
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      job_id TEXT NOT NULL REFERENCES schedule_events(id) ON DELETE CASCADE,
-      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE RESTRICT,
-      location_id TEXT,
-      quantity NUMERIC NOT NULL DEFAULT 0,
-      unit_cost_snapshot_cents INTEGER,
-      current_transaction_id TEXT,
-      status TEXT NOT NULL DEFAULT 'active',
-      note TEXT,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      idempotency_key TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS material_usages_job_idx ON material_usages(company_id, job_id, status);
-
-    CREATE TABLE IF NOT EXISTS inventory_count_schedules (
-      id TEXT PRIMARY KEY,
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      name TEXT NOT NULL,
-      location_id TEXT NOT NULL,
-      assigned_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      frequency TEXT NOT NULL DEFAULT 'weekly',
-      due_date DATE,
-      due_time TEXT,
-      reminder_minutes INTEGER,
-      variance_threshold NUMERIC NOT NULL DEFAULT 0,
-      approval_required BOOLEAN NOT NULL DEFAULT true,
-      enabled BOOLEAN NOT NULL DEFAULT true,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS inventory_count_schedules_company_idx ON inventory_count_schedules(company_id, enabled, due_date);
-
-    CREATE TABLE IF NOT EXISTS inventory_count_submissions (
-      id TEXT PRIMARY KEY,
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      schedule_id TEXT REFERENCES inventory_count_schedules(id) ON DELETE SET NULL,
-      location_id TEXT NOT NULL,
-      assigned_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      submitted_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      status TEXT NOT NULL DEFAULT 'draft',
-      due_date DATE,
-      submitted_at TIMESTAMPTZ,
-      reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      reviewed_at TIMESTAMPTZ,
-      review_note TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS inventory_count_submissions_company_idx ON inventory_count_submissions(company_id, status, due_date DESC);
-
-    CREATE TABLE IF NOT EXISTS inventory_count_submission_items (
-      id TEXT PRIMARY KEY,
-      submission_id TEXT NOT NULL REFERENCES inventory_count_submissions(id) ON DELETE CASCADE,
-      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE RESTRICT,
-      expected_quantity NUMERIC NOT NULL DEFAULT 0,
-      counted_quantity NUMERIC NOT NULL DEFAULT 0,
-      variance NUMERIC NOT NULL DEFAULT 0,
-      note TEXT
-    );
 
     CREATE TABLE IF NOT EXISTS mileage_company_settings (
       company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
@@ -1798,11 +1665,10 @@ async function bootstrap() {
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_settings BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_manage_company_finance_ai_memories BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
-    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS quote_id UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS service_items JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS quote_id UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS material_cost_cents INTEGER;
-    CREATE INDEX IF NOT EXISTS schedule_events_quote_idx ON schedule_events(quote_id);
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS created_by UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS sales_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
@@ -1811,6 +1677,7 @@ async function bootstrap() {
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS started_by UUID;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS finished_by UUID;
+    CREATE INDEX IF NOT EXISTS schedule_events_quote_idx ON schedule_events(quote_id);
 
     ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS start_rule TEXT;
     ALTER TABLE mileage_daily_logs ADD COLUMN IF NOT EXISTS end_rule TEXT;
@@ -1832,8 +1699,6 @@ async function bootstrap() {
     ALTER TABLE mileage_legs ADD COLUMN IF NOT EXISTS error_message TEXT;
     ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
     ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS reverses_transaction_id TEXT;
-    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_equipment_request_id TEXT;
-    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_inventory_count_id TEXT;
 
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS detail TEXT;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS creator_id UUID;
@@ -1856,8 +1721,6 @@ async function bootstrap() {
   await pool.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS user_id UUID;`);
   await pool.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS company_id UUID;`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_idempotency_idx ON inventory_transactions(company_id, idempotency_key) WHERE idempotency_key IS NOT NULL;`);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS material_usages_idempotency_idx ON material_usages(company_id, idempotency_key) WHERE idempotency_key IS NOT NULL;`);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS inventory_count_submission_once_idx ON inventory_count_submissions(company_id, schedule_id, due_date);`);
 
   // Ensure owner user exists (from env) and backfill any NULL user_id rows to this owner
   const ownerEmail = (process.env.OWNER_EMAIL || "").trim().toLowerCase();
@@ -1929,14 +1792,10 @@ async function bootstrap() {
       stripe_payouts_enabled BOOLEAN NOT NULL DEFAULT false,
       stripe_details_submitted BOOLEAN NOT NULL DEFAULT false,
       stripe_default_currency TEXT NOT NULL DEFAULT 'usd',
-      stripe_requirements JSONB NOT NULL DEFAULT '{}'::jsonb,
-      stripe_capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS company_id UUID;
-    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS stripe_requirements JSONB NOT NULL DEFAULT '{}'::jsonb;
-    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS stripe_capabilities JSONB NOT NULL DEFAULT '{}'::jsonb;
     CREATE INDEX IF NOT EXISTS business_settings_user_idx ON business_settings(user_id);
     CREATE INDEX IF NOT EXISTS business_settings_company_idx ON business_settings(company_id);
     CREATE INDEX IF NOT EXISTS business_settings_stripe_account_idx ON business_settings(stripe_account_id);
@@ -1968,11 +1827,9 @@ async function bootstrap() {
       stripe_payment_intent_id TEXT,
       stripe_subscription_status TEXT,
       stripe_latest_invoice_id TEXT,
-      stripe_payment_collection_paused BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-    ALTER TABLE service_plans ADD COLUMN IF NOT EXISTS stripe_payment_collection_paused BOOLEAN NOT NULL DEFAULT false;
     CREATE INDEX IF NOT EXISTS service_plans_user_status_idx ON service_plans(user_id, status);
     CREATE INDEX IF NOT EXISTS service_plans_company_status_idx ON service_plans(company_id, status);
     CREATE INDEX IF NOT EXISTS service_plans_created_by_idx ON service_plans(created_by_user_id);
@@ -2184,455 +2041,28 @@ function sanitizeBusinessSettings(row) {
     stripe_payouts_enabled: row.stripe_payouts_enabled,
     stripe_details_submitted: row.stripe_details_submitted,
     stripe_default_currency: row.stripe_default_currency,
-    stripe_requirements: row.stripe_requirements || {},
-    stripe_capabilities: row.stripe_capabilities || {},
     created_at: row.created_at,
     updated_at: row.updated_at
   };
 }
 
-async function persistStripeAccountReadiness(userId, account) {
-  const readiness = calculateStripeConnectReadiness(account);
-  const updated = await pool.query(
-    `UPDATE business_settings
-        SET stripe_charges_enabled = $2,
-            stripe_payouts_enabled = $3,
-            stripe_details_submitted = $4,
-            stripe_default_currency = COALESCE($5, stripe_default_currency),
-            stripe_connect_status = $6,
-            stripe_requirements = $7::jsonb,
-            stripe_capabilities = $8::jsonb,
-            updated_at = now()
-      WHERE user_id = $1
-      RETURNING *`,
-    [
-      userId,
-      readiness.stripe_charges_enabled,
-      readiness.stripe_payouts_enabled,
-      readiness.stripe_details_submitted,
-      readiness.stripe_default_currency,
-      readiness.stripe_connect_status,
-      JSON.stringify(readiness.stripe_requirements),
-      JSON.stringify(readiness.stripe_capabilities)
-    ]
-  );
-  return updated.rows[0];
-}
-
-async function persistStripeAccountReadinessByAccountId(account) {
-  const readiness = calculateStripeConnectReadiness(account);
-  await pool.query(
-    `UPDATE business_settings
-        SET stripe_charges_enabled = $2,
-            stripe_payouts_enabled = $3,
-            stripe_details_submitted = $4,
-            stripe_default_currency = COALESCE($5, stripe_default_currency),
-            stripe_connect_status = $6,
-            stripe_requirements = $7::jsonb,
-            stripe_capabilities = $8::jsonb,
-            updated_at = now()
-      WHERE stripe_account_id = $1`,
-    [
-      account.id,
-      readiness.stripe_charges_enabled,
-      readiness.stripe_payouts_enabled,
-      readiness.stripe_details_submitted,
-      readiness.stripe_default_currency,
-      readiness.stripe_connect_status,
-      JSON.stringify(readiness.stripe_requirements),
-      JSON.stringify(readiness.stripe_capabilities)
-    ]
-  );
-}
-
-function stripeChargesBlockedResponse(account) {
-  const readiness = calculateStripeConnectReadiness(account);
-  return {
-    error: readiness.stripe_connect_status === "action_required" ? "stripe_action_required" : "charges_not_enabled",
-    message: readiness.stripe_connect_status === "action_required"
-      ? "Stripe requires additional verification before you can accept payments."
-      : "Stripe is still reviewing your account before payments can be accepted.",
-    stripe_connect_status: readiness.stripe_connect_status,
-    stripe_requirements: readiness.stripe_requirements
-  };
-}
-
 function mapStripeSubscriptionStatus(s) {
-  return mapStripeSubscriptionStatusValue(s);
-}
-
-function localPaymentStatusFromStripePaymentIntent(pi) {
-  return mapStripePaymentIntentStatus(pi);
-}
-
-function automationEventForPaymentStatus(status) {
-  switch (status) {
-    case "succeeded": return "payment.succeeded";
-    case "failed": return "payment.failed";
-    case "canceled": return "payment.canceled";
-    default: return null;
+  switch (s) {
+    case "active":
+    case "trialing":
+      return "active";
+    case "incomplete":
+      return "payment_pending";
+    case "past_due":
+    case "unpaid":
+      return "past_due";
+    case "canceled":
+      return "canceled";
+    case "incomplete_expired":
+      return "failed";
+    default:
+      return null;
   }
-}
-
-async function applyStripePaymentIntentStatus({
-  paymentIntent,
-  connectedAccountId = null,
-  paymentRecordId = null,
-  source = "stripe.reconcile",
-  stripeEventId = null
-}) {
-  if (!paymentIntent || !paymentIntent.id) return [];
-  const localStatus = localPaymentStatusFromStripePaymentIntent(paymentIntent);
-  const params = [paymentIntent.id, localStatus, connectedAccountId];
-  let idClause = "";
-  if (paymentRecordId) {
-    params.push(paymentRecordId);
-    idClause = ` AND id = $4`;
-  }
-  const { rows } = await pool.query(
-    `UPDATE payment_records
-        SET status = $2,
-            updated_at = now()
-      WHERE stripe_payment_intent_id = $1
-        AND ($3::text IS NULL OR stripe_connected_account_id = $3)
-        ${idClause}
-      RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency, status, stripe_connected_account_id`,
-    params
-  );
-  const eventType = automationEventForPaymentStatus(localStatus);
-  if (eventType) {
-    for (const rec of rows) {
-      await emitAutomationEvent({
-        companyId: rec.company_id,
-        eventType,
-        subjectType: "payment",
-        subjectId: rec.id,
-        source,
-        dedupeKey: `${eventType}:${stripeEventId || paymentIntent.id}:${rec.id}`,
-        payload: {
-          payment_id: rec.id,
-          contact_id: rec.contact_id,
-          service_plan_id: rec.service_plan_id,
-          amount_cents: rec.amount_cents,
-          currency: rec.currency,
-          stripe_event_id: stripeEventId || null,
-          stripe_payment_intent_id: paymentIntent.id,
-          stripe_payment_intent_status: paymentIntent.status,
-          local_status: localStatus
-        }
-      });
-    }
-  }
-  console.log("[stripe] payment intent reconciled", {
-    source,
-    stripe_event_id: stripeEventId || null,
-    connected_account_id: connectedAccountId,
-    payment_intent_id: paymentIntent.id,
-    stripe_status: paymentIntent.status,
-    local_status: localStatus,
-    matched_records: rows.length
-  });
-  return rows;
-}
-
-async function reconcilePaymentRecordFromStripe(record, { source = "stripe.reconcile" } = {}) {
-  const stripe = getStripe();
-  if (!stripe) throw new Error("stripe_not_configured");
-  if (!record || !record.stripe_payment_intent_id) return record;
-  if (!record.stripe_connected_account_id) throw new Error("stripe_connected_account_missing");
-  const pi = await stripe.paymentIntents.retrieve(
-    record.stripe_payment_intent_id,
-    {},
-    { stripeAccount: record.stripe_connected_account_id }
-  );
-  const rows = await applyStripePaymentIntentStatus({
-    paymentIntent: pi,
-    connectedAccountId: record.stripe_connected_account_id,
-    paymentRecordId: record.id,
-    source
-  });
-  return rows[0] || record;
-}
-
-function stripeInvoicePaymentIntent(invoice) {
-  if (!invoice) return null;
-  const pi = invoice.payment_intent || invoice.confirmation_secret?.payment_intent || null;
-  return pi && typeof pi === "object" ? pi : null;
-}
-
-async function applyStripeSubscriptionStatus({
-  subscription,
-  connectedAccountId,
-  servicePlanId = null,
-  source = "stripe.subscription_reconcile",
-  stripeEventId = null
-}) {
-  if (!subscription || !subscription.id) return [];
-  const invoice = subscription.latest_invoice && typeof subscription.latest_invoice === "object"
-    ? subscription.latest_invoice
-    : null;
-  const pi = stripeInvoicePaymentIntent(invoice);
-  const paymentCollectionPaused = isStripePaymentCollectionPaused(subscription);
-  const localStatus = mapStripeSubscriptionToWolfCRMStatus(subscription);
-  const params = [
-    subscription.id,
-    subscription.status,
-    localStatus,
-    invoice?.id || null,
-    pi?.id || null,
-    connectedAccountId,
-    paymentCollectionPaused
-  ];
-  let idClause = "";
-  if (servicePlanId) {
-    params.push(servicePlanId);
-    idClause = ` AND id = $8`;
-  }
-  const { rows } = await pool.query(
-    `UPDATE service_plans
-        SET stripe_subscription_status = $2,
-            status = COALESCE($3, status),
-            stripe_latest_invoice_id = COALESCE($4, stripe_latest_invoice_id),
-            stripe_payment_intent_id = COALESCE($5, stripe_payment_intent_id),
-            stripe_payment_collection_paused = $7,
-            updated_at = now()
-      WHERE stripe_subscription_id = $1
-        AND ($6::text IS NULL OR stripe_connected_account_id = $6)
-        ${idClause}
-      RETURNING *`,
-    params
-  );
-  for (const plan of rows) {
-    if (plan.company_id) {
-      const eventType = localStatus === "active"
-        ? "service_plan.subscription_active"
-        : ({
-            past_due: "service_plan.subscription_past_due",
-            paused: "service_plan.subscription_paused",
-            canceled: "service_plan.subscription_canceled",
-            failed: "service_plan.subscription_failed",
-            payment_pending: "service_plan.subscription_payment_pending"
-          }[localStatus] || "service_plan.updated");
-      await emitAutomationEvent({
-        companyId: plan.company_id,
-        eventType,
-        subjectType: "service_plan",
-        subjectId: plan.id,
-        source,
-        dedupeKey: `${eventType}:${stripeEventId || subscription.id}:${plan.id}`,
-        payload: {
-          service_plan_id: plan.id,
-          contact_id: plan.contact_id,
-          stripe_event_id: stripeEventId || null,
-          stripe_subscription_id: subscription.id,
-          stripe_invoice_id: invoice?.id || null,
-          stripe_payment_intent_id: pi?.id || null,
-          subscription_status: subscription.status,
-          stripe_payment_collection_paused: paymentCollectionPaused,
-          status: plan.status
-        }
-      });
-      if (localStatus === "paused" || localStatus === "canceled") {
-        await cancelAutomationSchedulesForSubject(plan.company_id, "service_plan", plan.id);
-      } else {
-        await syncAutomationSchedulesForServicePlan(plan.company_id, plan);
-      }
-    }
-  }
-  if (pi) {
-    await applyStripePaymentIntentStatus({
-      paymentIntent: pi,
-      connectedAccountId,
-      source,
-      stripeEventId
-    });
-  }
-  console.log("[stripe] subscription reconciled", {
-    source,
-    stripe_event_id: stripeEventId || null,
-    connected_account_id: connectedAccountId,
-    subscription_id: subscription.id,
-    stripe_subscription_status: subscription.status,
-    stripe_payment_collection_paused: paymentCollectionPaused,
-    local_status: localStatus,
-    latest_invoice_id: invoice?.id || null,
-    payment_intent_id: pi?.id || null,
-    matched_plans: rows.length
-  });
-  return rows;
-}
-
-async function reconcileServicePlanFromStripe(plan, { source = "stripe.service_plan_reconcile" } = {}) {
-  const stripe = getStripe();
-  if (!stripe) throw new Error("stripe_not_configured");
-  if (!plan || !plan.stripe_subscription_id) throw new Error("stripe_subscription_missing");
-  if (!plan.stripe_connected_account_id) throw new Error("stripe_connected_account_missing");
-  let subscription = await stripe.subscriptions.retrieve(
-    plan.stripe_subscription_id,
-    { expand: ["latest_invoice.payment_intent"] },
-    { stripeAccount: plan.stripe_connected_account_id }
-  );
-  if (["canceled", "incomplete_expired"].includes(subscription.status)) {
-    subscription = await recoverServicePlanSubscriptionFromStripe(plan, subscription, { source });
-  }
-  const rows = await applyStripeSubscriptionStatus({
-    subscription,
-    connectedAccountId: plan.stripe_connected_account_id,
-    servicePlanId: plan.id,
-    source
-  });
-  return rows[0] || plan;
-}
-
-async function recoverServicePlanSubscriptionFromStripe(plan, storedSubscription, { source = "stripe.service_plan_recover" } = {}) {
-  const stripe = getStripe();
-  if (!plan.stripe_customer_id) {
-    console.warn("[stripe] subscription recovery skipped without customer", {
-      source,
-      service_plan_id: plan.id,
-      stored_subscription_id: storedSubscription.id,
-      stored_subscription_status: storedSubscription.status
-    });
-    return storedSubscription;
-  }
-  const listed = await stripe.subscriptions.list(
-    {
-      customer: plan.stripe_customer_id,
-      status: "all",
-      limit: 100,
-      expand: ["data.latest_invoice.payment_intent"]
-    },
-    { stripeAccount: plan.stripe_connected_account_id }
-  );
-  const recovery = selectRecoverableSubscription(listed.data || [], {
-    planId: plan.id,
-    customerId: plan.stripe_customer_id
-  });
-  if (recovery.action === "conflict") {
-    const err = new Error("multiple_active_matching_subscriptions");
-    err.statusCode = 409;
-    err.subscriptionIds = recovery.subscriptions.map((subscription) => subscription.id);
-    console.warn("[stripe] subscription recovery conflict", {
-      source,
-      service_plan_id: plan.id,
-      customer_id: plan.stripe_customer_id,
-      connected_account_id: plan.stripe_connected_account_id,
-      stored_subscription_id: storedSubscription.id,
-      matching_subscription_ids: err.subscriptionIds
-    });
-    throw err;
-  }
-  if (recovery.action !== "adopt") {
-    console.warn("[stripe] subscription recovery found no viable match", {
-      source,
-      service_plan_id: plan.id,
-      customer_id: plan.stripe_customer_id,
-      connected_account_id: plan.stripe_connected_account_id,
-      stored_subscription_id: storedSubscription.id,
-      stored_subscription_status: storedSubscription.status,
-      reason: recovery.reason
-    });
-    return storedSubscription;
-  }
-  const recovered = recovery.subscription;
-  const invoice = recovered.latest_invoice && typeof recovered.latest_invoice === "object"
-    ? recovered.latest_invoice
-    : null;
-  const pi = stripeInvoicePaymentIntent(invoice);
-  const customerId = stripeSubscriptionCustomerId(recovered) || plan.stripe_customer_id;
-  await pool.query(
-    `UPDATE service_plans
-        SET stripe_subscription_id = $2,
-            stripe_subscription_status = $3,
-            stripe_customer_id = COALESCE($4, stripe_customer_id),
-            stripe_latest_invoice_id = COALESCE($5, stripe_latest_invoice_id),
-            stripe_payment_intent_id = COALESCE($6, stripe_payment_intent_id),
-            updated_at = now()
-      WHERE id = $1`,
-    [plan.id, recovered.id, recovered.status, customerId, invoice?.id || null, pi?.id || null]
-  );
-  await pool.query(
-    `INSERT INTO service_plan_events (user_id, company_id, service_plan_id, contact_id, event_type, notes)
-     VALUES ($1,$2,$3,$4,'stripe_subscription_recovered',$5)
-     ON CONFLICT DO NOTHING`,
-    [
-      plan.user_id,
-      plan.company_id || null,
-      plan.id,
-      plan.contact_id || null,
-      `Recovered Stripe subscription ${recovered.id} (${recovered.status}) from stored subscription ${storedSubscription.id} (${storedSubscription.status})`
-    ]
-  );
-  console.warn("[stripe] subscription recovered from metadata", {
-    source,
-    service_plan_id: plan.id,
-    customer_id: customerId,
-    connected_account_id: plan.stripe_connected_account_id,
-    previous_subscription_id: storedSubscription.id,
-    previous_subscription_status: storedSubscription.status,
-    recovered_subscription_id: recovered.id,
-    recovered_subscription_status: recovered.status,
-    metadata_plan_id: recovered.metadata?.wolfcrm_plan_id || null
-  });
-  return recovered;
-}
-
-async function buildExistingSubscriptionPaymentSheetResponse({ plan, subscription, connectedAccountId, publishableKey, actorUserId }) {
-  const stripe = getStripe();
-  const invoice = subscription.latest_invoice && typeof subscription.latest_invoice === "object"
-    ? subscription.latest_invoice
-    : null;
-  const pi = stripeInvoicePaymentIntent(invoice);
-  if (!subscriptionCanResumePayment(subscription) || !invoice || !pi) return null;
-  const customerId = typeof subscription.customer === "string" ? subscription.customer : subscription.customer?.id;
-  if (!customerId) return null;
-  const ephemeralKey = await stripe.ephemeralKeys.create(
-    { customer: customerId },
-    { apiVersion: STRIPE_MOBILE_EPHEMERAL_KEY_API_VERSION, stripeAccount: connectedAccountId }
-  );
-  const paymentRecord = await pool.query(
-    `UPDATE payment_records
-        SET stripe_customer_id = COALESCE(stripe_customer_id, $4),
-            stripe_invoice_id = COALESCE(stripe_invoice_id, $5),
-            stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, $6),
-            updated_at = now()
-      WHERE service_plan_id = $1
-        AND stripe_subscription_id = $2
-        AND user_id = $3
-      RETURNING *`,
-    [plan.id, subscription.id, plan.user_id, customerId, invoice.id, pi.id]
-  );
-  let rec = paymentRecord.rows[0];
-  if (!rec) {
-    const inserted = await pool.query(
-      `INSERT INTO payment_records (
-         user_id, company_id, created_by_user_id, contact_id, service_plan_id,
-         payment_type, status, amount_cents, currency, description,
-         stripe_connected_account_id, stripe_customer_id, stripe_payment_intent_id,
-         stripe_invoice_id, stripe_subscription_id
-       ) VALUES ($1,$2,$3,$4,$5,'service_plan_first_payment','pending',$6,$7,$8,$9,$10,$11,$12,$13)
-       RETURNING *`,
-      [
-        plan.user_id, plan.company_id || null, actorUserId || plan.created_by_user_id || null,
-        plan.contact_id, plan.id,
-        plan.price_cents, (plan.currency || "usd").toLowerCase(),
-        `Initial payment for ${plan.plan_name}`,
-        connectedAccountId, customerId, pi.id, invoice.id, subscription.id
-      ]
-    );
-    rec = inserted.rows[0];
-  }
-  return {
-    publishable_key: publishableKey,
-    connected_account_id: connectedAccountId,
-    customer_id: customerId,
-    ephemeral_key_secret: ephemeralKey.secret,
-    payment_intent_client_secret: pi.client_secret,
-    subscription_id: subscription.id,
-    service_plan_id: plan.id,
-    payment_record_id: rec.id,
-    reused_existing_subscription: true
-  };
 }
 
 function serviceIntervalDays(interval, count) {
@@ -2680,7 +2110,6 @@ function sanitizeServicePlan(row, { employeeSafe = false } = {}) {
     included_services: row.included_services,
     notes: row.notes,
     stripe_subscription_status: row.stripe_subscription_status,
-    stripe_payment_collection_paused: Boolean(row.stripe_payment_collection_paused),
     created_at: row.created_at,
     updated_at: row.updated_at,
     // Contact info if joined
@@ -3281,6 +2710,7 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
         }
         await cancelNoReplySchedulesForConversation(phoneLine.company_id, conversationID);
         await syncAutomationSchedulesForSmsConversationActivity(phoneLine.company_id, conversationID, storedMessage || { id: messageSid, created_at: new Date().toISOString() });
+        if (contactID) await markGoogleSheetsContactDirty(pool, phoneLine.company_id, contactID, "sms.inbound");
         const counts = await pool.query(
           `SELECT COUNT(*) FILTER (WHERE direction = 'inbound')::int AS inbound_count,
                   COUNT(*) FILTER (WHERE direction = 'outbound')::int AS outbound_count,
@@ -4241,6 +3671,7 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
         } catch (automationError) {
           console.error("[twilio/voice/status] call automation emission failed:", { callSid: parentCallSid, code: automationError?.code, message: automationError?.message });
         }
+        if (contactID) await markGoogleSheetsContactDirty(pool, line.company_id, contactID, "call.updated");
         if (direction === "inbound" && ["busy", "failed", "canceled", "missed"].includes(disposition || "")) {
           await emitAutomationEvent({
             companyId: line.company_id,
@@ -4330,6 +3761,7 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
     } catch (automationError) {
       console.error("[twilio/voice/status] call automation emission failed:", { callSid, code: automationError?.code, message: automationError?.message });
     }
+    if (contactID) await markGoogleSheetsContactDirty(pool, line.company_id, contactID, "call.updated");
 
     res.status(200).type("text/plain").send("OK");
   } catch (e) {
@@ -4812,6 +4244,7 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
         }
         await syncAutomationSchedulesForSmsOutbound(req.companyId, { ...stored, contact_id: conversation.contact_id || null, external_phone_number: toNumber });
         await syncAutomationSchedulesForSmsConversationActivity(req.companyId, stored.conversation_id, stored);
+        if (conversation.contact_id) await markGoogleSheetsContactDirty(pool, req.companyId, conversation.contact_id, "sms.outbound");
       } catch (automationError) {
         console.error("[phone/messages] automation emission failed:", { messageId: stored.id, code: automationError?.code, message: automationError?.message });
       }
@@ -4983,6 +4416,7 @@ app.post("/webhooks/twilio/message-status", async (req, res) => {
         } catch (automationError) {
           console.error("[twilio/message-status] automation emission failed:", { messageSid, code: automationError?.code, message: automationError?.message });
         }
+        if (previous.contact_id) await markGoogleSheetsContactDirty(pool, previous.company_id, previous.contact_id, "sms.status");
       }
     }
     res.status(200).type("text/plain").send("OK");
@@ -6397,31 +5831,42 @@ app.get("/api/contacts/:id", authRequired, async (req, res) => {
   }
 });
 
+function parseOptionalContactDate(value) {
+  if (value == null || value === "") return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 app.post("/api/contacts", authRequired, async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
-    u1, u2, u3, u4, u5, lead_info, source
+    u1, u2, u3, u4, u5, lead_info, source,
+    lead_submitted_at, created_at
   } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
 
   const id = randomUUID();
+  const createdAt = parseOptionalContactDate(created_at);
+  const leadSubmittedAt = parseOptionalContactDate(lead_submitted_at);
   try {
     const r = await pool.query(
       `
       INSERT INTO contacts (
-        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info, source
+        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info, source, lead_submitted_at, created_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, COALESCE($21, now())
       ) RETURNING *;
       `,
       [
         id, req.userId, req.companyId, name || "", phone || "", email || "", address || "",
         Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
-        lat ?? null, lng ?? null, tags || "", job_type || "",
+        lat ?? null, lng ?? null, Array.isArray(tags) ? tags.join(",") : (tags || ""), job_type || "",
         u1 || "", u2 || "", u3 || "", u4 || "", u5 || "",
         Array.isArray(lead_info) ? JSON.stringify(lead_info) : null,
-        source || "manual"
+        source || "manual",
+        leadSubmittedAt,
+        createdAt
       ]
     );
     if (req.companyId) {
@@ -6452,6 +5897,7 @@ app.post("/api/contacts", authRequired, async (req, res) => {
         payload: { contact_id: r.rows[0].id, name: r.rows[0].name, source: origin }
       });
     }
+    if (req.companyId) await markGoogleSheetsContactDirty(pool, req.companyId, r.rows[0].id, "contact.created");
     res.status(201).json(r.rows[0]);
   } catch (e) {
     console.error(e);
@@ -6463,7 +5909,8 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
-    u1, u2, u3, u4, u5, lead_info, source
+    u1, u2, u3, u4, u5, lead_info, source,
+    lead_submitted_at, created_at
   } = req.body || {};
   try {
     const scope = companyOrUserContactWhere(req);
@@ -6497,6 +5944,8 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
     if (has("u5")) addUpdate("u5", u5 || null);
     if (has("lead_info")) addUpdate("lead_info", Array.isArray(lead_info) ? JSON.stringify(lead_info) : null, "::jsonb");
     if (has("source")) addUpdate("source", source || null);
+    if (has("lead_submitted_at")) addUpdate("lead_submitted_at", parseOptionalContactDate(lead_submitted_at));
+    if (has("created_at")) addUpdate("created_at", parseOptionalContactDate(created_at) || new Date());
     if (!updates.length) return res.json(before);
     addUpdate("updated_at", new Date());
     values.push(...scope.values);
@@ -6515,6 +5964,7 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
       if (Object.prototype.hasOwnProperty.call(req.body || {}, "tags")) {
         await emitContactTagEvents({ companyId: req.companyId, contactId: r.rows[0].id, actorUserId: req.userId, source: "contacts.api", previousTags: contactTagsArray(before?.tags), nextTags: contactTagsArray(r.rows[0].tags) });
       }
+      await markGoogleSheetsContactDirty(pool, req.companyId, r.rows[0].id, "contact.updated");
     }
     res.json(r.rows[0]);
   } catch (e) {
@@ -6791,6 +6241,7 @@ app.delete("/api/contacts/:id", authRequired, async (req, res) => {
         dedupeKey: `contact.deleted:${req.params.id}`,
         payload: { contact_id: req.params.id, name: before?.name || null, tags: contactTagsArray(before?.tags) }
       });
+      await markGoogleSheetsContactDirty(pool, req.companyId, req.params.id, "contact.deleted");
     }
     res.status(204).end();
   } catch (e) {
@@ -8106,47 +7557,10 @@ app.get("/api/quotes/totals", authRequired, async (req, res) => {
   try {
     const scope = quoteScopeSQL(req);
     const { rows } = await pool.query(
-      `WITH scoped AS (
-         SELECT q.*
-         FROM quotes q
-         WHERE ${scope.sql}
-       ),
-       counts AS (
-         SELECT contact_id, COUNT(*)::int AS quote_count
-         FROM scoped
-         GROUP BY contact_id
-       ),
-       ranked AS (
-         SELECT id,
-                contact_id,
-                total_cents,
-                status,
-                updated_at,
-                ROW_NUMBER() OVER (
-                  PARTITION BY contact_id
-                  ORDER BY
-                    CASE COALESCE(status, 'draft')
-                      WHEN 'sent' THEN 1
-                      WHEN 'accepted' THEN 2
-                      WHEN 'draft' THEN 3
-                      WHEN 'converted' THEN 4
-                      ELSE 9
-                    END ASC,
-                    updated_at DESC,
-                    created_at DESC,
-                    id ASC
-                ) AS rn
-         FROM scoped
-         WHERE COALESCE(status, 'draft') NOT IN ('declined', 'expired', 'deleted', 'canceled', 'cancelled')
-       )
-       SELECT c.contact_id,
-              COALESCE(r.total_cents, 0)::int AS total_cents,
-              c.quote_count,
-              r.id AS quote_id,
-              r.status AS quote_status,
-              r.updated_at AS quote_updated_at
-       FROM counts c
-       LEFT JOIN ranked r ON r.contact_id = c.contact_id AND r.rn = 1`,
+      `SELECT contact_id, SUM(total_cents)::int AS total_cents, COUNT(*)::int AS quote_count
+       FROM quotes q
+       WHERE ${scope.sql}
+       GROUP BY contact_id`,
       scope.values
     );
     res.json(rows);
@@ -8180,6 +7594,7 @@ app.post("/api/quotes", authRequired, async (req, res) => {
         payload: { quote_id: rows[0].id, contact_id, status: rows[0].status, total_cents: rows[0].total_cents, line_item_count: items.length, expires_at: rows[0].expires_at }
       });
       await syncAutomationSchedulesForQuote(req.companyId, rows[0]);
+      await markGoogleSheetsContactDirty(pool, req.companyId, contact_id, "quote.created");
     }
     res.status(201).json(rows[0]);
   } catch (e) {
@@ -8247,6 +7662,7 @@ app.put("/api/quotes/:id", authRequired, async (req, res) => {
         if (JSON.stringify(prev.line_items || []) !== JSON.stringify(rows[0].line_items || [])) await emitAutomationEvent({ companyId: req.companyId, eventType: "quote.line_items_changed", subjectType: "quote", subjectId: rows[0].id, actorUserId: req.userId, source: "quotes.api", dedupeKey: `quote.line_items_changed:${rows[0].id}:${rows[0].updated_at?.toISOString?.() || Date.now()}`, payload });
       }
       await syncAutomationSchedulesForQuote(req.companyId, rows[0]);
+      await markGoogleSheetsContactDirty(pool, req.companyId, rows[0].contact_id, "quote.updated");
     }
     res.json(rows[0]);
   } catch (e) {
@@ -8286,6 +7702,7 @@ app.delete("/api/quotes/:id", authRequired, async (req, res) => {
         dedupeKey: `quote.deleted:${req.params.id}`,
         payload: { quote_id: req.params.id, contact_id: result.rows[0].contact_id || null, status: result.rows[0].status, total_cents: result.rows[0].total_cents || 0 }
       });
+      await markGoogleSheetsContactDirty(pool, req.companyId, result.rows[0].contact_id, "quote.deleted");
     }
     res.status(204).end();
   } catch (e) {
@@ -8344,6 +7761,16 @@ app.put("/api/stages/:id", authRequired, async (req, res) => {
        RETURNING id, name, order_idx`,
       [req.params.id, req.userId, req.companyId || null, name, Number(order_idx) || 0]
     );
+    if (req.companyId) {
+      const affected = await pool.query(
+        `SELECT contact_id FROM opportunities
+          WHERE company_id = $1 AND stage_id = $2 AND contact_id IS NOT NULL`,
+        [req.companyId, req.params.id]
+      );
+      for (const row of affected.rows) {
+        await markGoogleSheetsContactDirty(pool, req.companyId, row.contact_id, "stage.updated");
+      }
+    }
     res.json(r.rows[0]);
   } catch (e) { console.error("[stages] upsert failed:", e); res.status(500).json({ error: "failed_upsert_stage" }); }
 });
@@ -8364,6 +7791,16 @@ app.delete("/api/stages/:id", authRequired, async (req, res) => {
        WHERE id = $1
          AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))`,
       [req.params.id, req.userId, req.companyId || null]);
+    if (req.companyId) {
+      const affected = await pool.query(
+        `SELECT contact_id FROM opportunities
+          WHERE company_id = $1 AND stage_id = $2 AND contact_id IS NOT NULL`,
+        [req.companyId, req.params.id]
+      );
+      for (const row of affected.rows) {
+        await markGoogleSheetsContactDirty(pool, req.companyId, row.contact_id, "stage.deleted");
+      }
+    }
     res.status(204).end();
   } catch (e) { console.error("[stages] delete failed:", e); res.status(500).json({ error: "failed_delete_stage" }); }
 });
@@ -8404,13 +7841,13 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
        ON CONFLICT (user_id, contact_id) DO UPDATE
          SET state = EXCLUDED.state,
              stage_id = EXCLUDED.stage_id,
+             company_id = COALESCE(EXCLUDED.company_id, opportunities.company_id),
              stage_entered_at = CASE
                WHEN opportunities.state IS DISTINCT FROM EXCLUDED.state
                  OR opportunities.stage_id IS DISTINCT FROM EXCLUDED.stage_id
                THEN now()
                ELSE COALESCE(opportunities.stage_entered_at, opportunities.created_at, now())
              END,
-             company_id = COALESCE(EXCLUDED.company_id, opportunities.company_id),
              updated_at = now()
        RETURNING id, contact_id, state, stage_id, created_at, stage_entered_at`,
       [req.params.id, req.userId, req.companyId || null, contact_id, state, stage_id || null, created_at || null, stage_entered_at || null]
@@ -8442,6 +7879,10 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
       if (["won", "lost"].includes(before?.state) && after.state === "stage") {
         await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.reopened", subjectType: "opportunity", subjectId: after.id, actorUserId: req.userId, source: "opportunities.api", payload: base });
       }
+      await markGoogleSheetsContactDirty(pool, req.companyId, after.contact_id, before ? "stage.updated" : "stage.created");
+      if (before?.contact_id && before.contact_id !== after.contact_id) {
+        await markGoogleSheetsContactDirty(pool, req.companyId, before.contact_id, "stage.updated");
+      }
     }
     res.json(r.rows[0]);
   } catch (e) { console.error("[opportunities] upsert failed:", e); res.status(500).json({ error: "failed_upsert_opportunity" }); }
@@ -8459,6 +7900,7 @@ app.delete("/api/opportunities/:id", authRequired, async (req, res) => {
       const payload = { opportunity_id: before.id, contact_id: before.contact_id, stage_id: before.stage_id, previous_stage_id: before.stage_id, state: before.state };
       await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.opportunity_removed", subjectType: "opportunity", subjectId: before.id, actorUserId: req.userId, source: "opportunities.api", payload });
       if (before.stage_id) await emitAutomationEvent({ companyId: req.companyId, eventType: "pipeline.stage_exited", subjectType: "opportunity", subjectId: before.id, actorUserId: req.userId, source: "opportunities.api", payload });
+      await markGoogleSheetsContactDirty(pool, req.companyId, before.contact_id, "stage.deleted");
     }
     res.status(204).end();
   } catch (e) { console.error("[opportunities] delete failed:", e); res.status(500).json({ error: "failed_delete_opportunity" }); }
@@ -8578,6 +8020,10 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
     if (req.companyId) {
       await emitJobRouteEvents(req.companyId, req.userId, previous.rows[0] || null, r.rows[0], "schedule.api");
       await syncAutomationSchedulesForJob(req.companyId, r.rows[0]);
+      if (previous.rows[0]?.contact_id && previous.rows[0].contact_id !== r.rows[0].contact_id) {
+        await markGoogleSheetsContactDirty(pool, req.companyId, previous.rows[0].contact_id, "job.contact_changed");
+      }
+      await markGoogleSheetsContactDirty(pool, req.companyId, r.rows[0].contact_id, isNewJob ? "job.created" : "job.updated");
     }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_schedule" }); }
@@ -8598,6 +8044,7 @@ app.delete("/api/schedule/:id", authRequired, async (req, res) => {
     if (before && req.companyId) {
       await emitAutomationEvent({ companyId: req.companyId, eventType: "job.deleted", subjectType: "job", subjectId: before.id, actorUserId: req.userId, source: "schedule.api", dedupeKey: `job.deleted:${before.id}`, payload: { job_id: before.id, contact_id: before.contact_id, title: before.title } });
       await cancelAutomationSchedulesForSubject(req.companyId, "job", before.id);
+      await markGoogleSheetsContactDirty(pool, req.companyId, before.contact_id, "job.deleted");
     }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_schedule" }); }
@@ -8637,13 +8084,7 @@ async function resolvedWorkflowSections(companyId, job) {
     [companyId, services]
   );
   const merged = rows.flatMap((r) => Array.isArray(r.sections) ? r.sections : []);
-  const base = merged.length ? merged : defaultWorkflowSections();
-  const additions = (await pool.query(
-    `SELECT sections FROM job_workflow_job_additions WHERE company_id = $1 AND job_id = $2`,
-    [companyId, job.id]
-  )).rows[0];
-  const jobSections = additions && Array.isArray(additions.sections) ? additions.sections : [];
-  return jobSections.length ? base.concat(jobSections) : base;
+  return merged.length ? merged : defaultWorkflowSections();
 }
 
 function workflowMissingRequired(snapshot) {
@@ -8742,12 +8183,13 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, async (req, res) => {
               finished_at = COALESCE(finished_at, $3), finished_by = COALESCE(finished_by, $4), updated_at = now()
        WHERE id = $1 AND company_id = $2
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
-                 contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
+                 contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
                  company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by`,
       [req.params.id, req.companyId, now, req.userId]
     )).rows[0];
     await emitAutomationEvent({ companyId: req.companyId, eventType: "job.completed", subjectType: "job", subjectId: req.params.id, actorUserId: req.userId, source: "job.workflow", dedupeKey: `job.completed:${req.params.id}:${updated.finished_at}`, payload: { job_id: req.params.id, finished_at: updated.finished_at, override: !!overrideReason } });
     await syncAutomationSchedulesForJob(req.companyId, updated);
+    await markGoogleSheetsContactDirty(pool, req.companyId, updated.contact_id, "job.completed");
     await client.query("COMMIT");
     res.json(updated);
   } catch (e) {
@@ -8787,36 +8229,6 @@ app.delete("/api/job-workflow-templates/:id", authRequired, requireEmployer, asy
   } catch (e) { console.error(e); res.status(500).json({ error: "workflow_template_archive_failed" }); }
 });
 
-app.get("/api/jobs/:id/workflow/additions", authRequired, requireEmployer, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const job = (await pool.query(`SELECT id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
-    if (!job) return res.status(404).json({ error: "job_not_found" });
-    const row = (await pool.query(`SELECT sections FROM job_workflow_job_additions WHERE company_id = $1 AND job_id = $2`, [req.companyId, req.params.id])).rows[0];
-    res.json({ sections: row && Array.isArray(row.sections) ? row.sections : [] });
-  } catch (e) { console.error(e); res.status(500).json({ error: "workflow_job_additions_failed" }); }
-});
-
-app.put("/api/jobs/:id/workflow/additions", authRequired, requireEmployer, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const sections = Array.isArray(req.body && req.body.sections) ? req.body.sections : [];
-  try {
-    const job = (await pool.query(`SELECT id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
-    if (!job) return res.status(404).json({ error: "job_not_found" });
-    const running = (await pool.query(`SELECT status FROM job_workflow_runs WHERE company_id = $1 AND job_id = $2`, [req.companyId, req.params.id])).rows[0];
-    if (running && running.status === "completed") return res.status(409).json({ error: "workflow_completed" });
-    const { rows } = await pool.query(
-      `INSERT INTO job_workflow_job_additions(id, company_id, job_id, sections, created_by, updated_by)
-       VALUES($1, $2, $3, $4::jsonb, $5, $5)
-       ON CONFLICT(company_id, job_id) DO UPDATE
-         SET sections = EXCLUDED.sections, updated_by = EXCLUDED.updated_by, updated_at = now()
-       RETURNING sections`,
-      [randomUUID(), req.companyId, req.params.id, JSON.stringify(sections), req.userId]
-    );
-    res.json({ sections: Array.isArray(rows[0].sections) ? rows[0].sections : [] });
-  } catch (e) { console.error(e); res.status(500).json({ error: "workflow_job_additions_save_failed" }); }
-});
-
 app.get("/api/jobs/:id/photos", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
@@ -8846,20 +8258,6 @@ app.post("/api/jobs/:id/photos", authRequired, async (req, res) => {
 });
 
 // ---------- OPERATIONS: EQUIPMENT & MATERIALS ----------
-async function recordAssetHistory(client, companyId, itemId, eventType, actorUserId, summary, metadata = {}) {
-  await client.query(
-    `INSERT INTO equipment_asset_history(id, company_id, item_id, event_type, actor_user_id, summary, metadata)
-     VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)`,
-    [randomUUID(), companyId, itemId, eventType, actorUserId || null, summary, JSON.stringify(metadata || {})]
-  );
-}
-
-function inventoryDeltaForType(type, qty) {
-  if (["received", "returned", "recount_correction"].includes(type)) return qty;
-  if (["used_on_job", "damaged", "lost", "disposed"].includes(type)) return -qty;
-  return 0;
-}
-
 app.get("/api/operations/inventory/locations", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
@@ -8880,11 +8278,8 @@ app.get("/api/operations/inventory/items", authRequired, async (req, res) => {
 app.put("/api/operations/inventory/items/:id", authRequired, requireEmployer, async (req, res) => {
   const { name, item_type, tracking_mode, category, unit, reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    const before = (await client.query(`SELECT * FROM inventory_items WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
-    const { rows } = await client.query(
+    const { rows } = await pool.query(
       `INSERT INTO inventory_items(id, company_id, name, item_type, tracking_mode, category, unit, reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, item_type = EXCLUDED.item_type, tracking_mode = EXCLUDED.tracking_mode, category = EXCLUDED.category, unit = EXCLUDED.unit, reorder_point = EXCLUDED.reorder_point, cost_per_unit_cents = EXCLUDED.cost_per_unit_cents, status = EXCLUDED.status, location_id = EXCLUDED.location_id, assigned_user_id = EXCLUDED.assigned_user_id, notes = EXCLUDED.notes, updated_at = now()
@@ -8892,19 +8287,8 @@ app.put("/api/operations/inventory/items/:id", authRequired, requireEmployer, as
        RETURNING id, name, item_type, tracking_mode, category, unit, quantity_on_hand::float8 AS quantity_on_hand, reorder_point::float8 AS reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes`,
       [req.params.id, req.companyId, name, item_type || "material", tracking_mode || "quantity", category || null, unit || "each", reorder_point ?? null, cost_per_unit_cents ?? null, status || "available", location_id || null, assigned_user_id || null, notes || null]
     );
-    if (!before) {
-      await recordAssetHistory(client, req.companyId, req.params.id, "asset_created", req.userId, `Added ${name}`, { status: status || "available", location_id: location_id || null });
-    } else {
-      if ((before.status || "") !== (status || "available")) await recordAssetHistory(client, req.companyId, req.params.id, "status_changed", req.userId, `Status changed to ${(status || "available").replace(/_/g, " ")}`, { from: before.status, to: status || "available" });
-      if ((before.location_id || "") !== (location_id || "")) await recordAssetHistory(client, req.companyId, req.params.id, "moved_location", req.userId, "Location changed", { from: before.location_id || null, to: location_id || null });
-      if ((before.assigned_user_id || "") !== (assigned_user_id || "")) await recordAssetHistory(client, req.companyId, req.params.id, "assigned", req.userId, "Assignment changed", { from: before.assigned_user_id || null, to: assigned_user_id || null });
-    }
-    await client.query("COMMIT");
     res.json(rows[0]);
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error(e); res.status(500).json({ error: "inventory_item_save_failed" });
-  } finally { client.release(); }
+  } catch (e) { console.error(e); res.status(500).json({ error: "inventory_item_save_failed" }); }
 });
 
 app.post("/api/operations/inventory/transactions", authRequired, async (req, res) => {
@@ -8925,7 +8309,9 @@ app.post("/api/operations/inventory/transactions", authRequired, async (req, res
     }
     const item = (await client.query(`SELECT * FROM inventory_items WHERE id = $1 AND company_id = $2 FOR UPDATE`, [item_id, req.companyId])).rows[0];
     if (!item) { await client.query("ROLLBACK"); return res.status(404).json({ error: "item_not_found" }); }
-    const delta = inventoryDeltaForType(transaction_type, qty);
+    let delta = 0;
+    if (["received", "returned", "recount_correction"].includes(transaction_type)) delta = qty;
+    if (["used_on_job", "damaged", "lost", "disposed"].includes(transaction_type)) delta = -qty;
     if (item.tracking_mode === "quantity" && Number(item.quantity_on_hand) + delta < 0) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "insufficient_inventory" });
@@ -8944,95 +8330,6 @@ app.post("/api/operations/inventory/transactions", authRequired, async (req, res
   } finally { client.release(); }
 });
 
-app.get("/api/operations/jobs/:id/material-usages", authRequired, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const { rows } = await pool.query(
-      `SELECT mu.id, mu.job_id, mu.item_id, ii.name AS item_name, mu.location_id, mu.quantity::float8 AS quantity,
-              mu.unit_cost_snapshot_cents, mu.current_transaction_id, mu.status, mu.note, mu.created_by, mu.updated_by, mu.created_at, mu.updated_at
-         FROM material_usages mu
-         JOIN inventory_items ii ON ii.id = mu.item_id AND ii.company_id = mu.company_id
-        WHERE mu.company_id = $1 AND mu.job_id = $2
-        ORDER BY mu.created_at DESC`,
-      [req.companyId, req.params.id]
-    );
-    res.json(rows);
-  } catch (e) { console.error("[operations] material usages failed:", e); res.status(500).json({ error: "material_usages_failed" }); }
-});
-
-app.post("/api/operations/jobs/:id/material-usages", authRequired, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const { item_id, location_id, quantity, note, idempotency_key } = req.body || {};
-  const qty = Number(quantity);
-  if (!item_id || !Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: "invalid_material_usage" });
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const key = cleanString(idempotency_key, 180) || `material-use:${req.params.id}:${item_id}:${location_id || ""}:${qty}:${cleanString(note, 200) || ""}`;
-    const existing = (await client.query(`SELECT id FROM material_usages WHERE company_id = $1 AND idempotency_key = $2`, [req.companyId, key])).rows[0];
-    if (existing) {
-      await client.query("COMMIT");
-      return res.json((await pool.query(`SELECT mu.id, mu.job_id, mu.item_id, ii.name AS item_name, mu.location_id, mu.quantity::float8 AS quantity, mu.unit_cost_snapshot_cents, mu.current_transaction_id, mu.status, mu.note, mu.created_by, mu.updated_by, mu.created_at, mu.updated_at FROM material_usages mu JOIN inventory_items ii ON ii.id = mu.item_id AND ii.company_id = mu.company_id WHERE mu.company_id = $1 AND mu.id = $2`, [req.companyId, existing.id])).rows[0]);
-    }
-    const item = (await client.query(`SELECT * FROM inventory_items WHERE id = $1 AND company_id = $2 FOR UPDATE`, [item_id, req.companyId])).rows[0];
-    if (!item) { await client.query("ROLLBACK"); return res.status(404).json({ error: "item_not_found" }); }
-    if (item.tracking_mode === "quantity" && Number(item.quantity_on_hand) - qty < 0) { await client.query("ROLLBACK"); return res.status(409).json({ error: "insufficient_inventory" }); }
-    const cost = item.cost_per_unit_cents == null ? null : Number(item.cost_per_unit_cents);
-    const tx = (await client.query(`INSERT INTO inventory_transactions(id, company_id, item_id, transaction_type, quantity, from_location_id, job_id, employee_id, note, cost_snapshot_cents, idempotency_key) VALUES($1,$2,$3,'used_on_job',$4,$5,$6,$7,$8,$9,$10) RETURNING id`, [randomUUID(), req.companyId, item_id, qty, location_id || null, req.params.id, req.userId, cleanString(note, 1000) || null, cost, `${key}:tx`])).rows[0];
-    await client.query(`UPDATE inventory_items SET quantity_on_hand = quantity_on_hand - $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [item_id, req.companyId, qty]);
-    if (cost != null) await client.query(`UPDATE schedule_events SET material_cost_cents = COALESCE(material_cost_cents, 0) + $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId, Math.round(qty * cost)]);
-    const row = (await client.query(`INSERT INTO material_usages(id, company_id, job_id, item_id, location_id, quantity, unit_cost_snapshot_cents, current_transaction_id, status, note, created_by, updated_by, idempotency_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$10,$10,$11) RETURNING id`, [randomUUID(), req.companyId, req.params.id, item_id, location_id || null, qty, cost, tx.id, cleanString(note, 1000) || null, req.userId, key])).rows[0];
-    await client.query("COMMIT");
-    const out = (await pool.query(`SELECT mu.id, mu.job_id, mu.item_id, ii.name AS item_name, mu.location_id, mu.quantity::float8 AS quantity, mu.unit_cost_snapshot_cents, mu.current_transaction_id, mu.status, mu.note, mu.created_by, mu.updated_by, mu.created_at, mu.updated_at FROM material_usages mu JOIN inventory_items ii ON ii.id = mu.item_id AND ii.company_id = mu.company_id WHERE mu.company_id = $1 AND mu.id = $2`, [req.companyId, row.id])).rows[0];
-    res.status(201).json(out);
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("[operations] material usage create failed:", e);
-    res.status(500).json({ error: "material_usage_create_failed" });
-  } finally { client.release(); }
-});
-
-app.patch("/api/operations/material-usages/:id", authRequired, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const mode = req.body?.delete ? "delete" : "edit";
-  const newQty = Number(req.body?.quantity);
-  if (mode === "edit" && (!Number.isFinite(newQty) || newQty <= 0)) return res.status(400).json({ error: "invalid_quantity" });
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const key = cleanString(req.body?.idempotency_key, 180) || `material-correct:${req.params.id}:${mode}:${Number.isFinite(newQty) ? newQty : 0}`;
-    const existingTx = (await client.query(`SELECT id FROM inventory_transactions WHERE company_id = $1 AND idempotency_key = ANY($2::text[]) LIMIT 1`, [req.companyId, [`${key}:replacement`, `${key}:reversal`]])).rows[0];
-    if (existingTx) {
-      await client.query("COMMIT");
-      return res.json((await pool.query(`SELECT mu.id, mu.job_id, mu.item_id, ii.name AS item_name, mu.location_id, mu.quantity::float8 AS quantity, mu.unit_cost_snapshot_cents, mu.current_transaction_id, mu.status, mu.note, mu.created_by, mu.updated_by, mu.created_at, mu.updated_at FROM material_usages mu JOIN inventory_items ii ON ii.id = mu.item_id AND ii.company_id = mu.company_id WHERE mu.company_id = $1 AND mu.id = $2`, [req.companyId, req.params.id])).rows[0]);
-    }
-    const usage = (await client.query(`SELECT * FROM material_usages WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
-    if (!usage || usage.status !== "active") { await client.query("ROLLBACK"); return res.status(404).json({ error: "material_usage_not_found" }); }
-    const reverseQty = Number(usage.quantity || 0);
-    const cost = usage.unit_cost_snapshot_cents == null ? null : Number(usage.unit_cost_snapshot_cents);
-    const reversal = (await client.query(`INSERT INTO inventory_transactions(id, company_id, item_id, transaction_type, quantity, from_location_id, job_id, employee_id, note, cost_snapshot_cents, idempotency_key, reverses_transaction_id) VALUES($1,$2,$3,'returned',$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`, [randomUUID(), req.companyId, usage.item_id, reverseQty, usage.location_id || null, usage.job_id, req.userId, "Material usage correction reversal", cost, `${key}:reversal`, usage.current_transaction_id || null])).rows[0];
-    await client.query(`UPDATE inventory_items SET quantity_on_hand = quantity_on_hand + $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [usage.item_id, req.companyId, reverseQty]);
-    if (cost != null) await client.query(`UPDATE schedule_events SET material_cost_cents = GREATEST(0, COALESCE(material_cost_cents, 0) - $3), updated_at = now() WHERE id = $1 AND company_id = $2`, [usage.job_id, req.companyId, Math.round(reverseQty * cost)]);
-    if (mode === "delete") {
-      await client.query(`UPDATE material_usages SET status = 'deleted', quantity = 0, current_transaction_id = $3, updated_by = $4, updated_at = now() WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId, reversal.id, req.userId]);
-    } else {
-      const item = (await client.query(`SELECT * FROM inventory_items WHERE id = $1 AND company_id = $2 FOR UPDATE`, [usage.item_id, req.companyId])).rows[0];
-      if (item.tracking_mode === "quantity" && Number(item.quantity_on_hand) - newQty < 0) { await client.query("ROLLBACK"); return res.status(409).json({ error: "insufficient_inventory" }); }
-      const replacement = (await client.query(`INSERT INTO inventory_transactions(id, company_id, item_id, transaction_type, quantity, from_location_id, job_id, employee_id, note, cost_snapshot_cents, idempotency_key) VALUES($1,$2,$3,'used_on_job',$4,$5,$6,$7,$8,$9,$10) RETURNING id`, [randomUUID(), req.companyId, usage.item_id, newQty, usage.location_id || null, usage.job_id, req.userId, cleanString(req.body?.note, 1000) || usage.note, cost, `${key}:replacement`])).rows[0];
-      await client.query(`UPDATE inventory_items SET quantity_on_hand = quantity_on_hand - $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [usage.item_id, req.companyId, newQty]);
-      if (cost != null) await client.query(`UPDATE schedule_events SET material_cost_cents = COALESCE(material_cost_cents, 0) + $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [usage.job_id, req.companyId, Math.round(newQty * cost)]);
-      await client.query(`UPDATE material_usages SET quantity = $3, note = COALESCE($4, note), current_transaction_id = $5, updated_by = $6, updated_at = now() WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId, newQty, cleanString(req.body?.note, 1000) || null, replacement.id, req.userId]);
-    }
-    await client.query("COMMIT");
-    const out = (await pool.query(`SELECT mu.id, mu.job_id, mu.item_id, ii.name AS item_name, mu.location_id, mu.quantity::float8 AS quantity, mu.unit_cost_snapshot_cents, mu.current_transaction_id, mu.status, mu.note, mu.created_by, mu.updated_by, mu.created_at, mu.updated_at FROM material_usages mu JOIN inventory_items ii ON ii.id = mu.item_id AND ii.company_id = mu.company_id WHERE mu.company_id = $1 AND mu.id = $2`, [req.companyId, req.params.id])).rows[0];
-    res.json(out);
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("[operations] material usage correction failed:", e);
-    res.status(500).json({ error: "material_usage_correction_failed" });
-  } finally { client.release(); }
-});
-
 app.get("/api/operations/requests", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
@@ -9045,19 +8342,10 @@ app.post("/api/operations/requests", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const { request_type, item_id, item_name, quantity, urgency, explanation } = req.body || {};
   if (!request_type || !explanation) return res.status(400).json({ error: "invalid_request" });
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    const { rows } = await client.query(`INSERT INTO equipment_requests(id, company_id, request_type, item_id, item_name, quantity, urgency, explanation, requester_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, request_type, item_id, item_name, quantity::float8 AS quantity, urgency, explanation, status, requester_id, owner_response, created_at`, [randomUUID(), req.companyId, request_type, item_id || null, item_name || null, quantity ?? null, urgency || "normal", explanation, req.userId]);
-    if (item_id && ["report_broken", "report_damaged", "report_lost", "needs_inspection"].includes(request_type)) {
-      await recordAssetHistory(client, req.companyId, item_id, request_type, req.userId, `${request_type.replace(/_/g, " ")}: ${cleanString(explanation, 180)}`, { request_id: rows[0].id, urgency: urgency || "normal" });
-    }
-    await client.query("COMMIT");
+    const { rows } = await pool.query(`INSERT INTO equipment_requests(id, company_id, request_type, item_id, item_name, quantity, urgency, explanation, requester_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, request_type, item_id, item_name, quantity::float8 AS quantity, urgency, explanation, status, requester_id, owner_response, created_at`, [randomUUID(), req.companyId, request_type, item_id || null, item_name || null, quantity ?? null, urgency || "normal", explanation, req.userId]);
     res.status(201).json(rows[0]);
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error(e); res.status(500).json({ error: "equipment_request_failed" });
-  } finally { client.release(); }
+  } catch (e) { console.error(e); res.status(500).json({ error: "equipment_request_failed" }); }
 });
 
 app.patch("/api/operations/requests/:id", authRequired, requireEmployer, async (req, res) => {
@@ -9067,304 +8355,6 @@ app.patch("/api/operations/requests/:id", authRequired, requireEmployer, async (
     if (!rows[0]) return res.status(404).json({ error: "request_not_found" });
     res.json(rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "equipment_request_update_failed" }); }
-});
-
-app.get("/api/operations/inventory/items/:id/history", authRequired, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const item = (await pool.query(`SELECT id FROM inventory_items WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
-    if (!item) return res.status(404).json({ error: "item_not_found" });
-    let { rows } = await pool.query(`SELECT id, item_id, event_type, actor_user_id, summary, metadata, created_at FROM equipment_asset_history WHERE company_id = $1 AND item_id = $2 ORDER BY created_at DESC LIMIT 100`, [req.companyId, req.params.id]);
-    if (!rows.length) {
-      await pool.query(
-        `INSERT INTO equipment_asset_history(id, company_id, item_id, event_type, actor_user_id, summary, metadata)
-         VALUES($1,$2,$3,'existing_asset_imported',$4,'Existing asset imported','{}'::jsonb)
-         ON CONFLICT DO NOTHING`,
-        [randomUUID(), req.companyId, req.params.id, req.userId]
-      );
-      rows = (await pool.query(`SELECT id, item_id, event_type, actor_user_id, summary, metadata, created_at FROM equipment_asset_history WHERE company_id = $1 AND item_id = $2 ORDER BY created_at DESC LIMIT 100`, [req.companyId, req.params.id])).rows;
-    }
-    res.json(rows);
-  } catch (e) { console.error("[operations] asset history failed:", e); res.status(500).json({ error: "asset_history_failed" }); }
-});
-
-function repairStatusToAssetStatus(status) {
-  if (["approved", "scheduled", "reported"].includes(status)) return "broken";
-  if (["in_repair", "waiting_for_parts"].includes(status)) return "under_repair";
-  if (status === "not_repairable") return "broken";
-  if (status === "completed") return "available";
-  return null;
-}
-
-async function repairPayload(client, companyId, id) {
-  return (await client.query(
-    `SELECT r.id, r.item_id, ii.name AS item_name, r.request_id, r.reported_by, r.created_by, r.assigned_user_id, r.vendor,
-            r.problem, r.diagnosis, r.status, r.priority, r.estimated_cost_cents, r.actual_cost_cents,
-            r.opened_at, r.scheduled_at, r.started_at, r.completed_at, r.resolution_notes, r.created_at, r.updated_at
-       FROM equipment_repairs r
-       JOIN inventory_items ii ON ii.id = r.item_id AND ii.company_id = r.company_id
-      WHERE r.company_id = $1 AND r.id = $2`,
-    [companyId, id]
-  )).rows[0];
-}
-
-async function inventoryCountSubmissionPayload(client, companyId, id, userId = null, isEmployer = true) {
-  const { rows } = await client.query(
-    `SELECT s.id, s.schedule_id, s.location_id, l.name AS location_name, s.assigned_user_id, s.status, s.due_date::text,
-            s.submitted_by, s.submitted_at, s.reviewed_by, s.reviewed_at, s.review_note,
-            COALESCE(jsonb_agg(jsonb_build_object('id', si.id, 'item_id', si.item_id, 'expected_quantity', si.expected_quantity::float8, 'counted_quantity', si.counted_quantity::float8, 'variance', si.variance::float8, 'note', si.note, 'item_name', ii.name) ORDER BY ii.name) FILTER (WHERE si.id IS NOT NULL), '[]'::jsonb) AS items
-       FROM inventory_count_submissions s
-       LEFT JOIN inventory_locations l ON l.id = s.location_id AND l.company_id = s.company_id
-       LEFT JOIN inventory_count_submission_items si ON si.submission_id = s.id
-       LEFT JOIN inventory_items ii ON ii.id = si.item_id
-      WHERE s.company_id = $1 AND s.id = $2 AND ($3 = true OR s.assigned_user_id = $4 OR s.submitted_by = $4)
-      GROUP BY s.id, l.name
-      LIMIT 1`,
-    [companyId, id, isEmployer, userId]
-  );
-  return rows[0];
-}
-
-app.get("/api/operations/repairs", authRequired, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const { rows } = await pool.query(
-      `SELECT r.id, r.item_id, ii.name AS item_name, r.request_id, r.reported_by, r.created_by, r.assigned_user_id, r.vendor,
-              r.problem, r.diagnosis, r.status, r.priority, r.estimated_cost_cents, r.actual_cost_cents,
-              r.opened_at, r.scheduled_at, r.started_at, r.completed_at, r.resolution_notes, r.created_at, r.updated_at
-         FROM equipment_repairs r
-         JOIN inventory_items ii ON ii.id = r.item_id AND ii.company_id = r.company_id
-        WHERE r.company_id = $1
-        ORDER BY CASE r.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, r.updated_at DESC`,
-      [req.companyId]
-    );
-    res.json(rows);
-  } catch (e) { console.error("[operations] repairs failed:", e); res.status(500).json({ error: "repairs_failed" }); }
-});
-
-app.post("/api/operations/repairs", authRequired, requireEmployer, async (req, res) => {
-  const { item_id, request_id, assigned_user_id, vendor, problem, diagnosis, priority, estimated_cost_cents, scheduled_at } = req.body || {};
-  if (!item_id || !problem) return res.status(400).json({ error: "repair_fields_required" });
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const item = (await client.query(`SELECT id, name FROM inventory_items WHERE id = $1 AND company_id = $2 FOR UPDATE`, [item_id, req.companyId])).rows[0];
-    if (!item) { await client.query("ROLLBACK"); return res.status(404).json({ error: "item_not_found" }); }
-    const request = request_id ? (await client.query(`SELECT requester_id, explanation FROM equipment_requests WHERE id = $1 AND company_id = $2`, [request_id, req.companyId])).rows[0] : null;
-    const id = randomUUID();
-    await client.query(
-      `INSERT INTO equipment_repairs(id, company_id, item_id, request_id, reported_by, created_by, assigned_user_id, vendor, problem, diagnosis, priority, estimated_cost_cents, scheduled_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-      [id, req.companyId, item_id, request_id || null, request?.requester_id || null, req.userId, assigned_user_id || null, cleanString(vendor, 200) || null, cleanString(problem, 2000), cleanString(diagnosis, 2000) || null, priority || "normal", estimated_cost_cents ?? null, scheduled_at || null]
-    );
-    await client.query(`UPDATE inventory_items SET status = 'broken', updated_at = now() WHERE id = $1 AND company_id = $2`, [item_id, req.companyId]);
-    if (request_id) await client.query(`UPDATE equipment_requests SET status = 'under_review', updated_at = now() WHERE id = $1 AND company_id = $2`, [request_id, req.companyId]);
-    await recordAssetHistory(client, req.companyId, item_id, "repair_created", req.userId, `Repair created: ${cleanString(problem, 180)}`, { repair_id: id, request_id: request_id || null });
-    await client.query("COMMIT");
-    res.status(201).json(await repairPayload(pool, req.companyId, id));
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("[operations] repair create failed:", e);
-    res.status(500).json({ error: "repair_create_failed" });
-  } finally { client.release(); }
-});
-
-app.patch("/api/operations/repairs/:id", authRequired, requireEmployer, async (req, res) => {
-  const allowedStatuses = new Set(["reported", "approved", "scheduled", "in_repair", "waiting_for_parts", "completed", "not_repairable", "cancelled"]);
-  const status = req.body?.status && allowedStatuses.has(req.body.status) ? req.body.status : null;
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const before = (await client.query(`SELECT * FROM equipment_repairs WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
-    if (!before) { await client.query("ROLLBACK"); return res.status(404).json({ error: "repair_not_found" }); }
-    const startedAt = status === "in_repair" && !before.started_at ? new Date() : before.started_at;
-    const completedAt = ["completed", "not_repairable"].includes(status) && !before.completed_at ? new Date() : before.completed_at;
-    await client.query(
-      `UPDATE equipment_repairs
-          SET assigned_user_id = COALESCE($3, assigned_user_id),
-              vendor = COALESCE($4, vendor),
-              diagnosis = COALESCE($5, diagnosis),
-              status = COALESCE($6, status),
-              priority = COALESCE($7, priority),
-              estimated_cost_cents = COALESCE($8, estimated_cost_cents),
-              actual_cost_cents = COALESCE($9, actual_cost_cents),
-              scheduled_at = COALESCE($10, scheduled_at),
-              started_at = $11,
-              completed_at = $12,
-              resolution_notes = COALESCE($13, resolution_notes),
-              updated_at = now()
-        WHERE id = $1 AND company_id = $2`,
-      [req.params.id, req.companyId, req.body?.assigned_user_id || null, cleanString(req.body?.vendor, 200) || null, cleanString(req.body?.diagnosis, 2000) || null, status, req.body?.priority || null, req.body?.estimated_cost_cents ?? null, req.body?.actual_cost_cents ?? null, req.body?.scheduled_at || null, startedAt, completedAt, cleanString(req.body?.resolution_notes, 2000) || null]
-    );
-    if (status && status !== before.status) {
-      const assetStatus = repairStatusToAssetStatus(status);
-      if (assetStatus) await client.query(`UPDATE inventory_items SET status = $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [before.item_id, req.companyId, assetStatus]);
-      await recordAssetHistory(client, req.companyId, before.item_id, `repair_${status}`, req.userId, `Repair ${status.replace(/_/g, " ")}`, { repair_id: req.params.id, previous_status: before.status });
-    }
-    await client.query("COMMIT");
-    res.json(await repairPayload(pool, req.companyId, req.params.id));
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("[operations] repair update failed:", e);
-    res.status(500).json({ error: "repair_update_failed" });
-  } finally { client.release(); }
-});
-
-app.get("/api/operations/inventory-counts/schedules", authRequired, requireEmployer, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`SELECT id, name, location_id, assigned_user_id, frequency, due_date::text, due_time, reminder_minutes, variance_threshold::float8 AS variance_threshold, approval_required, enabled, created_by, created_at, updated_at FROM inventory_count_schedules WHERE company_id = $1 ORDER BY enabled DESC, name`, [req.companyId]);
-    res.json(rows);
-  } catch (e) { console.error("[operations] count schedules failed:", e); res.status(500).json({ error: "count_schedules_failed" }); }
-});
-
-app.put("/api/operations/inventory-counts/schedules/:id", authRequired, requireEmployer, async (req, res) => {
-  const { name, location_id, assigned_user_id, frequency, due_date, due_time, reminder_minutes, variance_threshold, approval_required, enabled } = req.body || {};
-  if (!name || !location_id) return res.status(400).json({ error: "count_schedule_fields_required" });
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO inventory_count_schedules(id, company_id, name, location_id, assigned_user_id, frequency, due_date, due_time, reminder_minutes, variance_threshold, approval_required, enabled, created_by)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-       ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, location_id = EXCLUDED.location_id, assigned_user_id = EXCLUDED.assigned_user_id, frequency = EXCLUDED.frequency, due_date = EXCLUDED.due_date, due_time = EXCLUDED.due_time, reminder_minutes = EXCLUDED.reminder_minutes, variance_threshold = EXCLUDED.variance_threshold, approval_required = EXCLUDED.approval_required, enabled = EXCLUDED.enabled, updated_at = now()
-       WHERE inventory_count_schedules.company_id = $2
-       RETURNING id, name, location_id, assigned_user_id, frequency, due_date::text, due_time, reminder_minutes, variance_threshold::float8 AS variance_threshold, approval_required, enabled, created_by, created_at, updated_at`,
-      [req.params.id, req.companyId, name, location_id, assigned_user_id || null, frequency || "weekly", due_date || null, due_time || null, reminder_minutes ?? null, Number(variance_threshold || 0), toBool(approval_required, true), toBool(enabled, true), req.userId]
-    );
-    res.json(rows[0]);
-  } catch (e) { console.error("[operations] count schedule save failed:", e); res.status(500).json({ error: "count_schedule_save_failed" }); }
-});
-
-app.post("/api/operations/inventory-counts/schedules/:id/generate", authRequired, requireEmployer, async (req, res) => {
-  const due = (req.body?.due_date || new Date().toISOString().slice(0, 10)).toString().slice(0, 10);
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const schedule = (await client.query(`SELECT * FROM inventory_count_schedules WHERE id = $1 AND company_id = $2 AND enabled = true FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
-    if (!schedule) { await client.query("ROLLBACK"); return res.status(404).json({ error: "count_schedule_not_found" }); }
-    const submissionId = `${req.companyId}:${schedule.id}:${due}`;
-    const submission = (await client.query(
-      `INSERT INTO inventory_count_submissions(id, company_id, schedule_id, location_id, assigned_user_id, status, due_date)
-       VALUES($1,$2,$3,$4,$5,'draft',$6::date)
-       ON CONFLICT(company_id, schedule_id, due_date) DO UPDATE SET updated_at = now()
-       RETURNING id, schedule_id, location_id, assigned_user_id, status, due_date::text, submitted_by, submitted_at, reviewed_by, reviewed_at, review_note`,
-      [submissionId, req.companyId, schedule.id, schedule.location_id, schedule.assigned_user_id || null, due]
-    )).rows[0];
-    const taskId = `inventory-count:${submissionId}`;
-    await client.query(
-      `INSERT INTO todo_tasks(id, user_id, title, detail, creator_id, assignee_ids, due_date, priority, status, linked_inventory_count_id, reminders, subtasks, completed, completion_note_required)
-       VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,'normal','open',$8,'[]'::jsonb,'[]'::jsonb,false,false)
-       ON CONFLICT(id) DO UPDATE SET due_date = EXCLUDED.due_date, assignee_ids = EXCLUDED.assignee_ids, linked_inventory_count_id = EXCLUDED.linked_inventory_count_id, updated_at = now()`,
-      [taskId, req.userId, `Inventory Recount — ${schedule.name}`, "Count inventory and submit variances for owner review.", req.userId, JSON.stringify(schedule.assigned_user_id ? [schedule.assigned_user_id] : []), due, submission.id]
-    );
-    await client.query("COMMIT");
-    res.status(201).json(await inventoryCountSubmissionPayload(pool, req.companyId, submission.id, req.userId, true));
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("[operations] count generate failed:", e);
-    res.status(500).json({ error: "count_generate_failed" });
-  } finally { client.release(); }
-});
-
-app.get("/api/operations/inventory-counts/submissions", authRequired, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const submissions = await pool.query(
-      `SELECT s.id, s.schedule_id, s.location_id, l.name AS location_name, s.assigned_user_id, s.status, s.due_date::text,
-              s.submitted_by, s.submitted_at, s.reviewed_by, s.reviewed_at, s.review_note,
-              COALESCE(jsonb_agg(jsonb_build_object('id', si.id, 'item_id', si.item_id, 'expected_quantity', si.expected_quantity::float8, 'counted_quantity', si.counted_quantity::float8, 'variance', si.variance::float8, 'note', si.note, 'item_name', ii.name) ORDER BY ii.name) FILTER (WHERE si.id IS NOT NULL), '[]'::jsonb) AS items
-         FROM inventory_count_submissions s
-         LEFT JOIN inventory_locations l ON l.id = s.location_id AND l.company_id = s.company_id
-         LEFT JOIN inventory_count_submission_items si ON si.submission_id = s.id
-         LEFT JOIN inventory_items ii ON ii.id = si.item_id
-        WHERE s.company_id = $1 AND ($2 = true OR s.assigned_user_id = $3 OR s.submitted_by = $3)
-        GROUP BY s.id, l.name
-        ORDER BY s.due_date DESC, s.updated_at DESC LIMIT 80`,
-      [req.companyId, req.role === "employer", req.userId]
-    );
-    res.json(submissions.rows);
-  } catch (e) { console.error("[operations] count submissions failed:", e); res.status(500).json({ error: "count_submissions_failed" }); }
-});
-
-app.post("/api/operations/inventory-counts/submissions/:id/submit", authRequired, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const items = Array.isArray(req.body?.items) ? req.body.items : [];
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const submission = (await client.query(`SELECT s.*, sch.approval_required, sch.variance_threshold FROM inventory_count_submissions s LEFT JOIN inventory_count_schedules sch ON sch.id = s.schedule_id AND sch.company_id = s.company_id WHERE s.id = $1 AND s.company_id = $2 FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
-    if (!submission) { await client.query("ROLLBACK"); return res.status(404).json({ error: "count_submission_not_found" }); }
-    if (req.role !== "employer" && submission.assigned_user_id && submission.assigned_user_id !== req.userId) { await client.query("ROLLBACK"); return res.status(403).json({ error: "not_assigned" }); }
-    await client.query(`DELETE FROM inventory_count_submission_items WHERE submission_id = $1`, [submission.id]);
-    for (const input of items) {
-      const item = (await client.query(`SELECT id, quantity_on_hand FROM inventory_items WHERE id = $1 AND company_id = $2 AND location_id IS NOT DISTINCT FROM $3`, [input.item_id, req.companyId, submission.location_id])).rows[0];
-      if (!item) continue;
-      const counted = Number(input.counted_quantity);
-      if (!Number.isFinite(counted)) continue;
-      const expected = Number(item.quantity_on_hand || 0);
-      const variance = counted - expected;
-      if (Math.abs(variance) >= Number(submission.variance_threshold || 0) && !cleanString(input.note, 1000) && Number(submission.variance_threshold || 0) > 0) {
-        await client.query("ROLLBACK");
-        return res.status(422).json({ error: "variance_note_required", item_id: item.id });
-      }
-      await client.query(`INSERT INTO inventory_count_submission_items(id, submission_id, item_id, expected_quantity, counted_quantity, variance, note) VALUES($1,$2,$3,$4,$5,$6,$7)`, [randomUUID(), submission.id, item.id, expected, counted, variance, cleanString(input.note, 1000) || null]);
-    }
-    const nextStatus = toBool(submission.approval_required, true) ? "pending_approval" : "approved";
-    await client.query(`UPDATE inventory_count_submissions SET status = $3, submitted_by = $4, submitted_at = now(), updated_at = now() WHERE id = $1 AND company_id = $2`, [submission.id, req.companyId, nextStatus, req.userId]);
-    if (nextStatus === "approved") {
-      const rows = (await client.query(`SELECT * FROM inventory_count_submission_items WHERE submission_id = $1`, [submission.id])).rows;
-      for (const row of rows) {
-        const variance = Number(row.variance || 0);
-        if (variance === 0) continue;
-        const key = `count:${submission.id}:${row.item_id}`;
-        const existing = (await client.query(`SELECT id FROM inventory_transactions WHERE company_id = $1 AND idempotency_key = $2`, [req.companyId, key])).rows[0];
-        if (!existing) {
-          await client.query(`INSERT INTO inventory_transactions(id, company_id, item_id, transaction_type, quantity, from_location_id, employee_id, note, idempotency_key) VALUES($1,$2,$3,'recount_correction',$4,$5,$6,$7,$8)`, [randomUUID(), req.companyId, row.item_id, Math.abs(variance), submission.location_id, req.userId, `Inventory count correction variance ${variance}`, key]);
-          await client.query(`UPDATE inventory_items SET quantity_on_hand = quantity_on_hand + $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [row.item_id, req.companyId, variance]);
-        }
-      }
-    }
-    await client.query("COMMIT");
-    res.json(await inventoryCountSubmissionPayload(pool, req.companyId, submission.id, req.userId, req.role === "employer"));
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("[operations] count submit failed:", e);
-    res.status(500).json({ error: "count_submit_failed" });
-  } finally { client.release(); }
-});
-
-app.post("/api/operations/inventory-counts/submissions/:id/review", authRequired, requireEmployer, async (req, res) => {
-  const action = req.body?.action === "approve" ? "approved" : req.body?.action === "reject" ? "rejected" : null;
-  if (!action) return res.status(400).json({ error: "invalid_action" });
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const submission = (await client.query(`SELECT * FROM inventory_count_submissions WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
-    if (!submission) { await client.query("ROLLBACK"); return res.status(404).json({ error: "count_submission_not_found" }); }
-    if (submission.submitted_by === req.userId) { await client.query("ROLLBACK"); return res.status(403).json({ error: "cannot_approve_own_count" }); }
-    if (action === "approved") {
-      const rows = (await client.query(`SELECT * FROM inventory_count_submission_items WHERE submission_id = $1`, [submission.id])).rows;
-      for (const row of rows) {
-        const variance = Number(row.variance || 0);
-        if (variance === 0) continue;
-        const key = `count:${submission.id}:${row.item_id}`;
-        const existing = (await client.query(`SELECT id FROM inventory_transactions WHERE company_id = $1 AND idempotency_key = $2`, [req.companyId, key])).rows[0];
-        if (!existing) {
-          await client.query(`INSERT INTO inventory_transactions(id, company_id, item_id, transaction_type, quantity, from_location_id, employee_id, note, idempotency_key) VALUES($1,$2,$3,'recount_correction',$4,$5,$6,$7,$8)`, [randomUUID(), req.companyId, row.item_id, Math.abs(variance), submission.location_id, req.userId, `Inventory count correction variance ${variance}`, key]);
-          await client.query(`UPDATE inventory_items SET quantity_on_hand = quantity_on_hand + $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [row.item_id, req.companyId, variance]);
-        }
-      }
-    }
-    await client.query(`UPDATE inventory_count_submissions SET status = $3, reviewed_by = $4, reviewed_at = now(), review_note = $5, updated_at = now() WHERE id = $1 AND company_id = $2`, [submission.id, req.companyId, action, req.userId, cleanString(req.body?.note, 1000) || null]);
-    if (action === "rejected" && submission.assigned_user_id) {
-      const taskId = `inventory-count-recount:${submission.id}`;
-      await client.query(`INSERT INTO todo_tasks(id, user_id, title, detail, creator_id, assignee_ids, due_date, priority, status, linked_inventory_count_id, reminders, subtasks, completed, completion_note_required) VALUES($1,$2,'Inventory Recount Correction',$3,$2,$4::jsonb,now(),'high','open',$5,'[]'::jsonb,'[]'::jsonb,false,true) ON CONFLICT(id) DO UPDATE SET status = 'open', detail = EXCLUDED.detail, updated_at = now()`, [taskId, req.userId, cleanString(req.body?.note, 1000) || "Please recount and resubmit inventory.", JSON.stringify([submission.assigned_user_id]), submission.id]);
-    }
-    await client.query("COMMIT");
-    res.json(await inventoryCountSubmissionPayload(pool, req.companyId, submission.id, req.userId, true));
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("[operations] count review failed:", e);
-    res.status(500).json({ error: "count_review_failed" });
-  } finally { client.release(); }
 });
 
 // ---------- OPERATIONS: MILEAGE ----------
@@ -9593,33 +8583,6 @@ app.post("/api/operations/mileage/logs/:id/review", authRequired, requireEmploye
     const legs = (await pool.query(`SELECT id, sequence, from_label, to_label, distance_miles::float8 AS distance_miles, duration_seconds::float8 AS duration_seconds, job_id, manual_trip_id, calculation_status, error_message FROM mileage_legs WHERE log_id = $1 ORDER BY sequence`, [req.params.id])).rows;
     res.json({ ...rows[0], legs });
   } catch (e) { console.error("[operations] mileage log review failed:", e); res.status(500).json({ error: "mileage_log_review_failed" }); }
-});
-
-app.post("/api/operations/mileage/logs/:id/problem", authRequired, async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const kind = cleanString(req.body?.kind, 80) || "other";
-  const explanation = cleanString(req.body?.explanation, 1500);
-  if (!explanation) return res.status(400).json({ error: "explanation_required" });
-  try {
-    const existing = (await pool.query(`SELECT employee_id, status, employee_notes FROM mileage_daily_logs WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
-    if (!existing) return res.status(404).json({ error: "mileage_log_not_found" });
-    if (req.role !== "employer" && existing.employee_id !== req.userId) return res.status(403).json({ error: "not_allowed" });
-    const prefix = `[${new Date().toISOString()}] ${kind}: ${explanation}`;
-    const previous = cleanString(existing.employee_notes, 3000);
-    const note = previous ? `${previous}\n${prefix}` : prefix;
-    const nextStatus = ["approved", "paid"].includes(existing.status) ? existing.status : "ready_for_review";
-    const { rows } = await pool.query(
-      `UPDATE mileage_daily_logs
-          SET employee_notes = $3, status = $4, updated_at = now()
-        WHERE id = $1 AND company_id = $2
-        RETURNING id, employee_id, service_date::text, status, start_rule, end_rule, start_label, start_lat, start_lng,
-          end_label, end_lat, end_lng, job_order_estimated, total_miles::float8 AS total_miles, rate_cents_per_mile,
-          reimbursement_cents, employee_notes, owner_notes, reviewed_by, reviewed_at, paid_at`,
-      [req.params.id, req.companyId, note, nextStatus]
-    );
-    const legs = (await pool.query(`SELECT id, sequence, from_label, to_label, distance_miles::float8 AS distance_miles, duration_seconds::float8 AS duration_seconds, job_id, manual_trip_id, calculation_status, error_message FROM mileage_legs WHERE log_id = $1 ORDER BY sequence`, [req.params.id])).rows;
-    res.json({ ...rows[0], legs });
-  } catch (e) { console.error("[operations] mileage problem failed:", e); res.status(500).json({ error: "mileage_problem_failed" }); }
 });
 
 app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
@@ -9892,7 +8855,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
     if (revenueSource.failed) failedSources.push(revenueSource.source);
     const revenueResult = revenueSource.value;
 
-    const [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource, equipmentRequestsSource, mileageApprovalsSource, overdueTeamSource] = await Promise.all([
+    const [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource, equipmentRequestsSource, mileageApprovalsSource] = await Promise.all([
       dashboardSource(requestId, "todos", () => pool.query(
         `SELECT id, title, due_date, completed, updated_at, priority, assignee_ids
            FROM todo_tasks
@@ -9979,24 +8942,9 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
           ORDER BY service_date ASC
           LIMIT 8`,
         [req.companyId]
-      ) : Promise.resolve({ rows: [] }), { rows: [] }),
-      dashboardSource(requestId, "overdue_team_assignments", () => employer && req.companyId ? pool.query(
-        `SELECT t.id, t.title, t.due_date, t.completed, t.updated_at, t.priority, t.assignee_ids,
-                COALESCE(NULLIF(u.display_name, ''), u.email) AS assignee_name
-           FROM todo_tasks t
-           LEFT JOIN LATERAL jsonb_array_elements_text(t.assignee_ids) a(id) ON true
-           LEFT JOIN users u ON u.id::text = a.id AND u.company_id = $1
-          WHERE t.user_id IN (SELECT id FROM users WHERE company_id = $1)
-            AND t.completed = false
-            AND t.due_date IS NOT NULL
-            AND t.due_date < $2
-            AND jsonb_array_length(t.assignee_ids) > 0
-          ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, t.due_date ASC
-          LIMIT 8`,
-        [req.companyId, todayStart.toISOString()]
       ) : Promise.resolve({ rows: [] }), { rows: [] })
     ]);
-    for (const source of [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource, equipmentRequestsSource, mileageApprovalsSource, overdueTeamSource]) {
+    for (const source of [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource, equipmentRequestsSource, mileageApprovalsSource]) {
       if (source.failed) failedSources.push(source.source);
     }
     const tasksResult = tasksSource.value;
@@ -10009,7 +8957,6 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
     const dismissalsResult = dismissalsSource.value;
     const equipmentRequestsResult = equipmentRequestsSource.value;
     const mileageApprovalsResult = mileageApprovalsSource.value;
-    const overdueTeamResult = overdueTeamSource.value;
 
     const items = [];
     const jobsToday = jobsResult.rows.filter((row) => new Date(row.start) >= todayStart && new Date(row.start) < todayEnd);
@@ -10053,12 +9000,6 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
       const section = assignedToMe ? "my_assignments" : (due < todayStart ? "attention" : due < todayEnd ? "today" : "upcoming");
       const priority = due < todayStart || row.priority === "urgent" || row.priority === "high" ? "high" : "normal";
       items.push(buildDashboardTodoItem(row, section, priority));
-    }
-    for (const row of overdueTeamResult.rows) {
-      const item = buildDashboardTodoItem(row, "overdue_assignments", "high");
-      item.subtitle = `${row.assignee_name || "Employee"} • ${item.subtitle}`;
-      item.tint = "red";
-      items.push(item);
     }
     for (const row of customerResult.rows) {
       const due = new Date(row.due_date);
@@ -10189,7 +9130,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
     }
 
     const priorityRank = { critical: 0, high: 1, normal: 2, low: 3 };
-    const sectionRank = { unfinished_jobs: 0, overdue_assignments: 1, attention: 2, today: 3, upcoming_jobs: 4, equipment_requests: 5, upcoming: 6 };
+    const sectionRank = { unfinished_jobs: 0, attention: 1, today: 2, upcoming_jobs: 3, upcoming: 4 };
     const visibleItems = filterDashboardDismissed(dedupeDashboardItems(items), dismissalsResult.rows)
       .sort((a, b) => {
         if (sectionRank[a.section] !== sectionRank[b.section]) return sectionRank[a.section] - sectionRank[b.section];
@@ -10543,7 +9484,7 @@ app.get("/api/todo/tasks", authRequired, async (req, res) => {
       : [req.userId];
     const { rows } = await pool.query(
       `SELECT id, title, detail, creator_id, assignee_ids, due_date, priority, status,
-              linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
+              linked_contact_id, linked_job_id, linked_equipment_id,
               reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex
        FROM todo_tasks
        WHERE user_id = $1
@@ -10559,7 +9500,7 @@ app.get("/api/todo/tasks", authRequired, async (req, res) => {
 app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
   const {
     title, detail, creator_id, assignee_ids, due_date, priority, status,
-    linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
+    linked_contact_id, linked_job_id, linked_equipment_id,
     reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex
   } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
@@ -10573,9 +9514,9 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
     const r = await pool.query(
       `INSERT INTO todo_tasks
         (id, user_id, title, detail, creator_id, assignee_ids, due_date, priority, status,
-         linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id, reminders, subtasks,
+         linked_contact_id, linked_job_id, linked_equipment_id, reminders, subtasks,
          completed, completed_at, completed_by, completion_note, completion_note_required, color_hex)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, $17, $18, $19, $20, $21, $22)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, $16, $17, $18, $19, $20)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              detail = EXCLUDED.detail,
@@ -10587,8 +9528,6 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
              linked_contact_id = EXCLUDED.linked_contact_id,
              linked_job_id = EXCLUDED.linked_job_id,
              linked_equipment_id = EXCLUDED.linked_equipment_id,
-             linked_equipment_request_id = EXCLUDED.linked_equipment_request_id,
-             linked_inventory_count_id = EXCLUDED.linked_inventory_count_id,
              reminders = EXCLUDED.reminders,
              subtasks = EXCLUDED.subtasks,
              completed = EXCLUDED.completed,
@@ -10599,15 +9538,15 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
              color_hex = EXCLUDED.color_hex,
              updated_at = now()
        WHERE todo_tasks.user_id = $2
-          OR ($23::uuid IS NOT NULL AND todo_tasks.user_id IN (SELECT id FROM users WHERE company_id = $23))
-          OR todo_tasks.assignee_ids ? $24::text
+          OR ($21::uuid IS NOT NULL AND todo_tasks.user_id IN (SELECT id FROM users WHERE company_id = $21))
+          OR todo_tasks.assignee_ids ? $22::text
        RETURNING id, title, detail, creator_id, assignee_ids, due_date, priority, status,
-                 linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
+                 linked_contact_id, linked_job_id, linked_equipment_id,
                  reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex`,
       [
         req.params.id, ownerUserId, title, detail || null, creator_id || req.userId, JSON.stringify(assignees), due_date || null,
         priority || "normal", completed ? "completed" : (status || "open"),
-        linked_contact_id || null, linked_job_id || null, linked_equipment_id || null, linked_equipment_request_id || null, linked_inventory_count_id || null,
+        linked_contact_id || null, linked_job_id || null, linked_equipment_id || null,
         JSON.stringify(reminders || []), JSON.stringify(subtasks || []),
         toBool(completed), completed_at || (completed ? new Date() : null),
         completed_by || (completed ? req.userId : null), completion_note || null, toBool(completion_note_required), color_hex || null,
@@ -10868,8 +9807,29 @@ app.get("/api/payments/connect/status", authRequired, requireEmployer, async (re
     if (settings.stripe_account_id && stripe) {
       try {
         const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
-        const updated = await persistStripeAccountReadiness(req.userId, acct);
-        return res.json({ settings: sanitizeBusinessSettings(updated) });
+        const status = acct.details_submitted
+          ? (acct.charges_enabled ? "ready" : "verification_pending")
+          : "setup_incomplete";
+        const updated = await pool.query(
+          `UPDATE business_settings
+              SET stripe_charges_enabled = $2,
+                  stripe_payouts_enabled = $3,
+                  stripe_details_submitted = $4,
+                  stripe_default_currency = COALESCE($5, stripe_default_currency),
+                  stripe_connect_status = $6,
+                  updated_at = now()
+            WHERE user_id = $1
+            RETURNING *`,
+          [
+            req.userId,
+            !!acct.charges_enabled,
+            !!acct.payouts_enabled,
+            !!acct.details_submitted,
+            acct.default_currency || null,
+            status
+          ]
+        );
+        return res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
       } catch (err) {
         console.error("stripe accounts.retrieve failed:", err.message);
       }
@@ -10955,8 +9915,29 @@ app.post("/api/payments/connect/refresh-status", authRequired, requireEmployer, 
       return res.json({ settings: sanitizeBusinessSettings(settings) });
     }
     const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
-    const updated = await persistStripeAccountReadiness(req.userId, acct);
-    res.json({ settings: sanitizeBusinessSettings(updated) });
+    const status = acct.details_submitted
+      ? (acct.charges_enabled ? "ready" : "verification_pending")
+      : "setup_incomplete";
+    const updated = await pool.query(
+      `UPDATE business_settings
+          SET stripe_charges_enabled = $2,
+              stripe_payouts_enabled = $3,
+              stripe_details_submitted = $4,
+              stripe_default_currency = COALESCE($5, stripe_default_currency),
+              stripe_connect_status = $6,
+              updated_at = now()
+        WHERE user_id = $1
+        RETURNING *`,
+      [
+        req.userId,
+        !!acct.charges_enabled,
+        !!acct.payouts_enabled,
+        !!acct.details_submitted,
+        acct.default_currency || null,
+        status
+      ]
+    );
+    res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "connect_refresh_failed", detail: e.message });
@@ -11104,61 +10085,6 @@ app.get("/api/service-plans/:id", authRequired, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "get_service_plan_failed" });
-  }
-});
-
-app.post("/api/service-plans/:id/reconcile", authRequired, async (req, res) => {
-  try {
-    const employerId = await resolveEmployerUserId(req);
-    const { rows } = await pool.query(
-      `SELECT sp.*, c.name AS contact_name, c.phone AS contact_phone,
-              c.email AS contact_email, c.address AS contact_address
-         FROM service_plans sp
-         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
-        WHERE sp.id = $1 AND sp.user_id = $2`,
-      [req.params.id, employerId]
-    );
-    const plan = rows[0];
-    if (!plan) return res.status(404).json({ error: "not_found" });
-    if (req.role !== "employer" && plan.created_by_user_id !== req.userId) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-    const updated = await reconcileServicePlanFromStripe(plan, { source: "stripe.service_plan_client_reconcile" });
-    const joined = await pool.query(
-      `SELECT sp.*, c.name AS contact_name, c.phone AS contact_phone,
-              c.email AS contact_email, c.address AS contact_address
-         FROM service_plans sp
-         LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
-        WHERE sp.id = $1`,
-      [updated.id]
-    );
-    const payment = await pool.query(
-      `SELECT *
-         FROM payment_records
-        WHERE service_plan_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1`,
-      [updated.id]
-    );
-    res.json({
-      plan: sanitizeServicePlan(joined.rows[0] || updated, { employeeSafe: req.role !== "employer" }),
-      payment: payment.rows[0] ? sanitizePaymentRecord(payment.rows[0], { employeeSafe: req.role !== "employer" }) : null
-    });
-  } catch (e) {
-    console.error("service plan reconcile failed:", {
-      message: e.message,
-      type: e.type,
-      code: e.code,
-      requestId: e.requestId
-    });
-    if (e.statusCode === 409) {
-      return res.status(409).json({
-        error: e.message,
-        subscription_ids: e.subscriptionIds || [],
-        message: "Multiple active Stripe subscriptions match this WolfCRM plan. Review them in Stripe before adopting one."
-      });
-    }
-    res.status(500).json({ error: "service_plan_reconcile_failed", detail: e.message });
   }
 });
 
@@ -11385,71 +10311,21 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
     // Confirm the connected account can charge right now.
     const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
     if (!acct.charges_enabled) {
-      await persistStripeAccountReadiness(employerId, acct);
-      return res.status(400).json(stripeChargesBlockedResponse(acct));
+      await pool.query(
+        `UPDATE business_settings
+            SET stripe_charges_enabled = $2,
+                stripe_payouts_enabled = $3,
+                stripe_details_submitted = $4,
+                updated_at = now()
+          WHERE user_id = $1`,
+        [employerId, !!acct.charges_enabled, !!acct.payouts_enabled, !!acct.details_submitted]
+      );
+      return res.status(400).json({ error: "charges_not_enabled" });
     }
 
     const connectedAccountId = settings.stripe_account_id;
     const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
     if (!publishableKey) return res.status(503).json({ error: "publishable_key_missing" });
-
-    if (plan.stripe_subscription_id) {
-      const existingConnectedAccountId = plan.stripe_connected_account_id || connectedAccountId;
-      let subscription;
-      try {
-        subscription = await stripe.subscriptions.retrieve(
-          plan.stripe_subscription_id,
-          { expand: ["latest_invoice.payment_intent"] },
-          { stripeAccount: existingConnectedAccountId }
-        );
-      } catch (err) {
-        console.error("[stripe] existing subscription retrieve failed before start", {
-          service_plan_id: plan.id,
-          subscription_id: plan.stripe_subscription_id,
-          connected_account_id: existingConnectedAccountId,
-          message: err.message,
-          type: err.type,
-          code: err.code,
-          requestId: err.requestId
-        });
-        return res.status(409).json({
-          error: "existing_subscription_unavailable",
-          message: "This plan already has a Stripe subscription. Refresh the plan or review it in Stripe before starting another payment."
-        });
-      }
-      await applyStripeSubscriptionStatus({
-        subscription,
-        connectedAccountId: existingConnectedAccountId,
-        servicePlanId: plan.id,
-        source: "stripe.start_existing_subscription_guard"
-      });
-      const resume = await buildExistingSubscriptionPaymentSheetResponse({
-        plan,
-        subscription,
-        connectedAccountId: existingConnectedAccountId,
-        publishableKey,
-        actorUserId: req.userId
-      });
-      console.warn("[stripe] blocked duplicate subscription start", {
-        service_plan_id: plan.id,
-        existing_subscription_id: subscription.id,
-        connected_account_id: existingConnectedAccountId,
-        stripe_subscription_status: subscription.status,
-        returned_existing_payment_intent: Boolean(resume)
-      });
-      if (resume) return res.json(resume);
-      const localStatus = mapStripeSubscriptionToWolfCRMStatus(subscription) || plan.status;
-      const error = subscriptionBlocksNewStart(subscription.status)
-        ? "stripe_subscription_already_exists"
-        : "stripe_subscription_restart_required";
-      return res.status(409).json({
-        error,
-        message: "This service plan already has a Stripe subscription. Refresh the plan instead of starting another payment.",
-        subscription_id: subscription.id,
-        stripe_subscription_status: subscription.status,
-        status: localStatus
-      });
-    }
 
     // Create or reuse the Stripe customer ON THE CONNECTED ACCOUNT.
     let customerId = plan.stripe_customer_id;
@@ -11470,7 +10346,7 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
     // Create ephemeral key so PaymentSheet can render the saved-cards flow.
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customerId },
-      { apiVersion: STRIPE_MOBILE_EPHEMERAL_KEY_API_VERSION, stripeAccount: connectedAccountId }
+      { apiVersion: "2024-06-20", stripeAccount: connectedAccountId }
     );
 
     // Product + price on the connected account.
@@ -11539,7 +10415,6 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
               stripe_subscription_status = $7,
               stripe_payment_intent_id = $8,
               stripe_latest_invoice_id = $9,
-              stripe_payment_collection_paused = false,
               status = 'payment_pending',
               updated_at = now()
         WHERE id = $1`,
@@ -11597,17 +10472,6 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
       });
       await syncAutomationSchedulesForServicePlan(req.companyId, { ...plan, status: "payment_pending", stripe_subscription_id: subscription.id, stripe_subscription_status: subscription.status });
     }
-    console.log("[stripe] connected subscription payment started", {
-      mode: publishableKey.startsWith("pk_test_") ? "test" : publishableKey.startsWith("pk_live_") ? "live" : "unknown",
-      connected_account_id: connectedAccountId,
-      customer_id: customerId,
-      payment_intent_id: pi.id,
-      subscription_id: subscription.id,
-      service_plan_id: plan.id,
-      payment_record_id: paymentRecord.rows[0]?.id || null,
-      amount_cents: plan.price_cents,
-      currency: (plan.currency || "usd").toLowerCase()
-    });
 
     res.json({
       publishable_key: publishableKey,
@@ -11620,13 +10484,7 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
       payment_record_id: paymentRecord.rows[0].id
     });
   } catch (e) {
-    console.error("start-connected-subscription:", {
-      message: e.message,
-      type: e.type,
-      code: e.code,
-      decline_code: e.decline_code,
-      requestId: e.requestId
-    });
+    console.error("start-connected-subscription:", e);
     res.status(500).json({ error: "start_subscription_failed", detail: e.message });
   }
 });
@@ -11683,160 +10541,40 @@ app.post("/api/service-plans/:id/mark-serviced", authRequired, requireEmployer, 
 app.post("/api/service-plans/:id/pause", authRequired, requireEmployer, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
-    const planResult = await pool.query(
-      `SELECT * FROM service_plans WHERE id = $1 AND user_id = $2`,
+    const { rows } = await pool.query(
+      `UPDATE service_plans
+          SET status = 'paused', updated_at = now()
+        WHERE id = $1 AND user_id = $2
+        RETURNING *`,
       [req.params.id, employerId]
     );
-    const plan = planResult.rows[0];
-    if (!plan) return res.status(404).json({ error: "not_found" });
-
-    let updatedPlan = plan;
-    const stripe = getStripe();
-    if (stripe && plan.stripe_subscription_id) {
-      if (!plan.stripe_connected_account_id) {
-        return res.status(400).json({ error: "stripe_connected_account_missing" });
-      }
-      const subscription = await stripe.subscriptions.update(
-        plan.stripe_subscription_id,
-        { pause_collection: { behavior: "void" }, expand: ["latest_invoice.payment_intent"] },
-        { stripeAccount: plan.stripe_connected_account_id }
-      );
-      const applied = await applyStripeSubscriptionStatus({
-        subscription,
-        connectedAccountId: plan.stripe_connected_account_id,
-        servicePlanId: plan.id,
-        source: "service_plans.api.pause"
-      });
-      updatedPlan = applied[0] || plan;
-    } else {
-      const { rows } = await pool.query(
-        `UPDATE service_plans
-            SET status = 'paused',
-                stripe_payment_collection_paused = false,
-                updated_at = now()
-          WHERE id = $1 AND user_id = $2
-          RETURNING *`,
-        [req.params.id, employerId]
-      );
-      updatedPlan = rows[0];
-    }
-
+    if (!rows.length) return res.status(404).json({ error: "not_found" });
     await pool.query(
       `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
        VALUES ($1,$2,$3,$4,$5,'paused',$6)`,
-      [employerId, req.companyId || null, req.userId, updatedPlan.id, updatedPlan.contact_id,
+      [employerId, req.companyId || null, req.userId, rows[0].id, rows[0].contact_id,
        `Paused by ${req.userEmail || req.userId}`]
     );
+    // TODO: also pause the Stripe subscription (`pause_collection`) when a
+    // clear resume UX exists — leaving local-only for now so we never
+    // accidentally break Stripe billing state.
     if (req.companyId) {
-      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", updatedPlan.id);
+      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", rows[0].id);
       await emitAutomationEvent({
         companyId: req.companyId,
         eventType: "service_plan.paused",
         subjectType: "service_plan",
-        subjectId: updatedPlan.id,
+        subjectId: rows[0].id,
         actorUserId: req.userId,
         source: "service_plans.api",
-        dedupeKey: `service_plan.paused:${updatedPlan.id}:${updatedPlan.updated_at?.toISOString?.() || Date.now()}`,
-        payload: {
-          service_plan_id: updatedPlan.id,
-          contact_id: updatedPlan.contact_id,
-          status: updatedPlan.status,
-          stripe_subscription_id: updatedPlan.stripe_subscription_id || null,
-          stripe_payment_collection_paused: Boolean(updatedPlan.stripe_payment_collection_paused)
-        }
+        dedupeKey: `service_plan.paused:${rows[0].id}:${rows[0].updated_at?.toISOString?.() || Date.now()}`,
+        payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, status: rows[0].status }
       });
     }
-    res.json(sanitizeServicePlan(updatedPlan));
+    res.json(sanitizeServicePlan(rows[0]));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "pause_failed" });
-  }
-});
-
-app.post("/api/service-plans/:id/resume", authRequired, requireEmployer, async (req, res) => {
-  try {
-    const employerId = await resolveEmployerUserId(req);
-    const planResult = await pool.query(
-      `SELECT * FROM service_plans WHERE id = $1 AND user_id = $2`,
-      [req.params.id, employerId]
-    );
-    const plan = planResult.rows[0];
-    if (!plan) return res.status(404).json({ error: "not_found" });
-
-    let updatedPlan = plan;
-    const stripe = getStripe();
-    if (stripe && plan.stripe_subscription_id) {
-      if (!plan.stripe_connected_account_id) {
-        return res.status(400).json({ error: "stripe_connected_account_missing" });
-      }
-      const subscription = await stripe.subscriptions.update(
-        plan.stripe_subscription_id,
-        { pause_collection: "", expand: ["latest_invoice.payment_intent"] },
-        { stripeAccount: plan.stripe_connected_account_id }
-      );
-      const applied = await applyStripeSubscriptionStatus({
-        subscription,
-        connectedAccountId: plan.stripe_connected_account_id,
-        servicePlanId: plan.id,
-        source: "service_plans.api.resume"
-      });
-      updatedPlan = applied[0] || plan;
-    } else {
-      const { rows } = await pool.query(
-        `UPDATE service_plans
-            SET status = 'active',
-                stripe_payment_collection_paused = false,
-                updated_at = now()
-          WHERE id = $1 AND user_id = $2
-          RETURNING *`,
-        [req.params.id, employerId]
-      );
-      updatedPlan = rows[0];
-    }
-
-    const resumeNextDate = nextServiceDateAfterResume(updatedPlan.next_service_date);
-    if (resumeNextDate && String(updatedPlan.next_service_date).slice(0, 10) !== resumeNextDate) {
-      const shifted = await pool.query(
-        `UPDATE service_plans
-            SET next_service_date = $2::date,
-                updated_at = now()
-          WHERE id = $1
-          RETURNING *`,
-        [updatedPlan.id, resumeNextDate]
-      );
-      updatedPlan = shifted.rows[0] || updatedPlan;
-    }
-
-    await pool.query(
-      `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
-       VALUES ($1,$2,$3,$4,$5,'resumed',$6)`,
-      [employerId, req.companyId || null, req.userId, updatedPlan.id, updatedPlan.contact_id,
-       `Resumed by ${req.userEmail || req.userId}`]
-    );
-    if (req.companyId) {
-      await syncAutomationSchedulesForServicePlan(req.companyId, updatedPlan);
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "service_plan.resumed",
-        subjectType: "service_plan",
-        subjectId: updatedPlan.id,
-        actorUserId: req.userId,
-        source: "service_plans.api",
-        dedupeKey: `service_plan.resumed:${updatedPlan.id}:${updatedPlan.updated_at?.toISOString?.() || Date.now()}`,
-        payload: {
-          service_plan_id: updatedPlan.id,
-          contact_id: updatedPlan.contact_id,
-          status: updatedPlan.status,
-          next_service_date: updatedPlan.next_service_date,
-          stripe_subscription_id: updatedPlan.stripe_subscription_id || null,
-          stripe_payment_collection_paused: Boolean(updatedPlan.stripe_payment_collection_paused)
-        }
-      });
-    }
-    res.json(sanitizeServicePlan(updatedPlan));
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "resume_failed" });
   }
 });
 
@@ -11850,37 +10588,21 @@ app.post("/api/service-plans/:id/cancel", authRequired, requireEmployer, async (
     const plan = rows[0];
     if (!plan) return res.status(404).json({ error: "not_found" });
     const stripe = getStripe();
-    let updatedPlan = null;
     if (stripe && plan.stripe_subscription_id && plan.stripe_connected_account_id) {
       try {
-        const subscription = await stripe.subscriptions.cancel(
-          plan.stripe_subscription_id,
-          { expand: ["latest_invoice.payment_intent"] },
-          { stripeAccount: plan.stripe_connected_account_id }
-        );
-        const applied = await applyStripeSubscriptionStatus({
-          subscription,
-          connectedAccountId: plan.stripe_connected_account_id,
-          servicePlanId: plan.id,
-          source: "service_plans.api.cancel"
-        });
-        updatedPlan = applied[0] || null;
+        await stripe.subscriptions.cancel(plan.stripe_subscription_id,
+          { stripeAccount: plan.stripe_connected_account_id });
       } catch (err) {
         console.error("stripe cancel failed:", err.message);
       }
     }
-    if (!updatedPlan) {
-      const updated = await pool.query(
-        `UPDATE service_plans
-            SET status = 'canceled',
-                stripe_payment_collection_paused = false,
-                updated_at = now()
-          WHERE id = $1
-          RETURNING *`,
-        [plan.id]
-      );
-      updatedPlan = updated.rows[0];
-    }
+    const updated = await pool.query(
+      `UPDATE service_plans
+          SET status = 'canceled', updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [plan.id]
+    );
     await pool.query(
       `INSERT INTO service_plan_events (user_id, company_id, created_by_user_id, service_plan_id, contact_id, event_type, notes)
        VALUES ($1,$2,$3,$4,$5,'canceled',$6)`,
@@ -11888,26 +10610,19 @@ app.post("/api/service-plans/:id/cancel", authRequired, requireEmployer, async (
        `Canceled by ${req.userEmail || req.userId}`]
     );
     if (req.companyId) {
-      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", updatedPlan.id);
+      await cancelAutomationSchedulesForSubject(req.companyId, "service_plan", updated.rows[0].id);
       await emitAutomationEvent({
         companyId: req.companyId,
         eventType: "service_plan.canceled",
         subjectType: "service_plan",
-        subjectId: updatedPlan.id,
+        subjectId: updated.rows[0].id,
         actorUserId: req.userId,
         source: "service_plans.api",
-        dedupeKey: `service_plan.canceled:${updatedPlan.id}`,
-        payload: {
-          service_plan_id: updatedPlan.id,
-          contact_id: updatedPlan.contact_id,
-          status: updatedPlan.status,
-          stripe_subscription_id: updatedPlan.stripe_subscription_id || plan.stripe_subscription_id || null,
-          stripe_subscription_status: updatedPlan.stripe_subscription_status || null,
-          stripe_payment_collection_paused: Boolean(updatedPlan.stripe_payment_collection_paused)
-        }
+        dedupeKey: `service_plan.canceled:${updated.rows[0].id}`,
+        payload: { service_plan_id: updated.rows[0].id, contact_id: updated.rows[0].contact_id, status: updated.rows[0].status, stripe_subscription_id: plan.stripe_subscription_id || null }
       });
     }
-    res.json(sanitizeServicePlan(updatedPlan));
+    res.json(sanitizeServicePlan(updated.rows[0]));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "cancel_failed" });
@@ -11933,10 +10648,7 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
     const settings = await ensureBusinessSettings(employerId, req.companyId);
     if (!settings.stripe_account_id) return res.status(400).json({ error: "stripe_not_connected" });
     const acct = await stripe.accounts.retrieve(settings.stripe_account_id);
-    if (!acct.charges_enabled) {
-      await persistStripeAccountReadiness(employerId, acct);
-      return res.status(400).json(stripeChargesBlockedResponse(acct));
-    }
+    if (!acct.charges_enabled) return res.status(400).json({ error: "charges_not_enabled" });
 
     const amountInt = parseInt((req.body || {}).amount_cents, 10);
     if (!Number.isFinite(amountInt) || amountInt < 50) return res.status(400).json({ error: "invalid_amount" });
@@ -11959,7 +10671,7 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
     );
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
-      { apiVersion: STRIPE_MOBILE_EPHEMERAL_KEY_API_VERSION, stripeAccount: connectedAccountId }
+      { apiVersion: "2024-06-20", stripeAccount: connectedAccountId }
     );
 
     const piParams = {
@@ -12014,16 +10726,6 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
         payload: { payment_id: record.rows[0].id, contact_id: contact.id, amount_cents: amountInt, currency, status: "pending", stripe_payment_intent_id: intent.id }
       });
     }
-    console.log("[stripe] contact payment started", {
-      mode: publishableKey.startsWith("pk_test_") ? "test" : publishableKey.startsWith("pk_live_") ? "live" : "unknown",
-      connected_account_id: connectedAccountId,
-      customer_id: customer.id,
-      payment_intent_id: intent.id,
-      contact_id: contact.id,
-      payment_record_id: record.rows[0]?.id || null,
-      amount_cents: amountInt,
-      currency
-    });
     res.json({
       publishable_key: publishableKey,
       connected_account_id: connectedAccountId,
@@ -12033,13 +10735,7 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
       payment_record_id: record.rows[0].id
     });
   } catch (e) {
-    console.error("contact payment start:", {
-      message: e.message,
-      type: e.type,
-      code: e.code,
-      decline_code: e.decline_code,
-      requestId: e.requestId
-    });
+    console.error("contact payment start:", e);
     res.status(500).json({ error: "start_payment_failed", detail: e.message });
   }
 });
@@ -12050,34 +10746,6 @@ app.get("/api/contacts/:contactId/payments", authRequired, async (req, res) => {
     const c = await pool.query(`SELECT id FROM contacts WHERE id = $1 AND user_id = $2`,
       [req.params.contactId, employerId]);
     if (!c.rows.length) return res.status(404).json({ error: "contact_not_found" });
-    if (req.query.reconcile_pending === "true") {
-      const limit = Math.min(Math.max(Number(req.query.reconcile_limit || 20), 1), 25);
-      const pending = await pool.query(
-        `SELECT * FROM payment_records
-          WHERE user_id = $1
-            AND contact_id::text = $2
-            AND status = 'pending'
-            AND stripe_payment_intent_id IS NOT NULL
-            AND stripe_connected_account_id IS NOT NULL
-            AND created_at > now() - interval '14 days'
-            AND ($3 = 'employer' OR created_by_user_id = $4)
-          ORDER BY created_at DESC
-          LIMIT $5`,
-        [employerId, req.params.contactId, req.role, req.userId, limit]
-      );
-      for (const rec of pending.rows) {
-        try {
-          await reconcilePaymentRecordFromStripe(rec, { source: "stripe.history_reconcile" });
-        } catch (err) {
-          console.warn("[stripe] pending payment reconcile skipped", {
-            payment_record_id: rec.id,
-            payment_intent_id: rec.stripe_payment_intent_id,
-            connected_account_id: rec.stripe_connected_account_id,
-            message: err.message
-          });
-        }
-      }
-    }
     if (req.role === "employer") {
       const { rows } = await pool.query(
         `SELECT * FROM payment_records
@@ -12128,61 +10796,6 @@ app.get("/api/payments", authRequired, async (req, res) => {
   }
 });
 
-app.post("/api/payments/:id/reconcile", authRequired, async (req, res) => {
-  try {
-    const employerId = await resolveEmployerUserId(req);
-    const { rows } = await pool.query(
-      `SELECT * FROM payment_records WHERE id = $1 AND user_id = $2`,
-      [req.params.id, employerId]
-    );
-    const rec = rows[0];
-    if (!rec) return res.status(404).json({ error: "payment_not_found" });
-    if (req.role !== "employer" && rec.created_by_user_id !== req.userId) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-    const updated = await reconcilePaymentRecordFromStripe(rec, { source: "stripe.client_reconcile" });
-    res.json(sanitizePaymentRecord(updated, { employeeSafe: req.role !== "employer" }));
-  } catch (e) {
-    console.error("payment reconcile failed:", {
-      message: e.message,
-      type: e.type,
-      code: e.code,
-      requestId: e.requestId
-    });
-    res.status(500).json({ error: "payment_reconcile_failed", detail: e.message });
-  }
-});
-
-app.post("/api/payments/:id/client-result", authRequired, async (req, res) => {
-  try {
-    const employerId = await resolveEmployerUserId(req);
-    const status = req.body?.status === "canceled" ? "canceled" : req.body?.status === "failed" ? "failed" : null;
-    if (!status) return res.status(400).json({ error: "invalid_payment_client_status" });
-    const note = cleanString(req.body?.note, 500) || null;
-    const { rows } = await pool.query(
-      `UPDATE payment_records
-          SET status = $4,
-              description = COALESCE(description, $5),
-              updated_at = now()
-        WHERE id = $1
-          AND user_id = $2
-          AND status = 'pending'
-          AND ($3 = 'employer' OR created_by_user_id = $6)
-        RETURNING *`,
-      [req.params.id, employerId, req.role, status, note, req.userId]
-    );
-    if (!rows.length) {
-      const existing = await pool.query(`SELECT * FROM payment_records WHERE id = $1 AND user_id = $2`, [req.params.id, employerId]);
-      if (!existing.rows.length) return res.status(404).json({ error: "payment_not_found" });
-      return res.json(sanitizePaymentRecord(existing.rows[0], { employeeSafe: req.role !== "employer" }));
-    }
-    res.json(sanitizePaymentRecord(rows[0], { employeeSafe: req.role !== "employer" }));
-  } catch (e) {
-    console.error("payment client result failed:", e);
-    res.status(500).json({ error: "payment_client_result_failed" });
-  }
-});
-
 app.get("/api/payments/:id", authRequired, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
@@ -12208,63 +10821,24 @@ app.get("/api/payments/:id", authRequired, async (req, res) => {
 // The raw body middleware is registered near the top of the file. Here we
 // verify the signature and update local state to match Stripe's authoritative
 // view of the world.
-function verifyStripeWebhookEvent(req, stripe) {
-  const secrets = [
-    ["STRIPE_WEBHOOK_SECRET", process.env.STRIPE_WEBHOOK_SECRET],
-    ["STRIPE_CONNECT_WEBHOOK_SECRET", process.env.STRIPE_CONNECT_WEBHOOK_SECRET]
-  ].filter(([, value]) => value);
-  if (!secrets.length) {
-    const err = new Error("stripe_webhook_secret_missing");
-    err.statusCode = 503;
-    throw err;
-  }
-  let lastError = null;
-  for (const [name, secret] of secrets) {
-    try {
-      const event = stripe.webhooks.constructEvent(
-        req.body,
-        req.headers["stripe-signature"],
-        secret
-      );
-      return { event, secretName: name };
-    } catch (err) {
-      lastError = err;
-    }
-  }
-  const err = new Error(lastError?.message || "invalid_stripe_webhook_signature");
-  err.statusCode = 400;
-  throw err;
-}
-
-async function handleStripeWebhook(req, res) {
+app.post("/stripe/webhook", async (req, res) => {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
   const stripe = getStripe();
-  if (!stripe) return res.status(503).send("stripe_not_configured");
-  console.log("[stripe] webhook endpoint entered", {
-    path: req.originalUrl || req.path,
-    timestamp: new Date().toISOString(),
-    stripe_signature_present: Boolean(req.headers["stripe-signature"])
-  });
+  if (!secret || !stripe) return res.status(503).send("stripe_not_configured");
 
   let event;
-  let verifiedWith = null;
   try {
-    const verified = verifyStripeWebhookEvent(req, stripe);
-    event = verified.event;
-    verifiedWith = verified.secretName;
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      secret
+    );
   } catch (err) {
     console.error("webhook signature failed:", err.message);
-    return res.status(err.statusCode || 400).send(`Webhook Error: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   const connectedAccountId = event.account || null;
-  console.log("[stripe] webhook received", {
-    event_id: event.id,
-    event_type: event.type,
-    connected_account_id: connectedAccountId,
-    livemode: event.livemode,
-    signature_verified: true,
-    verified_with: verifiedWith
-  });
 
   try {
     // Duplicate protection: check if we've already recorded this stripe_event_id.
@@ -12272,14 +10846,7 @@ async function handleStripeWebhook(req, res) {
       `SELECT id FROM service_plan_events WHERE stripe_event_id = $1 LIMIT 1`,
       [event.id]
     );
-    if (dupe.rows.length) {
-      console.log("[stripe] webhook duplicate ignored", {
-        event_id: event.id,
-        event_type: event.type,
-        connected_account_id: connectedAccountId
-      });
-      return res.json({ received: true, duplicate: true });
-    }
+    if (dupe.rows.length) return res.json({ received: true, duplicate: true });
 
     async function markServicePlanEvent(planId, contactId, employerId, companyId, type, notes = null) {
       if (!planId) return;
@@ -12294,7 +10861,21 @@ async function handleStripeWebhook(req, res) {
     switch (event.type) {
       case "account.updated": {
         const acct = event.data.object;
-        await persistStripeAccountReadinessByAccountId(acct);
+        await pool.query(
+          `UPDATE business_settings
+              SET stripe_charges_enabled = $2,
+                  stripe_payouts_enabled = $3,
+                  stripe_details_submitted = $4,
+                  stripe_default_currency = COALESCE($5, stripe_default_currency),
+                  stripe_connect_status = CASE
+                    WHEN $4 = false THEN 'setup_incomplete'
+                    WHEN $2 = true THEN 'ready'
+                    ELSE 'verification_pending'
+                  END,
+                  updated_at = now()
+            WHERE stripe_account_id = $1`,
+          [acct.id, !!acct.charges_enabled, !!acct.payouts_enabled, !!acct.details_submitted, acct.default_currency || null]
+        );
         break;
       }
 
@@ -12302,30 +10883,53 @@ async function handleStripeWebhook(req, res) {
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
         const sub = event.data.object;
-        const rows = await applyStripeSubscriptionStatus({
-          subscription: sub,
-          connectedAccountId,
-          source: "stripe.webhook",
-          stripeEventId: event.id
-        });
+        const localStatus = event.type === "customer.subscription.deleted"
+          ? "canceled"
+          : (mapStripeSubscriptionStatus(sub.status) || null);
+        const { rows } = await pool.query(
+          `UPDATE service_plans
+              SET stripe_subscription_status = $2,
+                  status = COALESCE($3, status),
+                  updated_at = now()
+            WHERE stripe_subscription_id = $1
+              AND (stripe_connected_account_id = $4 OR $4 IS NULL)
+            RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
+          [sub.id, sub.status, localStatus, connectedAccountId]
+        );
         if (rows.length) {
           await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
             `stripe_${event.type}`, `Subscription is ${sub.status}`);
+          const mappedEvent = event.type === "customer.subscription.created"
+            ? "service_plan.subscription_created"
+            : event.type === "customer.subscription.deleted"
+              ? "service_plan.subscription_canceled"
+              : ({ active: "service_plan.subscription_active", past_due: "service_plan.subscription_past_due", unpaid: "service_plan.subscription_unpaid", paused: "service_plan.subscription_paused" }[sub.status] || "service_plan.updated");
+          if (rows[0].company_id) {
+            await emitAutomationEvent({
+              companyId: rows[0].company_id,
+              eventType: mappedEvent,
+              subjectType: "service_plan",
+              subjectId: rows[0].id,
+              source: "stripe.webhook",
+              dedupeKey: `${mappedEvent}:${event.id}:${rows[0].id}`,
+              payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, stripe_event_id: event.id, stripe_subscription_id: sub.id, subscription_status: sub.status, status: rows[0].status }
+            });
+            await syncAutomationSchedulesForServicePlan(rows[0].company_id, rows[0]);
+          }
         }
         break;
       }
 
-      case "invoice.paid":
       case "invoice.payment_succeeded": {
         const invoice = event.data.object;
         // Update payment record.
         const paidRecords = await pool.query(
           `UPDATE payment_records
               SET status = 'succeeded', updated_at = now()
-            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
-              AND ($3::text IS NULL OR stripe_connected_account_id = $3)
+            WHERE stripe_invoice_id = $1
+               OR stripe_subscription_id = $2
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [invoice.id, invoice.subscription || null, connectedAccountId]
+          [invoice.id, invoice.subscription || null]
         );
         for (const rec of paidRecords.rows) {
           await emitAutomationEvent({
@@ -12334,42 +10938,22 @@ async function handleStripeWebhook(req, res) {
             subjectType: "payment",
             subjectId: rec.id,
             source: "stripe.webhook",
-            dedupeKey: `payment.succeeded:invoice:${invoice.id}:${rec.id}`,
+            dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
             payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_invoice_id: invoice.id }
           });
         }
-        console.log("[stripe] invoice payment matched records", {
-          event_id: event.id,
-          event_type: event.type,
-          connected_account_id: connectedAccountId,
-          invoice_id: invoice.id,
-          subscription_id: invoice.subscription || null,
-          matched_payment_records: paidRecords.rows.length
-        });
-        // If this is a subscription invoice, reconcile the authoritative subscription status.
+        // If this is the initial invoice, mark plan active.
         if (invoice.subscription) {
-          let rows = [];
-          try {
-            const subscription = await stripe.subscriptions.retrieve(
-              invoice.subscription,
-              { expand: ["latest_invoice.payment_intent"] },
-              connectedAccountId ? { stripeAccount: connectedAccountId } : undefined
-            );
-            rows = await applyStripeSubscriptionStatus({
-              subscription,
-              connectedAccountId,
-              source: "stripe.webhook",
-              stripeEventId: `invoice:${invoice.id}`
-            });
-          } catch (err) {
-            console.warn("[stripe] invoice subscription reconcile failed", {
-              event_id: event.id,
-              invoice_id: invoice.id,
-              subscription_id: invoice.subscription,
-              connected_account_id: connectedAccountId,
-              message: err.message
-            });
-          }
+          const { rows } = await pool.query(
+            `UPDATE service_plans
+                SET status = 'active',
+                    stripe_subscription_status = 'active',
+                    updated_at = now()
+              WHERE stripe_subscription_id = $1
+                AND (stripe_connected_account_id = $2 OR $2 IS NULL)
+              RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
+            [invoice.subscription, connectedAccountId]
+          );
           if (rows.length) {
             await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
               "invoice_paid", `Invoice ${invoice.id} paid`);
@@ -12379,9 +10963,10 @@ async function handleStripeWebhook(req, res) {
               subjectType: "service_plan",
               subjectId: rows[0].id,
               source: "stripe.webhook",
-              dedupeKey: `service_plan.subscription_payment_succeeded:invoice:${invoice.id}:${rows[0].id}`,
+              dedupeKey: `service_plan.subscription_payment_succeeded:${event.id}:${rows[0].id}`,
               payload: { service_plan_id: rows[0].id, contact_id: rows[0].contact_id, stripe_event_id: event.id, stripe_invoice_id: invoice.id, stripe_subscription_id: invoice.subscription, subscription_status: "active" }
             });
+            await syncAutomationSchedulesForServicePlan(rows[0].company_id, rows[0]);
           }
         }
         break;
@@ -12392,10 +10977,10 @@ async function handleStripeWebhook(req, res) {
         const failedRecords = await pool.query(
           `UPDATE payment_records
               SET status = 'failed', updated_at = now()
-            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
-              AND ($3::text IS NULL OR stripe_connected_account_id = $3)
+            WHERE stripe_invoice_id = $1
+               OR stripe_subscription_id = $2
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [invoice.id, invoice.subscription || null, connectedAccountId]
+          [invoice.id, invoice.subscription || null]
         );
         for (const rec of failedRecords.rows) {
           await emitAutomationEvent({
@@ -12409,28 +10994,13 @@ async function handleStripeWebhook(req, res) {
           });
         }
         if (invoice.subscription) {
-          let rows = [];
-          try {
-            const subscription = await stripe.subscriptions.retrieve(
-              invoice.subscription,
-              { expand: ["latest_invoice.payment_intent"] },
-              connectedAccountId ? { stripeAccount: connectedAccountId } : undefined
-            );
-            rows = await applyStripeSubscriptionStatus({
-              subscription,
-              connectedAccountId,
-              source: "stripe.webhook",
-              stripeEventId: event.id
-            });
-          } catch (err) {
-            console.warn("[stripe] failed-invoice subscription reconcile failed", {
-              event_id: event.id,
-              invoice_id: invoice.id,
-              subscription_id: invoice.subscription,
-              connected_account_id: connectedAccountId,
-              message: err.message
-            });
-          }
+          const { rows } = await pool.query(
+            `UPDATE service_plans
+                SET status = 'past_due', updated_at = now()
+              WHERE stripe_subscription_id = $1
+              RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
+            [invoice.subscription]
+          );
           if (rows.length) {
             await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
               "invoice_failed", `Invoice ${invoice.id} failed`);
@@ -12448,16 +11018,49 @@ async function handleStripeWebhook(req, res) {
         break;
       }
 
-      case "payment_intent.succeeded":
-      case "payment_intent.processing":
+      case "payment_intent.succeeded": {
+        const pi = event.data.object;
+        const paidRecords = await pool.query(
+          `UPDATE payment_records
+              SET status = 'succeeded', updated_at = now()
+            WHERE stripe_payment_intent_id = $1
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
+          [pi.id]
+        );
+        for (const rec of paidRecords.rows) {
+          await emitAutomationEvent({
+            companyId: rec.company_id,
+            eventType: "payment.succeeded",
+            subjectType: "payment",
+            subjectId: rec.id,
+            source: "stripe.webhook",
+            dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
+          });
+        }
+        break;
+      }
+
       case "payment_intent.payment_failed": {
         const pi = event.data.object;
-        await applyStripePaymentIntentStatus({
-          paymentIntent: pi,
-          connectedAccountId,
-          source: "stripe.webhook",
-          stripeEventId: event.id
-        });
+        const failedRecords = await pool.query(
+          `UPDATE payment_records
+              SET status = 'failed', updated_at = now()
+            WHERE stripe_payment_intent_id = $1
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
+          [pi.id]
+        );
+        for (const rec of failedRecords.rows) {
+          await emitAutomationEvent({
+            companyId: rec.company_id,
+            eventType: "payment.failed",
+            subjectType: "payment",
+            subjectId: rec.id,
+            source: "stripe.webhook",
+            dedupeKey: `payment.failed:${event.id}:${rec.id}`,
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
+          });
+        }
         break;
       }
 
@@ -12547,10 +11150,7 @@ async function handleStripeWebhook(req, res) {
     console.error("webhook handling error:", e);
     res.status(500).json({ error: "webhook_handler_failed" });
   }
-}
-
-app.post("/stripe/webhook", handleStripeWebhook);
-app.post("/stripe/connect-webhook", handleStripeWebhook);
+});
 
 app.get("/", (_req, res) => res.send("WolfCRM backend up"));
 
@@ -12578,6 +11178,14 @@ async function startServer() {
     authRequired,
     requireEmployer
   });
+  await installGoogleSheetsSchema(pool);
+  installGoogleSheetsSystem({
+    app,
+    pool,
+    authRequired,
+    requireEmployer
+  });
+  startGoogleSheetsWorkers(pool);
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }
 
