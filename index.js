@@ -5690,8 +5690,10 @@ function contactTagsArray(value) {
 
 function contactTagsForDatabase(value, fallback = "lead") {
   const tags = contactTagsArray(value);
-  if (!tags.length && fallback) return [fallback];
-  return tags;
+  const finalTags = !tags.length && fallback ? [fallback] : tags;
+  if (!finalTags.length) return null;
+  const escaped = finalTags.map((tag) => `"${String(tag).replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`);
+  return `{${escaped.join(",")}}`;
 }
 
 function contactChangedFields(before, after, fields) {
