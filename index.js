@@ -5681,7 +5681,17 @@ function companyOrUserContactWhere(req, alias = "") {
 function contactTagsArray(value) {
   if (Array.isArray(value)) return value.flatMap(contactTagsArray);
   if (value == null) return [];
-  return String(value).split(",").map((t) => t.trim()).filter(Boolean);
+  let text = String(value).trim();
+  if (text.startsWith("{") && text.endsWith("}")) {
+    text = text.slice(1, -1).replaceAll('"', "");
+  }
+  return text.split(/[;,]/).map((t) => t.trim()).filter(Boolean);
+}
+
+function contactTagsForDatabase(value, fallback = "lead") {
+  const tags = contactTagsArray(value);
+  if (!tags.length && fallback) return [fallback];
+  return tags;
 }
 
 function contactChangedFields(before, after, fields) {
@@ -5852,7 +5862,7 @@ function contactCreateBaseValues(req, body, id = randomUUID()) {
   return [
     id, req.userId, req.companyId, name || "", phone || "", email || "", address || "",
     Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
-    lat ?? null, lng ?? null, Array.isArray(tags) ? tags.join(",") : (tags || ""), job_type || "",
+    lat ?? null, lng ?? null, contactTagsForDatabase(tags), job_type || "",
     u1 || "", u2 || "", u3 || "", u4 || "", u5 || ""
   ];
 }
@@ -5924,7 +5934,7 @@ function contactInsertStatements(req, body) {
         body?.phone || "",
         body?.email || "",
         body?.address || "",
-        Array.isArray(body?.tags) ? body.tags.join(",") : (body?.tags || "lead")
+        contactTagsForDatabase(body?.tags)
       ]
     }
   ];
@@ -6110,7 +6120,7 @@ app.put("/api/contacts/:id", authRequired, async (req, res) => {
     if (has("lng")) addUpdate("lng", lng == null ? null : Number(lng));
     if (has("address") && !address && !has("lat")) addUpdate("lat", null);
     if (has("address") && !address && !has("lng")) addUpdate("lng", null);
-    if (has("tags")) addUpdate("tags", Array.isArray(tags) ? tags.join(",") : (tags || null));
+    if (has("tags")) addUpdate("tags", contactTagsForDatabase(tags, null));
     if (has("job_type")) addUpdate("job_type", job_type || null);
     if (has("u1")) addUpdate("u1", u1 || null);
     if (has("u2")) addUpdate("u2", u2 || null);
