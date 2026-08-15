@@ -593,6 +593,15 @@ async function inspectSheet(connection, pool, env = process.env) {
   return { title, wolfManaged, nonEmpty, requiresConfirmation: nonEmpty && !wolfManaged };
 }
 
+async function ensureSheetHeader(connection, pool, env = process.env) {
+  const inspection = await inspectSheet(connection, pool, env);
+  if (inspection.requiresConfirmation) return inspection;
+  const data = await loadCompanyContactExportData(pool, connection.company_id);
+  const { schema } = buildContactExportRows(data, new Date());
+  await writeSheetSchema(connection, inspection.title, schema.headers, pool, env);
+  return inspection;
+}
+
 async function writeSheetSchema(connection, sheetTitle, headers, pool, env) {
   const range = `${quoteSheetName(sheetTitle)}!A1:${a1Column(headers.length - 1)}1`;
   await googleAPI(connection, `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(connection.spreadsheet_id)}/values/${encodeURIComponent(range)}?valueInputOption=RAW`, {
@@ -949,6 +958,9 @@ export function installGoogleSheetsSystem({ app, pool, authRequired, requireEmpl
       const inspection = await inspectSheet(updated, pool, env);
       if (inspection.requiresConfirmation) {
         await pool.query(`UPDATE google_sheets_connections SET tab_requires_confirmation = true WHERE id = $1`, [connection.id]);
+      } else {
+        await ensureSheetHeader(updated, pool, env);
+        await pool.query(`UPDATE google_sheets_connections SET tab_requires_confirmation = false, last_error = NULL, updated_at = now() WHERE id = $1`, [connection.id]);
       }
       res.json({ ...serializeConnection({ ...updated, tab_requires_confirmation: inspection.requiresConfirmation }), requires_confirmation: inspection.requiresConfirmation });
     } catch (e) {
