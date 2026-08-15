@@ -4,6 +4,7 @@ import { googleSheetsTestHooks, GOOGLE_SHEETS_SCOPE } from "../google-sheets.js"
 const {
   buildContactExportRows,
   createGoogleSheetsAuthURL,
+  exportHash,
   encryptRefreshToken,
   decryptRefreshToken,
   GOOGLE_SHEETS_CELL_LIMIT
@@ -61,6 +62,17 @@ async function testLongContinuationColumns() {
   assert.ok(schema.headers.indexOf("Lead Info 1") > schema.headers.indexOf("SMS Messages 2"));
 }
 
+async function testExportHashChangesOnlyWhenExportedRowChanges() {
+  const lastSynced = new Date("2026-08-15T12:30:00.000Z");
+  const syncDates = new Map([["11111111-1111-4111-8111-111111111111", lastSynced]]);
+  const first = buildContactExportRows([makeContact()], new Date("2026-08-16T12:30:00.000Z"), syncDates).rows[0];
+  const second = buildContactExportRows([makeContact()], new Date("2026-08-17T12:30:00.000Z"), syncDates).rows[0];
+  assert.equal(exportHash(first), exportHash(second));
+
+  const changed = buildContactExportRows([makeContact({ smsText: "08/15/2026 9:00 AM | IN\nNew message" })], new Date("2026-08-17T12:30:00.000Z"), syncDates).rows[0];
+  assert.notEqual(exportHash(first), exportHash(changed));
+}
+
 async function testOAuthURLScopeAndPicker() {
   const captured = [];
   const pool = {
@@ -96,6 +108,7 @@ async function testCredentialEncryptionRoundTrip() {
 
 await testExporterSchemaAndHistory();
 await testLongContinuationColumns();
+await testExportHashChangesOnlyWhenExportedRowChanges();
 await testOAuthURLScopeAndPicker();
 await testCredentialEncryptionRoundTrip();
 

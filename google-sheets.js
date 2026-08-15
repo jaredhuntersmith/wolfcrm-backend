@@ -4,6 +4,7 @@ import { decryptAccessToken, encryptAccessToken } from "./finance-plaid-helpers.
 export const GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/drive.file";
 export const GOOGLE_SHEETS_MIME = "application/vnd.google-apps.spreadsheet";
 export const GOOGLE_SHEETS_CELL_LIMIT = 30000;
+export const GOOGLE_SHEETS_EXPORT_VERSION = 2;
 const OAUTH_STATE_TTL_MINUTES = 15;
 
 function cleanString(value, maxLength = 4000) {
@@ -12,6 +13,15 @@ function cleanString(value, maxLength = 4000) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function exportHash(row) {
+  return crypto.createHash("sha256").update(JSON.stringify(row)).digest("hex");
+}
+
+function arraysEqual(a, b) {
+  if (a.length !== b.length) return false;
+  return a.every((value, index) => String(value ?? "") === String(b[index] ?? ""));
 }
 
 function baseURL(env = process.env) {
@@ -345,10 +355,11 @@ export function buildContactExportSchema(contacts) {
   return { headers: [...standard, ...historyHeaders, ...leadHeaders], historyKeys, maxChunks, leadHeaders };
 }
 
-export function buildContactExportRows(contacts, syncDate = new Date()) {
+export function buildContactExportRows(contacts, syncDate = new Date(), syncDatesByContactId = new Map()) {
   const schema = buildContactExportSchema(contacts);
   const rows = contacts.map((entry) => {
     const c = entry.contact;
+    const rowSyncDate = syncDatesByContactId.get(String(c.id)) || syncDate;
     const parts = nameParts(c.name);
     const addr = parseAddress(c.address);
     const leadValues = leadInfoArray(c);
@@ -372,7 +383,7 @@ export function buildContactExportRows(contacts, syncDate = new Date()) {
       dateTime(c.created_at),
       dateTime(c.updated_at),
       dateTime(entry.last_activity_at),
-      dateTime(syncDate)
+      dateTime(rowSyncDate)
     ];
     const history = [];
     for (const key of schema.historyKeys) {
@@ -517,6 +528,10 @@ export async function installGoogleSheetsSchema(pool) {
       disconnected_at TIMESTAMPTZ
     );
     CREATE INDEX IF NOT EXISTS google_sheets_connections_sync_idx ON google_sheets_connections(status, sync_mode, next_sync_at);
+    ALTER TABLE google_sheets_connections ADD COLUMN IF NOT EXISTS last_result_checked INTEGER;
+    ALTER TABLE google_sheets_connections ADD COLUMN IF NOT EXISTS last_result_unchanged INTEGER;
+    ALTER TABLE google_sheets_connections ADD COLUMN IF NOT EXISTS last_result_removed INTEGER;
+    ALTER TABLE google_sheets_connections ADD COLUMN IF NOT EXISTS last_result_failures INTEGER;
 
     CREATE TABLE IF NOT EXISTS google_sheets_dirty_contacts (
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -529,6 +544,22 @@ export async function installGoogleSheetsSchema(pool) {
       PRIMARY KEY(company_id, contact_id)
     );
     CREATE INDEX IF NOT EXISTS google_sheets_dirty_company_idx ON google_sheets_dirty_contacts(company_id, last_dirty_at);
+
+    CREATE TABLE IF NOT EXISTS google_sheets_contact_sync_state (
+      connection_id UUID NOT NULL REFERENCES google_sheets_connections(id) ON DELETE CASCADE,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      contact_id UUID NOT NULL,
+      export_version INTEGER NOT NULL,
+      export_hash TEXT NOT NULL,
+      row_number INTEGER,
+      last_synced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      deleted_marker BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY(connection_id, contact_id)
+    );
+    CREATE INDEX IF NOT EXISTS google_sheets_contact_sync_state_company_idx
+      ON google_sheets_contact_sync_state(company_id, contact_id);
   `);
 }
 
@@ -554,8 +585,12 @@ function serializeConnection(row) {
     last_attempted_sync_at: row.last_attempted_sync_at,
     last_successful_sync_at: row.last_successful_sync_at,
     last_result_contact_count: row.last_result_contact_count,
+    last_result_checked: row.last_result_checked,
     last_result_inserted: row.last_result_inserted,
     last_result_updated: row.last_result_updated,
+    last_result_unchanged: row.last_result_unchanged,
+    last_result_removed: row.last_result_removed,
+    last_result_failures: row.last_result_failures,
     reconnect_required: !!row.reconnect_required,
     tab_requires_confirmation: !!row.tab_requires_confirmation,
     last_error: row.last_error
@@ -569,7 +604,7 @@ export async function markGoogleSheetsContactDirty(pool, companyId, contactId, r
      SELECT $1, $2, $3
       WHERE EXISTS (
         SELECT 1 FROM google_sheets_connections
-         WHERE company_id = $1 AND status = 'connected' AND reconnect_required = false AND sync_mode = 'after_every_change'
+         WHERE company_id = $1 AND status = 'connected' AND reconnect_required = false AND sync_mode IN ('after_every_change','daily')
       )
      ON CONFLICT(company_id, contact_id)
      DO UPDATE SET dirty_reason = EXCLUDED.dirty_reason, dirty_count = google_sheets_dirty_contacts.dirty_count + 1, last_dirty_at = now()`,
@@ -604,6 +639,9 @@ async function ensureSheetHeader(connection, pool, env = process.env) {
 
 async function writeSheetSchema(connection, sheetTitle, headers, pool, env) {
   const range = `${quoteSheetName(sheetTitle)}!A1:${a1Column(headers.length - 1)}1`;
+  const existing = await googleAPI(connection, `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(connection.spreadsheet_id)}/values/${encodeURIComponent(range)}?majorDimension=ROWS`, {}, pool, env);
+  const existingHeader = existing.values?.[0] || [];
+  if (arraysEqual(existingHeader, headers)) return { changed: false };
   await googleAPI(connection, `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(connection.spreadsheet_id)}/values/${encodeURIComponent(range)}?valueInputOption=RAW`, {
     method: "PUT",
     body: JSON.stringify({ range, majorDimension: "ROWS", values: [headers] })
@@ -619,6 +657,7 @@ async function writeSheetSchema(connection, sheetTitle, headers, pool, env) {
     method: "POST",
     body: JSON.stringify({ requests })
   }, pool, env);
+  return { changed: true };
 }
 
 async function readContactRowMap(connection, sheetTitle, pool, env) {
@@ -633,6 +672,56 @@ async function readContactRowMap(connection, sheetTitle, pool, env) {
   return { map, lastRow: values.length };
 }
 
+async function readSheetRowSnapshot(connection, sheetTitle, columnCount, pool, env) {
+  const range = `${quoteSheetName(sheetTitle)}!A2:${a1Column(columnCount - 1)}`;
+  const data = await googleAPI(connection, `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(connection.spreadsheet_id)}/values/${encodeURIComponent(range)}?majorDimension=ROWS`, {}, pool, env);
+  const rows = data.values || [];
+  const map = new Map();
+  rows.forEach((row, index) => {
+    const contactId = row[0] ? String(row[0]) : "";
+    if (!contactId || map.has(contactId)) return;
+    const padded = [...row];
+    while (padded.length < columnCount) padded.push("");
+    map.set(contactId, { rowNumber: index + 2, row: padded.slice(0, columnCount) });
+  });
+  return map;
+}
+
+async function loadContactSyncState(pool, connectionId) {
+  const rows = (await pool.query(
+    `SELECT contact_id::text AS contact_id, export_version, export_hash, row_number, last_synced_at, deleted_marker
+       FROM google_sheets_contact_sync_state
+      WHERE connection_id = $1`,
+    [connectionId]
+  )).rows;
+  return new Map(rows.map((row) => [row.contact_id, row]));
+}
+
+async function saveContactSyncState(pool, connection, rows) {
+  if (!rows.length) return;
+  const values = [];
+  const params = [];
+  rows.forEach((row, index) => {
+    const offset = index * 8;
+    params.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8})`);
+    values.push(connection.id, connection.company_id, row.contactId, GOOGLE_SHEETS_EXPORT_VERSION, row.hash, row.rowNumber || null, row.syncedAt, !!row.deletedMarker);
+  });
+  await pool.query(
+    `INSERT INTO google_sheets_contact_sync_state(connection_id, company_id, contact_id, export_version, export_hash, row_number, last_synced_at, deleted_marker)
+     VALUES ${params.join(", ")}
+     ON CONFLICT(connection_id, contact_id)
+     DO UPDATE SET
+       company_id = EXCLUDED.company_id,
+       export_version = EXCLUDED.export_version,
+       export_hash = EXCLUDED.export_hash,
+       row_number = EXCLUDED.row_number,
+       last_synced_at = EXCLUDED.last_synced_at,
+       deleted_marker = EXCLUDED.deleted_marker,
+       updated_at = now()`,
+    values
+  );
+}
+
 export async function syncGoogleSheetsContacts({ pool, companyId, type = "manual", contactIds = null, force = false, env = process.env }) {
   const started = Date.now();
   const connection = await loadConnection(pool, companyId);
@@ -644,28 +733,56 @@ export async function syncGoogleSheetsContacts({ pool, companyId, type = "manual
     await pool.query(`UPDATE google_sheets_connections SET tab_requires_confirmation = true, last_error = NULL, updated_at = now() WHERE id = $1`, [connection.id]);
     return { needs_confirmation: true };
   }
+  const fullReconciliation = !contactIds;
   const data = await loadCompanyContactExportData(pool, companyId);
   const wantedIds = contactIds ? new Set(contactIds.map((id) => String(id))) : null;
   const currentIds = new Set(data.map((entry) => String(entry.contact.id)));
-  const { schema, rows: allRows } = buildContactExportRows(data, new Date());
-  const rowByContactId = new Map(data.map((entry, index) => [String(entry.contact.id), allRows[index]]));
+  const state = await loadContactSyncState(pool, connection.id);
+  const previousSyncDates = new Map([...state.entries()].map(([contactId, row]) => [contactId, row.last_synced_at]));
+  const now = new Date();
+  const { schema, rows: stableRows } = buildContactExportRows(data, now, previousSyncDates);
+  const { rows: freshRows } = buildContactExportRows(data, now);
+  const stableRowByContactId = new Map(data.map((entry, index) => [String(entry.contact.id), stableRows[index]]));
+  const freshRowByContactId = new Map(data.map((entry, index) => [String(entry.contact.id), freshRows[index]]));
   const filtered = wantedIds ? data.filter((entry) => wantedIds.has(String(entry.contact.id))) : data;
   const { map: rowMap, lastRow } = await readContactRowMap(connection, inspection.title, pool, env);
   await writeSheetSchema(connection, inspection.title, schema.headers, pool, env);
+  const sheetSnapshot = fullReconciliation ? await readSheetRowSnapshot(connection, inspection.title, schema.headers.length, pool, env) : new Map();
   const updates = [];
   const appends = [];
+  const acceptedStates = [];
   let inserted = 0;
   let updated = 0;
+  let unchanged = 0;
   let markedDeleted = 0;
+  let checked = 0;
   for (const entry of filtered) {
     const contactId = String(entry.contact.id);
-    const row = rowByContactId.get(contactId);
     const existingRow = rowMap.get(contactId);
+    const existingState = state.get(contactId);
+    const stableRow = stableRowByContactId.get(contactId);
+    const stableHash = exportHash(stableRow);
+    checked += 1;
     if (existingRow) {
+      const actualSheetRow = sheetSnapshot.get(contactId)?.row || null;
+      const actualSheetHash = actualSheetRow ? exportHash(actualSheetRow) : null;
+      if (
+        existingState?.export_version === GOOGLE_SHEETS_EXPORT_VERSION &&
+        existingState?.export_hash === stableHash &&
+        !existingState?.deleted_marker &&
+        (!fullReconciliation || actualSheetHash === stableHash)
+      ) {
+        unchanged += 1;
+        continue;
+      }
+      const row = freshRowByContactId.get(contactId);
       updates.push({ range: `${quoteSheetName(inspection.title)}!A${existingRow}:${a1Column(schema.headers.length - 1)}${existingRow}`, values: [row] });
+      acceptedStates.push({ contactId, hash: exportHash(row), rowNumber: existingRow, syncedAt: now, deletedMarker: false });
       updated += 1;
     } else {
+      const row = freshRowByContactId.get(contactId);
       appends.push(row);
+      acceptedStates.push({ contactId, hash: exportHash(row), rowNumber: lastRow + appends.length, syncedAt: now, deletedMarker: false });
       inserted += 1;
     }
   }
@@ -673,13 +790,28 @@ export async function syncGoogleSheetsContacts({ pool, companyId, type = "manual
   for (const contactId of deletedCandidateIds) {
     const existingRow = rowMap.get(contactId);
     if (!existingRow) continue;
+    checked += 1;
     const row = new Array(schema.headers.length).fill("");
     row[0] = contactId;
     const statusIndex = schema.headers.indexOf("Contact Status/Type");
     const syncIndex = schema.headers.indexOf("Last Synchronized Date");
     if (statusIndex >= 0) row[statusIndex] = "Deleted in WolfCRM";
-    if (syncIndex >= 0) row[syncIndex] = formatDateTime(new Date());
+    if (syncIndex >= 0) row[syncIndex] = formatDateTime(now);
+    const rowHash = exportHash(row);
+    const existingState = state.get(contactId);
+    const actualSheetRow = sheetSnapshot.get(contactId)?.row || null;
+    const actualSheetHash = actualSheetRow ? exportHash(actualSheetRow) : null;
+    if (
+      existingState?.export_version === GOOGLE_SHEETS_EXPORT_VERSION &&
+      existingState?.export_hash === rowHash &&
+      existingState?.deleted_marker &&
+      (!fullReconciliation || actualSheetHash === rowHash)
+    ) {
+      unchanged += 1;
+      continue;
+    }
     updates.push({ range: `${quoteSheetName(inspection.title)}!A${existingRow}:${a1Column(schema.headers.length - 1)}${existingRow}`, values: [row] });
+    acceptedStates.push({ contactId, hash: rowHash, rowNumber: existingRow, syncedAt: now, deletedMarker: true });
     markedDeleted += 1;
   }
   const chunks = [];
@@ -691,16 +823,27 @@ export async function syncGoogleSheetsContacts({ pool, companyId, type = "manual
       body: JSON.stringify({ valueInputOption: "RAW", data: chunks.slice(i, i + 50) })
     }, pool, env);
   }
+  await saveContactSyncState(pool, connection, acceptedStates);
   await pool.query(
     `UPDATE google_sheets_connections
         SET last_attempted_sync_at = now(), last_successful_sync_at = now(), last_result_contact_count = $2,
-            last_result_inserted = $3, last_result_updated = $4, last_error = NULL, tab_requires_confirmation = false, updated_at = now()
+            last_result_inserted = $3, last_result_updated = $4, last_result_checked = $5, last_result_unchanged = $6,
+            last_result_removed = $7, last_result_failures = 0, last_error = NULL, tab_requires_confirmation = false, updated_at = now()
       WHERE id = $1`,
-    [connection.id, data.length, inserted, updated]
+    [connection.id, data.length, inserted, updated, checked, unchanged, markedDeleted]
   );
   if (contactIds) await pool.query(`DELETE FROM google_sheets_dirty_contacts WHERE company_id = $1 AND contact_id = ANY($2::uuid[])`, [companyId, contactIds]);
-  console.log("[google-sheets] sync complete", { companyId, connectionId: connection.id, type, contactCount: data.length, inserted, updated, markedDeleted, durationMs: Date.now() - started });
-  return { contact_count: data.length, inserted, updated, marked_deleted: markedDeleted, duration_ms: Date.now() - started };
+  console.log("[google-sheets] sync complete", { companyId, connectionId: connection.id, type, fullReconciliation, contactsChecked: checked, inserted, updated, unchanged, markedDeleted, durationMs: Date.now() - started });
+  return {
+    contact_count: data.length,
+    contacts_checked: checked,
+    inserted,
+    updated,
+    unchanged,
+    marked_deleted: markedDeleted,
+    failures: 0,
+    duration_ms: Date.now() - started
+  };
 }
 
 async function processDirtyContacts(pool, env = process.env) {
@@ -802,7 +945,30 @@ async function processScheduledSyncs(pool, env = process.env) {
     const lock = await pool.query(`SELECT pg_try_advisory_lock(hashtext($1)) AS locked`, [`google_sheets_scheduled:${connection.company_id}`]);
     if (!lock.rows[0]?.locked) continue;
     try {
-      await syncGoogleSheetsContacts({ pool, companyId: connection.company_id, type: connection.sync_mode, env });
+      if (connection.sync_mode === "daily") {
+        const contactIds = (await pool.query(
+          `SELECT contact_id::text AS contact_id
+             FROM google_sheets_dirty_contacts
+            WHERE company_id = $1
+            ORDER BY last_dirty_at ASC
+            LIMIT 500`,
+          [connection.company_id]
+        )).rows.map((r) => r.contact_id);
+        if (contactIds.length) {
+          await syncGoogleSheetsContacts({ pool, companyId: connection.company_id, type: "daily", contactIds, env });
+        } else {
+          await pool.query(
+            `UPDATE google_sheets_connections
+                SET last_attempted_sync_at = now(), last_successful_sync_at = now(), last_result_checked = 0,
+                    last_result_inserted = 0, last_result_updated = 0, last_result_unchanged = 0,
+                    last_result_removed = 0, last_result_failures = 0, last_error = NULL, updated_at = now()
+              WHERE id = $1`,
+            [connection.id]
+          );
+        }
+      } else {
+        await syncGoogleSheetsContacts({ pool, companyId: connection.company_id, type: connection.sync_mode, env });
+      }
       await pool.query(`UPDATE google_sheets_connections SET next_sync_at = $2, updated_at = now() WHERE id = $1`, [connection.id, computeNextSync(connection.sync_mode, connection.timezone, connection.schedule_time, connection.schedule_weekday)]);
     } catch (error) {
       await pool.query(`UPDATE google_sheets_connections SET last_attempted_sync_at = now(), last_error = $2, updated_at = now() WHERE id = $1`, [connection.id, safeGoogleError(error).reason]);
@@ -896,6 +1062,7 @@ async function handleOAuthCallback(pool, query, env = process.env) {
      RETURNING *`,
     [stateRow.company_id, stateRow.user_id, info.email || null, info.sub || null, token.scope || GOOGLE_SHEETS_SCOPE, encrypted.refresh_token_ciphertext, encrypted.refresh_token_iv, encrypted.refresh_token_auth_tag, encrypted.token_encryption_version, file.id, file.name]
   );
+  await pool.query(`DELETE FROM google_sheets_contact_sync_state WHERE connection_id = $1`, [rows[0].id]);
   return rows[0];
 }
 
@@ -955,6 +1122,7 @@ export function installGoogleSheetsSystem({ app, pool, authRequired, requireEmpl
       const sheet = metadata.sheets?.find((s) => Number(s.properties.sheetId) === sheetId);
       if (!sheet) return res.status(404).json({ error: "sheet_not_found" });
       const updated = (await pool.query(`UPDATE google_sheets_connections SET sheet_id = $2, sheet_title = $3, updated_at = now() WHERE id = $1 RETURNING *`, [connection.id, sheetId, sheet.properties.title])).rows[0];
+      await pool.query(`DELETE FROM google_sheets_contact_sync_state WHERE connection_id = $1`, [connection.id]);
       const inspection = await inspectSheet(updated, pool, env);
       if (inspection.requiresConfirmation) {
         await pool.query(`UPDATE google_sheets_connections SET tab_requires_confirmation = true WHERE id = $1`, [connection.id]);
@@ -1024,6 +1192,7 @@ export const googleSheetsTestHooks = {
   buildContactExportSchema,
   createGoogleSheetsAuthURL,
   computeNextSync,
+  exportHash,
   encryptRefreshToken,
   decryptRefreshToken,
   GOOGLE_SHEETS_SCOPE,
