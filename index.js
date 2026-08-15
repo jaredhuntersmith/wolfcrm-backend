@@ -5856,25 +5856,47 @@ app.post("/api/contacts", authRequired, async (req, res) => {
   const createdAt = parseOptionalContactDate(created_at);
   const leadSubmittedAt = parseOptionalContactDate(lead_submitted_at);
   try {
-    const r = await pool.query(
-      `
-      INSERT INTO contacts (
-        id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info, source, lead_submitted_at, created_at
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, COALESCE($21, now())
-      ) RETURNING *;
-      `,
-      [
-        id, req.userId, req.companyId, name || "", phone || "", email || "", address || "",
-        Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
-        lat ?? null, lng ?? null, Array.isArray(tags) ? tags.join(",") : (tags || ""), job_type || "",
-        u1 || "", u2 || "", u3 || "", u4 || "", u5 || "",
-        Array.isArray(lead_info) ? JSON.stringify(lead_info) : null,
-        source || "manual",
-        leadSubmittedAt,
-        createdAt
-      ]
-    );
+    const baseValues = [
+      id, req.userId, req.companyId, name || "", phone || "", email || "", address || "",
+      Number.isFinite(Number(value_cents)) ? Number(value_cents) : null,
+      lat ?? null, lng ?? null, Array.isArray(tags) ? tags.join(",") : (tags || ""), job_type || "",
+      u1 || "", u2 || "", u3 || "", u4 || "", u5 || ""
+    ];
+    let r;
+    try {
+      r = await pool.query(
+        `
+        INSERT INTO contacts (
+          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info, source, lead_submitted_at, created_at
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, COALESCE($21, now())
+        ) RETURNING *;
+        `,
+        [
+          ...baseValues,
+          Array.isArray(lead_info) ? JSON.stringify(lead_info) : null,
+          source || "manual",
+          leadSubmittedAt,
+          createdAt
+        ]
+      );
+    } catch (insertError) {
+      if (insertError.code !== "42703") throw insertError;
+      console.warn("contacts_create_compat_insert", {
+        companyId: req.companyId,
+        missingColumn: insertError.column || null
+      });
+      r = await pool.query(
+        `
+        INSERT INTO contacts (
+          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+        ) RETURNING *;
+        `,
+        baseValues
+      );
+    }
     if (req.companyId) {
       const origin = source || "manual";
       await emitAutomationEvent({
