@@ -828,6 +828,7 @@ async function bootstrap() {
       longitude DOUBLE PRECISION,
       status TEXT NOT NULL DEFAULT 'not_visited',
       batch_number INTEGER,
+      locked_order INTEGER,
       source_type TEXT NOT NULL DEFAULT 'contact',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -839,6 +840,7 @@ async function bootstrap() {
     ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_latitude DOUBLE PRECISION;
     ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_longitude DOUBLE PRECISION;
     ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'contact';
+    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS locked_order INTEGER;
 
     CREATE TABLE IF NOT EXISTS zapier_tokens (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -6198,6 +6200,7 @@ function mapRouteStopRow(row) {
     longitude: row.longitude,
     status: row.status,
     batch_number: row.batch_number == null ? null : Number(row.batch_number),
+    locked_order: row.locked_order == null ? null : Number(row.locked_order),
     source_type: row.source_type || (row.contact_id ? "contact" : "custom")
   };
 }
@@ -6231,9 +6234,9 @@ async function replaceRouteStops(client, routeId, companyId, stops) {
     await client.query(
       `INSERT INTO crm_route_stops(
          id, route_id, company_id, contact_id, stop_order, name_snapshot, address_snapshot,
-         latitude, longitude, status, batch_number, source_type
+         latitude, longitude, status, batch_number, source_type, locked_order
        )
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [
         randomUUID(),
         routeId,
@@ -6246,7 +6249,8 @@ async function replaceRouteStops(client, routeId, companyId, stops) {
         Number.isFinite(Number(raw.longitude)) ? Number(raw.longitude) : null,
         ["not_visited", "arrived", "completed", "skipped"].includes(raw.status) ? raw.status : "not_visited",
         Number.isFinite(Number(raw.batch_number)) ? Number(raw.batch_number) : null,
-        ["contact", "custom"].includes(raw.source_type) ? raw.source_type : (raw.contact_id ? "contact" : "custom")
+        ["contact", "custom"].includes(raw.source_type) ? raw.source_type : (raw.contact_id ? "contact" : "custom"),
+        Number.isFinite(Number(raw.locked_order)) && Number(raw.locked_order) > 0 ? Number(raw.locked_order) : null
       ]
     );
   }
