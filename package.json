@@ -4,8 +4,8 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "NODE_ENV=development nodemon index.js",
+    "start": "node imessage-entry.js",
+    "dev": "NODE_ENV=development nodemon imessage-entry.js",
     "test": "npm run test:finance && npm run test:google-sheets",
     "test:automation-core": "node tests/automation-core.integration.js",
     "test:automation": "npm run test:automation-core",
