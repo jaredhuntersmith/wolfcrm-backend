@@ -171,9 +171,9 @@ async function ensureIMessageSchema(pool) {
       ON imessage_messages(provider_message_id)
       WHERE provider_message_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS imessage_messages_conversation_created_idx
-      ON imessage_messages(conversation_id, COALESCE(provider_created_at, created_at));
+      ON imessage_messages(conversation_id, (COALESCE(provider_created_at, created_at)));
     CREATE INDEX IF NOT EXISTS imessage_messages_unread_idx
-      ON imessage_messages(conversation_id, direction, COALESCE(provider_created_at, created_at))
+      ON imessage_messages(conversation_id, direction, (COALESCE(provider_created_at, created_at)))
       WHERE deleted_at IS NULL;
 
     CREATE TABLE IF NOT EXISTS imessage_webhook_events (
