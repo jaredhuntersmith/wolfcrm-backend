@@ -58,6 +58,7 @@ const CORE_TRIGGERS = new Set([
   "job.created", "job.completed",
   "task.due",
   "sms.received", "sms.reply_received",
+  "imessage.received", "imessage.sent", "imessage.delivered", "imessage.failed",
   "call.missed",
   "payment.succeeded", "payment.failed",
   "service_plan.service_due",
@@ -84,6 +85,7 @@ const CORE_ACTIONS = new Set([
   "task.create", "task.complete",
   "job.create", "job.mark_completed",
   "sms.send",
+  "imessage.send",
   "notification.send_push",
   "payment.create_payment_link",
   "service_plan.create_service_task"
@@ -258,6 +260,10 @@ const triggerCatalog = [
   ["sms.conversation_created", "SMS Conversation Created", "Cellular Messaging", "A customer SMS conversation was created.", ["sms_conversation"], ["sms.conversation_created"]],
   ["sms.conversation_read", "SMS Conversation Read", "Cellular Messaging", "A conversation was marked read.", ["sms_conversation"], ["sms.conversation_read"]],
   ["sms.conversation_unread", "SMS Conversation Unread", "Cellular Messaging", "A conversation became unread from inbound activity.", ["sms_conversation"], ["sms.conversation_unread"]],
+  ["imessage.received", "iMessage Received", "iMessage", "An inbound iMessage was received through Texting Blue.", ["imessage_message", "contact"], ["imessage.received"]],
+  ["imessage.sent", "iMessage Sent", "iMessage", "An outbound iMessage was sent through Texting Blue.", ["imessage_message", "imessage_conversation", "contact"], ["imessage.sent"]],
+  ["imessage.delivered", "iMessage Delivered", "iMessage", "Texting Blue reported an outbound iMessage delivered.", ["imessage_message", "imessage_conversation", "contact"], ["imessage.delivered"]],
+  ["imessage.failed", "iMessage Failed", "iMessage", "Texting Blue reported an outbound iMessage failed.", ["imessage_message", "imessage_conversation", "contact"], ["imessage.failed"]],
   ["sms.reply_received", "Customer Reply Received", "Cellular Messaging", "An inbound message arrived after a prior outbound message.", ["sms_conversation", "contact"], ["sms.reply_received"]],
   ["sms.first_inbound", "First Inbound SMS", "Cellular Messaging", "The first inbound message in a conversation was received.", ["sms_conversation", "contact"], ["sms.first_inbound"]],
   ["sms.first_outbound", "First Outbound SMS", "Cellular Messaging", "The first outbound message in a conversation was sent.", ["sms_conversation", "contact"], ["sms.first_outbound"]],
@@ -519,6 +525,7 @@ const actionCatalog = [
   ["task.create", "Create Task", "Tasks", "Creates a todo task.", ["generic"], ["default"]],
   ["notification.send_push", "Send Push Notification", "Notifications", "Sends APNs push notifications to scoped company users.", ["generic"], ["default"]],
   ["sms.send", "Send SMS", "Phone", "Sends SMS to the selected Contact, SMS conversation, or phone number through the configured company phone line.", ["contact", "sms_conversation"], ["default"]],
+  ["imessage.send", "Send iMessage", "iMessage", "Sends an iMessage through Texting Blue without changing Twilio SMS.", ["contact", "imessage_conversation"], ["default"]],
   ["sms.send_mms", "Send MMS", "Cellular Messaging", "Sends MMS through the configured company phone line.", ["contact", "sms_conversation"], ["default"]],
   ["sms.mark_conversation_read", "Mark SMS Conversation Read", "Cellular Messaging", "Marks a cellular conversation read.", ["sms_conversation"], ["default"]],
   ["sms.mark_conversation_unread", "Mark SMS Conversation Unread", "Cellular Messaging", "Marks a cellular conversation unread.", ["sms_conversation"], ["default"]],
@@ -748,6 +755,7 @@ const actionExecutors = {
   "task.create": executeTaskCreate,
   "notification.send_push": executePushNotification,
   "sms.send": executeSmsSend,
+  "imessage.send": executeIMessageSend,
   "sms.send_mms": executeMmsSend,
   "sms.mark_conversation_read": executeSmsConversationRead,
   "sms.mark_conversation_unread": executeSmsConversationUnread,
@@ -983,6 +991,7 @@ function actionConfigFields(key) {
     case "notification.send_push":
       return [commonText("title", "Title"), commonText("body", "Body"), { key: "user_ids", label: "Recipients", type: "user_list" }];
     case "sms.send":
+    case "imessage.send":
     case "sms.send_mms":
     case "call.send_followup_sms":
     case "voicemail.send_followup_sms":
@@ -1606,6 +1615,7 @@ function templateVariableCatalog() {
     "employee.id", "employee.name", "employee.role", "employee.email",
     "time_clock.clock_in", "time_clock.clock_out", "time_clock.duration_hours", "time_clock.employee_name",
     "sms.body", "sms.from", "sms.to", "sms.external_number", "sms.status",
+    "imessage.body", "imessage.from", "imessage.to", "imessage.external_number", "imessage.status", "imessage.provider_message_id",
     "conversation.last_message", "conversation.last_inbound_at", "conversation.last_outbound_at",
     "call.external_number", "call.duration_seconds", "call.status",
     "voicemail.external_number", "voicemail.duration",
@@ -3197,8 +3207,9 @@ function validateGraphPayload(payload) {
       if (config.action_key === "routine.create" && !config.title) errors.push(`routine_title_required:${nodeKey}`);
       if (config.action_key === "customer_reminder.create" && !config.due_date) errors.push(`customer_reminder_due_required:${nodeKey}`);
       if (["sms.send", "call.send_followup_sms", "voicemail.send_followup_sms"].includes(config.action_key) && !config.body) errors.push(`sms_body_required:${nodeKey}`);
+      if (config.action_key === "imessage.send" && !config.body) errors.push(`imessage_body_required:${nodeKey}`);
       if (config.action_key === "sms.send_mms" && !config.body && !(Array.isArray(config.media) && config.media.length)) errors.push(`mms_body_or_media_required:${nodeKey}`);
-      if (["sms.send", "sms.send_mms", "call.send_followup_sms", "voicemail.send_followup_sms"].includes(config.action_key)) {
+      if (["sms.send", "imessage.send", "sms.send_mms", "call.send_followup_sms", "voicemail.send_followup_sms"].includes(config.action_key)) {
         const targetMode = config.target_mode || (config.phone ? "phone_number" : "current_contact");
         if (targetMode === "phone_number" && !config.phone) errors.push(`sms_phone_required:${nodeKey}`);
         if (targetMode === "phone_template" && !config.phone) errors.push(`sms_phone_variable_required:${nodeKey}`);
@@ -3317,6 +3328,7 @@ function graphProvidedContextTypes(nodes) {
       if (key.startsWith("pipeline.")) { types.add("opportunity"); types.add("contact"); }
       if (key.startsWith("job.")) { types.add("job"); types.add("contact"); }
       if (key.startsWith("task.")) types.add("task");
+      if (key.startsWith("imessage.")) { types.add("imessage_message"); types.add("imessage_conversation"); types.add("contact"); }
       if (key.startsWith("quote.")) { types.add("quote"); types.add("contact"); }
       if (key.startsWith("payment.")) { types.add("payment"); types.add("contact"); }
       if (key.startsWith("service_plan.")) { types.add("service_plan"); types.add("contact"); }
@@ -3363,7 +3375,7 @@ function actionRequiresContactTarget(actionKey) {
     "contact.set_source", "contact.set_value", "contact.set_job_type", "contact.set_custom_field", "contact.set_location",
     "contact.delete", "contact.add_note", "contact.add_activity", "contact.add_to_map", "pipeline.create_opportunity",
     "pipeline.move_stage", "pipeline.set_value", "pipeline.mark_won", "pipeline.mark_lost", "pipeline.reopen",
-    "pipeline.remove_opportunity", "pipeline.create_reminder", "sms.send", "sms.send_mms", "call.send_followup_sms",
+    "pipeline.remove_opportunity", "pipeline.create_reminder", "sms.send", "imessage.send", "sms.send_mms", "call.send_followup_sms",
     "voicemail.send_followup_sms"
   ].includes(actionKey);
 }
@@ -4993,6 +5005,8 @@ async function loadSubject(companyId, subjectType, subjectId) {
   if (subjectType === "opportunity") return (await ctx.pool.query(`SELECT * FROM opportunities WHERE id = $1 AND company_id = $2`, [subjectId, companyId])).rows[0] || null;
   if (subjectType === "sms_message") return loadSmsMessageContext(companyId, subjectId);
   if (subjectType === "sms_conversation") return loadSmsConversationContext(companyId, subjectId);
+  if (subjectType === "imessage_message") return loadIMessageMessageContext(companyId, subjectId);
+  if (subjectType === "imessage_conversation") return loadIMessageConversationContext(companyId, subjectId);
   if (subjectType === "call") return loadCallContext(companyId, subjectId);
   if (subjectType === "voicemail") return loadVoicemailContext(companyId, subjectId);
   if (subjectType === "internal_message") return loadInternalMessageContext(companyId, subjectId);
@@ -5309,12 +5323,67 @@ function parseAddressParts(address) {
 
 function subjectContextKey(type) {
   if (type === "sms_conversation" || type === "sms_message") return "sms";
+  if (type === "imessage_conversation" || type === "imessage_message") return "imessage";
   if (type === "service_plan") return "servicePlan";
   if (type === "internal_message" || type === "internal_conversation") return "internal";
   if (type === "map_pin") return "map";
   if (type === "route_stop") return "routeStop";
   if (type === "time_entry") return "time_clock";
   return type;
+}
+
+async function loadIMessageMessageContext(companyId, messageId) {
+  const row = (await ctx.pool.query(
+    `SELECT im.*, ic.external_phone_number, ic.contact_id, ic.last_read_at, il.phone_number AS business_phone
+       FROM imessage_messages im
+       JOIN imessage_conversations ic ON ic.id = im.conversation_id
+       JOIN imessage_lines il ON il.id = ic.line_id
+      WHERE im.id = $1 AND ic.company_id = $2`,
+    [messageId, companyId]
+  )).rows[0];
+  if (!row) return { exists: false };
+  return imessageContextFromRow(row);
+}
+
+async function loadIMessageConversationContext(companyId, conversationId) {
+  const row = (await ctx.pool.query(
+    `SELECT im.*, ic.id AS conversation_id, ic.external_phone_number, ic.contact_id, ic.last_read_at, il.phone_number AS business_phone
+       FROM imessage_conversations ic
+       JOIN imessage_lines il ON il.id = ic.line_id
+       LEFT JOIN LATERAL (
+         SELECT * FROM imessage_messages m
+          WHERE m.conversation_id = ic.id AND m.deleted_at IS NULL
+          ORDER BY COALESCE(m.provider_created_at, m.created_at) DESC
+          LIMIT 1
+       ) im ON true
+      WHERE ic.id = $1 AND ic.company_id = $2`,
+    [conversationId, companyId]
+  )).rows[0];
+  if (!row) return { exists: false };
+  return imessageContextFromRow(row);
+}
+
+function imessageContextFromRow(row) {
+  return {
+    exists: true,
+    id: row.id,
+    message_id: row.id,
+    provider_message_id: row.provider_message_id,
+    conversation_id: row.conversation_id,
+    body: row.body || "",
+    from: row.from_number,
+    to: row.to_number,
+    external_number: row.external_phone_number,
+    business_phone: row.business_phone,
+    direction: row.direction,
+    status: row.message_status,
+    contact_id: row.contact_id,
+    contact_exists: !!row.contact_id,
+    media_url: row.media_url,
+    has_media: !!row.media_url,
+    channel: "imessage",
+    provider: "texting_blue"
+  };
 }
 
 async function loadSmsMessageContext(companyId, messageId) {
@@ -6655,6 +6724,61 @@ async function executeMmsSend(run, node, config, scopeKey = "root") {
   return executeSmsSendShared(run, node, config, { mms: true, scopeKey });
 }
 
+async function executeIMessageSend(run, node, config, scopeKey = "root") {
+  if (!ctx.sendAutomatedIMessage) throw new Error("imessage_not_configured");
+  const existing = await getRunVariable(run.id, `idempotency:${node.id}:imessage_message_id`);
+  if (existing) {
+    const row = (await ctx.pool.query(
+      `SELECT im.id, im.provider_message_id, im.conversation_id, im.to_number, im.message_status
+         FROM imessage_messages im
+         JOIN imessage_conversations ic ON ic.id = im.conversation_id
+        WHERE im.id::text = $1 AND ic.company_id = $2
+        LIMIT 1`,
+      [existing, run.company_id]
+    )).rows[0];
+    if (row) return { message_id: row.id, conversation_id: row.conversation_id, provider_message_id: row.provider_message_id, status: row.message_status, to_number: row.to_number, reused: true };
+  }
+  const context = await buildRunContext(run, { scopeKey });
+  const target = await resolveIMessageTarget(run, context, config);
+  const toNumber = normalizePhone(target.phone);
+  if (!toNumber) throw new Error("contact_phone_required");
+  const body = resolveTemplate(config.body || "", context).slice(0, 5000);
+  if (!body) throw new Error("imessage_body_required");
+  const policy = config.business_hours_policy || config.business_hours || "send_immediately";
+  const eligibility = await canSendAutomatedCustomerMessage(run.company_id, toNumber, target.contact_id, policy);
+  if (!eligibility.allowed) {
+    await logRun(run, node, "warn", "imessage.blocked", `Automated iMessage blocked: ${eligibility.reason}`, { reason: eligibility.reason, resume_at: eligibility.resume_at || null });
+    if (eligibility.reason === "deferred_until_business_hours" && eligibility.resume_at) {
+      const wait = await ctx.pool.query(
+        `INSERT INTO automation_waits(run_id, node_id, wait_type, resume_at, status)
+         VALUES($1,$2,'until_datetime',$3,'waiting')
+         RETURNING id, resume_at`,
+        [run.id, node.id, eligibility.resume_at]
+      );
+      await ctx.pool.query(`UPDATE automation_runs SET status = 'waiting', updated_at = now() WHERE id = $1`, [run.id]);
+      return { waiting: true, wait_id: wait.rows[0]?.id, reason: eligibility.reason, resume_at: eligibility.resume_at };
+    }
+    return { skipped: true, reason: eligibility.reason, to_number: toNumber };
+  }
+  const sent = await ctx.sendAutomatedIMessage({
+    pool: ctx.pool,
+    companyId: run.company_id,
+    userId: run.actor_user_id || run.created_by_user_id || null,
+    contactId: target.contact_id,
+    phone: toNumber,
+    conversationId: target.conversation_id,
+    body
+  });
+  await setRunVariable(run.id, `idempotency:${node.id}:imessage_message_id`, sent.message.id);
+  return {
+    message_id: sent.message.id,
+    conversation_id: sent.conversation.id,
+    provider_message_id: sent.message.provider_message_id,
+    to_number: sent.message.to_number,
+    status: sent.message.message_status
+  };
+}
+
 async function executeSmsSendShared(run, node, config, options = {}) {
   const existing = await getRunVariable(run.id, `idempotency:${node.id}:sms_message_id`);
   if (existing) {
@@ -6746,6 +6870,29 @@ async function resolveSmsTarget(run, context, config) {
       [conversationId, run.company_id]
     )).rows[0];
     if (!row) throw new Error("sms_conversation_not_found");
+    return { conversation_id: row.id, contact_id: row.contact_id, phone: row.external_phone_number };
+  }
+  if (config.target_mode === "phone_number" || config.target_mode === "phone_template" || config.phone || config.to_phone || config.to_number) {
+    if (isBracedNumericLiteral(config.phone || config.to_phone || config.to_number)) throw new Error("sms_phone_number_wrapped_as_template");
+    return { contact_id: null, phone: resolveTemplate(config.phone || config.to_phone || config.to_number, context) };
+  }
+  const contactId = await resolveContactId(run, context, config);
+  const contact = (await ctx.pool.query(`SELECT id, phone FROM contacts WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL`, [contactId, run.company_id])).rows[0];
+  if (!contact) throw new Error("contact_not_found");
+  return { contact_id: contact.id, phone: contact.phone };
+}
+
+async function resolveIMessageTarget(run, context, config) {
+  if (config.conversation_id || config.target_mode === "current_conversation") {
+    const conversationId = resolveTemplate(config.conversation_id || context.imessage?.conversation_id || "", context);
+    const row = (await ctx.pool.query(
+      `SELECT id, external_phone_number, contact_id
+         FROM imessage_conversations
+        WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL
+        LIMIT 1`,
+      [conversationId, run.company_id]
+    )).rows[0];
+    if (!row) throw new Error("imessage_conversation_not_found");
     return { conversation_id: row.id, contact_id: row.contact_id, phone: row.external_phone_number };
   }
   if (config.target_mode === "phone_number" || config.target_mode === "phone_template" || config.phone || config.to_phone || config.to_number) {
@@ -8628,7 +8775,7 @@ async function validateSubject(companyId, type, id) {
 }
 
 function isRetrySafe(node) {
-  return SIDE_EFFECT_FREE_ACTIONS.has(node.config?.action_key) || ["notification.send_push", "webhook.send", "sms.send", "sms.send_mms", "payment.create_request", "payment.create_payment_link"].includes(node.config?.action_key);
+  return SIDE_EFFECT_FREE_ACTIONS.has(node.config?.action_key) || ["notification.send_push", "webhook.send", "sms.send", "imessage.send", "sms.send_mms", "payment.create_request", "payment.create_payment_link"].includes(node.config?.action_key);
 }
 
 function classifyErrorCode(code) {
@@ -8694,7 +8841,7 @@ async function enforceRunBudget(run, node, scopeKey) {
 async function enforceActionBudget(run, node, scopeKey, versionSettings = {}) {
   const key = node.config?.action_key || "";
   const counters = {
-    customer: ["sms.send", "sms.send_mms", "payment.send_payment_sms", "service_plan.send_scheduling_sms", "call.send_followup_sms", "voicemail.send_followup_sms"],
+    customer: ["sms.send", "imessage.send", "sms.send_mms", "payment.send_payment_sms", "service_plan.send_scheduling_sms", "call.send_followup_sms", "voicemail.send_followup_sms"],
     internal: ["internal.send_message", "internal.send_dm", "internal.send_group_message", "internal.send_channel_message", "employee.send_internal_message", "employee.send_push", "notification.send_push"],
     webhook: ["webhook.send"],
     child: ["automation.start"]

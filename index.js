@@ -36,6 +36,7 @@ import {
   markGoogleSheetsContactDirty,
   startGoogleSheetsWorkers
 } from "./google-sheets.js";
+import { installIMessageSystem, sendAutomatedIMessage } from "./imessage.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -189,6 +190,7 @@ async function deviceTokensForUsers(userIds) {
 
 const DEFAULT_PUSH_CATEGORIES = {
   cellular_sms: true,
+  imessage: true,
   missed_call: true,
   voicemail: true,
   internal_message: true,
@@ -273,6 +275,17 @@ async function phoneUnreadBadgeCount(companyId) {
             AND sm.deleted_at IS NULL
             AND sm.direction = 'inbound'
             AND sm.created_at > COALESCE(sc.last_read_at, '1970-01-01'::timestamptz)
+       ), 0)::int
+       +
+       COALESCE((
+         SELECT COUNT(*)
+           FROM imessage_messages im
+           JOIN imessage_conversations ic ON ic.id = im.conversation_id
+          WHERE ic.company_id = $1
+            AND ic.deleted_at IS NULL
+            AND im.deleted_at IS NULL
+            AND im.direction = 'inbound'
+            AND COALESCE(im.provider_created_at, im.created_at) > COALESCE(ic.last_read_at, '1970-01-01'::timestamptz)
        ), 0)::int
        +
        COALESCE((
@@ -365,7 +378,14 @@ app.use(cors());
 // raw-body middleware for that exact path lives here.
 app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }));
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({
+  limit: "2mb",
+  verify: (req, _res, buf) => {
+    if (req.originalUrl === "/webhooks/texting-blue") {
+      req.rawBody = Buffer.from(buf);
+    }
+  }
+}));
 app.use(express.urlencoded({ extended: false, limit: "2mb" }));
 
 app.get("/api/health", (_req, res) => {
@@ -3129,7 +3149,8 @@ app.post("/webhooks/twilio/voice/outgoing", async (req, res) => {
       return res.status(200).type("text/xml").send(voiceResponse.toString());
     }
 
-    const callerId = normalizeE164Phone(rows[0].phone_number);
+    const configuredCallerId = normalizeE164Phone(process.env.TWILIO_OUTBOUND_CALLER_ID || "");
+    const callerId = isUsableE164(configuredCallerId) ? configuredCallerId : normalizeE164Phone(rows[0].phone_number);
     if (!isUsableE164(callerId)) {
       console.warn("[voice outgoing] rejected", {
         reason: "invalid_caller_id",
@@ -11373,7 +11394,14 @@ async function startServer() {
     sendPushToUsers,
     createTwilioClient,
     twilioPublicUrl,
-    getStripe
+    getStripe,
+    sendAutomatedIMessage
+  });
+  await installIMessageSystem({
+    app,
+    pool,
+    authRequired,
+    sendCompanyPhonePush
   });
   await installFinanceSystem({
     app,
