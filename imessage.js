@@ -725,14 +725,8 @@ export async function installIMessageSystem({ app, pool, authRequired, sendCompa
       if (!eventType || !providerMessageId || !event.data) return res.status(400).json({ error: "invalid_webhook" });
 
       if (eventId) {
-        const inserted = await pool.query(
-          `INSERT INTO imessage_webhook_events(event_id, event_type, provider_message_id)
-           VALUES($1,$2,$3)
-           ON CONFLICT (event_id) DO NOTHING
-           RETURNING event_id`,
-          [eventId, eventType, providerMessageId]
-        );
-        if (!inserted.rowCount) return res.json({ received: true, duplicate: true });
+        const duplicate = await pool.query(`SELECT event_id FROM imessage_webhook_events WHERE event_id = $1 LIMIT 1`, [eventId]);
+        if (duplicate.rowCount) return res.json({ received: true, duplicate: true });
       }
 
       const line = await resolveWebhookLine(pool, event.data);
@@ -745,6 +739,14 @@ export async function installIMessageSystem({ app, pool, authRequired, sendCompa
       const automationEvent = providerEventToAutomationEvent(eventType);
       if (automationEvent) await emitIMessageEvent({ line, saved, eventType: automationEvent });
       await notifyInboundIMessage({ pool, sendCompanyPhonePush, line, saved });
+      if (eventId) {
+        await pool.query(
+          `INSERT INTO imessage_webhook_events(event_id, event_type, provider_message_id)
+           VALUES($1,$2,$3)
+           ON CONFLICT (event_id) DO NOTHING`,
+          [eventId, eventType, providerMessageId]
+        );
+      }
       res.json({ received: true });
     } catch (error) {
       console.error("[imessage/webhook] failed:", { code: error?.code, message: error?.message });
