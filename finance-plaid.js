@@ -411,6 +411,15 @@ function transactionPayload(row) {
     iso_currency_code: row.iso_currency_code,
     removed_at: row.removed_at,
     receipt_count: Number(row.receipt_count || 0),
+    accounting_note: row.accounting_note || null,
+    reconciliation_status: row.reconciliation_status || "unreconciled",
+    reconciled_at: row.reconciled_at || null,
+    reconciled_by: row.reconciled_by || null,
+    accounting_version: Number(row.accounting_version || 1),
+    accounting_updated_at: row.accounting_updated_at || null,
+    accounting_updated_by: row.accounting_updated_by || null,
+    accounting_split_count: Number(row.accounting_split_count || 0),
+    accounting_allocated_cents: Number(row.accounting_allocated_cents || 0),
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -1390,6 +1399,28 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
         conditions.push(`t.direction = $${values.length}`);
       } else if (filter === "pending") {
         conditions.push("t.pending = true");
+      } else if (filter === "unclassified") {
+        conditions.push("t.pending = false");
+        conditions.push("t.status = 'posted'");
+        conditions.push(`(
+          COALESCE((
+            SELECT SUM(s.amount_cents)
+              FROM finance_transaction_splits s
+             WHERE s.company_id = t.company_id AND s.transaction_id = t.id
+          ), 0) <> t.amount_cents
+          OR EXISTS (
+            SELECT 1
+              FROM finance_transaction_splits s
+              JOIN finance_chart_accounts c
+                ON c.id = s.chart_account_id AND c.company_id = s.company_id
+             WHERE s.company_id = t.company_id
+               AND s.transaction_id = t.id
+               AND (
+                 (t.direction = 'income' AND c.account_type NOT IN ('income','asset','liability','equity'))
+                 OR (t.direction = 'expense' AND c.account_type NOT IN ('expense','asset','liability','equity'))
+               )
+          )
+        )`);
       } else if (filter === "missing_receipt") {
         conditions.push("t.direction = 'expense'");
         conditions.push("t.pending = false");
@@ -1398,7 +1429,9 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       values.push(limit, offset);
       const { rows } = await pool.query(
         `SELECT t.*, a.name AS account_name, a.institution_name,
-                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count
+                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count,
+                (SELECT COUNT(*)::int FROM finance_transaction_splits s WHERE s.company_id = t.company_id AND s.transaction_id = t.id) AS accounting_split_count,
+                (SELECT COALESCE(SUM(s.amount_cents), 0) FROM finance_transaction_splits s WHERE s.company_id = t.company_id AND s.transaction_id = t.id) AS accounting_allocated_cents
            FROM finance_transactions t
            JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
           WHERE ${conditions.join(" AND ")}
@@ -1417,7 +1450,9 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     try {
       const { rows } = await pool.query(
         `SELECT t.*, a.name AS account_name, a.institution_name,
-                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count
+                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count,
+                (SELECT COUNT(*)::int FROM finance_transaction_splits s WHERE s.company_id = t.company_id AND s.transaction_id = t.id) AS accounting_split_count,
+                (SELECT COALESCE(SUM(s.amount_cents), 0) FROM finance_transaction_splits s WHERE s.company_id = t.company_id AND s.transaction_id = t.id) AS accounting_allocated_cents
            FROM finance_transactions t
            JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
           WHERE t.id = $1 AND t.company_id = $2`,

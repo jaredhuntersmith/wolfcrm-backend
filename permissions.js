@@ -97,7 +97,7 @@ export const PERMISSION_CAPABILITIES = Object.freeze([
   capability("finance.ai.use", "finance", "Use Finance AI", "Use AI with permitted company finance data.", true, ["finance.view", "ai.use"]),
   capability("finance.ai.manage_memory", "finance", "Manage Finance AI memory", "Change company-wide Finance AI memory.", true, ["finance.ai.use", "ai.manage"]),
   capability("accounting.view", "finance", "View accounting", "See accounting records and reports.", true, ["finance.view"]),
-  capability("accounting.manage", "finance", "Manage accounting", "Classify, reconcile, and edit accounting records.", true, ["accounting.view", "finance.manage"]),
+  capability("accounting.manage", "finance", "Manage accounting", "Classify, reconcile, and edit accounting records.", true, ["accounting.view", "finance.transactions.view", "finance.manage"]),
 
   capability("pay.view_self", "pay", "View own pay", "See personal pay and mileage reimbursement."),
   capability("pay.view_all", "pay", "View employee pay", "See pay information for all employees.", true, ["pay.view_self"]),
@@ -286,6 +286,9 @@ export function requiredAutomationCapability(method, path = "") {
 
 export function requiredFinanceCapability(method, path = "") {
   const isRead = method === "GET";
+  if (path.includes("/finance/accounting")) {
+    return isRead ? "accounting.view" : "accounting.manage";
+  }
   if (path.includes("/finance/ai")) {
     return !isRead && /memor/.test(path) ? "finance.ai.manage_memory" : "finance.ai.use";
   }

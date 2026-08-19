@@ -67,6 +67,11 @@ function testSparseOverrideAddsDependencies() {
   assert.equal(update.capabilities["quotes.view"], true);
   assert.equal(update.overrides["quotes.edit"], true);
   assert.equal(update.overrides["quotes.view"], true);
+
+  const accounting = validateAccessUpdate({ preset: "technician", overrides: { "accounting.manage": true } });
+  assert.equal(accounting.capabilities["accounting.view"], true);
+  assert.equal(accounting.capabilities["finance.transactions.view"], true);
+  assert.equal(accounting.capabilities["finance.manage"], true);
 }
 
 function testExplicitViewDenyCascadesToActions() {
@@ -142,6 +147,8 @@ function testAdministrativeRouteClassification() {
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounts"), "finance.accounts.create");
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounts/123/balance-adjustments"), "finance.accounts.adjust");
   assert.equal(requiredFinanceCapability("PATCH", "/api/finance/ai/memories/123"), "finance.ai.manage_memory");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/reports/profit-loss"), "accounting.view");
+  assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/transactions/123"), "accounting.manage");
 }
 
 const tests = [
