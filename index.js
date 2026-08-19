@@ -70,11 +70,35 @@ import {
   validateOnMyWayMessage,
   validateOnMyWayTemplate
 } from "./on-my-way.js";
+import {
+  WeatherSchedulingError,
+  buildWeatherRiskReport,
+  createGoogleWeatherService,
+  normalizeWeatherExposure,
+  planWeatherReschedule,
+  renderWeatherRescheduleMessage,
+  resolveWeatherSettings,
+  validateWeatherNotificationTemplate,
+  validateWeatherExpectedIntervals,
+  validateWeatherSettings
+} from "./weather-scheduling.js";
+import {
+  AssignmentRecommendationError,
+  buildAssignmentRecommendations,
+  planAssignmentApplication
+} from "./assignment-recommendations.js";
+import {
+  SMART_CONTACT_LIST_LIMITS,
+  SmartContactListError,
+  buildSmartContactPreview,
+  validateSmartContactFilters
+} from "./smart-contact-lists.js";
 
 const { Pool } = pkg;
 const app = express();
 const PORT = process.env.PORT || 8080;
 const googleRoutingService = createGoogleRoutingService();
+const googleWeatherService = createGoogleWeatherService();
 
 const useSSL =
   process.env.DB_SSL === "true" ||
@@ -1289,6 +1313,7 @@ async function bootstrap() {
       started_by UUID,
       finished_at TIMESTAMPTZ,
       finished_by UUID,
+      weather_exposure TEXT NOT NULL DEFAULT 'auto',
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS schedule_user_start_idx
@@ -1311,6 +1336,81 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS employee_schedule_availability_company_idx
       ON employee_schedule_availability(company_id, user_id);
+
+    CREATE TABLE IF NOT EXISTS weather_risk_observations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      job_id TEXT NOT NULL,
+      job_start_at TIMESTAMPTZ NOT NULL,
+      severity TEXT NOT NULL,
+      snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+      first_detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      resolved_at TIMESTAMPTZ,
+      UNIQUE(company_id, job_id, job_start_at)
+    );
+    CREATE INDEX IF NOT EXISTS weather_risk_observations_active_idx
+      ON weather_risk_observations(company_id, resolved_at, last_detected_at DESC);
+
+    CREATE TABLE IF NOT EXISTS weather_reschedule_batches (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      idempotency_key TEXT NOT NULL,
+      replacement_start_at TIMESTAMPTZ NOT NULL,
+      notify_customers BOOLEAN NOT NULL DEFAULT false,
+      notification_template TEXT,
+      status TEXT NOT NULL DEFAULT 'processing',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS weather_reschedule_batches_company_idx
+      ON weather_reschedule_batches(company_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS weather_reschedule_items (
+      batch_id UUID NOT NULL REFERENCES weather_reschedule_batches(id) ON DELETE CASCADE,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      job_id TEXT NOT NULL,
+      contact_id TEXT,
+      contact_name TEXT,
+      recipient_phone TEXT,
+      job_title TEXT NOT NULL,
+      old_start_at TIMESTAMPTZ NOT NULL,
+      old_end_at TIMESTAMPTZ NOT NULL,
+      new_start_at TIMESTAMPTZ NOT NULL,
+      new_end_at TIMESTAMPTZ NOT NULL,
+      notification_status TEXT NOT NULL DEFAULT 'not_requested',
+      notification_message TEXT,
+      sms_conversation_id UUID REFERENCES sms_conversations(id) ON DELETE SET NULL,
+      sms_message_id UUID REFERENCES sms_messages(id) ON DELETE SET NULL,
+      provider_message_sid TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY(batch_id, job_id)
+    );
+    CREATE INDEX IF NOT EXISTS weather_reschedule_items_job_idx
+      ON weather_reschedule_items(company_id, job_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS job_assignment_recommendation_applications (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      job_id TEXT NOT NULL,
+      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      selected_worker_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      assignment_mode TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      expected_job_updated_at TIMESTAMPTZ NOT NULL,
+      applied_job_updated_at TIMESTAMPTZ NOT NULL,
+      previous_worker_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      new_worker_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      recommendation_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS job_assignment_applications_job_idx
+      ON job_assignment_recommendation_applications(company_id, job_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS job_on_my_way_events (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1810,6 +1910,9 @@ async function bootstrap() {
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_close_time TEXT NOT NULL DEFAULT '17:00';
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS tab_role_policies JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS on_my_way_message_template TEXT NOT NULL DEFAULT 'Hi {{customer_first_name}}, {{employee_name}} from {{company_name}} is on the way. Estimated arrival: {{eta}}.';
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS weather_settings JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS weather_exposure TEXT NOT NULL DEFAULT 'auto';
+    ALTER TABLE weather_reschedule_items ADD COLUMN IF NOT EXISTS recipient_phone TEXT;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_use_finance_ai BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_transactions BOOLEAN NOT NULL DEFAULT false;
@@ -6988,6 +7091,166 @@ app.put("/api/contacts/:id", authRequired, requireCapability("contacts.edit"), a
   }
 });
 
+async function loadSmartContactFacts(companyId) {
+  const contactRows = (await pool.query(
+    `WITH scoped_contacts AS (
+       SELECT *
+         FROM contacts
+        WHERE company_id = $1 AND deleted_at IS NULL
+        ORDER BY updated_at DESC, id
+        LIMIT $2
+     ),
+     job_facts AS (
+       SELECT contact_id,
+              COUNT(*)::int AS job_count,
+              COUNT(*) FILTER (WHERE finished_at IS NOT NULL)::int AS completed_job_count,
+              MAX(finished_at) AS latest_completed_at
+         FROM schedule_events
+        WHERE company_id = $1 AND contact_id IS NOT NULL
+        GROUP BY contact_id
+     ),
+     quote_facts AS (
+       SELECT contact_id, COUNT(*)::int AS quote_count, MAX(created_at) AS latest_quote_at
+         FROM quotes
+        WHERE company_id = $1
+        GROUP BY contact_id
+     ),
+     latest_opportunities AS (
+       SELECT DISTINCT ON (contact_id) contact_id, state, stage_id
+         FROM opportunities
+        WHERE company_id = $1
+        ORDER BY contact_id, updated_at DESC, id
+     )
+     SELECT c.*,
+            CASE WHEN o.state = 'stage' AND o.stage_id IS NOT NULL THEN jsonb_build_array(o.stage_id) ELSE '[]'::jsonb END AS stage_ids,
+            (o.state = 'lost') AS lost_lead,
+            COALESCE(j.job_count, 0)::int AS job_count,
+            COALESCE(j.completed_job_count, 0)::int AS completed_job_count,
+            j.latest_completed_at,
+            COALESCE(q.quote_count, 0)::int AS quote_count,
+            q.latest_quote_at
+       FROM scoped_contacts c
+       LEFT JOIN job_facts j ON j.contact_id = c.id::text
+       LEFT JOIN quote_facts q ON q.contact_id = c.id::text
+       LEFT JOIN latest_opportunities o ON o.contact_id = c.id::text
+      ORDER BY c.updated_at DESC, c.id`,
+    [companyId, SMART_CONTACT_LIST_LIMITS.maximumSourceContacts + 1]
+  )).rows;
+  const sourceTruncated = contactRows.length > SMART_CONTACT_LIST_LIMITS.maximumSourceContacts;
+  const contacts = contactRows.slice(0, SMART_CONTACT_LIST_LIMITS.maximumSourceContacts);
+  const contactIDs = contacts.map((contact) => String(contact.id));
+  const communicationCoverage = { sms: true, calls: true, consent: true };
+  const [smsResult, callsResult] = await Promise.all([
+    pool.query(
+      `SELECT sc.contact_id::text AS contact_id, MAX(sc.last_message_at) AS last_sms_at
+         FROM sms_conversations sc
+         JOIN phone_lines pl ON pl.id = sc.phone_line_id AND pl.company_id = $1
+        WHERE sc.deleted_at IS NULL AND sc.contact_id::text = ANY($2::text[])
+        GROUP BY sc.contact_id`,
+      [companyId, contactIDs]
+    ).catch((error) => {
+      communicationCoverage.sms = false;
+      console.warn("[smart-contacts] SMS evidence unavailable", error?.code || error?.message);
+      return { rows: [] };
+    }),
+    pool.query(
+      `SELECT contact_id::text AS contact_id,
+              MAX(COALESCE(ended_at, answered_at, started_at)) AS last_call_at
+         FROM phone_calls
+        WHERE company_id = $1 AND contact_id::text = ANY($2::text[])
+        GROUP BY contact_id`,
+      [companyId, contactIDs]
+    ).catch((error) => {
+      communicationCoverage.calls = false;
+      console.warn("[smart-contacts] call evidence unavailable", error?.code || error?.message);
+      return { rows: [] };
+    })
+  ]);
+  const lastSMSByContact = new Map(smsResult.rows.map((row) => [String(row.contact_id), row.last_sms_at]));
+  const lastCallByContact = new Map(callsResult.rows.map((row) => [String(row.contact_id), row.last_call_at]));
+  const normalizedPhoneByContact = new Map();
+  const normalizedPhones = [];
+  for (const contact of contacts) {
+    const phone = normalizeE164Phone(contact.phone);
+    normalizedPhoneByContact.set(String(contact.id), phone);
+    if (isUsableE164(phone)) normalizedPhones.push(phone);
+  }
+  const optedOut = new Set();
+  if (normalizedPhones.length) {
+    const result = await pool.query(
+      `SELECT normalized_phone FROM phone_opt_outs
+        WHERE company_id = $1 AND channel = 'sms' AND status = 'opted_out'
+          AND normalized_phone = ANY($2::text[])`,
+      [companyId, [...new Set(normalizedPhones)]]
+    ).catch((error) => {
+      communicationCoverage.consent = false;
+      console.warn("[smart-contacts] consent evidence unavailable", error?.code || error?.message);
+      return { rows: [] };
+    });
+    for (const row of result.rows) optedOut.add(String(row.normalized_phone));
+  }
+  return {
+    contacts: contacts.map((contact) => {
+      const id = String(contact.id);
+      const normalizedPhone = normalizedPhoneByContact.get(id);
+      return {
+        ...contact,
+        last_sms_at: lastSMSByContact.get(id) || null,
+        last_call_at: lastCallByContact.get(id) || null,
+        sms_phone_valid: isUsableE164(normalizedPhone),
+        sms_opted_out: optedOut.has(normalizedPhone)
+      };
+    }),
+    sourceTruncated,
+    communicationCoverage
+  };
+}
+
+function sendSmartContactError(res, error) {
+  if (error instanceof SmartContactListError) {
+    return res.status(error.statusCode || 400).json({
+      error: error.code,
+      message: error.message,
+      ...(error.details ? { details: error.details } : {})
+    });
+  }
+  console.error("[smart-contacts] preview failed", { code: error?.code, message: error?.message });
+  return res.status(500).json({ error: "smart_contacts_preview_failed", message: "WolfCRM couldn't preview this smart contact list." });
+}
+
+app.post("/api/smart-contact-lists/preview", authRequired, requireCapability("contacts.view"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const rawFilters = req.body?.filters || req.body || {};
+    const filters = validateSmartContactFilters(rawFilters);
+    const requestedStageIDs = [...new Set([...filters.stage_ids, ...filters.not_stage_ids])];
+    if (requestedStageIDs.length) {
+      const known = (await pool.query(
+        `SELECT id FROM stages WHERE company_id = $1 AND id = ANY($2::text[])`,
+        [req.companyId, requestedStageIDs]
+      )).rows.map((row) => String(row.id));
+      const unknown = requestedStageIDs.filter((id) => !known.includes(id));
+      if (unknown.length) {
+        throw new SmartContactListError(
+          "smart_contacts_stage_not_found",
+          "One or more selected Pipeline stages no longer exist. Refresh the filters and try again.",
+          { statusCode: 409, details: { stage_ids: unknown.join(",") } }
+        );
+      }
+    }
+    const facts = await loadSmartContactFacts(req.companyId);
+    const report = buildSmartContactPreview({
+      contacts: facts.contacts,
+      filters: rawFilters,
+      sourceTruncated: facts.sourceTruncated,
+      communicationCoverage: facts.communicationCoverage
+    });
+    res.json(report);
+  } catch (error) {
+    sendSmartContactError(res, error);
+  }
+});
+
 function routeScope(req, alias = "r") {
   if (req.companyId) return { sql: `${alias}.company_id = $1`, values: [req.companyId] };
   return { sql: `${alias}.user_id = $1`, values: [req.userId] };
@@ -9058,7 +9321,8 @@ app.get("/api/schedule", authRequired, requireCapability("schedule.view"), async
     const { rows } = await pool.query(
       `SELECT id, title, start_at AS start, end_at AS "end", color, notes,
               contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
-              company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by
+              company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
+              weather_exposure
        FROM schedule_events WHERE ${where.sql} ORDER BY start_at ASC`,
       where.values
     );
@@ -9206,7 +9470,7 @@ app.delete("/api/schedule/team/:userId/availability", authRequired, requireCapab
 app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create", "schedule.edit"), async (req, res) => {
   const {
     title, start, end, color, notes, contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
-    sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by
+    sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by, weather_exposure
   } = req.body || {};
   if (!title || !start || !end) return res.status(400).json({ error: "missing_params" });
   const startDate = new Date(start);
@@ -9237,11 +9501,15 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
       ? previous.rows[0].worker_user_ids
       : [];
     const isNewJob = previous.rowCount === 0;
+    const weatherExposure = weather_exposure == null && previous.rowCount
+      ? normalizeWeatherExposure(previous.rows[0].weather_exposure || "auto")
+      : normalizeWeatherExposure(weather_exposure);
     const r = await pool.query(
       `INSERT INTO schedule_events
         (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, quote_id,
-         reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by)
-       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $16::jsonb, $17::jsonb, $18, $19, $20, $21)
+         reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
+         weather_exposure)
+       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $16::jsonb, $17::jsonb, $18, $19, $20, $21, $22)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              start_at = EXCLUDED.start_at,
@@ -9262,11 +9530,13 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
              started_by = EXCLUDED.started_by,
              finished_at = EXCLUDED.finished_at,
              finished_by = EXCLUDED.finished_by,
+             weather_exposure = EXCLUDED.weather_exposure,
              updated_at = now()
        WHERE schedule_events.user_id = $2 OR schedule_events.company_id = $3
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
                  contact_id, quote_id, reminder_minutes, services, price_cents, material_cost_cents,
-                 service_items, company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by`,
+                 service_items, company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
+                 weather_exposure`,
       [
         req.params.id, req.userId, req.companyId, title, start, end,
         color || '#3478F6', notes || null, contact_id || null, quote_id || null,
@@ -9280,7 +9550,8 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
         started_at || null,
         started_by || null,
         finished_at || null,
-        finished_by || null
+        finished_by || null,
+        weatherExposure
       ]
     );
     const addedWorkers = workerIDs.filter((id) => !oldWorkerIDs.includes(id));
@@ -9327,6 +9598,9 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
     if (e instanceof ScheduleTeamError) {
       return res.status(e.status).json({ error: e.code, message: e.message, details: e.details });
     }
+    if (e instanceof WeatherSchedulingError) {
+      return res.status(e.statusCode).json({ error: e.code, message: e.message, details: e.details });
+    }
     console.error(e);
     res.status(500).json({ error: "failed_upsert_schedule" });
   }
@@ -9352,6 +9626,980 @@ app.delete("/api/schedule/:id", authRequired, requireCapability("schedule.delete
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_schedule" }); }
 });
+
+// ---------- WEATHER-AWARE SCHEDULING ----------
+function sendWeatherError(res, error, fallbackCode = "weather_scheduling_failed") {
+  if (error instanceof WeatherSchedulingError || error instanceof OnMyWayError) {
+    return res.status(error.statusCode || 400).json({
+      error: error.code,
+      message: error.message,
+      ...(error.details ? { details: error.details } : {})
+    });
+  }
+  console.error("[weather] failed:", { code: error?.code, message: error?.message });
+  return res.status(500).json({ error: fallbackCode, message: "WolfCRM couldn't complete the weather workflow." });
+}
+
+function normalizeWeatherJobIDs(raw) {
+  if (!Array.isArray(raw) || !raw.length || raw.length > 50) {
+    throw new WeatherSchedulingError("invalid_weather_reschedule_jobs", "Choose between 1 and 50 jobs.");
+  }
+  const ids = raw.map((value) => String(value || "").trim());
+  if (ids.some((id) => !id || id.length > 160) || new Set(ids).size !== ids.length) {
+    throw new WeatherSchedulingError("invalid_weather_reschedule_jobs", "Every selected job must be unique.");
+  }
+  return ids;
+}
+
+async function loadWeatherCompany(queryable, companyId) {
+  const company = (await queryable.query(
+    `SELECT id, name, timezone, weather_settings
+       FROM companies
+      WHERE id = $1
+      LIMIT 1`,
+    [companyId]
+  )).rows[0];
+  if (!company) throw new WeatherSchedulingError("company_not_found", "Company is no longer available.", { statusCode: 404 });
+  return { ...company, settings: resolveWeatherSettings(company.weather_settings) };
+}
+
+const WEATHER_JOB_SELECT = `
+  SELECT se.id, se.title, se.start_at, se.end_at, se.services, se.service_items,
+         se.worker_user_ids, se.sales_user_ids, se.weather_exposure, se.started_at, se.finished_at,
+         se.contact_id, se.updated_at, COUNT(*) OVER()::int AS weather_query_total,
+         c.name AS contact_name, c.phone AS contact_phone, c.address AS contact_address,
+         c.lat AS contact_latitude, c.lng AS contact_longitude, c.job_type AS contact_job_type
+    FROM schedule_events se
+    LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id`;
+
+async function loadUpcomingWeatherJobs(queryable, companyId, settings) {
+  const horizon = new Date(Date.now() + settings.lookahead_days * 86_400_000);
+  return (await queryable.query(
+    `${WEATHER_JOB_SELECT}
+      WHERE se.company_id = $1
+        AND se.finished_at IS NULL
+        AND se.end_at > now()
+        AND se.start_at < $2
+      ORDER BY se.start_at ASC
+      LIMIT 200`,
+    [companyId, horizon]
+  )).rows;
+}
+
+async function loadSelectedWeatherJobs(queryable, companyId, ids, { forUpdate = false } = {}) {
+  const result = await queryable.query(
+    `${WEATHER_JOB_SELECT}
+      WHERE se.company_id = $1 AND se.id = ANY($2::text[])
+        AND se.started_at IS NULL
+        AND se.finished_at IS NULL
+        AND se.end_at > now()
+      ORDER BY se.start_at ASC, se.id ASC
+      ${forUpdate ? "FOR UPDATE OF se" : ""}`,
+    [companyId, ids]
+  );
+  if (result.rows.length !== ids.length) {
+    const found = new Set(result.rows.map((row) => String(row.id)));
+    throw new WeatherSchedulingError("weather_jobs_changed", "One or more selected jobs are no longer available. Reload and review the selection.", {
+      statusCode: 409,
+      details: { missing_job_ids: ids.filter((id) => !found.has(id)) }
+    });
+  }
+  return result.rows;
+}
+
+async function createWeatherRiskReport(companyId) {
+  const company = await loadWeatherCompany(pool, companyId);
+  const jobs = await loadUpcomingWeatherJobs(pool, companyId, company.settings);
+  return buildWeatherRiskReport({ jobs, settings: company.settings, weatherService: googleWeatherService });
+}
+
+async function syncWeatherRiskObservations(companyId, report, { actorUserId = null, source = "weather.monitor" } = {}) {
+  if (!report.monitoring_enabled || !report.provider_configured) return [];
+  const fresh = [];
+  const evaluatedIDs = new Set((report.observation_resolution_job_ids || report.evaluated_job_ids || []).map(String));
+  const activeKeys = new Set(report.risks.map((risk) => `${risk.job_id}:${new Date(risk.start_at).toISOString()}`));
+  const db = await pool.connect();
+  try {
+    await db.query("BEGIN");
+    await db.query(
+      `UPDATE weather_risk_observations o
+          SET resolved_at = COALESCE(resolved_at, now())
+        WHERE o.company_id = $1 AND o.resolved_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM schedule_events se
+             WHERE se.company_id = o.company_id AND se.id = o.job_id
+               AND se.start_at = o.job_start_at AND se.started_at IS NULL
+               AND se.finished_at IS NULL AND se.end_at > now()
+          )`,
+      [companyId]
+    );
+    for (const risk of report.risks) {
+      const inserted = await db.query(
+        `INSERT INTO weather_risk_observations(company_id, job_id, job_start_at, severity, snapshot)
+         VALUES($1,$2,$3,$4,$5::jsonb)
+         ON CONFLICT(company_id, job_id, job_start_at) DO NOTHING
+         RETURNING id`,
+        [companyId, risk.job_id, risk.start_at, risk.severity, JSON.stringify(risk)]
+      );
+      if (inserted.rowCount) fresh.push(risk);
+      else {
+        await db.query(
+          `UPDATE weather_risk_observations
+              SET severity = $4, snapshot = $5::jsonb, last_detected_at = now(), resolved_at = NULL
+            WHERE company_id = $1 AND job_id = $2 AND job_start_at = $3`,
+          [companyId, risk.job_id, risk.start_at, risk.severity, JSON.stringify(risk)]
+        );
+      }
+    }
+    const active = await db.query(
+      `SELECT id, job_id, job_start_at FROM weather_risk_observations
+        WHERE company_id = $1 AND resolved_at IS NULL`,
+      [companyId]
+    );
+    const resolvedIDs = active.rows
+      .filter((row) => evaluatedIDs.has(String(row.job_id)))
+      .filter((row) => !activeKeys.has(`${row.job_id}:${new Date(row.job_start_at).toISOString()}`))
+      .map((row) => row.id);
+    if (resolvedIDs.length) {
+      await db.query(`UPDATE weather_risk_observations SET resolved_at = now() WHERE company_id = $1 AND id = ANY($2::uuid[])`, [companyId, resolvedIDs]);
+    }
+    await db.query("COMMIT");
+  } catch (error) {
+    await db.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    db.release();
+  }
+  for (const risk of fresh) {
+    await emitAutomationEvent({
+      companyId,
+      eventType: "weather.job_at_risk",
+      subjectType: "job",
+      subjectId: risk.job_id,
+      actorUserId,
+      source,
+      dedupeKey: `weather.job_at_risk:${risk.job_id}:${risk.start_at}`,
+      payload: { job_id: risk.job_id, contact_id: risk.contact_id, start_at: risk.start_at, severity: risk.severity, summary: risk.summary, risk }
+    }).catch((error) => console.error("[weather] automation event failed", error?.message || error));
+  }
+  return fresh;
+}
+
+function weatherServiceName(job) {
+  const items = Array.isArray(job.service_items) ? job.service_items : [];
+  return String(items[0]?.name || items[0] || (Array.isArray(job.services) ? job.services[0] : "") || job.title || "service").trim();
+}
+
+async function weatherNotificationPreviews(queryable, company, jobs, plan, template) {
+  const phonesByJob = new Map();
+  const normalizedPhones = [];
+  for (const job of jobs) {
+    const phone = normalizeE164Phone(job.contact_phone);
+    phonesByJob.set(String(job.id), phone);
+    if (isUsableE164(phone)) normalizedPhones.push(phone);
+  }
+  const optedOutRows = normalizedPhones.length ? (await queryable.query(
+    `SELECT normalized_phone FROM phone_opt_outs
+      WHERE company_id = $1 AND channel = 'sms' AND status = 'opted_out'
+        AND normalized_phone = ANY($2::text[])`,
+    [company.id, [...new Set(normalizedPhones)]]
+  )).rows : [];
+  const optedOut = new Set(optedOutRows.map((row) => row.normalized_phone));
+  const jobsByID = new Map(jobs.map((job) => [String(job.id), job]));
+  return plan.items.map((item) => {
+    const job = jobsByID.get(item.job_id);
+    const recipientPhone = phonesByJob.get(item.job_id);
+    let blockReason = null;
+    if (!job.contact_id || !job.contact_name) blockReason = "linked_contact_required";
+    else if (!isUsableE164(recipientPhone)) blockReason = "valid_customer_phone_required";
+    else if (optedOut.has(recipientPhone)) blockReason = "customer_sms_opted_out";
+    const message = renderWeatherRescheduleMessage(template, {
+      customerName: job.contact_name,
+      companyName: company.name,
+      serviceName: weatherServiceName(job),
+      oldTime: item.old_start_at,
+      newTime: item.new_start_at,
+      timeZone: company.timezone
+    });
+    return {
+      ...item,
+      recipient_phone: isUsableE164(recipientPhone) ? recipientPhone : null,
+      notification_eligible: blockReason == null,
+      notification_block_reason: blockReason,
+      notification_message: message
+    };
+  });
+}
+
+async function loadWeatherBatch(queryable, companyId, batchId) {
+  const batch = (await queryable.query(
+    `SELECT * FROM weather_reschedule_batches WHERE company_id = $1 AND id = $2 LIMIT 1`,
+    [companyId, batchId]
+  )).rows[0];
+  if (!batch) return null;
+  const items = (await queryable.query(
+    `SELECT * FROM weather_reschedule_items WHERE company_id = $1 AND batch_id = $2 ORDER BY new_start_at ASC, job_id ASC`,
+    [companyId, batchId]
+  )).rows;
+  return { ...batch, items };
+}
+
+async function processWeatherBatchNotifications(companyId, actorUserId, batchId) {
+  const pending = (await pool.query(
+    `SELECT * FROM weather_reschedule_items
+      WHERE company_id = $1 AND batch_id = $2 AND notification_status = 'pending'
+      ORDER BY new_start_at ASC`,
+    [companyId, batchId]
+  )).rows;
+  for (const item of pending) {
+    const claimed = await pool.query(
+      `UPDATE weather_reschedule_items
+          SET notification_status = 'sending', updated_at = now()
+        WHERE company_id = $1 AND batch_id = $2 AND job_id = $3 AND notification_status = 'pending'
+        RETURNING *`,
+      [companyId, batchId, item.job_id]
+    );
+    if (!claimed.rowCount) continue;
+    let delivery;
+    try {
+      delivery = await deliverCustomerWorkflowMessage({
+        channel: "sms",
+        companyId,
+        contactId: item.contact_id,
+        recipientPhone: item.recipient_phone,
+        body: item.notification_message
+      });
+    } catch (error) {
+      if (error?.code === "customer_sms_opted_out") {
+        await recordPhoneSmsConsent(companyId, item.recipient_phone, "opted_out", "weather.reschedule").catch(() => {});
+      }
+      await pool.query(
+        `UPDATE weather_reschedule_items
+            SET notification_status = 'failed', error_code = $4, error_message = $5, updated_at = now()
+          WHERE company_id = $1 AND batch_id = $2 AND job_id = $3`,
+        [companyId, batchId, item.job_id, error?.code || "customer_message_send_failed", error?.message || "Customer message failed."]
+      );
+      continue;
+    }
+
+    const persistence = await pool.connect();
+    let storedMessage;
+    try {
+      await persistence.query("BEGIN");
+      await persistence.query(
+        `UPDATE weather_reschedule_items
+            SET notification_status = 'provider_accepted', provider_message_sid = $4, updated_at = now()
+          WHERE company_id = $1 AND batch_id = $2 AND job_id = $3`,
+        [companyId, batchId, item.job_id, delivery.providerMessageSid]
+      );
+      storedMessage = (await persistence.query(
+        `INSERT INTO sms_messages(
+           conversation_id, twilio_message_sid, direction, from_number, to_number,
+           body, message_status, media_count, media
+         ) VALUES($1,$2,'outbound',$3,$4,$5,$6,0,'[]'::jsonb)
+         RETURNING *`,
+        [delivery.conversationId, delivery.providerMessageSid, delivery.fromNumber, delivery.toNumber, item.notification_message, delivery.status]
+      )).rows[0];
+      await persistence.query(`UPDATE sms_conversations SET last_message_at = now(), updated_at = now() WHERE id = $1`, [delivery.conversationId]);
+      await persistence.query(
+        `UPDATE weather_reschedule_items
+            SET notification_status = $4, sms_conversation_id = $5, sms_message_id = $6,
+                provider_message_sid = $7, updated_at = now()
+          WHERE company_id = $1 AND batch_id = $2 AND job_id = $3`,
+        [companyId, batchId, item.job_id, delivery.status, delivery.conversationId, storedMessage.id, delivery.providerMessageSid]
+      );
+      await persistence.query("COMMIT");
+    } catch (error) {
+      await persistence.query("ROLLBACK").catch(() => {});
+      await pool.query(
+        `UPDATE weather_reschedule_items
+            SET notification_status = 'delivery_unknown', provider_message_sid = $4,
+                error_code = 'message_store_failed',
+                error_message = 'Provider accepted the message but local persistence did not finish.', updated_at = now()
+          WHERE company_id = $1 AND batch_id = $2 AND job_id = $3`,
+        [companyId, batchId, item.job_id, delivery.providerMessageSid]
+      ).catch(() => {});
+      continue;
+    } finally {
+      persistence.release();
+    }
+    await emitCustomerWorkflowSmsHooks({
+      companyId,
+      actorUserId,
+      contactId: item.contact_id,
+      storedMessage,
+      recipientPhone: delivery.toNumber,
+      fromNumber: delivery.fromNumber,
+      workflow: "weather.reschedule",
+      dirtyReason: "sms.weather_reschedule"
+    });
+  }
+  const counts = (await pool.query(
+    `SELECT COUNT(*) FILTER (WHERE notification_status IN ('failed','delivery_unknown'))::int AS failed_count,
+            COUNT(*) FILTER (WHERE notification_status IN ('pending','sending','provider_accepted'))::int AS pending_count
+       FROM weather_reschedule_items
+      WHERE company_id = $1 AND batch_id = $2`,
+    [companyId, batchId]
+  )).rows[0];
+  const status = Number(counts?.pending_count || 0) > 0 ? "processing" : Number(counts?.failed_count || 0) > 0 ? "partial" : "complete";
+  await pool.query(`UPDATE weather_reschedule_batches SET status = $3, updated_at = now() WHERE company_id = $1 AND id = $2`, [companyId, batchId, status]);
+}
+
+app.get("/api/weather/status", authRequired, requireCapability("schedule.view"), async (req, res) => {
+  try {
+    const company = await loadWeatherCompany(pool, req.companyId);
+    res.json({ ...googleWeatherService.status(), monitoring_enabled: company.settings.enabled });
+  } catch (error) {
+    sendWeatherError(res, error, "weather_status_failed");
+  }
+});
+
+app.get("/api/weather/settings", authRequired, requireCapability("schedule.view"), async (req, res) => {
+  try {
+    const company = await loadWeatherCompany(pool, req.companyId);
+    res.json(company.settings);
+  } catch (error) {
+    sendWeatherError(res, error, "weather_settings_load_failed");
+  }
+});
+
+app.put("/api/weather/settings", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
+  try {
+    const settings = validateWeatherSettings(req.body);
+    const saved = await pool.query(
+      `UPDATE companies SET weather_settings = $2::jsonb, updated_at = now() WHERE id = $1 RETURNING weather_settings`,
+      [req.companyId, JSON.stringify(settings)]
+    );
+    if (!saved.rowCount) return res.status(404).json({ error: "company_not_found" });
+    res.json(resolveWeatherSettings(saved.rows[0].weather_settings));
+  } catch (error) {
+    sendWeatherError(res, error, "weather_settings_update_failed");
+  }
+});
+
+app.get("/api/weather/risks", authRequired, requireCapability("schedule.view"), async (req, res) => {
+  try {
+    const report = await createWeatherRiskReport(req.companyId);
+    await syncWeatherRiskObservations(req.companyId, report, { actorUserId: req.userId, source: "weather.ios_refresh" });
+    res.json(report);
+  } catch (error) {
+    sendWeatherError(res, error, "weather_risks_failed");
+  }
+});
+
+app.post("/api/weather/reschedule/preview", authRequired, requireCapability("schedule.edit"), async (req, res) => {
+  try {
+    const ids = normalizeWeatherJobIDs(req.body?.job_ids);
+    const [company, jobs] = await Promise.all([
+      loadWeatherCompany(pool, req.companyId),
+      loadSelectedWeatherJobs(pool, req.companyId, ids)
+    ]);
+    const plan = planWeatherReschedule(jobs, req.body?.replacement_start_at);
+    const template = req.body?.notification_template == null
+      ? company.settings.notification_template
+      : validateWeatherNotificationTemplate(req.body.notification_template);
+    let items = await weatherNotificationPreviews(pool, company, jobs, plan, template);
+    const canNotifyCustomers = hasCapability(req, "messaging.customer.send");
+    if (!canNotifyCustomers) {
+      items = items.map((item) => ({
+        ...item,
+        recipient_phone: null,
+        notification_eligible: false,
+        notification_block_reason: "permission_denied"
+      }));
+    }
+    res.json({ ...plan, notification_template: template, can_notify_customers: canNotifyCustomers, items });
+  } catch (error) {
+    sendWeatherError(res, error, "weather_reschedule_preview_failed");
+  }
+});
+
+app.post("/api/weather/reschedule", authRequired, requireCapability("schedule.edit"), async (req, res) => {
+  const idempotencyKey = String(req.body?.idempotency_key || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) {
+    return res.status(400).json({ error: "weather_idempotency_key_required", message: "Reload the reschedule preview and try again." });
+  }
+  const notifyCustomers = req.body?.notify_customers === true;
+  if (notifyCustomers && !hasCapability(req, "messaging.customer.send")) {
+    return res.status(403).json({ error: "permission_denied", required_capability: "messaging.customer.send" });
+  }
+  let batchId;
+  let replayed = false;
+  let beforeJobs = [];
+  let updatedJobs = [];
+  const db = await pool.connect();
+  try {
+    const ids = normalizeWeatherJobIDs(req.body?.job_ids);
+    await db.query("BEGIN");
+    await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`weather-reschedule:${req.companyId}:${idempotencyKey}`]);
+    const existing = (await db.query(
+      `SELECT id FROM weather_reschedule_batches WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1`,
+      [req.companyId, idempotencyKey]
+    )).rows[0];
+    if (existing) {
+      batchId = existing.id;
+      replayed = true;
+      await db.query("COMMIT");
+    } else {
+      const company = await loadWeatherCompany(db, req.companyId);
+      beforeJobs = await loadSelectedWeatherJobs(db, req.companyId, ids, { forUpdate: true });
+      validateWeatherExpectedIntervals(beforeJobs, req.body?.expected_intervals);
+      const plan = planWeatherReschedule(beforeJobs, req.body?.replacement_start_at);
+      const template = req.body?.notification_template == null
+        ? company.settings.notification_template
+        : validateWeatherNotificationTemplate(req.body.notification_template);
+      const previews = await weatherNotificationPreviews(db, company, beforeJobs, plan, template);
+      batchId = randomUUID();
+      await db.query(
+        `INSERT INTO weather_reschedule_batches(
+           id, company_id, created_by, idempotency_key, replacement_start_at,
+           notify_customers, notification_template, status
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,'processing')`,
+        [batchId, req.companyId, req.userId, idempotencyKey, plan.replacement_start_at, notifyCustomers, template]
+      );
+      for (const item of previews) {
+        const notificationStatus = !notifyCustomers ? "not_requested" : item.notification_eligible ? "pending" : "failed";
+        await db.query(
+          `INSERT INTO weather_reschedule_items(
+             batch_id, company_id, job_id, contact_id, contact_name, recipient_phone, job_title,
+             old_start_at, old_end_at, new_start_at, new_end_at,
+             notification_status, notification_message, error_code, error_message
+           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          [batchId, req.companyId, item.job_id, item.contact_id, item.contact_name, item.recipient_phone, item.title,
+            item.old_start_at, item.old_end_at, item.new_start_at, item.new_end_at,
+            notificationStatus, item.notification_message,
+            notifyCustomers && !item.notification_eligible ? item.notification_block_reason : null,
+            notifyCustomers && !item.notification_eligible ? "Customer notification was not eligible." : null]
+        );
+        const updated = (await db.query(
+          `UPDATE schedule_events
+              SET start_at = $3, end_at = $4, updated_at = now()
+            WHERE company_id = $1 AND id = $2
+            RETURNING *`,
+          [req.companyId, item.job_id, item.new_start_at, item.new_end_at]
+        )).rows[0];
+        if (!updated) throw new WeatherSchedulingError("weather_jobs_changed", "A selected job changed before the move completed.", { statusCode: 409 });
+        updatedJobs.push(updated);
+      }
+      await db.query("COMMIT");
+    }
+  } catch (error) {
+    await db.query("ROLLBACK").catch(() => {});
+    return sendWeatherError(res, error, "weather_reschedule_failed");
+  } finally {
+    db.release();
+  }
+
+  if (!replayed) {
+    for (let index = 0; index < updatedJobs.length; index += 1) {
+      const before = beforeJobs.find((job) => String(job.id) === String(updatedJobs[index].id));
+      const after = updatedJobs[index];
+      await emitJobRouteEvents(req.companyId, req.userId, before, after, "weather.reschedule").catch((error) => console.error("[weather] job event failed", error?.message || error));
+      await syncAutomationSchedulesForJob(req.companyId, after).catch((error) => console.error("[weather] job schedule sync failed", error?.message || error));
+      await markGoogleSheetsContactDirty(pool, req.companyId, after.contact_id, "job.weather_rescheduled").catch(() => {});
+    }
+    if (notifyCustomers) await processWeatherBatchNotifications(req.companyId, req.userId, batchId);
+    else await pool.query(`UPDATE weather_reschedule_batches SET status = 'complete', updated_at = now() WHERE company_id = $1 AND id = $2`, [req.companyId, batchId]);
+  } else {
+    await pool.query(
+      `UPDATE weather_reschedule_items
+          SET notification_status = 'delivery_unknown', error_code = 'interrupted_send',
+              error_message = 'A prior request ended while the provider result was unknown.', updated_at = now()
+        WHERE company_id = $1 AND batch_id = $2 AND notification_status IN ('sending','provider_accepted')`,
+      [req.companyId, batchId]
+    );
+    const existingBatch = await loadWeatherBatch(pool, req.companyId, batchId);
+    if (existingBatch?.notify_customers) await processWeatherBatchNotifications(req.companyId, req.userId, batchId);
+  }
+  const batch = await loadWeatherBatch(pool, req.companyId, batchId);
+  res.status(replayed ? 200 : 201).json({ batch, replayed });
+});
+
+let weatherScannerRunning = false;
+async function scanEnabledWeatherCompanies() {
+  if (weatherScannerRunning || !googleWeatherService.status().configured) return;
+  weatherScannerRunning = true;
+  try {
+    const companies = (await pool.query(
+      `SELECT id FROM companies
+        WHERE COALESCE((weather_settings ->> 'enabled')::boolean, false) = true
+        ORDER BY id ASC`
+    )).rows;
+    let cursor = 0;
+    async function worker() {
+      while (cursor < companies.length) {
+        const companyId = companies[cursor++].id;
+        try {
+          const report = await createWeatherRiskReport(companyId);
+          const fresh = await syncWeatherRiskObservations(companyId, report, { source: "weather.periodic_monitor" });
+          if (fresh.length) {
+            const owners = await employerUserIdsForCompany(companyId);
+            const highest = fresh.some((risk) => risk.severity === "critical") ? "Critical weather risk"
+              : fresh.some((risk) => risk.severity === "high") ? "High weather risk" : "Weather risk detected";
+            await sendPushToUsers(owners, "weather_risk", {
+              title: highest,
+              body: `${fresh.length} upcoming ${fresh.length === 1 ? "job may be" : "jobs may be"} affected. Review the Weather section in Schedule.`,
+              payload: { type: "weather_risk", schedule_mode: "weather" },
+              threadId: "weather-risk"
+            });
+          }
+        } catch (error) {
+          console.error("[weather] periodic company scan failed", { companyId, code: error?.code, message: error?.message });
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(2, companies.length) }, worker));
+  } finally {
+    weatherScannerRunning = false;
+  }
+}
+
+function startWeatherRiskWorkers() {
+  const configuredMinutes = Number(process.env.WEATHER_SCAN_INTERVAL_MINUTES || 180);
+  const intervalMinutes = Math.min(720, Math.max(30, Number.isFinite(configuredMinutes) ? configuredMinutes : 180));
+  setTimeout(() => scanEnabledWeatherCompanies().catch(() => {}), 15_000).unref?.();
+  setInterval(() => scanEnabledWeatherCompanies().catch(() => {}), intervalMinutes * 60_000).unref?.();
+}
+
+// ---------- INTELLIGENT WORKER ASSIGNMENT ----------
+function sendAssignmentRecommendationError(res, error) {
+  if (error instanceof AssignmentRecommendationError) {
+    return res.status(error.statusCode || 400).json({
+      error: error.code,
+      message: error.message,
+      ...(error.details ? { details: error.details } : {})
+    });
+  }
+  console.error("[assignment-recommendations] failed", { code: error?.code, message: error?.message });
+  return res.status(500).json({
+    error: "assignment_recommendations_failed",
+    message: "WolfCRM couldn't build worker recommendations."
+  });
+}
+
+async function loadAssignmentRecommendationContext(companyId, jobId, queryable = pool) {
+  const target = (await queryable.query(
+    `SELECT se.*, c.lat AS contact_latitude, c.lng AS contact_longitude
+       FROM schedule_events se
+       LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id
+      WHERE se.company_id = $1 AND se.id = $2
+      LIMIT 1`,
+    [companyId, jobId]
+  )).rows[0];
+  if (!target) {
+    throw new AssignmentRecommendationError("assignment_job_not_found", "The scheduled job was not found.", { statusCode: 404 });
+  }
+  const companyResult = await queryable.query(
+    `SELECT timezone, business_days, business_open_time, business_close_time
+       FROM companies WHERE id = $1`,
+    [companyId]
+  );
+  if (!companyResult.rowCount) {
+    throw new AssignmentRecommendationError("company_not_found", "Company is no longer available.", { statusCode: 404 });
+  }
+  const windowStart = new Date(new Date(target.start_at).getTime() - 36 * 3_600_000);
+  const windowEnd = new Date(new Date(target.end_at).getTime() + 36 * 3_600_000);
+  const [workersResult, availabilityResult, scheduleResult, originsResult] = await Promise.all([
+    queryable.query(
+      `SELECT u.id, u.email, u.display_name, u.role, p.*
+         FROM users u
+         LEFT JOIN employee_permissions p ON p.user_id = u.id
+        WHERE u.company_id = $1 AND u.deleted_at IS NULL
+        ORDER BY COALESCE(NULLIF(BTRIM(u.display_name), ''), u.email), u.id
+        LIMIT 51`,
+      [companyId]
+    ),
+    queryable.query(
+      `SELECT user_id, weekdays, start_time, end_time, timezone, enabled
+         FROM employee_schedule_availability WHERE company_id = $1`,
+      [companyId]
+    ),
+    queryable.query(
+      `SELECT se.id, se.title, se.start_at, se.end_at, se.worker_user_ids, se.started_at, se.finished_at,
+              c.lat AS contact_latitude, c.lng AS contact_longitude
+         FROM schedule_events se
+         LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id
+        WHERE se.company_id = $1 AND se.id <> $2
+          AND se.finished_at IS NULL
+          AND se.start_at < $4 AND se.end_at > $3
+        ORDER BY se.start_at, se.end_at, se.id
+        LIMIT 501`,
+      [companyId, jobId, windowStart, windowEnd]
+    ),
+    queryable.query(
+      `SELECT mes.employee_id, l.name, l.lat, l.lng
+         FROM mileage_employee_settings mes
+         JOIN mileage_company_locations l
+           ON l.company_id = mes.company_id AND l.id = mes.start_location_id AND l.active = true
+        WHERE mes.company_id = $1`,
+      [companyId]
+    )
+  ]);
+  if (workersResult.rows.length > 50) {
+    throw new AssignmentRecommendationError("assignment_workers_invalid", "Recommendations support up to 50 active employees.");
+  }
+  const workers = workersResult.rows.map((worker) => {
+    const access = resolveAccess({
+      role: worker.role,
+      preset: worker.permission_preset,
+      overrides: worker.permission_overrides,
+      legacy: worker
+    });
+    return {
+      id: worker.id,
+      email: worker.email,
+      display_name: worker.display_name,
+      permitted: access.capabilities["jobs.work"] === true
+    };
+  });
+  const company = companyResult.rows[0];
+  return {
+    target,
+    workers,
+    existingJobs: scheduleResult.rows,
+    availabilityByWorker: Object.fromEntries(availabilityResult.rows.map((row) => [row.user_id, row])),
+    companyAvailability: {
+      weekdays: Array.isArray(company.business_days) ? company.business_days.map(Number) : [1, 2, 3, 4, 5],
+      start_time: company.business_open_time || "09:00",
+      end_time: company.business_close_time || "17:00",
+      enabled: true
+    },
+    timeZone: company.timezone || "America/New_York",
+    originsByWorker: Object.fromEntries(originsResult.rows.map((row) => [row.employee_id, row]))
+  };
+}
+
+function assignmentRoutePoint(raw, id, fallbackLabel) {
+  if (raw?.contact_latitude == null && raw?.lat == null) return null;
+  if (raw?.contact_longitude == null && raw?.lng == null) return null;
+  const latitude = Number(raw.contact_latitude ?? raw.lat);
+  const longitude = Number(raw.contact_longitude ?? raw.lng);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)
+      || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
+  return { id, label: String(raw.title || raw.name || fallbackLabel), latitude, longitude };
+}
+
+async function estimateAssignmentInsertionTravel({ context, recommendation, routingStatus }) {
+  if (!routingStatus.configured) {
+    return { coverage: "unavailable", warning: "Google routing is not configured." };
+  }
+  const targetPoint = assignmentRoutePoint(context.target, "assignment-target", "Target job");
+  if (!targetPoint) return { coverage: "unavailable", warning: "The target job has no saved coordinates." };
+  const jobsByID = new Map(context.existingJobs.map((job) => [String(job.id), job]));
+  const previous = recommendation.previous_job ? jobsByID.get(String(recommendation.previous_job.id)) : null;
+  const next = recommendation.next_job ? jobsByID.get(String(recommendation.next_job.id)) : null;
+  const previousPoint = previous ? assignmentRoutePoint(previous, "assignment-origin", "Previous job") : null;
+  const approvedOrigin = !previous
+    ? assignmentRoutePoint(context.originsByWorker[recommendation.worker_id], "assignment-origin", "Approved start location")
+    : null;
+  const origin = previousPoint || approvedOrigin;
+  const nextPoint = next ? assignmentRoutePoint(next, "assignment-next", "Next job") : null;
+  const departure = previous?.end_at || context.target.start_at;
+  const targetDurationSeconds = Math.max(0, Math.round(
+    (new Date(context.target.end_at).getTime() - new Date(context.target.start_at).getTime()) / 1000
+  ));
+
+  try {
+    if (!origin) {
+      if (!nextPoint) {
+        return {
+          coverage: "unavailable",
+          warning: previous
+            ? "The previous job and next leg do not have enough saved coordinates."
+            : "No preceding job or approved employee start location has saved coordinates."
+        };
+      }
+      const outgoingPlan = await googleRoutingService.plan({
+        start: targetPoint,
+        stops: [{ ...nextPoint, id: "assignment-next", service_duration_seconds: 0 }],
+        ending_behavior: "finish_at_final_stop",
+        optimize_order: false,
+        departure_time: context.target.end_at
+      });
+      return {
+        coverage: "partial",
+        source: "target_to_next_only",
+        incoming_seconds: null,
+        outgoing_seconds: outgoingPlan.legs[0]?.travel_time_seconds ?? outgoingPlan.travel_time_seconds,
+        baseline_seconds: null,
+        added_seconds: null,
+        distance_meters: outgoingPlan.distance_meters,
+        warning: previous
+          ? "The previous job is missing coordinates, so incoming and added travel are unknown."
+          : "No preceding job or approved start location is available, so incoming travel is unknown."
+      };
+    }
+
+    const withTarget = await googleRoutingService.plan({
+      start: origin,
+      stops: [{ ...targetPoint, id: "assignment-target", service_duration_seconds: targetDurationSeconds }],
+      ending_behavior: nextPoint ? "custom_address" : "finish_at_final_stop",
+      ...(nextPoint ? { end: { ...nextPoint, id: "assignment-end" } } : {}),
+      optimize_order: false,
+      departure_time: departure
+    });
+    let baselineSeconds = 0;
+    if (nextPoint) {
+      const baseline = await googleRoutingService.plan({
+        start: origin,
+        stops: [{ ...nextPoint, id: "assignment-next", service_duration_seconds: 0 }],
+        ending_behavior: "finish_at_final_stop",
+        optimize_order: false,
+        departure_time: departure
+      });
+      baselineSeconds = baseline.travel_time_seconds;
+    }
+    const incomingSeconds = withTarget.legs[0]?.travel_time_seconds ?? null;
+    const outgoingSeconds = next ? (nextPoint ? withTarget.legs[1]?.travel_time_seconds ?? null : null) : 0;
+    const complete = !next || Boolean(nextPoint);
+    return {
+      coverage: complete ? "complete" : "partial",
+      source: previousPoint ? "previous_job" : "approved_start_location",
+      incoming_seconds: incomingSeconds,
+      outgoing_seconds: outgoingSeconds,
+      baseline_seconds: complete ? baselineSeconds : null,
+      added_seconds: complete && incomingSeconds != null && outgoingSeconds != null
+        ? incomingSeconds + outgoingSeconds - baselineSeconds
+        : null,
+      distance_meters: withTarget.distance_meters,
+      warning: complete ? null : "The next job is missing coordinates, so outgoing and added travel are unknown."
+    };
+  } catch (error) {
+    return {
+      coverage: "unavailable",
+      source: previousPoint ? "previous_job" : approvedOrigin ? "approved_start_location" : null,
+      warning: error?.code === "invalid_route_request"
+        ? "This job is outside the routing provider's supported departure window."
+        : "Google could not calculate this employee's road insertion."
+    };
+  }
+}
+
+async function mapAssignmentWorkers(items, work, concurrency = 3) {
+  const output = Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      output[index] = await work(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, worker));
+  return output;
+}
+
+app.get("/api/jobs/:id/assignment-recommendations", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const context = await loadAssignmentRecommendationContext(req.companyId, req.params.id);
+    const routingStatus = googleRoutingService.status();
+    const initial = buildAssignmentRecommendations({
+      targetJob: context.target,
+      workers: context.workers,
+      existingJobs: context.existingJobs,
+      availabilityByWorker: context.availabilityByWorker,
+      companyAvailability: context.companyAvailability,
+      timeZone: context.timeZone,
+      routingStatus
+    });
+    const maximumRoadCandidates = 15;
+    const roadCandidateIDs = new Set(initial.recommendations.slice(0, maximumRoadCandidates).map((item) => item.worker_id));
+    const travelRows = await mapAssignmentWorkers(initial.recommendations, (recommendation) => (
+      roadCandidateIDs.has(recommendation.worker_id)
+        ? estimateAssignmentInsertionTravel({ context, recommendation, routingStatus })
+        : { coverage: "unavailable", warning: "Road estimate omitted by the bounded candidate limit." }
+    ));
+    const travelByWorker = Object.fromEntries(initial.recommendations.map((recommendation, index) => [
+      recommendation.worker_id,
+      travelRows[index]
+    ]));
+    const report = buildAssignmentRecommendations({
+      targetJob: context.target,
+      workers: context.workers,
+      existingJobs: context.existingJobs,
+      availabilityByWorker: context.availabilityByWorker,
+      companyAvailability: context.companyAvailability,
+      timeZone: context.timeZone,
+      travelByWorker,
+      routingStatus
+    });
+    if (initial.recommendations.length > maximumRoadCandidates) {
+      report.warnings.push(`Road estimates were limited to the leading ${maximumRoadCandidates} schedule candidates.`);
+    }
+    res.json(report);
+  } catch (error) {
+    sendAssignmentRecommendationError(res, error);
+  }
+});
+
+function assignmentApplicationPayload(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    job_id: row.job_id,
+    actor_user_id: row.actor_user_id,
+    selected_worker_user_id: row.selected_worker_user_id,
+    assignment_mode: row.assignment_mode,
+    expected_job_updated_at: row.expected_job_updated_at,
+    applied_job_updated_at: row.applied_job_updated_at,
+    previous_worker_user_ids: safeArray(row.previous_worker_user_ids),
+    new_worker_user_ids: safeArray(row.new_worker_user_ids),
+    recommendation_snapshot: row.recommendation_snapshot || {},
+    created_at: row.created_at
+  };
+}
+
+async function loadAssignmentApplicationEvent(queryable, companyId, jobId) {
+  return (await queryable.query(
+    `SELECT se.*, se.start_at AS start, se.end_at AS "end"
+       FROM schedule_events se
+      WHERE se.company_id = $1 AND se.id = $2
+      LIMIT 1`,
+    [companyId, jobId]
+  )).rows[0] || null;
+}
+
+app.post(
+  "/api/jobs/:id/assignment-recommendations/apply",
+  authRequired,
+  requireAllCapabilities("schedule.manage_team", "schedule.edit"),
+  async (req, res) => {
+    if (!req.companyId) return res.status(403).json({ error: "company_required" });
+    const idempotencyKey = String(req.body?.idempotency_key || "").trim().toLowerCase();
+    const selectedWorkerID = String(req.body?.selected_worker_user_id || "").trim().toLowerCase();
+    const assignmentMode = String(req.body?.assignment_mode || "").trim().toLowerCase();
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    if (!uuidPattern.test(idempotencyKey)) {
+      return res.status(400).json({ error: "assignment_idempotency_key_required", message: "Reload recommendations and try again." });
+    }
+    if (!uuidPattern.test(selectedWorkerID)) {
+      return res.status(400).json({ error: "assignment_worker_required", message: "Choose an active employee." });
+    }
+
+    let replayed = false;
+    let application = null;
+    let before = null;
+    let event = null;
+    const db = await pool.connect();
+    try {
+      await db.query("BEGIN");
+      await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`job-assignment:${req.companyId}:${idempotencyKey}`]);
+      const existing = (await db.query(
+        `SELECT * FROM job_assignment_recommendation_applications
+          WHERE company_id = $1 AND idempotency_key = $2
+          LIMIT 1`,
+        [req.companyId, idempotencyKey]
+      )).rows[0];
+      if (existing) {
+        if (String(existing.job_id) !== String(req.params.id)
+            || existing.assignment_mode !== assignmentMode
+            || (existing.selected_worker_user_id && String(existing.selected_worker_user_id) !== selectedWorkerID)) {
+          throw new AssignmentRecommendationError(
+            "assignment_idempotency_conflict",
+            "That apply token was already used for a different assignment. Refresh and try again.",
+            { statusCode: 409 }
+          );
+        }
+        replayed = true;
+        application = existing;
+        event = await loadAssignmentApplicationEvent(db, req.companyId, req.params.id);
+      } else {
+        before = (await db.query(
+          `SELECT * FROM schedule_events
+            WHERE company_id = $1 AND id = $2
+            FOR UPDATE`,
+          [req.companyId, req.params.id]
+        )).rows[0];
+        if (!before) {
+          throw new AssignmentRecommendationError("assignment_job_not_found", "The scheduled job was not found.", { statusCode: 404 });
+        }
+        const context = await loadAssignmentRecommendationContext(req.companyId, req.params.id, db);
+        const report = buildAssignmentRecommendations({
+          targetJob: context.target,
+          workers: context.workers,
+          existingJobs: context.existingJobs,
+          availabilityByWorker: context.availabilityByWorker,
+          companyAvailability: context.companyAvailability,
+          timeZone: context.timeZone,
+          routingStatus: { configured: false, provider: googleRoutingService.status().provider || "google" }
+        });
+        const change = planAssignmentApplication({
+          report,
+          selectedWorkerID,
+          assignmentMode,
+          expectedUpdatedAt: req.body?.expected_updated_at
+        });
+        event = (await db.query(
+          `UPDATE schedule_events
+              SET worker_user_ids = $3::jsonb, updated_at = now()
+            WHERE company_id = $1 AND id = $2
+            RETURNING *, start_at AS start, end_at AS "end"`,
+          [req.companyId, req.params.id, JSON.stringify(change.new_worker_user_ids)]
+        )).rows[0];
+        if (!event) {
+          throw new AssignmentRecommendationError(
+            "assignment_job_changed",
+            "This job changed while the assignment was being applied. Refresh and review it again.",
+            { statusCode: 409 }
+          );
+        }
+        application = (await db.query(
+          `INSERT INTO job_assignment_recommendation_applications(
+             id, company_id, job_id, actor_user_id, selected_worker_user_id,
+             assignment_mode, idempotency_key, expected_job_updated_at, applied_job_updated_at,
+             previous_worker_user_ids, new_worker_user_ids, recommendation_snapshot
+           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb)
+           RETURNING *`,
+          [
+            randomUUID(), req.companyId, req.params.id, req.userId, selectedWorkerID,
+            change.assignment_mode, idempotencyKey, req.body.expected_updated_at, event.updated_at,
+            JSON.stringify(change.previous_worker_user_ids), JSON.stringify(change.new_worker_user_ids),
+            JSON.stringify({
+              generated_at: report.generated_at,
+              target_job: report.target_job,
+              selected_recommendation: change.recommendation,
+              provider_status: googleRoutingService.status(),
+              validation: "schedule_availability_permission",
+              route_evidence_revalidated: false
+            })
+          ]
+        )).rows[0];
+      }
+      await db.query("COMMIT");
+    } catch (error) {
+      await db.query("ROLLBACK").catch(() => {});
+      return sendAssignmentRecommendationError(res, error);
+    } finally {
+      db.release();
+    }
+
+    if (!replayed && before && event) {
+      const oldWorkerIDs = safeArray(before.worker_user_ids).map(String);
+      const newWorkerIDs = safeArray(event.worker_user_ids).map(String);
+      const addedWorkers = newWorkerIDs.filter((id) => !oldWorkerIDs.includes(id));
+      await notifyMany(
+        addedWorkers,
+        req.companyId,
+        "job_assignment",
+        "New Job Assigned to You",
+        event.title,
+        { schedule_event_id: event.id },
+        req.userId
+      ).catch((error) => console.error("[assignment-recommendations] notification hook failed", error?.message || error));
+      await emitJobRouteEvents(req.companyId, req.userId, before, event, "assignment_recommendations.api")
+        .catch((error) => console.error("[assignment-recommendations] automation hook failed", error?.message || error));
+      await syncAutomationSchedulesForJob(req.companyId, event)
+        .catch((error) => console.error("[assignment-recommendations] schedule hook failed", error?.message || error));
+      await markGoogleSheetsContactDirty(pool, req.companyId, event.contact_id, "job.assignment_recommendation_applied")
+        .catch((error) => console.error("[assignment-recommendations] sheets hook failed", error?.message || error));
+    }
+    res.status(replayed ? 200 : 201).json({
+      application: assignmentApplicationPayload(application),
+      event,
+      replayed
+    });
+  }
+);
 
 // ---------- JOB ON MY WAY ----------
 function onMyWayEventPayload(row) {
@@ -9466,6 +10714,15 @@ async function deliverCustomerWorkflowMessage({ channel, companyId, contactId, r
   if (channel !== "sms") {
     throw new OnMyWayError("on_my_way_channel_unavailable", "Only SMS is available for On My Way messages.", { statusCode: 422 });
   }
+  const consent = await pool.query(
+    `SELECT status FROM phone_opt_outs
+      WHERE company_id = $1 AND normalized_phone = $2 AND channel = 'sms'
+      LIMIT 1`,
+    [companyId, recipientPhone]
+  );
+  if (consent.rows[0]?.status === "opted_out") {
+    throw new OnMyWayError("customer_sms_opted_out", "This customer has opted out of SMS messages.", { statusCode: 422 });
+  }
   const lineResult = await pool.query(
     `SELECT id, phone_number
        FROM phone_lines
@@ -9518,7 +10775,16 @@ async function deliverCustomerWorkflowMessage({ channel, companyId, contactId, r
   }
 }
 
-async function emitOnMyWaySmsHooks({ companyId, actorUserId, contactId, storedMessage, recipientPhone, fromNumber }) {
+async function emitCustomerWorkflowSmsHooks({
+  companyId,
+  actorUserId,
+  contactId,
+  storedMessage,
+  recipientPhone,
+  fromNumber,
+  workflow = "customer.workflow",
+  dirtyReason = "sms.customer_workflow"
+}) {
   try {
     const stats = await pool.query(
       `SELECT COUNT(*) FILTER (WHERE direction = 'outbound')::int AS outbound_count
@@ -9539,7 +10805,7 @@ async function emitOnMyWaySmsHooks({ companyId, actorUserId, contactId, storedMe
       media_count: 0,
       has_media: false,
       outbound_count: stats.rows[0]?.outbound_count || 0,
-      workflow: "job.on_my_way"
+      workflow
     };
     await emitAutomationEvent({
       companyId,
@@ -9547,7 +10813,7 @@ async function emitOnMyWaySmsHooks({ companyId, actorUserId, contactId, storedMe
       subjectType: "sms_message",
       subjectId: storedMessage.id,
       actorUserId,
-      source: "job.on_my_way",
+      source: workflow,
       dedupeKey: `sms.sent:${storedMessage.id}`,
       payload
     });
@@ -9558,14 +10824,14 @@ async function emitOnMyWaySmsHooks({ companyId, actorUserId, contactId, storedMe
         subjectType: "sms_message",
         subjectId: storedMessage.id,
         actorUserId,
-        source: "job.on_my_way",
+        source: workflow,
         dedupeKey: `sms.first_outbound:${storedMessage.conversation_id}`,
         payload
       });
     }
     await syncAutomationSchedulesForSmsOutbound(companyId, { ...storedMessage, contact_id: contactId, external_phone_number: recipientPhone });
     await syncAutomationSchedulesForSmsConversationActivity(companyId, storedMessage.conversation_id, storedMessage);
-    await markGoogleSheetsContactDirty(pool, companyId, contactId, "sms.on_my_way");
+    await markGoogleSheetsContactDirty(pool, companyId, contactId, dirtyReason);
   } catch (error) {
     console.error("[on-my-way] SMS automation hook failed:", { messageId: storedMessage.id, code: error?.code, message: error?.message });
   }
@@ -9782,13 +11048,15 @@ app.post("/api/jobs/:id/on-my-way/send", authRequired, requireAllCapabilities("j
     persistence.release();
   }
 
-  await emitOnMyWaySmsHooks({
+  await emitCustomerWorkflowSmsHooks({
     companyId: req.companyId,
     actorUserId: req.userId,
     contactId: context.contact_id,
     storedMessage,
     recipientPhone: delivery.toNumber,
-    fromNumber: delivery.fromNumber
+    fromNumber: delivery.fromNumber,
+    workflow: "job.on_my_way",
+    dirtyReason: "sms.on_my_way"
   });
   const completed = await fetchOnMyWayEvent(pool, req.companyId, eventId);
   res.status(201).json({ event: onMyWayEventPayload(completed), replayed: false });
@@ -9928,7 +11196,8 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, requireCapability("job
        WHERE id = $1 AND company_id = $2
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
                  contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
-                 company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by`,
+                 company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
+                 weather_exposure`,
       [req.params.id, req.companyId, now, req.userId]
     )).rows[0];
     await emitAutomationEvent({ companyId: req.companyId, eventType: "job.completed", subjectType: "job", subjectId: req.params.id, actorUserId: req.userId, source: "job.workflow", dedupeKey: `job.completed:${req.params.id}:${updated.finished_at}`, payload: { job_id: req.params.id, finished_at: updated.finished_at, override: !!overrideReason } });
@@ -12942,6 +14211,7 @@ async function startServer() {
     requireIntegrationView: requireCapability("integrations.view")
   });
   startGoogleSheetsWorkers(pool);
+  startWeatherRiskWorkers();
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }
 
