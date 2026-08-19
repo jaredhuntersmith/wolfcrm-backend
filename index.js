@@ -7194,8 +7194,12 @@ app.delete("/api/time-clock/entries/:id", authRequired, requireAnyCapability("ti
     }
     const linkedEvidence = await client.query(
       `SELECT 1
-         FROM finance_time_job_links
-        WHERE company_id = $1 AND time_entry_id = $2 AND job_id IS NOT NULL
+         FROM finance_time_job_links l
+        WHERE l.company_id = $1 AND l.time_entry_id = $2
+          AND (l.job_id IS NOT NULL OR EXISTS (
+            SELECT 1 FROM finance_time_allocation_lines al
+             WHERE al.company_id = l.company_id AND al.link_id = l.id
+          ))
         LIMIT 1`,
       [req.companyId, req.params.id]
     );
