@@ -184,6 +184,12 @@ function testAdministrativeRouteClassification() {
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/operational-journals/receivables/123/preview"), "accounting.view");
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/operational-journals/receivables/123/post"), "accounting.manage");
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/operational-journals/receivables/123/void"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/operational-applications"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/operational-applications/payments/123"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/operational-applications/customer-credit-preview"), "accounting.view");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/operational-applications/payments/123/post"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/operational-applications/refunds/123/void"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/operational-applications/customer-credits"), "accounting.manage");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/transactions/123"), "accounting.manage");
 }
 

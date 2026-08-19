@@ -35,6 +35,7 @@ test("default chart has stable unique codes and system keys", () => {
   assert.ok(DEFAULT_CHART_ACCOUNTS.some((item) => item.account_type === "income"));
   assert.ok(DEFAULT_CHART_ACCOUNTS.some((item) => item.account_type === "expense"));
   assert.ok(DEFAULT_CHART_ACCOUNTS.some((item) => item.system_key === "customer_credits" && item.account_type === "liability"));
+  assert.ok(DEFAULT_CHART_ACCOUNTS.some((item) => item.system_key === "payment_clearing" && item.account_type === "asset"));
   assert.ok(DEFAULT_CHART_ACCOUNTS.some((item) => item.system_key === "opening_balance_equity" && item.account_type === "equity"));
 });
 

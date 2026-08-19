@@ -16612,6 +16612,7 @@ app.post("/stripe/webhook", async (req, res) => {
               refund_amount_known = false
               OR LEAST(amount_cents, $2::bigint) > refunded_amount_cents
               OR ($3::boolean AND status <> 'refunded')
+              OR (refunded_at IS NULL AND $4::timestamptz IS NOT NULL AND LEAST(amount_cents, $2::bigint) >= refunded_amount_cents)
             )
           RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency,
                     status, refunded_amount_cents, job_id`,

@@ -38,6 +38,10 @@ import {
   installFinanceOperationalJournalRoutes,
   installFinanceOperationalJournalSchema
 } from "./finance-operational-journals.js";
+import {
+  installFinanceOperationalApplicationRoutes,
+  installFinanceOperationalApplicationSchema
+} from "./finance-operational-applications.js";
 
 const ACCOUNT_TYPES = new Set(["asset", "liability", "equity", "income", "expense"]);
 const RECONCILIATION_STATUSES = new Set(["unreconciled", "cleared", "reconciled"]);
@@ -47,6 +51,7 @@ const MAX_REPORT_DAYS = 731;
 export const DEFAULT_CHART_ACCOUNTS = Object.freeze([
   { code: "1000", name: "Cash & Bank Accounts", account_type: "asset", subtype: "cash", system_key: "cash" },
   { code: "1100", name: "Accounts Receivable", account_type: "asset", subtype: "accounts_receivable", system_key: "accounts_receivable" },
+  { code: "1150", name: "Payment Clearing", account_type: "asset", subtype: "payment_clearing", system_key: "payment_clearing" },
   { code: "1300", name: "Vehicles & Equipment", account_type: "asset", subtype: "fixed_assets", system_key: "vehicles_equipment" },
   { code: "2000", name: "Accounts Payable", account_type: "liability", subtype: "accounts_payable", system_key: "accounts_payable" },
   { code: "2100", name: "Credit Cards", account_type: "liability", subtype: "credit_card", system_key: "credit_cards" },
@@ -459,6 +464,7 @@ export async function installFinanceAccountingSchema(pool) {
   await installFinanceBankTransferSchema(pool);
   await installOperationalAccountingSchema(pool);
   await installFinanceOperationalJournalSchema(pool);
+  await installFinanceOperationalApplicationSchema(pool);
   await installFinanceCostAllocationSchema(pool);
   await installFinanceMileageAllocationSchema(pool);
   await installFinancePayrollCostSchema(pool);
@@ -812,6 +818,7 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
 
   installOperationalAccountingRoutes({ app, pool, authRequired, requireEmployer });
   installFinanceOperationalJournalRoutes({ app, pool, authRequired, requireFinanceAccess: requireEmployer, ensureChartAccounts: ensureDefaultChartAccounts });
+  installFinanceOperationalApplicationRoutes({ app, pool, authRequired, requireFinanceAccess: requireEmployer, ensureChartAccounts: ensureDefaultChartAccounts });
   installFinanceCostAllocationRoutes({
     app,
     pool,

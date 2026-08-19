@@ -314,7 +314,7 @@ export async function installFinanceGeneralLedgerSchema(pool) {
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
       entry_date DATE NOT NULL,
-      entry_kind TEXT NOT NULL CHECK (entry_kind IN ('opening_balance','adjustment','transfer','owner_equity','reclassification','bank_transaction','bank_transfer','job_receivable','reversal')),
+      entry_kind TEXT NOT NULL CHECK (entry_kind IN ('opening_balance','adjustment','transfer','owner_equity','reclassification','bank_transaction','bank_transfer','job_receivable','payment_application','refund_application','customer_credit_application','reversal')),
       status TEXT NOT NULL DEFAULT 'posted' CHECK (status = 'posted'),
       description TEXT NOT NULL,
       reference TEXT,
@@ -322,7 +322,7 @@ export async function installFinanceGeneralLedgerSchema(pool) {
       client_request_id UUID NOT NULL,
       request_fingerprint TEXT NOT NULL CHECK (char_length(request_fingerprint) = 64),
       reason TEXT NOT NULL,
-      source_type TEXT NOT NULL DEFAULT 'manual' CHECK (source_type IN ('manual','finance_transaction','finance_transfer_pair','finance_operational_source')),
+      source_type TEXT NOT NULL DEFAULT 'manual' CHECK (source_type IN ('manual','finance_transaction','finance_transfer_pair','finance_operational_source','finance_operational_application')),
       source_id UUID,
       source_version INTEGER,
       created_by UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -334,7 +334,7 @@ export async function installFinanceGeneralLedgerSchema(pool) {
       CHECK ((entry_kind = 'reversal') = (reversal_of_entry_id IS NOT NULL)),
       CONSTRAINT finance_journal_entries_source_identity_check CHECK (
         (source_type = 'manual' AND source_id IS NULL AND source_version IS NULL)
-        OR (source_type IN ('finance_transaction','finance_transfer_pair','finance_operational_source') AND source_id IS NOT NULL AND source_version > 0)
+        OR (source_type IN ('finance_transaction','finance_transfer_pair','finance_operational_source','finance_operational_application') AND source_id IS NOT NULL AND source_version > 0)
       )
     );
     CREATE UNIQUE INDEX IF NOT EXISTS finance_journal_entries_one_reversal_idx
@@ -388,13 +388,13 @@ export async function installFinanceGeneralLedgerSchema(pool) {
   await pool.query(`ALTER TABLE finance_journal_entries ADD COLUMN IF NOT EXISTS source_id UUID`);
   await pool.query(`ALTER TABLE finance_journal_entries ADD COLUMN IF NOT EXISTS source_version INTEGER`);
   await pool.query(`ALTER TABLE finance_journal_entries DROP CONSTRAINT IF EXISTS finance_journal_entries_entry_kind_check`);
-  await pool.query(`ALTER TABLE finance_journal_entries ADD CONSTRAINT finance_journal_entries_entry_kind_check CHECK (entry_kind IN ('opening_balance','adjustment','transfer','owner_equity','reclassification','bank_transaction','bank_transfer','job_receivable','reversal'))`);
+  await pool.query(`ALTER TABLE finance_journal_entries ADD CONSTRAINT finance_journal_entries_entry_kind_check CHECK (entry_kind IN ('opening_balance','adjustment','transfer','owner_equity','reclassification','bank_transaction','bank_transfer','job_receivable','payment_application','refund_application','customer_credit_application','reversal'))`);
   await pool.query(`ALTER TABLE finance_journal_entries DROP CONSTRAINT IF EXISTS finance_journal_entries_source_type_check`);
-  await pool.query(`ALTER TABLE finance_journal_entries ADD CONSTRAINT finance_journal_entries_source_type_check CHECK (source_type IN ('manual','finance_transaction','finance_transfer_pair','finance_operational_source'))`);
+  await pool.query(`ALTER TABLE finance_journal_entries ADD CONSTRAINT finance_journal_entries_source_type_check CHECK (source_type IN ('manual','finance_transaction','finance_transfer_pair','finance_operational_source','finance_operational_application'))`);
   await pool.query(`ALTER TABLE finance_journal_entries DROP CONSTRAINT IF EXISTS finance_journal_entries_source_identity_check`);
   await pool.query(`ALTER TABLE finance_journal_entries ADD CONSTRAINT finance_journal_entries_source_identity_check CHECK (
     (source_type = 'manual' AND source_id IS NULL AND source_version IS NULL)
-    OR (source_type IN ('finance_transaction','finance_transfer_pair','finance_operational_source') AND source_id IS NOT NULL AND source_version > 0)
+    OR (source_type IN ('finance_transaction','finance_transfer_pair','finance_operational_source','finance_operational_application') AND source_id IS NOT NULL AND source_version > 0)
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS finance_journal_entries_company_source_idx ON finance_journal_entries(company_id, source_type, source_id, source_version) WHERE source_id IS NOT NULL`);
 }
@@ -634,8 +634,8 @@ async function loadGeneralLedgerReport(poolOrClient, companyID, range, limit) {
     accounts: trial.accounts,
     entries,
     warnings: [
-      "This trial balance includes explicitly posted manual journals, reviewed bank-source journals, explicit bank-transfer pairs, and reviewed completed-job receivable journals.",
-      "Unposted or blocked bank activity, unpaired transfers, Finance balances, operational payments/refunds/customer credits, Stripe settlement identity, mileage, and supported payroll are not posted here yet.",
+      "This trial balance includes explicitly posted manual journals, reviewed bank-source journals, explicit bank-transfer pairs, completed-job receivables, and reviewed payment/refund/customer-credit applications.",
+      "Unposted or blocked activity, Finance balances, Stripe settlement/fee identity, mileage, and supported payroll are not posted here yet; Payment Clearing is not bank cash.",
       "Opening-balance and source coverage are not yet complete, so this is not a formal Balance Sheet or Cash Flow statement."
     ]
   };
