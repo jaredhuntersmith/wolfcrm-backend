@@ -31,6 +31,14 @@ import {
   syncAutomationSchedulesForTimeEntry
 } from "./automations.js";
 import { installFinanceSystem, loadProjection } from "./finance.js";
+import { installPayStructureSystem } from "./pay-structures.js";
+import { mapStripePaymentIntentStatus } from "./stripe-payment-sync.js";
+import {
+  claimStripeWebhookEvent,
+  completeStripeWebhookEvent,
+  failStripeWebhookEvent,
+  normalizeStripeRefundState
+} from "./finance-operational-accounting.js";
 import {
   installGoogleSheetsSchema,
   installGoogleSheetsSystem,
@@ -2682,6 +2690,14 @@ function sanitizePaymentRecord(row, { employeeSafe = false } = {}) {
     amount_cents: row.amount_cents,
     currency: row.currency,
     description: row.description,
+    job_id: row.job_id || null,
+    paid_at: row.paid_at || null,
+    refunded_amount_cents: row.refund_amount_known === false ? null : Number(row.refunded_amount_cents || 0),
+    refunded_at: row.refunded_at || null,
+    refund_amount_known: row.refund_amount_known !== false,
+    accounting_link_version: Number(row.accounting_link_version || 1),
+    accounting_linked_at: row.accounting_linked_at || null,
+    accounting_linked_by: row.accounting_linked_by || null,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -7156,21 +7172,51 @@ app.patch("/api/time-clock/entries/:id", authRequired, requireAnyCapability("tim
 });
 
 app.delete("/api/time-clock/entries/:id", authRequired, requireAnyCapability("time.clock", "time.manage"), async (req, res) => {
+  let client;
   try {
-    const existing = await pool.query(`SELECT start_at FROM time_clock_entries WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const existing = await client.query(
+      req.role === "employer"
+        ? `SELECT start_at FROM time_clock_entries WHERE id = $1 AND company_id = $2 FOR UPDATE`
+        : `SELECT start_at FROM time_clock_entries WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+      [req.params.id, req.role === "employer" ? req.companyId : req.userId]
+    );
+    if (!existing.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "entry_not_found" });
+    }
     if (req.role !== "employer") {
-      if (!existing.rowCount) return res.status(404).json({ error: "entry_not_found" });
       if (!canEmployeeChangeTimeEntry(existing.rows[0].start_at)) {
+        await client.query("ROLLBACK");
         return res.status(403).json({ error: "Cannot change previous week time cards at this Time" });
       }
     }
-    const { rowCount } = await pool.query(
+    const linkedEvidence = await client.query(
+      `SELECT 1
+         FROM finance_time_job_links
+        WHERE company_id = $1 AND time_entry_id = $2 AND job_id IS NOT NULL
+        LIMIT 1`,
+      [req.companyId, req.params.id]
+    );
+    if (linkedEvidence.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "accounting_time_linked",
+        message: "A manager must unlink this time entry in Finance > Accounting before it can be deleted."
+      });
+    }
+    const { rowCount } = await client.query(
       req.role === "employer"
         ? `DELETE FROM time_clock_entries WHERE id = $1 AND company_id = $2`
         : `DELETE FROM time_clock_entries WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.role === "employer" ? req.companyId : req.userId]
     );
-    if (!rowCount) return res.status(404).json({ error: "entry_not_found" });
+    if (!rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "entry_not_found" });
+    }
+    await client.query("COMMIT");
     try {
       await cancelAutomationSchedulesForSubject(req.companyId, "time_entry", req.params.id);
       await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.shift_updated", subjectType: "time_entry", subjectId: req.params.id, actorUserId: req.userId, source: "ios", payload: { time_entry_id: req.params.id, deleted: true } });
@@ -7178,7 +7224,13 @@ app.delete("/api/time-clock/entries/:id", authRequired, requireAnyCapability("ti
       console.warn("[automations] time delete hook failed", automationErr?.message || automationErr);
     }
     res.status(204).end();
-  } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_delete_failed" }); }
+  } catch (e) {
+    await client?.query("ROLLBACK").catch(() => {});
+    console.error(e);
+    res.status(500).json({ error: "time_entry_delete_failed" });
+  } finally {
+    client?.release();
+  }
 });
 
 app.get("/api/time-clock/manual-entries", authRequired, requireCapability("time.manage"), async (req, res) => {
@@ -16392,6 +16444,92 @@ app.get("/api/payments/:id", authRequired, requireCapability("payments.view"), a
   }
 });
 
+app.post("/api/payments/:id/client-result", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
+  const status = String(req.body?.status || "").trim().toLowerCase();
+  if (!["canceled", "failed"].includes(status)) {
+    return res.status(400).json({ error: "payment_client_result_invalid", message: "The app can only record a canceled or failed presentation result." });
+  }
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const existing = await pool.query(`SELECT * FROM payment_records WHERE id::text = $1 AND user_id = $2`, [req.params.id, employerId]);
+    const payment = existing.rows[0];
+    if (!payment) return res.status(404).json({ error: "payment_not_found" });
+    if (req.role !== "employer" && payment.created_by_user_id !== req.userId) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    const { rows } = await pool.query(
+      `UPDATE payment_records
+          SET client_result_status = $3,
+              client_result_note = $4,
+              client_result_at = now(),
+              status = CASE
+                WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status
+                WHEN status = 'pending' THEN $3
+                ELSE status
+              END,
+              updated_at = now()
+        WHERE id::text = $1 AND user_id = $2
+        RETURNING *`,
+      [req.params.id, employerId, status, String(req.body?.note || "").trim().slice(0, 500) || null]
+    );
+    res.json(sanitizePaymentRecord(rows[0], { employeeSafe: req.role !== "employer" }));
+  } catch (error) {
+    console.error("[payments] client result failed", { code: error?.code, message: error?.message });
+    res.status(500).json({ error: "payment_client_result_failed" });
+  }
+});
+
+app.post("/api/payments/:id/reconcile", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
+  const stripe = requireStripe(res); if (!stripe) return;
+  try {
+    const employerId = await resolveEmployerUserId(req);
+    const existing = await pool.query(`SELECT * FROM payment_records WHERE id::text = $1 AND user_id = $2`, [req.params.id, employerId]);
+    const payment = existing.rows[0];
+    if (!payment) return res.status(404).json({ error: "payment_not_found" });
+    if (req.role !== "employer" && payment.created_by_user_id !== req.userId) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    if (!payment.stripe_payment_intent_id || !payment.stripe_connected_account_id) {
+      return res.status(409).json({ error: "payment_not_reconcilable", message: "This payment has no Stripe PaymentIntent to reconcile." });
+    }
+    const intent = await stripe.paymentIntents.retrieve(
+      payment.stripe_payment_intent_id,
+      { expand: ["latest_charge"] },
+      { stripeAccount: payment.stripe_connected_account_id }
+    );
+    const mapped = mapStripePaymentIntentStatus(intent);
+    const latestCharge = intent.latest_charge && typeof intent.latest_charge === "object" ? intent.latest_charge : null;
+    const refundState = latestCharge
+      ? normalizeStripeRefundState({
+        paymentAmountCents: Number(payment.amount_cents || 0),
+        providerRefundedCents: Number(latestCharge.amount_refunded || 0),
+        providerFullyRefunded: Boolean(latestCharge.refunded)
+      })
+      : null;
+    const paidAt = latestCharge?.created ? new Date(Number(latestCharge.created) * 1000) : null;
+    const nextStatus = refundState?.refunded_amount_cents > 0 ? refundState.status : mapped;
+    const { rows } = await pool.query(
+      `UPDATE payment_records
+          SET status = CASE
+                WHEN status IN ('partially_refunded','refunded') AND $3 NOT IN ('partially_refunded','refunded') THEN status
+                ELSE $3
+              END,
+              paid_at = CASE WHEN $3 IN ('succeeded','partially_refunded','refunded') THEN COALESCE(paid_at, $4) ELSE paid_at END,
+              refunded_amount_cents = COALESCE($5, refunded_amount_cents),
+              refund_amount_known = CASE WHEN $5::bigint IS NULL THEN refund_amount_known ELSE true END,
+              stripe_charge_id = COALESCE($6, stripe_charge_id),
+              updated_at = now()
+        WHERE id::text = $1 AND user_id = $2
+        RETURNING *`,
+      [req.params.id, employerId, nextStatus, paidAt, refundState?.refunded_amount_cents ?? null, latestCharge?.id || null]
+    );
+    res.json(sanitizePaymentRecord(rows[0], { employeeSafe: req.role !== "employer" }));
+  } catch (error) {
+    console.error("[payments] reconcile failed", { code: error?.code, message: error?.message });
+    res.status(502).json({ error: "payment_reconcile_failed", message: "WolfCRM could not confirm the payment with Stripe." });
+  }
+});
+
 // ==========================================================================
 //                            STRIPE WEBHOOK
 // ==========================================================================
@@ -16416,15 +16554,21 @@ app.post("/stripe/webhook", async (req, res) => {
   }
 
   const connectedAccountId = event.account || null;
+  let claim;
+  try {
+    claim = await claimStripeWebhookEvent(pool, event);
+  } catch (error) {
+    console.error("stripe webhook claim failed:", error?.message || error);
+    return res.status(500).json({ error: "webhook_claim_failed" });
+  }
+  if (!claim.claimed) {
+    return res.json({ received: true, duplicate: claim.duplicate, processing: claim.in_progress });
+  }
+  const eventOccurredAt = Number.isFinite(Number(event.created)) && Number(event.created) > 0
+    ? new Date(Number(event.created) * 1000)
+    : null;
 
   try {
-    // Duplicate protection: check if we've already recorded this stripe_event_id.
-    const dupe = await pool.query(
-      `SELECT id FROM service_plan_events WHERE stripe_event_id = $1 LIMIT 1`,
-      [event.id]
-    );
-    if (dupe.rows.length) return res.json({ received: true, duplicate: true });
-
     async function markServicePlanEvent(planId, contactId, employerId, companyId, type, notes = null) {
       if (!planId) return;
       await pool.query(
@@ -16433,6 +16577,60 @@ app.post("/stripe/webhook", async (req, res) => {
          ON CONFLICT DO NOTHING`,
         [employerId, companyId || null, planId, contactId || null, type, notes, event.id]
       );
+    }
+
+    async function applyChargeRefund(charge) {
+      const paymentIntentId = typeof charge?.payment_intent === "string"
+        ? charge.payment_intent
+        : charge?.payment_intent?.id || null;
+      if (!paymentIntentId) return [];
+      const providerRefunded = Number(charge.amount_refunded || 0);
+      if (!Number.isSafeInteger(providerRefunded) || providerRefunded < 0) return [];
+      const refunded = await pool.query(
+        `UPDATE payment_records
+            SET refunded_amount_cents = GREATEST(refunded_amount_cents, LEAST(amount_cents, $2::bigint)),
+                refund_amount_known = true,
+                status = CASE
+                  WHEN $3::boolean OR GREATEST(refunded_amount_cents, LEAST(amount_cents, $2::bigint)) >= amount_cents THEN 'refunded'
+                  WHEN GREATEST(refunded_amount_cents, LEAST(amount_cents, $2::bigint)) > 0 THEN 'partially_refunded'
+                  ELSE status
+                END,
+                refunded_at = CASE
+                  WHEN LEAST(amount_cents, $2::bigint) >= refunded_amount_cents
+                    THEN GREATEST(COALESCE(refunded_at, $4), $4)
+                  ELSE refunded_at
+                END,
+                stripe_charge_id = COALESCE($5, stripe_charge_id),
+                updated_at = now()
+          WHERE stripe_payment_intent_id = $1
+            AND stripe_connected_account_id IS NOT DISTINCT FROM $6
+            AND (
+              refund_amount_known = false
+              OR LEAST(amount_cents, $2::bigint) > refunded_amount_cents
+              OR ($3::boolean AND status <> 'refunded')
+            )
+          RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency,
+                    status, refunded_amount_cents, job_id`,
+        [paymentIntentId, providerRefunded, Boolean(charge.refunded), eventOccurredAt, charge.id || null, connectedAccountId]
+      );
+      for (const rec of refunded.rows) {
+        const automationType = rec.status === "refunded" ? "payment.refunded" : "payment.partially_refunded";
+        await emitAutomationEvent({
+          companyId: rec.company_id,
+          eventType: automationType,
+          subjectType: "payment",
+          subjectId: rec.id,
+          source: "stripe.webhook",
+          dedupeKey: `${automationType}:${event.id}:${rec.id}`,
+          payload: {
+            payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id,
+            job_id: rec.job_id || null, amount_cents: rec.amount_cents,
+            refunded_amount_cents: Number(rec.refunded_amount_cents || 0), currency: rec.currency,
+            stripe_event_id: event.id, stripe_payment_intent_id: paymentIntentId, stripe_charge_id: charge.id || null
+          }
+        });
+      }
+      return refunded.rows;
     }
 
     switch (event.type) {
@@ -16469,7 +16667,7 @@ app.post("/stripe/webhook", async (req, res) => {
                   status = COALESCE($3, status),
                   updated_at = now()
             WHERE stripe_subscription_id = $1
-              AND (stripe_connected_account_id = $4 OR $4 IS NULL)
+              AND stripe_connected_account_id IS NOT DISTINCT FROM $4
             RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
           [sub.id, sub.status, localStatus, connectedAccountId]
         );
@@ -16502,13 +16700,16 @@ app.post("/stripe/webhook", async (req, res) => {
         // Update payment record.
         const paidRecords = await pool.query(
           `UPDATE payment_records
-              SET status = 'succeeded', updated_at = now()
-            WHERE stripe_invoice_id = $1
-               OR stripe_subscription_id = $2
-            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [invoice.id, invoice.subscription || null]
+              SET status = CASE WHEN status IN ('partially_refunded','refunded') THEN status ELSE 'succeeded' END,
+                  paid_at = COALESCE(paid_at, $3),
+                  updated_at = now()
+            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
+              AND stripe_connected_account_id IS NOT DISTINCT FROM $4
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency, job_id, status`,
+          [invoice.id, invoice.subscription || null, eventOccurredAt, connectedAccountId]
         );
         for (const rec of paidRecords.rows) {
+          if (rec.status !== "succeeded" && rec.status !== "paid") continue;
           await emitAutomationEvent({
             companyId: rec.company_id,
             eventType: "payment.succeeded",
@@ -16516,7 +16717,7 @@ app.post("/stripe/webhook", async (req, res) => {
             subjectId: rec.id,
             source: "stripe.webhook",
             dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
-            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_invoice_id: invoice.id }
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, job_id: rec.job_id || null, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_invoice_id: invoice.id }
           });
         }
         // If this is the initial invoice, mark plan active.
@@ -16527,7 +16728,7 @@ app.post("/stripe/webhook", async (req, res) => {
                     stripe_subscription_status = 'active',
                     updated_at = now()
               WHERE stripe_subscription_id = $1
-                AND (stripe_connected_account_id = $2 OR $2 IS NULL)
+                AND stripe_connected_account_id IS NOT DISTINCT FROM $2
               RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
             [invoice.subscription, connectedAccountId]
           );
@@ -16553,11 +16754,13 @@ app.post("/stripe/webhook", async (req, res) => {
         const invoice = event.data.object;
         const failedRecords = await pool.query(
           `UPDATE payment_records
-              SET status = 'failed', updated_at = now()
-            WHERE stripe_invoice_id = $1
-               OR stripe_subscription_id = $2
+              SET status = CASE WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status ELSE 'failed' END,
+                  updated_at = now()
+            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
+              AND stripe_connected_account_id IS NOT DISTINCT FROM $3
+              AND status NOT IN ('succeeded','paid','partially_refunded','refunded')
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [invoice.id, invoice.subscription || null]
+          [invoice.id, invoice.subscription || null, connectedAccountId]
         );
         for (const rec of failedRecords.rows) {
           await emitAutomationEvent({
@@ -16575,8 +16778,9 @@ app.post("/stripe/webhook", async (req, res) => {
             `UPDATE service_plans
                 SET status = 'past_due', updated_at = now()
               WHERE stripe_subscription_id = $1
+                AND stripe_connected_account_id IS NOT DISTINCT FROM $2
               RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
-            [invoice.subscription]
+            [invoice.subscription, connectedAccountId]
           );
           if (rows.length) {
             await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
@@ -16597,14 +16801,20 @@ app.post("/stripe/webhook", async (req, res) => {
 
       case "payment_intent.succeeded": {
         const pi = event.data.object;
+        const latestChargeId = typeof pi.latest_charge === "string" ? pi.latest_charge : pi.latest_charge?.id || null;
         const paidRecords = await pool.query(
           `UPDATE payment_records
-              SET status = 'succeeded', updated_at = now()
+              SET status = CASE WHEN status IN ('partially_refunded','refunded') THEN status ELSE 'succeeded' END,
+                  paid_at = COALESCE(paid_at, $2),
+                  stripe_charge_id = COALESCE($3, stripe_charge_id),
+                  updated_at = now()
             WHERE stripe_payment_intent_id = $1
-            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [pi.id]
+              AND stripe_connected_account_id IS NOT DISTINCT FROM $4
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency, job_id, status`,
+          [pi.id, eventOccurredAt, latestChargeId, connectedAccountId]
         );
         for (const rec of paidRecords.rows) {
+          if (rec.status !== "succeeded" && rec.status !== "paid") continue;
           await emitAutomationEvent({
             companyId: rec.company_id,
             eventType: "payment.succeeded",
@@ -16612,7 +16822,7 @@ app.post("/stripe/webhook", async (req, res) => {
             subjectId: rec.id,
             source: "stripe.webhook",
             dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
-            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, job_id: rec.job_id || null, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
           });
         }
         break;
@@ -16622,10 +16832,13 @@ app.post("/stripe/webhook", async (req, res) => {
         const pi = event.data.object;
         const failedRecords = await pool.query(
           `UPDATE payment_records
-              SET status = 'failed', updated_at = now()
+              SET status = CASE WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status ELSE 'failed' END,
+                  updated_at = now()
             WHERE stripe_payment_intent_id = $1
+              AND stripe_connected_account_id IS NOT DISTINCT FROM $2
+              AND status NOT IN ('succeeded','paid','partially_refunded','refunded')
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [pi.id]
+          [pi.id, connectedAccountId]
         );
         for (const rec of failedRecords.rows) {
           await emitAutomationEvent({
@@ -16643,25 +16856,17 @@ app.post("/stripe/webhook", async (req, res) => {
 
       case "charge.refunded": {
         const charge = event.data.object;
-        if (charge.payment_intent) {
-          const refunded = await pool.query(
-            `UPDATE payment_records
-                SET status = 'refunded', updated_at = now()
-              WHERE stripe_payment_intent_id = $1
-              RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-            [charge.payment_intent]
-          );
-          for (const rec of refunded.rows) {
-            await emitAutomationEvent({
-              companyId: rec.company_id,
-              eventType: charge.amount_refunded && charge.amount_refunded < charge.amount ? "payment.partially_refunded" : "payment.refunded",
-              subjectType: "payment",
-              subjectId: rec.id,
-              source: "stripe.webhook",
-              dedupeKey: `payment.refunded:${event.id}:${rec.id}`,
-              payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: charge.payment_intent }
-            });
-          }
+        await applyChargeRefund(charge);
+        break;
+      }
+
+      case "refund.created":
+      case "refund.updated": {
+        const refund = event.data.object;
+        const chargeId = typeof refund.charge === "string" ? refund.charge : refund.charge?.id || null;
+        if (chargeId) {
+          const charge = await stripe.charges.retrieve(chargeId, {}, { stripeAccount: connectedAccountId || undefined });
+          await applyChargeRefund(charge);
         }
         break;
       }
@@ -16673,10 +16878,14 @@ app.post("/stripe/webhook", async (req, res) => {
         const statusMap = { "payment_intent.canceled": "canceled", "payment_intent.requires_action": "action_required", "payment_intent.requires_payment_method": "payment_method_required" };
         const eventMap = { "payment_intent.canceled": "payment.canceled", "payment_intent.requires_action": "payment.action_required", "payment_intent.requires_payment_method": "payment.payment_method_required" };
         const records = await pool.query(
-          `UPDATE payment_records SET status = $2, updated_at = now()
+          `UPDATE payment_records
+              SET status = CASE WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status ELSE $2 END,
+                  updated_at = now()
             WHERE stripe_payment_intent_id = $1
+              AND stripe_connected_account_id IS NOT DISTINCT FROM $3
+              AND status NOT IN ('succeeded','paid','partially_refunded','refunded')
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [pi.id, statusMap[event.type]]
+          [pi.id, statusMap[event.type], connectedAccountId]
         );
         for (const rec of records.rows) {
           await emitAutomationEvent({
@@ -16700,8 +16909,9 @@ app.post("/stripe/webhook", async (req, res) => {
         const records = await pool.query(
           `SELECT id, company_id, contact_id, service_plan_id, amount_cents, currency
              FROM payment_records
-            WHERE stripe_payment_intent_id = $1 OR stripe_invoice_id = $2`,
-          [dispute.payment_intent || null, dispute.invoice || null]
+            WHERE (stripe_payment_intent_id = $1 OR stripe_invoice_id = $2)
+              AND stripe_connected_account_id IS NOT DISTINCT FROM $3`,
+          [dispute.payment_intent || null, dispute.invoice || null, connectedAccountId]
         );
         for (const rec of records.rows) {
           await emitAutomationEvent({
@@ -16722,8 +16932,10 @@ app.post("/stripe/webhook", async (req, res) => {
         break;
     }
 
+    await completeStripeWebhookEvent(pool, event.id);
     res.json({ received: true });
   } catch (e) {
+    await failStripeWebhookEvent(pool, event.id, e).catch(() => {});
     console.error("webhook handling error:", e);
     res.status(500).json({ error: "webhook_handler_failed" });
   }
@@ -16764,6 +16976,12 @@ async function startServer() {
     pool,
     authRequired,
     requireEmployer: requireFinanceAccess
+  });
+  await installPayStructureSystem({
+    app,
+    pool,
+    authRequired,
+    requirePayManage: requireCapability("pay.manage")
   });
   await installGoogleSheetsSchema(pool);
   installGoogleSheetsSystem({

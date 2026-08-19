@@ -1,3 +1,16 @@
+import {
+  installOperationalAccountingRoutes,
+  installOperationalAccountingSchema
+} from "./finance-operational-accounting.js";
+import {
+  installFinanceCostAllocationRoutes,
+  installFinanceCostAllocationSchema
+} from "./finance-cost-allocations.js";
+import {
+  installFinanceMileageAllocationRoutes,
+  installFinanceMileageAllocationSchema
+} from "./finance-mileage-allocations.js";
+
 const ACCOUNT_TYPES = new Set(["asset", "liability", "equity", "income", "expense"]);
 const RECONCILIATION_STATUSES = new Set(["unreconciled", "cleared", "reconciled"]);
 const MAX_SPLITS = 20;
@@ -411,6 +424,9 @@ export async function installFinanceAccountingSchema(pool) {
     CREATE INDEX IF NOT EXISTS finance_transaction_audit_company_transaction_idx
       ON finance_transaction_audit(company_id, transaction_id, created_at DESC);
   `);
+  await installOperationalAccountingSchema(pool);
+  await installFinanceCostAllocationSchema(pool);
+  await installFinanceMileageAllocationSchema(pool);
 }
 
 export async function ensureDefaultChartAccounts(poolOrClient, companyId, userId = null) {
@@ -733,5 +749,19 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     } catch (error) {
       handleAccountingError(res, error, "profit_loss_report_failed");
     }
+  });
+
+  installOperationalAccountingRoutes({ app, pool, authRequired, requireEmployer });
+  installFinanceCostAllocationRoutes({
+    app,
+    pool,
+    authRequired,
+    requireFinanceAccess: requireEmployer
+  });
+  installFinanceMileageAllocationRoutes({
+    app,
+    pool,
+    authRequired,
+    requireFinanceAccess: requireEmployer
   });
 }

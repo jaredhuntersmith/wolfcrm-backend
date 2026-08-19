@@ -148,6 +148,12 @@ function testAdministrativeRouteClassification() {
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounts/123/balance-adjustments"), "finance.accounts.adjust");
   assert.equal(requiredFinanceCapability("PATCH", "/api/finance/ai/memories/123"), "finance.ai.manage_memory");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/reports/profit-loss"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/reports/job-contribution"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/time-allocations"), "accounting.view");
+  assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/time-allocations/123/job-link"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/mileage-allocations"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/mileage-allocations/123"), "accounting.view");
+  assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/mileage-allocations/123"), "accounting.manage");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/transactions/123"), "accounting.manage");
 }
 

@@ -7573,7 +7573,7 @@ async function executePaymentRecordManual(run, node, config) {
   const amount = intOrNull(resolveTemplate(config.amount_cents || "", context));
   if (!amount || amount < 1) throw new Error("payment_amount_required");
   const owner = await resolveCompanyUser(run.company_id, config.user_id);
-  const row = (await ctx.pool.query(`INSERT INTO payment_records(user_id, company_id, created_by_user_id, contact_id, payment_type, status, amount_cents, currency, description) VALUES($1,$2,$1,$3,'manual','succeeded',$4,$5,$6) RETURNING *`, [owner, run.company_id, contactId, amount, (config.currency || "usd").toLowerCase(), resolveTemplate(config.description || "Manual payment", context)])).rows[0];
+  const row = (await ctx.pool.query(`INSERT INTO payment_records(user_id, company_id, created_by_user_id, contact_id, payment_type, status, amount_cents, currency, description, paid_at, refund_amount_known) VALUES($1,$2,$1,$3,'manual','succeeded',$4,$5,$6,now(),true) RETURNING *`, [owner, run.company_id, contactId, amount, (config.currency || "usd").toLowerCase(), resolveTemplate(config.description || "Manual payment", context)])).rows[0];
   await setRunVariable(run.id, `idempotency:${node.id}:payment_record_id`, row.id);
   await emitFinancialEvent(run, node, "payment.succeeded", "payment", row.id, paymentPayload(row));
   return { payment_record_id: row.id, amount_cents: amount, status: row.status };
