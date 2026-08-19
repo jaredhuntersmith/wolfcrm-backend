@@ -56,10 +56,20 @@ import {
 } from "./navigation-tabs.js";
 import {
   ScheduleTeamError,
+  requiredScheduleWriteCapability,
   summarizeScheduleTeam,
   validateAssignments,
   validateAvailability
 } from "./schedule-team.js";
+import {
+  DEFAULT_ON_MY_WAY_TEMPLATE,
+  OnMyWayError,
+  normalizeOnMyWayChannel,
+  parseOnMyWayCoordinate,
+  renderOnMyWayTemplate,
+  validateOnMyWayMessage,
+  validateOnMyWayTemplate
+} from "./on-my-way.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -1302,6 +1312,36 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS employee_schedule_availability_company_idx
       ON employee_schedule_availability(company_id, user_id);
 
+    CREATE TABLE IF NOT EXISTS job_on_my_way_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      job_id TEXT NOT NULL,
+      contact_id TEXT,
+      contact_name TEXT,
+      recipient_phone TEXT NOT NULL,
+      employee_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      employee_name TEXT NOT NULL,
+      channel TEXT NOT NULL DEFAULT 'sms',
+      message_body TEXT NOT NULL,
+      eta_seconds INTEGER,
+      eta_source TEXT NOT NULL DEFAULT 'unavailable',
+      status TEXT NOT NULL DEFAULT 'sending',
+      sms_conversation_id UUID REFERENCES sms_conversations(id) ON DELETE SET NULL,
+      sms_message_id UUID REFERENCES sms_messages(id) ON DELETE SET NULL,
+      provider_message_sid TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      idempotency_key TEXT NOT NULL,
+      explicit_resend BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS job_on_my_way_events_job_idx
+      ON job_on_my_way_events(company_id, job_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS job_on_my_way_events_contact_idx
+      ON job_on_my_way_events(company_id, contact_id, created_at DESC);
+
     CREATE TABLE IF NOT EXISTS map_pins (
       id TEXT PRIMARY KEY,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1769,6 +1809,7 @@ async function bootstrap() {
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_open_time TEXT NOT NULL DEFAULT '09:00';
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_close_time TEXT NOT NULL DEFAULT '17:00';
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS tab_role_policies JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS on_my_way_message_template TEXT NOT NULL DEFAULT 'Hi {{customer_first_name}}, {{employee_name}} from {{company_name}} is on the way. Estimated arrival: {{eta}}.';
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_use_finance_ai BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_transactions BOOLEAN NOT NULL DEFAULT false;
@@ -2132,6 +2173,16 @@ function requireAnyCapability(...capabilities) {
   return (req, res, next) => {
     if (!capabilities.some((capability) => hasCapability(req, capability))) {
       return res.status(403).json({ error: "permission_denied", required_capabilities: capabilities });
+    }
+    next();
+  };
+}
+
+function requireAllCapabilities(...capabilities) {
+  return (req, res, next) => {
+    const missing = capabilities.filter((capability) => !hasCapability(req, capability));
+    if (missing.length) {
+      return res.status(403).json({ error: "permission_denied", required_capabilities: capabilities, missing_capabilities: missing });
     }
     next();
   };
@@ -5082,7 +5133,8 @@ app.delete("/api/company/employees/:id/tabs", authRequired, requireEmployer, asy
 app.get("/api/company/settings", authRequired, requireEmployer, async (req, res) => {
   try {
     const company = await pool.query(
-      `SELECT id, name, join_code, logo_data_url, website, address, phone, email, notify_all_members_on_jobs
+      `SELECT id, name, join_code, logo_data_url, website, address, phone, email,
+              notify_all_members_on_jobs, on_my_way_message_template
          FROM companies WHERE id = $1`,
       [req.companyId]
     );
@@ -5153,7 +5205,8 @@ app.patch("/api/company/invoice-settings", authRequired, requireCapability("sett
               email = $6,
               updated_at = now()
         WHERE id = $1
-        RETURNING id, name, join_code, logo_data_url, website, address, phone, email`,
+        RETURNING id, name, join_code, logo_data_url, website, address, phone, email,
+                  notify_all_members_on_jobs, on_my_way_message_template`,
       [
         req.companyId,
         logo || null,
@@ -5178,7 +5231,8 @@ app.patch("/api/company/job-notification-settings", authRequired, requireCapabil
           SET notify_all_members_on_jobs = $2,
               updated_at = now()
         WHERE id = $1
-        RETURNING id, name, join_code, logo_data_url, website, address, phone, email, notify_all_members_on_jobs`,
+        RETURNING id, name, join_code, logo_data_url, website, address, phone, email,
+                  notify_all_members_on_jobs, on_my_way_message_template`,
       [req.companyId, notifyAll]
     );
     res.json({ company: rows[0] });
@@ -5188,11 +5242,37 @@ app.patch("/api/company/job-notification-settings", authRequired, requireCapabil
   }
 });
 
+app.patch("/api/company/on-my-way-settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
+  try {
+    const template = validateOnMyWayTemplate(req.body?.message_template);
+    const { rows } = await pool.query(
+      `UPDATE companies
+          SET on_my_way_message_template = $2,
+              updated_at = now()
+        WHERE id = $1
+        RETURNING id, name, join_code, logo_data_url, website, address, phone, email,
+                  notify_all_members_on_jobs, on_my_way_message_template`,
+      [req.companyId, template]
+    );
+    res.json({ company: rows[0] });
+  } catch (error) {
+    if (error instanceof OnMyWayError) {
+      return res.status(error.statusCode).json({
+        error: error.code,
+        message: error.message
+      });
+    }
+    console.error("[on-my-way/settings] failed:", { code: error?.code, message: error?.message });
+    res.status(500).json({ error: "on_my_way_settings_update_failed", message: "Couldn't save the On My Way template." });
+  }
+});
+
 app.get("/api/company/invoice-settings", authRequired, requireCapability("settings.view"), async (req, res) => {
   try {
     if (!req.companyId) return res.status(404).json({ error: "company_not_found" });
     const { rows } = await pool.query(
-      `SELECT id, name, join_code, logo_data_url, website, address, phone, email, notify_all_members_on_jobs
+      `SELECT id, name, join_code, logo_data_url, website, address, phone, email,
+              notify_all_members_on_jobs, on_my_way_message_template
          FROM companies WHERE id = $1`,
       [req.companyId]
     );
@@ -9135,6 +9215,14 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
     return res.status(400).json({ error: "invalid_schedule_interval", message: "Job end time must be after its start time." });
   }
   try {
+    const previous = await pool.query(
+      `SELECT * FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
+      [req.params.id, req.userId, req.companyId]
+    );
+    const requiredCapability = requiredScheduleWriteCapability(previous.rowCount > 0);
+    if (!hasCapability(req, requiredCapability)) {
+      return res.status(403).json({ error: "permission_denied", required_capability: requiredCapability });
+    }
     const activeMembers = req.companyId
       ? await pool.query(`SELECT id FROM users WHERE company_id = $1 AND deleted_at IS NULL`, [req.companyId])
       : { rows: [{ id: req.userId }] };
@@ -9145,10 +9233,6 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
     });
     const salesIDs = assignments.sales_user_ids;
     const workerIDs = assignments.worker_user_ids;
-    const previous = await pool.query(
-      `SELECT * FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
-      [req.params.id, req.userId, req.companyId]
-    );
     const oldWorkerIDs = previous.rows.length && Array.isArray(previous.rows[0].worker_user_ids)
       ? previous.rows[0].worker_user_ids
       : [];
@@ -9267,6 +9351,447 @@ app.delete("/api/schedule/:id", authRequired, requireCapability("schedule.delete
     }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_schedule" }); }
+});
+
+// ---------- JOB ON MY WAY ----------
+function onMyWayEventPayload(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    job_id: row.job_id,
+    contact_id: row.contact_id,
+    contact_name: row.contact_name,
+    recipient_phone: row.recipient_phone,
+    employee_id: row.employee_id,
+    employee_name: row.employee_name,
+    channel: row.channel,
+    message_body: row.message_body,
+    eta_seconds: row.eta_seconds == null ? null : Number(row.eta_seconds),
+    eta_source: row.eta_source,
+    status: row.live_status || row.status,
+    sms_conversation_id: row.sms_conversation_id,
+    sms_message_id: row.sms_message_id,
+    provider_message_sid: row.provider_message_sid,
+    error_code: row.error_code,
+    error_message: row.error_message,
+    explicit_resend: !!row.explicit_resend,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+async function fetchOnMyWayEvent(queryable, companyId, eventId) {
+  const { rows } = await queryable.query(
+    `SELECT e.*, COALESCE(sm.message_status, e.status) AS live_status
+       FROM job_on_my_way_events e
+       LEFT JOIN sms_messages sm ON sm.id = e.sms_message_id
+      WHERE e.company_id = $1 AND e.id = $2
+      LIMIT 1`,
+    [companyId, eventId]
+  );
+  return rows[0] || null;
+}
+
+async function loadOnMyWayContext(queryable, req, { forUpdate = false } = {}) {
+  const { rows } = await queryable.query(
+    `SELECT se.id AS job_id,
+            se.title AS job_title,
+            se.contact_id,
+            se.worker_user_ids,
+            se.finished_at,
+            c.name AS contact_name,
+            c.phone AS contact_phone,
+            c.lat AS contact_latitude,
+            c.lng AS contact_longitude,
+            co.name AS company_name,
+            co.on_my_way_message_template,
+            COALESCE(NULLIF(actor.display_name, ''), split_part(actor.email, '@', 1), 'A team member') AS employee_name
+       FROM schedule_events se
+       JOIN companies co ON co.id = se.company_id
+       JOIN users actor ON actor.id = $3 AND actor.company_id = se.company_id
+       LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id
+      WHERE se.id = $1 AND se.company_id = $2
+      LIMIT 1
+      ${forUpdate ? "FOR UPDATE OF se" : ""}`,
+    [req.params.id, req.companyId, req.userId]
+  );
+  const context = rows[0];
+  if (!context) throw new OnMyWayError("job_not_found", "This job is no longer available.", { statusCode: 404 });
+  if (context.finished_at) throw new OnMyWayError("job_already_finished", "Finished jobs cannot send an On My Way message.", { statusCode: 409 });
+  const workerIDs = Array.isArray(context.worker_user_ids) ? context.worker_user_ids.map(String) : [];
+  if (req.role !== "employer" && !hasCapability(req, "schedule.edit") && !workerIDs.includes(String(req.userId))) {
+    throw new OnMyWayError("job_not_assigned", "Only an assigned worker or scheduler can send this update.", { statusCode: 403 });
+  }
+  if (!context.contact_id || !context.contact_name) {
+    throw new OnMyWayError("job_contact_required", "Link a customer to this job before sending On My Way.", { statusCode: 422 });
+  }
+  const recipientPhone = normalizeE164Phone(context.contact_phone);
+  if (!isUsableE164(recipientPhone)) {
+    throw new OnMyWayError("customer_phone_required", "Add a valid customer mobile number before sending On My Way.", { statusCode: 422 });
+  }
+  return { ...context, recipient_phone: recipientPhone };
+}
+
+function sendOnMyWayError(res, error, fallbackCode = "on_my_way_failed") {
+  if (error instanceof OnMyWayError) {
+    return res.status(error.statusCode).json({
+      error: error.code,
+      message: error.message
+    });
+  }
+  console.error("[on-my-way] failed:", { code: error?.code, message: error?.message });
+  return res.status(500).json({ error: fallbackCode, message: "WolfCRM couldn't complete the On My Way workflow." });
+}
+
+async function calculateOnMyWayEta(req, origin, destination) {
+  if (!origin || !destination || !googleRoutingRateAllowed(req)) return null;
+  try {
+    const plan = await googleRoutingService.plan({
+      start: { id: "on-my-way-origin", label: "Current location", ...origin },
+      stops: [{ id: "on-my-way-destination", label: "Customer", ...destination, service_duration_seconds: 0, locked_order: null }],
+      ending_behavior: "finish_at_final_stop",
+      end: null,
+      optimize_order: false,
+      departure_time: new Date().toISOString()
+    });
+    const seconds = Math.round(Number(plan.travel_time_seconds));
+    return Number.isFinite(seconds) && seconds > 0 && seconds <= 86_400 ? seconds : null;
+  } catch (error) {
+    console.warn("[on-my-way/preview] ETA unavailable:", error?.code || error?.name || "routing_failed");
+    return null;
+  }
+}
+
+async function deliverCustomerWorkflowMessage({ channel, companyId, contactId, recipientPhone, body }) {
+  if (channel !== "sms") {
+    throw new OnMyWayError("on_my_way_channel_unavailable", "Only SMS is available for On My Way messages.", { statusCode: 422 });
+  }
+  const lineResult = await pool.query(
+    `SELECT id, phone_number
+       FROM phone_lines
+      WHERE company_id = $1 AND active = true AND lower(status) = 'active'
+      ORDER BY created_at ASC
+      LIMIT 1`,
+    [companyId]
+  );
+  const line = lineResult.rows[0];
+  const fromNumber = normalizeE164Phone(line?.phone_number);
+  if (!line || !isUsableE164(fromNumber)) {
+    throw new OnMyWayError("phone_line_inactive", "No active company SMS line is available.", { statusCode: 503 });
+  }
+  const twilioClient = createTwilioClient();
+  if (!twilioClient) {
+    throw new OnMyWayError("twilio_not_configured", "Twilio SMS is not configured for this company.", { statusCode: 503 });
+  }
+  const conversation = (await pool.query(
+    `INSERT INTO sms_conversations(phone_line_id, external_phone_number, contact_id)
+     VALUES($1,$2,$3)
+     ON CONFLICT(phone_line_id, external_phone_number) DO UPDATE
+       SET contact_id = COALESCE(EXCLUDED.contact_id, sms_conversations.contact_id),
+           deleted_at = NULL,
+           updated_at = now()
+     RETURNING id`,
+    [line.id, recipientPhone, contactId]
+  )).rows[0];
+
+  try {
+    const sent = await twilioClient.messages.create({
+      from: fromNumber,
+      to: recipientPhone,
+      body,
+      statusCallback: twilioPublicUrl("/webhooks/twilio/message-status")
+    });
+    return {
+      conversationId: conversation.id,
+      fromNumber,
+      toNumber: recipientPhone,
+      providerMessageSid: sent.sid || null,
+      status: sent.status || "queued"
+    };
+  } catch (error) {
+    const optedOut = String(error?.code || "") === "21610";
+    throw new OnMyWayError(
+      optedOut ? "customer_sms_opted_out" : "twilio_send_failed",
+      optedOut ? "This customer has opted out of SMS messages." : "Twilio couldn't queue this message. No success was recorded.",
+      { statusCode: 502, details: error?.code ? { provider_code: String(error.code) } : null }
+    );
+  }
+}
+
+async function emitOnMyWaySmsHooks({ companyId, actorUserId, contactId, storedMessage, recipientPhone, fromNumber }) {
+  try {
+    const stats = await pool.query(
+      `SELECT COUNT(*) FILTER (WHERE direction = 'outbound')::int AS outbound_count
+         FROM sms_messages
+        WHERE conversation_id = $1 AND deleted_at IS NULL`,
+      [storedMessage.conversation_id]
+    );
+    const payload = {
+      message_id: storedMessage.id,
+      conversation_id: storedMessage.conversation_id,
+      contact_id: contactId,
+      external_number: recipientPhone,
+      from_number: fromNumber,
+      to_number: recipientPhone,
+      body: storedMessage.body,
+      direction: "outbound",
+      status: storedMessage.message_status,
+      media_count: 0,
+      has_media: false,
+      outbound_count: stats.rows[0]?.outbound_count || 0,
+      workflow: "job.on_my_way"
+    };
+    await emitAutomationEvent({
+      companyId,
+      eventType: "sms.sent",
+      subjectType: "sms_message",
+      subjectId: storedMessage.id,
+      actorUserId,
+      source: "job.on_my_way",
+      dedupeKey: `sms.sent:${storedMessage.id}`,
+      payload
+    });
+    if (Number(stats.rows[0]?.outbound_count || 0) === 1) {
+      await emitAutomationEvent({
+        companyId,
+        eventType: "sms.first_outbound",
+        subjectType: "sms_message",
+        subjectId: storedMessage.id,
+        actorUserId,
+        source: "job.on_my_way",
+        dedupeKey: `sms.first_outbound:${storedMessage.conversation_id}`,
+        payload
+      });
+    }
+    await syncAutomationSchedulesForSmsOutbound(companyId, { ...storedMessage, contact_id: contactId, external_phone_number: recipientPhone });
+    await syncAutomationSchedulesForSmsConversationActivity(companyId, storedMessage.conversation_id, storedMessage);
+    await markGoogleSheetsContactDirty(pool, companyId, contactId, "sms.on_my_way");
+  } catch (error) {
+    console.error("[on-my-way] SMS automation hook failed:", { messageId: storedMessage.id, code: error?.code, message: error?.message });
+  }
+}
+
+app.get("/api/jobs/:id/on-my-way", authRequired, requireCapability("jobs.view"), async (req, res) => {
+  try {
+    const exists = await pool.query(`SELECT id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+    if (!exists.rowCount) return res.status(404).json({ error: "job_not_found" });
+    const { rows } = await pool.query(
+      `SELECT e.*, COALESCE(sm.message_status, e.status) AS live_status
+         FROM job_on_my_way_events e
+         LEFT JOIN sms_messages sm ON sm.id = e.sms_message_id
+        WHERE e.company_id = $1 AND e.job_id = $2
+        ORDER BY e.created_at DESC
+        LIMIT 20`,
+      [req.companyId, req.params.id]
+    );
+    res.json(rows.map(onMyWayEventPayload));
+  } catch (error) {
+    sendOnMyWayError(res, error, "on_my_way_history_failed");
+  }
+});
+
+app.post("/api/jobs/:id/on-my-way/preview", authRequired, requireAllCapabilities("jobs.work", "messaging.customer.send"), async (req, res) => {
+  try {
+    const context = await loadOnMyWayContext(pool, req);
+    const origin = parseOnMyWayCoordinate(req.body?.origin_latitude, req.body?.origin_longitude);
+    let destination = parseOnMyWayCoordinate(req.body?.destination_latitude, req.body?.destination_longitude);
+    if (!destination && context.contact_latitude != null && context.contact_longitude != null) {
+      destination = parseOnMyWayCoordinate(context.contact_latitude, context.contact_longitude);
+    }
+    const etaSeconds = await calculateOnMyWayEta(req, origin, destination);
+    const latest = (await pool.query(
+      `SELECT e.*, COALESCE(sm.message_status, e.status) AS live_status
+         FROM job_on_my_way_events e
+         LEFT JOIN sms_messages sm ON sm.id = e.sms_message_id
+        WHERE e.company_id = $1 AND e.job_id = $2
+        ORDER BY e.created_at DESC
+        LIMIT 1`,
+      [req.companyId, req.params.id]
+    )).rows[0];
+    const template = context.on_my_way_message_template || DEFAULT_ON_MY_WAY_TEMPLATE;
+    const message = renderOnMyWayTemplate(template, {
+      customerName: context.contact_name,
+      employeeName: context.employee_name,
+      companyName: context.company_name,
+      etaSeconds
+    });
+    res.json({
+      job_id: context.job_id,
+      contact_id: context.contact_id,
+      contact_name: context.contact_name,
+      recipient_phone: context.recipient_phone,
+      message_template: template,
+      message,
+      eta_seconds: etaSeconds,
+      eta_source: etaSeconds == null ? "unavailable" : "google_routes",
+      estimated_arrival_at: etaSeconds == null ? null : new Date(Date.now() + etaSeconds * 1000).toISOString(),
+      last_event: onMyWayEventPayload(latest)
+    });
+  } catch (error) {
+    sendOnMyWayError(res, error, "on_my_way_preview_failed");
+  }
+});
+
+app.post("/api/jobs/:id/on-my-way/send", authRequired, requireAllCapabilities("jobs.work", "messaging.customer.send"), async (req, res) => {
+  let context;
+  let eventId;
+  let message;
+  let channel;
+  let etaSeconds = null;
+  const idempotencyKey = (req.body?.idempotency_key || "").toString().trim().toLowerCase();
+  const allowDuplicate = req.body?.allow_duplicate === true;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) {
+    return res.status(400).json({ error: "on_my_way_idempotency_key_required", message: "Reload the confirmation and try again." });
+  }
+
+  const db = await pool.connect();
+  try {
+    message = validateOnMyWayMessage(req.body?.message);
+    channel = normalizeOnMyWayChannel(req.body?.channel);
+    const rawEta = Number(req.body?.eta_seconds);
+    etaSeconds = Number.isFinite(rawEta) && rawEta > 0 && rawEta <= 86_400 ? Math.round(rawEta) : null;
+
+    await db.query("BEGIN");
+    context = await loadOnMyWayContext(db, req, { forUpdate: true });
+    const existing = (await db.query(
+      `SELECT * FROM job_on_my_way_events WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1`,
+      [req.companyId, idempotencyKey]
+    )).rows[0];
+    if (existing && existing.status !== "failed") {
+      await db.query("COMMIT");
+      const replayed = await fetchOnMyWayEvent(pool, req.companyId, existing.id);
+      return res.status(existing.status === "sending" || existing.status === "delivery_unknown" ? 202 : 200).json({
+        event: onMyWayEventPayload(replayed),
+        replayed: true
+      });
+    }
+
+    if (!allowDuplicate) {
+      const recent = (await db.query(
+        `SELECT e.*, COALESCE(sm.message_status, e.status) AS live_status
+           FROM job_on_my_way_events e
+           LEFT JOIN sms_messages sm ON sm.id = e.sms_message_id
+          WHERE e.company_id = $1 AND e.job_id = $2
+            AND COALESCE(sm.message_status, e.status) IN ('sending','queued','sent','delivered','delivery_unknown')
+            AND e.created_at >= now() - interval '30 minutes'
+          ORDER BY e.created_at DESC
+          LIMIT 1`,
+        [req.companyId, req.params.id]
+      )).rows[0];
+      if (recent) {
+        await db.query("ROLLBACK");
+        return res.status(409).json({
+          error: "on_my_way_recently_sent",
+          message: "An On My Way message was already sent recently. Confirm Send Again to resend.",
+          recent_event: onMyWayEventPayload(recent)
+        });
+      }
+    }
+
+    if (existing) {
+      eventId = existing.id;
+      await db.query(
+        `UPDATE job_on_my_way_events
+            SET recipient_phone = $3, employee_id = $4, employee_name = $5, channel = $6,
+                message_body = $7, eta_seconds = $8, eta_source = $9, status = 'sending',
+                explicit_resend = $10, error_code = NULL, error_message = NULL, updated_at = now()
+          WHERE company_id = $1 AND id = $2`,
+        [req.companyId, eventId, context.recipient_phone, req.userId, context.employee_name, channel,
+          message, etaSeconds, etaSeconds == null ? "unavailable" : "google_routes", allowDuplicate]
+      );
+    } else {
+      eventId = randomUUID();
+      await db.query(
+        `INSERT INTO job_on_my_way_events(
+           id, company_id, job_id, contact_id, contact_name, recipient_phone,
+           employee_id, employee_name, channel, message_body, eta_seconds, eta_source,
+           status, idempotency_key, explicit_resend
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'sending',$13,$14)`,
+        [eventId, req.companyId, req.params.id, context.contact_id, context.contact_name, context.recipient_phone,
+          req.userId, context.employee_name, channel, message, etaSeconds,
+          etaSeconds == null ? "unavailable" : "google_routes", idempotencyKey, allowDuplicate]
+      );
+    }
+    await db.query("COMMIT");
+  } catch (error) {
+    await db.query("ROLLBACK").catch(() => {});
+    return sendOnMyWayError(res, error, "on_my_way_reservation_failed");
+  } finally {
+    db.release();
+  }
+
+  let delivery;
+  try {
+    delivery = await deliverCustomerWorkflowMessage({
+      channel,
+      companyId: req.companyId,
+      contactId: context.contact_id,
+      recipientPhone: context.recipient_phone,
+      body: message
+    });
+  } catch (error) {
+    await pool.query(
+      `UPDATE job_on_my_way_events
+          SET status = 'failed', error_code = $3, error_message = $4, updated_at = now()
+        WHERE company_id = $1 AND id = $2`,
+      [req.companyId, eventId, error?.code || "customer_message_send_failed", error?.message || "Customer message failed."]
+    ).catch(() => {});
+    return sendOnMyWayError(res, error, "on_my_way_delivery_failed");
+  }
+
+  const persistence = await pool.connect();
+  let storedMessage;
+  try {
+    await persistence.query("BEGIN");
+    storedMessage = (await persistence.query(
+      `INSERT INTO sms_messages(
+         conversation_id, twilio_message_sid, direction, from_number, to_number,
+         body, message_status, media_count, media
+       ) VALUES($1,$2,'outbound',$3,$4,$5,$6,0,'[]'::jsonb)
+       RETURNING *`,
+      [delivery.conversationId, delivery.providerMessageSid, delivery.fromNumber, delivery.toNumber, message, delivery.status]
+    )).rows[0];
+    await persistence.query(
+      `UPDATE sms_conversations SET last_message_at = now(), updated_at = now() WHERE id = $1`,
+      [delivery.conversationId]
+    );
+    await persistence.query(
+      `UPDATE job_on_my_way_events
+          SET status = $3, sms_conversation_id = $4, sms_message_id = $5,
+              provider_message_sid = $6, updated_at = now()
+        WHERE company_id = $1 AND id = $2`,
+      [req.companyId, eventId, delivery.status, delivery.conversationId, storedMessage.id, delivery.providerMessageSid]
+    );
+    await persistence.query("COMMIT");
+  } catch (error) {
+    await persistence.query("ROLLBACK").catch(() => {});
+    await pool.query(
+      `UPDATE job_on_my_way_events
+          SET status = 'delivery_unknown', provider_message_sid = $3,
+              error_code = 'message_store_failed',
+              error_message = 'Provider accepted the message but local persistence did not finish.',
+              updated_at = now()
+        WHERE company_id = $1 AND id = $2`,
+      [req.companyId, eventId, delivery.providerMessageSid]
+    ).catch(() => {});
+    return res.status(502).json({
+      error: "on_my_way_delivery_unknown",
+      message: "Twilio accepted the message, but WolfCRM couldn't confirm its local record. Do not resend automatically."
+    });
+  } finally {
+    persistence.release();
+  }
+
+  await emitOnMyWaySmsHooks({
+    companyId: req.companyId,
+    actorUserId: req.userId,
+    contactId: context.contact_id,
+    storedMessage,
+    recipientPhone: delivery.toNumber,
+    fromNumber: delivery.fromNumber
+  });
+  const completed = await fetchOnMyWayEvent(pool, req.companyId, eventId);
+  res.status(201).json({ event: onMyWayEventPayload(completed), replayed: false });
 });
 
 // ---------- OPERATIONS: JOB WORKFLOWS ----------

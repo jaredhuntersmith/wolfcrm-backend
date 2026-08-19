@@ -43,6 +43,10 @@ export function validateAssignments({ salesIDs, workerIDs, activeMemberIDs }) {
   return { sales_user_ids, worker_user_ids };
 }
 
+export function requiredScheduleWriteCapability(eventExists) {
+  return eventExists ? "schedule.edit" : "schedule.create";
+}
+
 export function validateAvailability(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new ScheduleTeamError("invalid_availability", "An availability document is required.");
@@ -160,4 +164,3 @@ function eventFitsAvailability(event, profile, timeZone) {
     && start.minutes >= timeMinutes(profile.start_time)
     && end.minutes <= timeMinutes(profile.end_time);
 }
-

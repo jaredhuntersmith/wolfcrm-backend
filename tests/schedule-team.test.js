@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeAssignmentIDs, summarizeScheduleTeam, validateAssignments, validateAvailability } from "../schedule-team.js";
+import {
+  normalizeAssignmentIDs,
+  requiredScheduleWriteCapability,
+  summarizeScheduleTeam,
+  validateAssignments,
+  validateAvailability
+} from "../schedule-team.js";
 
 const owner = "11111111-1111-4111-8111-111111111111";
 const worker = "22222222-2222-4222-8222-222222222222";
@@ -27,6 +33,11 @@ test("availability requires ISO weekdays and a non-overnight HH:mm interval", ()
   });
   assert.throws(() => validateAvailability({ weekdays: [0], start_time: "08:00", end_time: "17:00" }), /ISO weekdays/);
   assert.throws(() => validateAvailability({ weekdays: [1], start_time: "17:00", end_time: "08:00" }), /after start/);
+});
+
+test("schedule writes distinguish create permission from edit permission", () => {
+  assert.equal(requiredScheduleWriteCapability(false), "schedule.create");
+  assert.equal(requiredScheduleWriteCapability(true), "schedule.edit");
 });
 
 test("team summary finds unassigned, overlapping, and outside-hours work", () => {
@@ -56,4 +67,3 @@ test("back-to-back jobs do not conflict and finished jobs do not consume current
   assert.deepEqual(summary.conflicts, []);
   assert.equal(summary.assigned_minutes_by_user[worker], 120);
 });
-
