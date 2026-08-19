@@ -1,4 +1,4 @@
-export const PERMISSION_CATALOG_VERSION = 2;
+export const PERMISSION_CATALOG_VERSION = 3;
 
 export const PERMISSION_GROUPS = Object.freeze([
   group("dashboard", "Dashboard", "Command center and daily business overview."),
@@ -21,6 +21,8 @@ export const PERMISSION_GROUPS = Object.freeze([
 
 export const PERMISSION_CAPABILITIES = Object.freeze([
   capability("dashboard.view", "dashboard", "View dashboard", "See the command center and daily summaries."),
+  capability("dashboard.exceptions.view", "dashboard", "View business exceptions", "See company-wide operational exceptions and affected records.", true, ["dashboard.view"]),
+  capability("dashboard.exceptions.manage", "dashboard", "Manage business exceptions", "Snooze, dismiss, resolve, or reopen company-wide exceptions.", true, ["dashboard.exceptions.view"]),
   capability("tasks.view", "dashboard", "View tasks", "See personal tasks, routines, reminders, and logs."),
   capability("tasks.manage", "dashboard", "Manage tasks", "Create, complete, edit, or delete tasks and routines.", false, ["tasks.view"]),
 
@@ -128,6 +130,7 @@ const KNOWN_KEYS = new Set(ALL_KEYS);
 const CAPABILITY_BY_KEY = new Map(PERMISSION_CAPABILITIES.map((item) => [item.key, item]));
 
 const legacyEmployee = new Set(ALL_KEYS.filter((key) => !key.startsWith("finance.") && !key.startsWith("accounting.") && ![
+  "dashboard.exceptions.view", "dashboard.exceptions.manage",
   "contacts.delete", "contacts.export", "sales.view_all", "sales.manage",
   "jobs.manage_templates", "routes.manage", "communications.manage",
   "operations.manage", "payments.manage", "payments.refund",
@@ -139,7 +142,7 @@ const legacyEmployee = new Set(ALL_KEYS.filter((key) => !key.startsWith("finance
 const PRESET_KEYS = Object.freeze({
   admin: new Set(ALL_KEYS),
   manager: keys(
-    "dashboard.view", "tasks.*", "contacts.*", "pipeline.*", "quotes.*", "sales.*",
+    "dashboard.*", "tasks.*", "contacts.*", "pipeline.*", "quotes.*", "sales.*",
     "schedule.*", "jobs.*", "routes.*", "messaging.customer.*",
     "communications.*", "operations.*", "payments.collect", "payments.view",
     "pay.view_self", "pay.view_all", "time.*", "team.view", "automations.view",
@@ -161,7 +164,7 @@ const PRESET_KEYS = Object.freeze({
     "sales.view_self", "settings.view"
   ),
   office: keys(
-    "dashboard.view", "tasks.*", "contacts.view", "contacts.create", "contacts.edit",
+    "dashboard.view", "dashboard.exceptions.view", "dashboard.exceptions.manage", "tasks.*", "contacts.view", "contacts.create", "contacts.edit",
     "pipeline.*", "quotes.*", "sales.view_self", "sales.view_all",
     "schedule.*", "jobs.view", "jobs.work", "routes.view", "routes.create",
     "routes.edit", "messaging.customer.view", "messaging.customer.send",

@@ -20,7 +20,7 @@ function testCatalogIsUniqueAndComplete() {
   assert.ok(PERMISSION_CAPABILITIES.every((item) => groupIds.has(item.group_id)));
   assert.ok(PERMISSION_CAPABILITIES.every((item) => item.depends_on.every((dependency) => keys.includes(dependency))));
   const payload = permissionCatalogPayload();
-  assert.equal(payload.version, 2);
+  assert.equal(payload.version, 3);
   assert.equal(Object.keys(payload.presets.find((item) => item.id === "admin").capabilities).length, keys.length);
 }
 
@@ -42,6 +42,23 @@ function testTechnicianPresetIsOperationalButRestricted() {
   assert.equal(access.capabilities["finance.view"], false);
   assert.equal(access.capabilities["team.manage"], false);
   assert.equal(access.capabilities["contacts.delete"], false);
+  assert.equal(access.capabilities["dashboard.exceptions.view"], false);
+  assert.equal(access.capabilities["dashboard.exceptions.manage"], false);
+}
+
+function testBusinessExceptionAccessIsLimitedToOperationalLeaders() {
+  const manager = resolveAccess({ role: "employee", preset: "manager" }).capabilities;
+  const office = resolveAccess({ role: "employee", preset: "office" }).capabilities;
+  const sales = resolveAccess({ role: "employee", preset: "sales" }).capabilities;
+  const legacy = resolveAccess({ role: "employee", preset: "legacy_employee" }).capabilities;
+  assert.equal(manager["dashboard.exceptions.view"], true);
+  assert.equal(manager["dashboard.exceptions.manage"], true);
+  assert.equal(office["dashboard.exceptions.view"], true);
+  assert.equal(office["dashboard.exceptions.manage"], true);
+  assert.equal(sales["dashboard.exceptions.view"], false);
+  assert.equal(sales["dashboard.exceptions.manage"], false);
+  assert.equal(legacy["dashboard.exceptions.view"], false);
+  assert.equal(legacy["dashboard.exceptions.manage"], false);
 }
 
 function testSparseOverrideAddsDependencies() {
@@ -131,6 +148,7 @@ const tests = [
   ["catalog uniqueness and completeness", testCatalogIsUniqueAndComplete],
   ["owner invariant", testOwnerAlwaysHasEveryCapability],
   ["technician preset", testTechnicianPresetIsOperationalButRestricted],
+  ["business exception access", testBusinessExceptionAccessIsLimitedToOperationalLeaders],
   ["override dependency expansion", testSparseOverrideAddsDependencies],
   ["explicit parent deny", testExplicitViewDenyCascadesToActions],
   ["invalid document validation", testInvalidDocumentsFailClosed],

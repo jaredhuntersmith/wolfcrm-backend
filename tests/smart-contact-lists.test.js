@@ -3,6 +3,17 @@ import assert from "node:assert/strict";
 import {
   SmartContactListError,
   buildSmartContactPreview,
+  evaluateSmartContactSMSEligibility,
+  prepareSmartContactListPersistence,
+  redactSmartContactFiltersForAudit,
+  renderSmartContactSMSTemplate,
+  renderSmartContactTaskTemplate,
+  smartContactSMSRequestSnapshot,
+  validateSmartContactSMSPreview,
+  validateSmartContactSMSSend,
+  validateSmartContactTaskAction,
+  validateSmartContactListMode,
+  validateSmartContactListName,
   validateSmartContactFilters
 } from "../smart-contact-lists.js";
 
@@ -63,6 +74,227 @@ test("filter validation rejects broadening mistakes and incompatible filters", (
   assert.throws(
     () => validateSmartContactFilters({ stage_ids: ["a"], not_stage_ids: ["a"] }),
     (error) => error.code === "smart_contacts_filters_conflict"
+  );
+});
+
+test("saved-list metadata validates names modes and bounded snapshot members", () => {
+  assert.equal(validateSmartContactListName("  Spring   Follow Up  "), "Spring Follow Up");
+  assert.equal(validateSmartContactListMode("dynamic"), "dynamic");
+  assert.throws(
+    () => validateSmartContactListName("   "),
+    (error) => error.code === "smart_contact_list_name_invalid"
+  );
+  assert.throws(
+    () => validateSmartContactListMode("automatic"),
+    (error) => error.code === "smart_contact_list_mode_invalid"
+  );
+  assert.throws(
+    () => prepareSmartContactListPersistence({
+      mode: "snapshot",
+      contact_ids: Array.from({ length: 501 }, (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`)
+    }),
+    (error) => error.code === "smart_contact_list_members_invalid"
+  );
+});
+
+test("dynamic geographic lists require an explicit named fixed origin", () => {
+  const filters = {
+    distance_mode: "inside",
+    radius_miles: 15,
+    origin: { latitude: 38.25, longitude: -85.75, label: "Main Office" }
+  };
+  assert.throws(
+    () => prepareSmartContactListPersistence({ mode: "dynamic", filters, origin_policy: "transient" }),
+    (error) => error.code === "smart_contact_list_fixed_origin_required"
+  );
+  const prepared = prepareSmartContactListPersistence({ mode: "dynamic", filters, origin_policy: "fixed" });
+  assert.equal(prepared.filters.distance_mode, "inside");
+  assert.equal(prepared.filters.origin.label, "Main Office");
+  assert.equal(prepared.origin_redacted, false);
+});
+
+test("snapshot persistence deduplicates members and redacts transient coordinates", () => {
+  const first = "11111111-1111-4111-8111-111111111111";
+  const second = "22222222-2222-4222-8222-222222222222";
+  const prepared = prepareSmartContactListPersistence({
+    mode: "snapshot",
+    origin_policy: "transient",
+    contact_ids: [first, second, first.toUpperCase()],
+    filters: {
+      distance_mode: "outside",
+      radius_miles: 5,
+      origin: { latitude: 38.25, longitude: -85.75, label: "Current Location" },
+      sort: "distance",
+      tags_any: ["VIP"]
+    }
+  });
+  assert.deepEqual(prepared.contact_ids, [first, second]);
+  assert.equal(prepared.origin_redacted, true);
+  assert.equal(prepared.filters.distance_mode, "none");
+  assert.equal(prepared.filters.origin, null);
+  assert.equal(prepared.filters.radius_miles, null);
+  assert.equal(prepared.filters.sort, "name");
+  assert.deepEqual(prepared.filters.tags_any, ["vip"]);
+});
+
+test("bulk task actions validate exact bounded inputs and normalize idempotency", () => {
+  const first = "11111111-1111-4111-8111-111111111111";
+  const second = "22222222-2222-4222-8222-222222222222";
+  const prepared = validateSmartContactTaskAction({
+    contact_ids: [first, second, first.toUpperCase()],
+    title_template: "  Follow   up with {{contact}}  ",
+    detail_template: "Review the prior quote.",
+    due_date: "2026-08-20T13:00:00Z",
+    priority: "HIGH",
+    assignee_ids: ["33333333-3333-4333-8333-333333333333"],
+    filters: { tags_any: ["VIP"] },
+    idempotency_key: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+  });
+  assert.deepEqual(prepared.contact_ids, [first, second]);
+  assert.equal(prepared.title_template, "Follow up with {{contact}}");
+  assert.equal(prepared.priority, "high");
+  assert.equal(prepared.idempotency_key, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+  assert.throws(
+    () => validateSmartContactTaskAction({ contact_ids: [], title_template: "Call", idempotency_key: prepared.idempotency_key }),
+    (error) => error.code === "smart_contact_task_contacts_invalid"
+  );
+  assert.throws(
+    () => validateSmartContactTaskAction({ contact_ids: [first], title_template: "Call", extra: true, idempotency_key: prepared.idempotency_key }),
+    (error) => error.code === "smart_contact_task_request_invalid"
+  );
+});
+
+test("bulk task templates are literal and audit filters redact origin coordinates", () => {
+  assert.equal(renderSmartContactTaskTemplate("Call {{contact}} about {{offer}}", "Morgan Home"), "Call Morgan Home about {{offer}}");
+  const filters = redactSmartContactFiltersForAudit({
+    distance_mode: "inside",
+    radius_miles: 12,
+    origin: { latitude: 38.2, longitude: -85.7, label: "Main Office" }
+  });
+  assert.deepEqual(filters.origin, { label: "Main Office", redacted: true });
+  assert.equal(JSON.stringify(filters).includes("38.2"), false);
+  assert.equal(JSON.stringify(filters).includes("-85.7"), false);
+});
+
+test("SMS campaign requests require bounded exact recipients and compliant copy", () => {
+  const first = "11111111-1111-4111-8111-111111111111";
+  const second = "22222222-2222-4222-8222-222222222222";
+  const request = validateSmartContactSMSPreview({
+    contact_ids: [first, second, first.toUpperCase()],
+    message_template: "{{company}}: Hi {{contact}}, save 10% this week. Reply STOP to opt out.",
+    filters: { tags_any: ["Customer"] }
+  });
+  assert.deepEqual(request.contact_ids, [first, second]);
+  assert.equal(request.filters.tags_any[0], "customer");
+  assert.throws(
+    () => validateSmartContactSMSPreview({ contact_ids: [first], message_template: "Hi {{contact}}. Reply STOP." }),
+    (error) => error.code === "smart_contact_sms_company_required"
+  );
+  assert.throws(
+    () => validateSmartContactSMSPreview({ contact_ids: [first], message_template: "{{company}}: Hi. Opt out anytime." }),
+    (error) => error.code === "smart_contact_sms_opt_out_language_required"
+  );
+  assert.throws(
+    () => validateSmartContactSMSPreview({ contact_ids: [first], message_template: "{{company}}: {{offer}}. Reply STOP." }),
+    (error) => error.code === "smart_contact_sms_placeholder_invalid"
+  );
+});
+
+test("SMS campaign send requires an unchanged explicit confirmation boundary", () => {
+  const request = {
+    contact_ids: ["11111111-1111-4111-8111-111111111111"],
+    message_template: "{{company}}: Hi {{contact}}, an offer for you. Reply STOP to opt out.",
+    preview_id: "22222222-2222-4222-8222-222222222222",
+    idempotency_key: "33333333-3333-4333-8333-333333333333",
+    confirmed: true
+  };
+  const action = validateSmartContactSMSSend(request);
+  assert.equal(action.confirmed, true);
+  assert.equal(action.preview_id, request.preview_id);
+  assert.deepEqual(
+    smartContactSMSRequestSnapshot(action),
+    smartContactSMSRequestSnapshot(validateSmartContactSMSPreview({
+      contact_ids: request.contact_ids,
+      message_template: request.message_template
+    }))
+  );
+  assert.throws(
+    () => validateSmartContactSMSSend({ ...request, confirmed: false }),
+    (error) => error.code === "smart_contact_sms_confirmation_required"
+  );
+});
+
+test("SMS campaign templates replace only supported literal contact and company fields", () => {
+  assert.equal(
+    renderSmartContactSMSTemplate("{{company}} for {{contact}} — {{other}}", {
+      contactName: "Morgan Home",
+      companyName: "Wolf Services"
+    }),
+    "Wolf Services for Morgan Home — {{other}}"
+  );
+});
+
+test("SMS campaign eligibility requires opt-in local time and provider readiness", () => {
+  const eligible = evaluateSmartContactSMSEligibility({
+    contactExists: true,
+    phoneValid: true,
+    consentStatus: "opted_in",
+    recipientTimeZone: "America/New_York",
+    providerReady: true,
+    now: "2026-08-19T13:00:00Z"
+  });
+  assert.deepEqual(eligible, { eligible: true, reason: null });
+  assert.equal(evaluateSmartContactSMSEligibility({
+    contactExists: true,
+    phoneValid: true,
+    consentStatus: "opted_in",
+    recipientTimeZone: "America/Los_Angeles",
+    providerReady: true,
+    now: "2026-08-19T13:00:00Z"
+  }).reason, "quiet_hours");
+  assert.equal(evaluateSmartContactSMSEligibility({
+    contactExists: true,
+    phoneValid: true,
+    consentStatus: null,
+    recipientTimeZone: "America/New_York",
+    providerReady: true,
+    now: "2026-08-19T13:00:00Z"
+  }).reason, "marketing_consent_required");
+  assert.equal(evaluateSmartContactSMSEligibility({
+    contactExists: true,
+    phoneValid: true,
+    consentStatus: "opted_out",
+    recipientTimeZone: "America/New_York",
+    providerReady: true,
+    now: "2026-08-19T13:00:00Z"
+  }).reason, "opted_out");
+  assert.equal(evaluateSmartContactSMSEligibility({
+    contactExists: true,
+    phoneValid: true,
+    consentStatus: "opted_in",
+    recipientTimeZone: null,
+    providerReady: true,
+    now: "2026-08-19T13:00:00Z"
+  }).reason, "recipient_timezone_unknown");
+  assert.equal(evaluateSmartContactSMSEligibility({
+    contactExists: true,
+    phoneValid: true,
+    consentStatus: "opted_in",
+    recipientTimeZone: "America/New_York",
+    providerReady: false,
+    now: "2026-08-19T13:00:00Z"
+  }).reason, "provider_unavailable");
+});
+
+test("snapshot membership is required and dynamic definitions reject members", () => {
+  const contactID = "33333333-3333-4333-8333-333333333333";
+  assert.throws(
+    () => prepareSmartContactListPersistence({ mode: "snapshot" }),
+    (error) => error.code === "smart_contact_list_snapshot_empty"
+  );
+  assert.throws(
+    () => prepareSmartContactListPersistence({ mode: "dynamic", contact_ids: [contactID] }),
+    (error) => error.code === "smart_contact_list_members_not_allowed"
   );
 });
 

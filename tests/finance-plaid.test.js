@@ -83,7 +83,9 @@ await run("wrong key fails", () => {
 await run("modified ciphertext fails authentication", () => {
   const env = { FINANCE_TOKEN_ENCRYPTION_KEY: keyA };
   const encrypted = encryptAccessToken("secret-token", env);
-  encrypted.access_token_ciphertext = encrypted.access_token_ciphertext.replace(/.$/, "A");
+  const ciphertext = Buffer.from(encrypted.access_token_ciphertext, "base64");
+  ciphertext[0] ^= 0x01;
+  encrypted.access_token_ciphertext = ciphertext.toString("base64");
   assert.throws(() => decryptAccessToken(encrypted, env));
 });
 

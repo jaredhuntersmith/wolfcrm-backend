@@ -2,7 +2,16 @@ export const SMART_CONTACT_LIST_LIMITS = Object.freeze({
   maximumSourceContacts: 2_000,
   maximumReturnedContacts: 500,
   maximumFilterValues: 50,
-  maximumTextLength: 120
+  maximumTextLength: 120,
+  maximumSavedLists: 100,
+  maximumSnapshotContacts: 500,
+  maximumNameLength: 80,
+  maximumBulkTasks: 100,
+  maximumTaskTitleLength: 160,
+  maximumTaskDetailLength: 4_000,
+  maximumTaskAssignees: 20,
+  maximumBulkSMSContacts: 100,
+  maximumSMSBodyLength: 1_600
 });
 
 export class SmartContactListError extends Error {
@@ -101,6 +110,322 @@ export function validateSmartContactFilters(raw = {}) {
     routable_only: boolean(raw.routable_only, "routable_only"),
     sort,
     limit: optionalInteger(raw.limit, 1, SMART_CONTACT_LIST_LIMITS.maximumReturnedContacts, "limit") || 200
+  };
+}
+
+export function validateSmartContactListName(value) {
+  const name = clean(value).replace(/\s+/g, " ");
+  if (!name || name.length > SMART_CONTACT_LIST_LIMITS.maximumNameLength || /[\u0000-\u001f\u007f]/.test(name)) {
+    throw new SmartContactListError(
+      "smart_contact_list_name_invalid",
+      `List names must contain 1–${SMART_CONTACT_LIST_LIMITS.maximumNameLength} visible characters.`
+    );
+  }
+  return name;
+}
+
+export function validateSmartContactListMode(value) {
+  if (value !== "dynamic" && value !== "snapshot") {
+    throw new SmartContactListError(
+      "smart_contact_list_mode_invalid",
+      "Choose a Dynamic or Snapshot saved list."
+    );
+  }
+  return value;
+}
+
+export function prepareSmartContactListPersistence({
+  mode,
+  filters = {},
+  contact_ids = [],
+  origin_policy = "transient"
+} = {}) {
+  const normalizedMode = validateSmartContactListMode(mode);
+  if (origin_policy !== "transient" && origin_policy !== "fixed") {
+    throw new SmartContactListError(
+      "smart_contact_list_origin_policy_invalid",
+      "Choose whether this geographic origin is transient or a saved fixed location."
+    );
+  }
+  const normalizedFilters = validateSmartContactFilters(filters);
+  let persistedFilters = serializeFilters(normalizedFilters);
+  let originRedacted = false;
+
+  if (normalizedFilters.distance_mode !== "none" && origin_policy === "transient") {
+    if (normalizedMode === "dynamic") {
+      throw new SmartContactListError(
+        "smart_contact_list_fixed_origin_required",
+        "Dynamic geographic lists require an explicitly saved fixed origin."
+      );
+    }
+    persistedFilters = {
+      ...persistedFilters,
+      distance_mode: "none",
+      radius_miles: null,
+      origin: null,
+      sort: normalizedFilters.sort === "distance" ? "name" : normalizedFilters.sort
+    };
+    originRedacted = true;
+  }
+
+  if (normalizedFilters.distance_mode !== "none" && origin_policy === "fixed" && !clean(normalizedFilters.origin?.label)) {
+    throw new SmartContactListError(
+      "smart_contact_list_origin_label_required",
+      "Name the fixed origin before saving this geographic list."
+    );
+  }
+
+  const contactIDs = normalizeSnapshotContactIDs(contact_ids);
+  if (normalizedMode === "snapshot" && !contactIDs.length) {
+    throw new SmartContactListError(
+      "smart_contact_list_snapshot_empty",
+      "Select at least one contact before saving a Snapshot list."
+    );
+  }
+  if (normalizedMode === "dynamic" && contactIDs.length) {
+    throw new SmartContactListError(
+      "smart_contact_list_members_not_allowed",
+      "Dynamic lists are defined by filters and cannot store snapshot members."
+    );
+  }
+
+  return {
+    mode: normalizedMode,
+    filters: persistedFilters,
+    filter_version: normalizedFilters.version,
+    contact_ids: contactIDs,
+    origin_redacted: originRedacted
+  };
+}
+
+export function validateSmartContactTaskAction(raw = {}) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new SmartContactListError("smart_contact_task_request_invalid", "The bulk task request is invalid.");
+  }
+  const allowedKeys = new Set([
+    "contact_ids", "title_template", "detail_template", "due_date", "priority",
+    "assignee_ids", "source_list_id", "filters", "idempotency_key"
+  ]);
+  const unknown = Object.keys(raw).filter((key) => !allowedKeys.has(key));
+  if (unknown.length) {
+    throw new SmartContactListError(
+      "smart_contact_task_request_invalid",
+      `Unsupported bulk task field: ${unknown[0]}.`,
+      { details: { fields: unknown.join(",") } }
+    );
+  }
+
+  const contactIDs = normalizeUUIDList(raw.contact_ids, {
+    field: "contact_ids",
+    maximum: SMART_CONTACT_LIST_LIMITS.maximumBulkTasks,
+    minimum: 1,
+    errorCode: "smart_contact_task_contacts_invalid"
+  });
+  const titleTemplate = clean(raw.title_template).replace(/\s+/g, " ");
+  if (!titleTemplate || titleTemplate.length > SMART_CONTACT_LIST_LIMITS.maximumTaskTitleLength || /[\u0000-\u001f\u007f]/.test(titleTemplate)) {
+    throw new SmartContactListError(
+      "smart_contact_task_title_invalid",
+      `Task titles must contain 1–${SMART_CONTACT_LIST_LIMITS.maximumTaskTitleLength} visible characters.`
+    );
+  }
+  const detailTemplate = raw.detail_template == null ? null : String(raw.detail_template).trim();
+  if ((detailTemplate?.length || 0) > SMART_CONTACT_LIST_LIMITS.maximumTaskDetailLength || /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(detailTemplate || "")) {
+    throw new SmartContactListError(
+      "smart_contact_task_detail_invalid",
+      `Task details may contain at most ${SMART_CONTACT_LIST_LIMITS.maximumTaskDetailLength} characters.`
+    );
+  }
+  const dueDate = raw.due_date == null || raw.due_date === "" ? null : validDate(raw.due_date);
+  if (raw.due_date != null && raw.due_date !== "" && !dueDate) {
+    throw new SmartContactListError("smart_contact_task_due_date_invalid", "Choose a valid task due date.");
+  }
+  const priority = raw.priority == null ? "normal" : clean(raw.priority).toLowerCase();
+  if (!["low", "normal", "high", "urgent"].includes(priority)) {
+    throw new SmartContactListError("smart_contact_task_priority_invalid", "Choose a valid task priority.");
+  }
+  const assigneeIDs = normalizeUUIDList(raw.assignee_ids || [], {
+    field: "assignee_ids",
+    maximum: SMART_CONTACT_LIST_LIMITS.maximumTaskAssignees,
+    minimum: 0,
+    errorCode: "smart_contact_task_assignees_invalid"
+  });
+  const sourceListID = optionalUUID(raw.source_list_id, "smart_contact_task_source_list_invalid");
+  const idempotencyKey = optionalUUID(raw.idempotency_key, "smart_contact_task_idempotency_key_required");
+  if (!idempotencyKey) {
+    throw new SmartContactListError(
+      "smart_contact_task_idempotency_key_required",
+      "Reload the task confirmation and try again."
+    );
+  }
+  const filters = validateSmartContactFilters(raw.filters || {});
+
+  return {
+    contact_ids: contactIDs,
+    title_template: titleTemplate,
+    detail_template: detailTemplate || null,
+    due_date: dueDate?.toISOString() || null,
+    priority,
+    assignee_ids: assigneeIDs,
+    source_list_id: sourceListID,
+    filters: redactSmartContactFiltersForAudit(filters),
+    idempotency_key: idempotencyKey
+  };
+}
+
+export function renderSmartContactTaskTemplate(template, contactName) {
+  const name = clean(contactName) || "Contact";
+  return String(template || "").replaceAll("{{contact}}", name);
+}
+
+export function validateSmartContactSMSPreview(raw = {}) {
+  return validateSmartContactSMSRequest(raw, false);
+}
+
+export function validateSmartContactSMSSend(raw = {}) {
+  return validateSmartContactSMSRequest(raw, true);
+}
+
+export function renderSmartContactSMSTemplate(template, { contactName, companyName } = {}) {
+  return String(template || "")
+    .replaceAll("{{contact}}", clean(contactName) || "there")
+    .replaceAll("{{company}}", clean(companyName) || "Our team");
+}
+
+export function smartContactSMSRequestSnapshot(action = {}) {
+  return {
+    campaign_type: "marketing",
+    contact_ids: Array.isArray(action.contact_ids) ? action.contact_ids : [],
+    message_template: action.message_template || "",
+    source_list_id: action.source_list_id || null,
+    filters: action.filters || {}
+  };
+}
+
+export function evaluateSmartContactSMSEligibility({
+  contactExists = true,
+  phoneValid = false,
+  consentStatus = null,
+  recipientTimeZone = null,
+  providerReady = true,
+  now = new Date()
+} = {}) {
+  if (!contactExists) return { eligible: false, reason: "contact_not_found" };
+  if (!phoneValid) return { eligible: false, reason: "invalid_phone" };
+  if (consentStatus === "opted_out") return { eligible: false, reason: "opted_out" };
+  if (consentStatus !== "opted_in") return { eligible: false, reason: "marketing_consent_required" };
+  if (!clean(recipientTimeZone)) return { eligible: false, reason: "recipient_timezone_unknown" };
+  const localHour = hourInTimeZone(now, recipientTimeZone);
+  if (localHour == null) return { eligible: false, reason: "recipient_timezone_unknown" };
+  if (localHour < 8 || localHour >= 21) return { eligible: false, reason: "quiet_hours" };
+  if (!providerReady) return { eligible: false, reason: "provider_unavailable" };
+  return { eligible: true, reason: null };
+}
+
+function validateSmartContactSMSRequest(raw, send) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new SmartContactListError("smart_contact_sms_request_invalid", "The message campaign request is invalid.");
+  }
+  const allowedKeys = new Set([
+    "contact_ids", "message_template", "source_list_id", "filters",
+    ...(send ? ["preview_id", "idempotency_key", "confirmed"] : [])
+  ]);
+  const unknown = Object.keys(raw).filter((key) => !allowedKeys.has(key));
+  if (unknown.length) {
+    throw new SmartContactListError(
+      "smart_contact_sms_request_invalid",
+      `Unsupported message campaign field: ${unknown[0]}.`,
+      { details: { fields: unknown.join(",") } }
+    );
+  }
+  const contactIDs = normalizeUUIDList(raw.contact_ids, {
+    field: "contact_ids",
+    maximum: SMART_CONTACT_LIST_LIMITS.maximumBulkSMSContacts,
+    minimum: 1,
+    errorCode: "smart_contact_sms_contacts_invalid"
+  });
+  const messageTemplate = raw.message_template == null ? "" : String(raw.message_template).trim();
+  if (!messageTemplate
+      || messageTemplate.length > SMART_CONTACT_LIST_LIMITS.maximumSMSBodyLength
+      || /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(messageTemplate)) {
+    throw new SmartContactListError(
+      "smart_contact_sms_message_invalid",
+      `Campaign messages must contain 1–${SMART_CONTACT_LIST_LIMITS.maximumSMSBodyLength} characters.`
+    );
+  }
+  const placeholders = [...messageTemplate.matchAll(/\{\{([^{}]+)\}\}/g)].map((match) => match[1]);
+  const unsupported = placeholders.filter((placeholder) => !["contact", "company"].includes(placeholder));
+  if (unsupported.length) {
+    throw new SmartContactListError(
+      "smart_contact_sms_placeholder_invalid",
+      `Unsupported message placeholder: {{${unsupported[0]}}}.`
+    );
+  }
+  if (!messageTemplate.includes("{{company}}")) {
+    throw new SmartContactListError(
+      "smart_contact_sms_company_required",
+      "Campaign messages must identify the sender with {{company}}."
+    );
+  }
+  if (!/\breply\s+stop\b/i.test(messageTemplate)) {
+    throw new SmartContactListError(
+      "smart_contact_sms_opt_out_language_required",
+      "Campaign messages must include “Reply STOP” opt-out instructions."
+    );
+  }
+  const sourceListID = optionalUUID(raw.source_list_id, "smart_contact_sms_source_list_invalid");
+  const filters = redactSmartContactFiltersForAudit(validateSmartContactFilters(raw.filters || {}));
+  const normalized = {
+    contact_ids: contactIDs,
+    message_template: messageTemplate,
+    source_list_id: sourceListID,
+    filters
+  };
+  if (!send) return normalized;
+  const previewID = optionalUUID(raw.preview_id, "smart_contact_sms_preview_required");
+  if (!previewID) {
+    throw new SmartContactListError("smart_contact_sms_preview_required", "Preview this campaign again before sending.");
+  }
+  const idempotencyKey = optionalUUID(raw.idempotency_key, "smart_contact_sms_idempotency_key_required");
+  if (!idempotencyKey) {
+    throw new SmartContactListError("smart_contact_sms_idempotency_key_required", "Reload the campaign confirmation and try again.");
+  }
+  if (raw.confirmed !== true) {
+    throw new SmartContactListError("smart_contact_sms_confirmation_required", "Review and explicitly confirm the campaign before sending.");
+  }
+  return {
+    ...normalized,
+    preview_id: previewID,
+    idempotency_key: idempotencyKey,
+    confirmed: true
+  };
+}
+
+function hourInTimeZone(value, timeZone) {
+  const date = validDate(value);
+  if (!date) return null;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hour: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(date);
+    const hour = Number(parts.find((part) => part.type === "hour")?.value);
+    return Number.isInteger(hour) && hour >= 0 && hour <= 23 ? hour : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+export function redactSmartContactFiltersForAudit(rawFilters = {}) {
+  const filters = rawFilters?.job_completed_before instanceof Date
+    ? rawFilters
+    : validateSmartContactFilters(rawFilters);
+  const serialized = serializeFilters(filters);
+  return {
+    ...serialized,
+    origin: serialized.origin
+      ? { label: clean(serialized.origin.label) || null, redacted: true }
+      : null
   };
 }
 
@@ -340,6 +665,53 @@ function serializeFilters(filters) {
     ...filters,
     job_completed_before: filters.job_completed_before?.toISOString() || null
   };
+}
+
+function normalizeSnapshotContactIDs(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.length > SMART_CONTACT_LIST_LIMITS.maximumSnapshotContacts) {
+    throw new SmartContactListError(
+      "smart_contact_list_members_invalid",
+      `Snapshot lists support at most ${SMART_CONTACT_LIST_LIMITS.maximumSnapshotContacts} selected contacts.`
+    );
+  }
+  const ids = [];
+  for (const item of value) {
+    const id = clean(item).toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+      throw new SmartContactListError(
+        "smart_contact_list_members_invalid",
+        "One or more selected contacts are invalid. Refresh the results and try again."
+      );
+    }
+    if (!ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+function normalizeUUIDList(value, { field, maximum, minimum, errorCode }) {
+  if (!Array.isArray(value) || value.length > maximum) {
+    throw new SmartContactListError(errorCode, `${field} must contain ${minimum}–${maximum} valid IDs.`);
+  }
+  const ids = [];
+  for (const item of value) {
+    const id = optionalUUID(item, errorCode);
+    if (!id) throw new SmartContactListError(errorCode, `${field} contains an invalid ID.`);
+    if (!ids.includes(id)) ids.push(id);
+  }
+  if (ids.length < minimum) {
+    throw new SmartContactListError(errorCode, `${field} must contain ${minimum}–${maximum} valid IDs.`);
+  }
+  return ids;
+}
+
+function optionalUUID(value, errorCode) {
+  if (value == null || value === "") return null;
+  const id = clean(value).toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) {
+    throw new SmartContactListError(errorCode, "One or more IDs are invalid.");
+  }
+  return id;
 }
 
 function stringList(value, field, { lower = true } = {}) {
