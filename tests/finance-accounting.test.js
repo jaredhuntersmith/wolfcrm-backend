@@ -34,6 +34,8 @@ test("default chart has stable unique codes and system keys", () => {
   assert.equal(new Set(DEFAULT_CHART_ACCOUNTS.map((item) => item.system_key)).size, DEFAULT_CHART_ACCOUNTS.length);
   assert.ok(DEFAULT_CHART_ACCOUNTS.some((item) => item.account_type === "income"));
   assert.ok(DEFAULT_CHART_ACCOUNTS.some((item) => item.account_type === "expense"));
+  assert.ok(DEFAULT_CHART_ACCOUNTS.some((item) => item.system_key === "customer_credits" && item.account_type === "liability"));
+  assert.ok(DEFAULT_CHART_ACCOUNTS.some((item) => item.system_key === "opening_balance_equity" && item.account_type === "equity"));
 });
 
 test("default chart seeding is idempotent in one bounded query", async () => {

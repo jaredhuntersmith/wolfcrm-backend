@@ -22,6 +22,10 @@ import {
   installFinancePayrollEvaluationRoutes,
   installFinancePayrollEvaluationSchema
 } from "./finance-payroll-evaluation.js";
+import {
+  installFinanceGeneralLedgerRoutes,
+  installFinanceGeneralLedgerSchema
+} from "./finance-general-ledger.js";
 
 const ACCOUNT_TYPES = new Set(["asset", "liability", "equity", "income", "expense"]);
 const RECONCILIATION_STATUSES = new Set(["unreconciled", "cleared", "reconciled"]);
@@ -35,8 +39,10 @@ export const DEFAULT_CHART_ACCOUNTS = Object.freeze([
   { code: "2000", name: "Accounts Payable", account_type: "liability", subtype: "accounts_payable", system_key: "accounts_payable" },
   { code: "2100", name: "Credit Cards", account_type: "liability", subtype: "credit_card", system_key: "credit_cards" },
   { code: "2200", name: "Loans Payable", account_type: "liability", subtype: "loans_payable", system_key: "loans_payable" },
+  { code: "2300", name: "Customer Credits", account_type: "liability", subtype: "customer_credits", system_key: "customer_credits" },
   { code: "3000", name: "Owner Equity", account_type: "equity", subtype: "owner_equity", system_key: "owner_equity" },
   { code: "3100", name: "Owner Distributions", account_type: "equity", subtype: "owner_distributions", system_key: "owner_distributions" },
+  { code: "3200", name: "Opening Balance Equity", account_type: "equity", subtype: "opening_balance_equity", system_key: "opening_balance_equity" },
   { code: "4000", name: "Service Revenue", account_type: "income", subtype: "service_revenue", system_key: "service_revenue" },
   { code: "4100", name: "Recurring Service Revenue", account_type: "income", subtype: "recurring_revenue", system_key: "recurring_service_revenue" },
   { code: "4200", name: "Other Revenue", account_type: "income", subtype: "other_revenue", system_key: "other_revenue" },
@@ -436,6 +442,7 @@ export async function installFinanceAccountingSchema(pool) {
     CREATE INDEX IF NOT EXISTS finance_transaction_audit_company_transaction_idx
       ON finance_transaction_audit(company_id, transaction_id, created_at DESC);
   `);
+  await installFinanceGeneralLedgerSchema(pool);
   await installOperationalAccountingSchema(pool);
   await installFinanceCostAllocationSchema(pool);
   await installFinanceMileageAllocationSchema(pool);
@@ -764,6 +771,14 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     } catch (error) {
       handleAccountingError(res, error, "profit_loss_report_failed");
     }
+  });
+
+  installFinanceGeneralLedgerRoutes({
+    app,
+    pool,
+    authRequired,
+    requireFinanceAccess: requireEmployer,
+    ensureChartAccounts: ensureDefaultChartAccounts
   });
 
   installOperationalAccountingRoutes({ app, pool, authRequired, requireEmployer });
