@@ -154,6 +154,8 @@ function testAdministrativeRouteClassification() {
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/mileage-allocations"), "accounting.view");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/mileage-allocations/123"), "accounting.view");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/mileage-allocations/123"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/payroll-costs"), "accounting.view");
+  assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/payroll-costs/recognition"), "accounting.manage");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/transactions/123"), "accounting.manage");
 }
 

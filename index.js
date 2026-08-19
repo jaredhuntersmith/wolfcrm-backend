@@ -16975,17 +16975,17 @@ async function startServer() {
     requireIntegrationManage: requireCapability("integrations.manage"),
     sendCompanyPhonePush
   });
-  await installFinanceSystem({
-    app,
-    pool,
-    authRequired,
-    requireEmployer: requireFinanceAccess
-  });
   await installPayStructureSystem({
     app,
     pool,
     authRequired,
     requirePayManage: requireCapability("pay.manage")
+  });
+  await installFinanceSystem({
+    app,
+    pool,
+    authRequired,
+    requireEmployer: requireFinanceAccess
   });
   await installGoogleSheetsSchema(pool);
   installGoogleSheetsSystem({
