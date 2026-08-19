@@ -12,6 +12,7 @@ const POLICY_STATUSES = new Set(["draft", "reviewed"]);
 const EXEMPTION_STATUSES = new Set(["undetermined", "nonexempt", "exempt"]);
 const OVERTIME_METHODS = new Set(["undetermined", "weekly_regular_rate", "manual_premium", "not_applicable"]);
 const STATE_OVERTIME_STATUSES = new Set(["undetermined", "none", "configured", "manual"]);
+const OVERTIME_COMBINATION_METHODS = new Set(["undetermined", "weekly_only", "highest_applicable_multiplier", "manual", "not_applicable"]);
 const BURDEN_STATUSES = new Set(["undetermined", "none", "configured"]);
 const BURDEN_CATEGORIES = new Set(["employer_tax", "benefit", "workers_comp", "insurance", "other"]);
 const BURDEN_BASES = new Set(["percent_of_wages", "fixed_per_hour", "fixed_per_workweek"]);
@@ -158,6 +159,10 @@ export function normalizePayrollPolicyInput(body = {}) {
   const exemptionStatus = enumValue(body.exemption_status, EXEMPTION_STATUSES, "exemption_status");
   const overtimeMethod = enumValue(body.overtime_method, OVERTIME_METHODS, "overtime_method");
   const stateOvertimeStatus = enumValue(body.state_overtime_status, STATE_OVERTIME_STATUSES, "state_overtime_status");
+  const defaultCombinationMethod = body.overtime_combination_method == null
+    ? (exemptionStatus === "exempt" ? "not_applicable" : stateOvertimeStatus === "none" ? "weekly_only" : "undetermined")
+    : body.overtime_combination_method;
+  const overtimeCombinationMethod = enumValue(defaultCombinationMethod, OVERTIME_COMBINATION_METHODS, "overtime_combination_method");
   const burdenStatus = enumValue(body.burden_status, BURDEN_STATUSES, "burden_status");
   const jurisdictionCode = cleanString(body.jurisdiction_code, 32).toUpperCase();
   if (!jurisdictionCode) throw new PayrollAuthorityError("jurisdiction_code_required", "Add the reviewed work jurisdiction.");
@@ -182,6 +187,18 @@ export function normalizePayrollPolicyInput(body = {}) {
   if (stateOvertimeStatus === "manual" && !specialRuleNotes) {
     throw new PayrollAuthorityError("special_rule_notes_required", "Manual state/local overtime requires a bounded explanation.");
   }
+  if (exemptionStatus === "exempt" && overtimeCombinationMethod !== "not_applicable") {
+    throw new PayrollAuthorityError("exempt_overtime_combination_invalid", "An exempt policy must explicitly mark overtime combination Not Applicable.");
+  }
+  if (exemptionStatus === "nonexempt" && stateOvertimeStatus === "none" && overtimeCombinationMethod !== "weekly_only") {
+    throw new PayrollAuthorityError("weekly_overtime_combination_invalid", "A policy with no state/local daily overtime must use Weekly Only combination.");
+  }
+  if (stateOvertimeStatus === "configured" && overtimeCombinationMethod !== "highest_applicable_multiplier") {
+    throw new PayrollAuthorityError("daily_overtime_combination_invalid", "Configured daily overtime must explicitly use the highest applicable daily/weekly multiplier once.");
+  }
+  if (stateOvertimeStatus === "manual" && overtimeCombinationMethod !== "manual") {
+    throw new PayrollAuthorityError("manual_overtime_combination_invalid", "Manual state/local overtime must use Manual combination.");
+  }
   if (overtimeMethod === "manual_premium" && !specialRuleNotes) {
     throw new PayrollAuthorityError("special_rule_notes_required", "Manual overtime-premium authority requires a bounded explanation.");
   }
@@ -199,7 +216,8 @@ export function normalizePayrollPolicyInput(body = {}) {
   }
   if (status === "reviewed") {
     if (exemptionStatus === "undetermined" || overtimeMethod === "undetermined"
-        || stateOvertimeStatus === "undetermined" || burdenStatus === "undetermined") {
+        || stateOvertimeStatus === "undetermined" || overtimeCombinationMethod === "undetermined"
+        || burdenStatus === "undetermined") {
       throw new PayrollAuthorityError("reviewed_policy_incomplete", "Reviewed payroll policies cannot retain undetermined rule coverage.");
     }
   }
@@ -213,6 +231,7 @@ export function normalizePayrollPolicyInput(body = {}) {
     weekly_threshold_seconds: weeklyThresholdSeconds,
     weekly_multiplier_basis_points: weeklyMultiplierBasisPoints,
     state_overtime_status: stateOvertimeStatus,
+    overtime_combination_method: overtimeCombinationMethod,
     daily_overtime_rules: dailyRules,
     burden_status: burdenStatus,
     burden_rules: burdenRules,
@@ -231,6 +250,7 @@ function policyFacts(row) {
     weekly_threshold_seconds: row.weekly_threshold_seconds == null ? null : Number(row.weekly_threshold_seconds),
     weekly_multiplier_basis_points: row.weekly_multiplier_basis_points == null ? null : Number(row.weekly_multiplier_basis_points),
     state_overtime_status: row.state_overtime_status,
+    overtime_combination_method: row.overtime_combination_method || "undetermined",
     daily_overtime_rules: Array.isArray(row.daily_overtime_rules) ? row.daily_overtime_rules : [],
     burden_status: row.burden_status,
     burden_rules: Array.isArray(row.burden_rules) ? row.burden_rules : [],
@@ -248,6 +268,7 @@ function samePolicyFacts(row, update) {
     weekly_threshold_seconds: update.weekly_threshold_seconds,
     weekly_multiplier_basis_points: update.weekly_multiplier_basis_points,
     state_overtime_status: update.state_overtime_status,
+    overtime_combination_method: update.overtime_combination_method,
     daily_overtime_rules: update.daily_overtime_rules,
     burden_status: update.burden_status,
     burden_rules: update.burden_rules,
@@ -391,6 +412,7 @@ function policyAuditSnapshot(row) {
     weekly_threshold_seconds: payload.weekly_threshold_seconds,
     weekly_multiplier_basis_points: payload.weekly_multiplier_basis_points,
     state_overtime_status: payload.state_overtime_status,
+    overtime_combination_method: payload.overtime_combination_method,
     daily_overtime_rules: payload.daily_overtime_rules,
     burden_status: payload.burden_status,
     burden_rules: payload.burden_rules,
@@ -475,6 +497,7 @@ export async function installFinancePayrollAuthoritySchema(pool) {
       weekly_threshold_seconds INTEGER,
       weekly_multiplier_basis_points INTEGER,
       state_overtime_status TEXT NOT NULL DEFAULT 'undetermined',
+      overtime_combination_method TEXT NOT NULL DEFAULT 'undetermined',
       daily_overtime_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
       burden_status TEXT NOT NULL DEFAULT 'undetermined',
       burden_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -493,6 +516,7 @@ export async function installFinancePayrollAuthoritySchema(pool) {
       CHECK (weekly_threshold_seconds IS NULL OR weekly_threshold_seconds > 0),
       CHECK (weekly_multiplier_basis_points IS NULL OR weekly_multiplier_basis_points >= 10000),
       CHECK (state_overtime_status IN ('undetermined','none','configured','manual')),
+      CHECK (overtime_combination_method IN ('undetermined','weekly_only','highest_applicable_multiplier','manual','not_applicable')),
       CHECK (burden_status IN ('undetermined','none','configured')),
       CHECK (jsonb_typeof(daily_overtime_rules) = 'array'),
       CHECK (jsonb_typeof(burden_rules) = 'array'),
@@ -512,6 +536,15 @@ export async function installFinancePayrollAuthoritySchema(pool) {
       )),
       CHECK (version > 0)
     );
+    ALTER TABLE finance_payroll_policies
+      ADD COLUMN IF NOT EXISTS overtime_combination_method TEXT NOT NULL DEFAULT 'undetermined';
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'finance_payroll_policies_overtime_combination_check') THEN
+        ALTER TABLE finance_payroll_policies
+          ADD CONSTRAINT finance_payroll_policies_overtime_combination_check
+          CHECK (overtime_combination_method IN ('undetermined','weekly_only','highest_applicable_multiplier','manual','not_applicable'));
+      END IF;
+    END $$;
     CREATE INDEX IF NOT EXISTS finance_payroll_policies_company_employee_effective_idx
       ON finance_payroll_policies(company_id, employee_id, effective_from DESC, effective_to);
 
@@ -913,13 +946,15 @@ export function installFinancePayrollAuthorityRoutes({ app, pool, authRequired, 
           `UPDATE finance_payroll_policies SET
              status=$4, jurisdiction_code=$5, exemption_status=$6, overtime_method=$7,
              weekly_threshold_seconds=$8, weekly_multiplier_basis_points=$9, state_overtime_status=$10,
-             daily_overtime_rules=$11, burden_status=$12, burden_rules=$13, special_rule_notes=$14,
-             notes=$15, version=version+1, updated_by=$16, updated_at=now()
+             overtime_combination_method=$11, daily_overtime_rules=$12, burden_status=$13,
+             burden_rules=$14, special_rule_notes=$15,
+             notes=$16, version=version+1, updated_by=$17, updated_at=now()
            WHERE company_id=$1 AND employee_id=$2::uuid AND id=$3 RETURNING *`,
           [req.companyId, req.params.employeeId, plan.target.id, update.status, update.jurisdiction_code,
             update.exemption_status, update.overtime_method, update.weekly_threshold_seconds,
             update.weekly_multiplier_basis_points, update.state_overtime_status,
-            JSON.stringify(update.daily_overtime_rules), update.burden_status, JSON.stringify(update.burden_rules),
+            update.overtime_combination_method, JSON.stringify(update.daily_overtime_rules),
+            update.burden_status, JSON.stringify(update.burden_rules),
             update.special_rule_notes, update.notes, req.userId]
         )).rows[0];
         await appendPolicyAudit(client, {
@@ -946,14 +981,15 @@ export function installFinancePayrollAuthorityRoutes({ app, pool, authRequired, 
           `INSERT INTO finance_payroll_policies (
              company_id, employee_id, effective_from, effective_to, status, jurisdiction_code,
              exemption_status, overtime_method, weekly_threshold_seconds, weekly_multiplier_basis_points,
-             state_overtime_status, daily_overtime_rules, burden_status, burden_rules,
+             state_overtime_status, overtime_combination_method, daily_overtime_rules, burden_status, burden_rules,
              special_rule_notes, notes, created_by, updated_by
-           ) VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+           ) VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$18)
            RETURNING *`,
           [req.companyId, req.params.employeeId, plan.effective_from, plan.effective_to, update.status,
             update.jurisdiction_code, update.exemption_status, update.overtime_method,
             update.weekly_threshold_seconds, update.weekly_multiplier_basis_points,
-            update.state_overtime_status, JSON.stringify(update.daily_overtime_rules), update.burden_status,
+            update.state_overtime_status, update.overtime_combination_method,
+            JSON.stringify(update.daily_overtime_rules), update.burden_status,
             JSON.stringify(update.burden_rules), update.special_rule_notes, update.notes, req.userId]
         )).rows[0];
         await appendPolicyAudit(client, {

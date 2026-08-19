@@ -18,6 +18,10 @@ import {
   installFinancePayrollAuthorityRoutes,
   installFinancePayrollAuthoritySchema
 } from "./finance-payroll-authority.js";
+import {
+  installFinancePayrollEvaluationRoutes,
+  installFinancePayrollEvaluationSchema
+} from "./finance-payroll-evaluation.js";
 
 const ACCOUNT_TYPES = new Set(["asset", "liability", "equity", "income", "expense"]);
 const RECONCILIATION_STATUSES = new Set(["unreconciled", "cleared", "reconciled"]);
@@ -437,6 +441,7 @@ export async function installFinanceAccountingSchema(pool) {
   await installFinanceMileageAllocationSchema(pool);
   await installFinancePayrollCostSchema(pool);
   await installFinancePayrollAuthoritySchema(pool);
+  await installFinancePayrollEvaluationSchema(pool);
 }
 
 export async function ensureDefaultChartAccounts(poolOrClient, companyId, userId = null) {
@@ -781,6 +786,12 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     requireFinanceAccess: requireEmployer
   });
   installFinancePayrollAuthorityRoutes({
+    app,
+    pool,
+    authRequired,
+    requireFinanceAccess: requireEmployer
+  });
+  installFinancePayrollEvaluationRoutes({
     app,
     pool,
     authRequired,

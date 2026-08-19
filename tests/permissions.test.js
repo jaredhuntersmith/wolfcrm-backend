@@ -160,6 +160,10 @@ function testAdministrativeRouteClassification() {
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/payroll-authority/employees/123"), "accounting.view");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/payroll-authority/employees/123/policy"), "accounting.manage");
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/payroll-authority/commission-events"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/payroll-evaluation"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/payroll-evaluation/commission-events/123/allocation"), "accounting.view");
+  assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/payroll-evaluation/commission-events/123/allocation"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/payroll-evaluation/recognition"), "accounting.manage");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/transactions/123"), "accounting.manage");
 }
 

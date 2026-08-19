@@ -77,6 +77,7 @@ test("reviewed policy requires explicit complete exemption, overtime, state, and
 test("daily overtime tiers and burden rules are exact, bounded, and basis-correct", () => {
   const result = normalizePayrollPolicyInput(reviewedPolicy({
     state_overtime_status: "configured",
+    overtime_combination_method: "highest_applicable_multiplier",
     daily_overtime_rules: [
       { id: "double", threshold_seconds: 43_200, multiplier_basis_points: 20_000 },
       { id: "time-half", threshold_seconds: 28_800, multiplier_basis_points: 15_000 }
@@ -96,7 +97,7 @@ test("daily overtime tiers and burden rules are exact, bounded, and basis-correc
     (error) => ["burden_rule_label_required", "burden_rules_unexpected"].includes(error.code)
   );
   assert.throws(
-    () => normalizePayrollPolicyInput(reviewedPolicy({ state_overtime_status: "manual", special_rule_notes: "" })),
+    () => normalizePayrollPolicyInput(reviewedPolicy({ state_overtime_status: "manual", overtime_combination_method: "manual", special_rule_notes: "" })),
     (error) => error.code === "special_rule_notes_required"
   );
   assert.throws(

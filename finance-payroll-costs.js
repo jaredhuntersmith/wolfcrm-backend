@@ -611,7 +611,7 @@ export async function installFinancePayrollCostSchema(pool) {
   `);
 }
 
-async function loadCompanyContext(client, companyId) {
+export async function loadCompanyContext(client, companyId) {
   const { rows } = await client.query(
     `SELECT COALESCE(NULLIF(c.timezone, ''), 'America/New_York') AS timezone,
             (now() AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'America/New_York'))::date::text AS company_today,
@@ -752,7 +752,7 @@ function previewPayload(preview) {
   return safe;
 }
 
-async function payrollCostReport(client, companyId, range, context, { lock = false } = {}) {
+export async function payrollCostReport(client, companyId, range, context, { lock = false } = {}) {
   const evidence = await loadPayrollEvidence(client, companyId, range, context, { lock });
   const preview = calculateBaseCompensationPreview({
     range,
