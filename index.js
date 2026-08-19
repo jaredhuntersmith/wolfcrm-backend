@@ -37,10 +37,34 @@ import {
   startGoogleSheetsWorkers
 } from "./google-sheets.js";
 import { installIMessageSystem, sendAutomatedIMessage } from "./imessage.js";
+import { createGoogleRoutingService, GoogleRoutingError } from "./google-routing.js";
+import {
+  hasCapability,
+  legacyColumnsForCapabilities,
+  permissionCatalogPayload,
+  requiredAutomationCapability,
+  requiredFinanceCapability,
+  resolveAccess,
+  validateAccessUpdate
+} from "./permissions.js";
+import {
+  TAB_ROLE_PRESETS,
+  isKnownTabRolePreset,
+  resolveTabNavigation,
+  tabCatalogPayload,
+  validateTabLayout
+} from "./navigation-tabs.js";
+import {
+  ScheduleTeamError,
+  summarizeScheduleTeam,
+  validateAssignments,
+  validateAvailability
+} from "./schedule-team.js";
 
 const { Pool } = pkg;
 const app = express();
 const PORT = process.env.PORT || 8080;
+const googleRoutingService = createGoogleRoutingService();
 
 const useSSL =
   process.env.DB_SSL === "true" ||
@@ -720,6 +744,7 @@ async function bootstrap() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_by UUID;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS pre_delete_email TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS tab_preferences JSONB NOT NULL DEFAULT '{}'::jsonb;
     CREATE INDEX IF NOT EXISTS users_deleted_at_idx ON users(deleted_at);
 
     CREATE TABLE IF NOT EXISTS companies (
@@ -736,6 +761,7 @@ async function bootstrap() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS companies_join_code_idx ON companies(join_code);
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS tab_role_policies JSONB NOT NULL DEFAULT '{}'::jsonb;
 
     CREATE TABLE IF NOT EXISTS employee_permissions (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -762,8 +788,38 @@ async function bootstrap() {
       can_view_finance_settings BOOLEAN NOT NULL DEFAULT false,
       can_edit_finance_settings BOOLEAN NOT NULL DEFAULT false,
       can_manage_company_finance_ai_memories BOOLEAN NOT NULL DEFAULT false,
+      permission_preset TEXT NOT NULL DEFAULT 'legacy_employee',
+      permission_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
+      tab_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+
+    CREATE TABLE IF NOT EXISTS employee_permission_audit (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      employee_user_id UUID NOT NULL,
+      changed_by_user_id UUID NOT NULL,
+      previous_preset TEXT,
+      previous_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
+      new_preset TEXT NOT NULL,
+      new_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS employee_permission_audit_employee_idx
+      ON employee_permission_audit(company_id, employee_user_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS tab_layout_audit (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      changed_by_user_id UUID NOT NULL,
+      target_type TEXT NOT NULL CHECK (target_type IN ('role', 'employee')),
+      target_id TEXT NOT NULL,
+      previous_layout JSONB NOT NULL DEFAULT '{}'::jsonb,
+      new_layout JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS tab_layout_audit_target_idx
+      ON tab_layout_audit(company_id, target_type, target_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS password_reset_codes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -830,6 +886,13 @@ async function bootstrap() {
       end_longitude DOUBLE PRECISION,
       distance_meters DOUBLE PRECISION,
       travel_time_seconds DOUBLE PRECISION,
+      service_time_seconds DOUBLE PRECISION,
+      total_route_time_seconds DOUBLE PRECISION,
+      estimated_start_at TIMESTAMPTZ,
+      estimated_finish_at TIMESTAMPTZ,
+      routing_provider TEXT,
+      routing_strategy TEXT,
+      routing_calculated_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -850,6 +913,11 @@ async function bootstrap() {
       batch_number INTEGER,
       locked_order INTEGER,
       source_type TEXT NOT NULL DEFAULT 'contact',
+      service_duration_seconds DOUBLE PRECISION,
+      leg_distance_meters DOUBLE PRECISION,
+      leg_travel_time_seconds DOUBLE PRECISION,
+      estimated_arrival_at TIMESTAMPTZ,
+      estimated_departure_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -859,8 +927,20 @@ async function bootstrap() {
     ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_label TEXT;
     ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_latitude DOUBLE PRECISION;
     ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_longitude DOUBLE PRECISION;
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS service_time_seconds DOUBLE PRECISION;
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS total_route_time_seconds DOUBLE PRECISION;
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS estimated_start_at TIMESTAMPTZ;
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS estimated_finish_at TIMESTAMPTZ;
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS routing_provider TEXT;
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS routing_strategy TEXT;
+    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS routing_calculated_at TIMESTAMPTZ;
     ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'contact';
     ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS locked_order INTEGER;
+    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS service_duration_seconds DOUBLE PRECISION;
+    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS leg_distance_meters DOUBLE PRECISION;
+    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS leg_travel_time_seconds DOUBLE PRECISION;
+    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS estimated_arrival_at TIMESTAMPTZ;
+    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS estimated_departure_at TIMESTAMPTZ;
 
     CREATE TABLE IF NOT EXISTS zapier_tokens (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -1205,6 +1285,22 @@ async function bootstrap() {
       ON schedule_events(user_id, start_at);
     CREATE INDEX IF NOT EXISTS schedule_events_quote_idx
       ON schedule_events(quote_id);
+
+    CREATE TABLE IF NOT EXISTS employee_schedule_availability (
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      weekdays JSONB NOT NULL DEFAULT '[1,2,3,4,5]'::jsonb,
+      start_time TEXT NOT NULL DEFAULT '09:00',
+      end_time TEXT NOT NULL DEFAULT '17:00',
+      timezone TEXT NOT NULL DEFAULT 'America/New_York',
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      updated_by UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY(company_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS employee_schedule_availability_company_idx
+      ON employee_schedule_availability(company_id, user_id);
 
     CREATE TABLE IF NOT EXISTS map_pins (
       id TEXT PRIMARY KEY,
@@ -1656,6 +1752,7 @@ async function bootstrap() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS tab_preferences JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS notify_all_members_on_jobs BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS manual_entry BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS manual_status TEXT NOT NULL DEFAULT 'approved';
@@ -1671,6 +1768,7 @@ async function bootstrap() {
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_days JSONB NOT NULL DEFAULT '[1,2,3,4,5]'::jsonb;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_open_time TEXT NOT NULL DEFAULT '09:00';
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_close_time TEXT NOT NULL DEFAULT '17:00';
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS tab_role_policies JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_use_finance_ai BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_transactions BOOLEAN NOT NULL DEFAULT false;
@@ -1692,6 +1790,9 @@ async function bootstrap() {
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_settings BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_settings BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_manage_company_finance_ai_memories BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS permission_preset TEXT NOT NULL DEFAULT 'legacy_employee';
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS permission_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS tab_policy JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS service_items JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
@@ -1966,7 +2067,8 @@ async function authRequired(req, res, next) {
                 COALESCE(p.can_edit_finance_debts, u.role = 'employer') AS can_edit_finance_debts,
                 COALESCE(p.can_view_finance_settings, u.role = 'employer') AS can_view_finance_settings,
                 COALESCE(p.can_edit_finance_settings, u.role = 'employer') AS can_edit_finance_settings,
-                COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories`,
+                COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories,
+                p.permission_preset, p.permission_overrides`,
     [token]
   );
   if (!rows.length) return res.status(401).json({ error: "unauthorized" });
@@ -1974,6 +2076,12 @@ async function authRequired(req, res, next) {
   req.userEmail = rows[0].email;
   req.role = rows[0].role;
   req.companyId = rows[0].company_id;
+  const access = resolveAccess({
+    role: rows[0].role,
+    preset: rows[0].permission_preset,
+    overrides: rows[0].permission_overrides,
+    legacy: rows[0]
+  });
   req.permissions = {
     canDeleteContacts: !!rows[0].can_delete_contacts,
     canViewFinance: !!rows[0].can_view_finance,
@@ -1996,14 +2104,54 @@ async function authRequired(req, res, next) {
     canEditFinanceDebts: !!rows[0].can_edit_finance_debts,
     canViewFinanceSettings: !!rows[0].can_view_finance_settings,
     canEditFinanceSettings: !!rows[0].can_edit_finance_settings,
-    canManageCompanyFinanceAiMemories: !!rows[0].can_manage_company_finance_ai_memories
+    canManageCompanyFinanceAiMemories: !!rows[0].can_manage_company_finance_ai_memories,
+    preset: access.preset,
+    overrides: access.overrides,
+    capabilities: access.capabilities
   };
+  req.permissionPayload = employeePermissionPayload({ ...rows[0], access });
   req.sessionToken = token;
   next();
 }
 
 function requireEmployer(req, res, next) {
   if (req.role !== "employer") return res.status(403).json({ error: "employer_required" });
+  next();
+}
+
+function requireCapability(capability) {
+  return (req, res, next) => {
+    if (!hasCapability(req, capability)) {
+      return res.status(403).json({ error: "permission_denied", required_capability: capability });
+    }
+    next();
+  };
+}
+
+function requireAnyCapability(...capabilities) {
+  return (req, res, next) => {
+    if (!capabilities.some((capability) => hasCapability(req, capability))) {
+      return res.status(403).json({ error: "permission_denied", required_capabilities: capabilities });
+    }
+    next();
+  };
+}
+
+function requireAutomationAccess(req, res, next) {
+  const capability = requiredAutomationCapability(req.method, req.path);
+  if (!hasCapability(req, capability)) {
+    return res.status(403).json({ error: "permission_denied", required_capability: capability });
+  }
+  next();
+}
+
+function requireFinanceAccess(req, res, next) {
+  const isRead = req.method === "GET";
+  const capability = requiredFinanceCapability(req.method, req.path);
+  const mayUseManagementOverride = !isRead && hasCapability(req, "finance.manage");
+  if (!hasCapability(req, capability) && !mayUseManagementOverride) {
+    return res.status(403).json({ error: "permission_denied", required_capability: capability });
+  }
   next();
 }
 
@@ -2197,35 +2345,154 @@ function userPayload(user, permissions = null, company = null) {
     display_name: user.display_name,
     photo_url: user.photo_url,
     company,
-    permissions: permissions || { can_delete_contacts: user.role === "employer" }
+    permissions: permissions || employeePermissionPayload(user)
   };
 }
 
 function employeePermissionPayload(row = {}) {
+  const access = row.access || resolveAccess({
+    role: row.role,
+    preset: row.permission_preset,
+    overrides: row.permission_overrides,
+    legacy: row
+  });
+  const legacy = row.role === "employer" ? legacyColumnsForCapabilities(access.capabilities) : row;
   return {
-    can_delete_contacts: !!row.can_delete_contacts,
-    can_view_finance: !!row.can_view_finance,
-    can_use_finance_ai: !!row.can_use_finance_ai,
-    can_view_finance_transactions: !!row.can_view_finance_transactions,
-    can_edit_finance_transactions: !!row.can_edit_finance_transactions,
-    can_view_finance_accounts: !!row.can_view_finance_accounts,
-    can_create_finance_accounts: !!row.can_create_finance_accounts,
-    can_edit_finance_accounts: !!row.can_edit_finance_accounts,
-    can_adjust_finance_account_balances: !!row.can_adjust_finance_account_balances,
-    can_view_finance_receipts: !!row.can_view_finance_receipts,
-    can_edit_finance_receipts: !!row.can_edit_finance_receipts,
-    can_view_finance_planning: !!row.can_view_finance_planning,
-    can_edit_finance_planning: !!row.can_edit_finance_planning,
-    can_view_finance_budgets: !!row.can_view_finance_budgets,
-    can_edit_finance_budgets: !!row.can_edit_finance_budgets,
-    can_view_finance_goals: !!row.can_view_finance_goals,
-    can_edit_finance_goals: !!row.can_edit_finance_goals,
-    can_view_finance_debts: !!row.can_view_finance_debts,
-    can_edit_finance_debts: !!row.can_edit_finance_debts,
-    can_view_finance_settings: !!row.can_view_finance_settings,
-    can_edit_finance_settings: !!row.can_edit_finance_settings,
-    can_manage_company_finance_ai_memories: !!row.can_manage_company_finance_ai_memories
+    can_delete_contacts: !!legacy.can_delete_contacts,
+    can_view_finance: !!legacy.can_view_finance,
+    can_use_finance_ai: !!legacy.can_use_finance_ai,
+    can_view_finance_transactions: !!legacy.can_view_finance_transactions,
+    can_edit_finance_transactions: !!legacy.can_edit_finance_transactions,
+    can_view_finance_accounts: !!legacy.can_view_finance_accounts,
+    can_create_finance_accounts: !!legacy.can_create_finance_accounts,
+    can_edit_finance_accounts: !!legacy.can_edit_finance_accounts,
+    can_adjust_finance_account_balances: !!legacy.can_adjust_finance_account_balances,
+    can_view_finance_receipts: !!legacy.can_view_finance_receipts,
+    can_edit_finance_receipts: !!legacy.can_edit_finance_receipts,
+    can_view_finance_planning: !!legacy.can_view_finance_planning,
+    can_edit_finance_planning: !!legacy.can_edit_finance_planning,
+    can_view_finance_budgets: !!legacy.can_view_finance_budgets,
+    can_edit_finance_budgets: !!legacy.can_edit_finance_budgets,
+    can_view_finance_goals: !!legacy.can_view_finance_goals,
+    can_edit_finance_goals: !!legacy.can_edit_finance_goals,
+    can_view_finance_debts: !!legacy.can_view_finance_debts,
+    can_edit_finance_debts: !!legacy.can_edit_finance_debts,
+    can_view_finance_settings: !!legacy.can_view_finance_settings,
+    can_edit_finance_settings: !!legacy.can_edit_finance_settings,
+    can_manage_company_finance_ai_memories: !!legacy.can_manage_company_finance_ai_memories,
+    preset: access.preset,
+    overrides: access.overrides,
+    capabilities: access.capabilities
   };
+}
+
+async function persistEmployeeAccess(client, { employeeUserId, companyId, access }) {
+  const legacy = legacyColumnsForCapabilities(access.capabilities);
+  const legacyColumns = Object.keys(legacy);
+  const insertColumns = ["user_id", "company_id", "permission_preset", "permission_overrides", ...legacyColumns];
+  const values = [employeeUserId, companyId, access.preset, JSON.stringify(access.overrides), ...legacyColumns.map((key) => legacy[key])];
+  const placeholders = values.map((_, index) => index === 3 ? `$${index + 1}::jsonb` : `$${index + 1}`);
+  const updates = [
+    "company_id = EXCLUDED.company_id",
+    "permission_preset = EXCLUDED.permission_preset",
+    "permission_overrides = EXCLUDED.permission_overrides",
+    ...legacyColumns.map((column) => `${column} = EXCLUDED.${column}`),
+    "updated_at = now()"
+  ];
+  const { rows } = await client.query(
+    `INSERT INTO employee_permissions(${insertColumns.join(", ")})
+     VALUES(${placeholders.join(", ")})
+     ON CONFLICT(user_id) DO UPDATE SET ${updates.join(", ")}
+     RETURNING *`,
+    values
+  );
+  return { row: rows[0], legacy };
+}
+
+function tabNavigationPayload(navigation) {
+  return { catalog: tabCatalogPayload(), ...navigation };
+}
+
+async function loadSelfTabNavigationContext(req, db = pool) {
+  const { rows } = await db.query(
+    `SELECT u.tab_preferences,
+            COALESCE(p.tab_policy, '{}'::jsonb) AS tab_policy,
+            COALESCE(c.tab_role_policies, '{}'::jsonb) AS tab_role_policies
+       FROM users u
+       LEFT JOIN employee_permissions p ON p.user_id = u.id
+       LEFT JOIN companies c ON c.id = u.company_id
+      WHERE u.id = $1 AND u.deleted_at IS NULL`,
+    [req.userId]
+  );
+  if (!rows.length) return null;
+  return {
+    row: rows[0],
+    navigation: resolveTabNavigation({
+      role: req.role,
+      preset: req.permissions.preset,
+      capabilities: req.permissions.capabilities,
+      userPreferences: rows[0].tab_preferences,
+      employeePolicy: rows[0].tab_policy,
+      rolePolicies: rows[0].tab_role_policies
+    })
+  };
+}
+
+async function loadEmployeeTabNavigationContext(employeeUserId, companyId, db = pool) {
+  const { rows } = await db.query(
+    `SELECT u.id, u.role, u.deleted_at, u.tab_preferences,
+            p.*,
+            COALESCE(c.tab_role_policies, '{}'::jsonb) AS tab_role_policies
+       FROM users u
+       LEFT JOIN employee_permissions p ON p.user_id = u.id
+       LEFT JOIN companies c ON c.id = u.company_id
+      WHERE u.id = $1 AND u.company_id = $2 AND u.role = 'employee'`,
+    [employeeUserId, companyId]
+  );
+  if (!rows.length || rows[0].deleted_at) return null;
+  const access = resolveAccess({
+    role: rows[0].role,
+    preset: rows[0].permission_preset,
+    overrides: rows[0].permission_overrides,
+    legacy: rows[0]
+  });
+  return {
+    row: rows[0],
+    access,
+    navigation: resolveTabNavigation({
+      role: rows[0].role,
+      preset: access.preset,
+      capabilities: access.capabilities,
+      userPreferences: rows[0].tab_preferences,
+      employeePolicy: rows[0].tab_policy,
+      rolePolicies: rows[0].tab_role_policies
+    })
+  };
+}
+
+async function insertTabLayoutAudit(client, { companyId, actorUserId, targetType, targetId, previousLayout, newLayout }) {
+  await client.query(
+    `INSERT INTO tab_layout_audit
+       (id, company_id, changed_by_user_id, target_type, target_id, previous_layout, new_layout)
+     VALUES($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)`,
+    [
+      randomUUID(),
+      companyId,
+      actorUserId,
+      targetType,
+      targetId,
+      JSON.stringify(previousLayout || {}),
+      JSON.stringify(newLayout || {})
+    ]
+  );
+}
+
+function sendTabLayoutError(res, error, fallbackCode) {
+  if (error?.code === "invalid_tab_layout") {
+    return res.status(error.status || 400).json({ error: error.code, message: error.message, details: error.details || {} });
+  }
+  console.error(`[tabs] ${fallbackCode}`, error);
+  return res.status(500).json({ error: fallbackCode });
 }
 
 async function createNotification(userId, companyId, kind, title, body, data = {}) {
@@ -2353,8 +2620,13 @@ app.post("/auth/signup", async (req, res) => {
       await pool.query(`UPDATE companies SET owner_user_id = $1 WHERE id = $2`, [user.id, company.id]);
     } else {
       await pool.query(
-        `INSERT INTO employee_permissions(user_id, company_id, can_delete_contacts)
-         VALUES($1,$2,false)`,
+        `INSERT INTO employee_permissions(user_id, company_id, can_delete_contacts, permission_preset, permission_overrides)
+         VALUES($1,$2,false,'technician','{}'::jsonb)
+         ON CONFLICT(user_id) DO UPDATE
+           SET company_id = EXCLUDED.company_id,
+               permission_preset = 'technician',
+               permission_overrides = '{}'::jsonb,
+               updated_at = now()`,
         [user.id, company.id]
       );
     }
@@ -2370,7 +2642,14 @@ app.post("/auth/signup", async (req, res) => {
 
     const token = randomUUID();
     await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, user.id]);
-    res.json({ token, user: userPayload(user, { can_delete_contacts: role === "employer" }, { id: company.id, name: company.name, join_code: company.join_code }) });
+    res.json({
+      token,
+      user: userPayload(
+        { ...user, permission_preset: role === "employee" ? "technician" : null },
+        null,
+        { id: company.id, name: company.name, join_code: company.join_code }
+      )
+    });
   } catch (e) {
     if (e.code === "23505") return res.status(409).json({ error: "company_code_taken" });
     console.error(e);
@@ -2383,7 +2662,7 @@ app.post("/auth/login", async (req, res) => {
     const email = normalizeEmail(req.body.email);
     const password = (req.body.password || "").toString();
     const { rows } = await pool.query(
-      `SELECT u.*, c.name AS company_name, c.join_code, COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts
+      `SELECT u.*, c.name AS company_name, c.join_code, to_jsonb(p) AS permission_record
          FROM users u
          LEFT JOIN companies c ON c.id = u.company_id
          LEFT JOIN employee_permissions p ON p.user_id = u.id
@@ -2397,14 +2676,14 @@ app.post("/auth/login", async (req, res) => {
       // Account was revoked by the employer.
       return res.status(403).json({ error: "account_disabled", message: "This account has been removed. Contact your employer to restore access." });
     }
-    const u = rows[0];
+    const u = { ...rows[0], ...(rows[0].permission_record || {}) };
     const token = randomUUID();
     await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, u.id]);
     res.json({
       token,
       user: userPayload(
         u,
-        { can_delete_contacts: !!u.can_delete_contacts },
+        employeePermissionPayload(u),
         u.company_id ? { id: u.company_id, name: u.company_name, join_code: u.join_code } : null
       )
     });
@@ -2565,7 +2844,8 @@ app.get("/me", authRequired, async (req, res) => {
             COALESCE(p.can_edit_finance_debts, u.role = 'employer') AS can_edit_finance_debts,
             COALESCE(p.can_view_finance_settings, u.role = 'employer') AS can_view_finance_settings,
             COALESCE(p.can_edit_finance_settings, u.role = 'employer') AS can_edit_finance_settings,
-            COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories
+            COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories,
+            p.permission_preset, p.permission_overrides
        FROM users u
        LEFT JOIN companies c ON c.id = u.company_id
        LEFT JOIN employee_permissions p ON p.user_id = u.id
@@ -2583,7 +2863,7 @@ app.get("/me", authRequired, async (req, res) => {
 });
 
 // ---------- Twilio diagnostics ----------
-app.get("/api/twilio/status", authRequired, async (_req, res) => {
+app.get("/api/twilio/status", authRequired, requireCapability("integrations.view"), async (_req, res) => {
   const { configured, accountSid } = twilioConfig();
   if (!configured) {
     return res.json({
@@ -2852,7 +3132,7 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
   }
 });
 
-app.get("/api/phone/conversations", authRequired, async (req, res) => {
+app.get("/api/phone/conversations", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   if (!req.companyId) return res.json([]);
   try {
     const { rows } = await pool.query(
@@ -2903,7 +3183,7 @@ app.get("/api/phone/conversations", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/phone/lines", authRequired, async (req, res) => {
+app.get("/api/phone/lines", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   if (!req.companyId) return res.json([]);
   try {
     const { rows } = await pool.query(
@@ -2927,7 +3207,7 @@ app.get("/api/phone/lines", authRequired, async (req, res) => {
   }
 });
 
-app.post("/api/phone/lines/attach-existing", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/phone/lines/attach-existing", authRequired, requireCapability("integrations.manage"), async (req, res) => {
   if (!req.companyId) return res.status(400).json({ error: "company_required" });
 
   const phoneNumber = normalizeE164Phone(req.body?.phoneNumber);
@@ -2984,7 +3264,7 @@ app.post("/api/phone/lines/attach-existing", authRequired, requireEmployer, asyn
   }
 });
 
-app.get("/api/voice/token", authRequired, async (req, res) => {
+app.get("/api/voice/token", authRequired, requireCapability("messaging.customer.send"), async (req, res) => {
   if (!req.userId || !req.companyId) {
     return res.status(400).json({ error: "company_required" });
   }
@@ -3041,7 +3321,7 @@ app.get("/api/voice/token", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/voice/diagnostics", authRequired, async (req, res) => {
+app.get("/api/voice/diagnostics", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   const { configured, twimlAppSid, pushCredentialSid } = twilioVoiceConfig();
   const voiceIdentity = voiceIdentityForUserID(req.userId);
   try {
@@ -3799,7 +4079,7 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
   }
 });
 
-app.get("/api/phone/calls", authRequired, async (req, res) => {
+app.get("/api/phone/calls", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   if (!req.companyId) return res.json([]);
   const limit = Math.min(Math.max(parseInt(req.query.limit || "100", 10) || 100, 1), 200);
   try {
@@ -3842,7 +4122,7 @@ app.get("/api/phone/calls", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/phone/unread-count", authRequired, async (req, res) => {
+app.get("/api/phone/unread-count", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   if (!req.companyId) return res.json({ count: 0 });
   try {
     res.json({ count: await phoneUnreadBadgeCount(req.companyId) });
@@ -3852,7 +4132,7 @@ app.get("/api/phone/unread-count", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/phone/voicemails", authRequired, async (req, res) => {
+app.get("/api/phone/voicemails", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   if (!req.companyId) return res.json([]);
   const limit = Math.min(Math.max(parseInt(req.query.limit || "100", 10) || 100, 1), 200);
   try {
@@ -3882,7 +4162,7 @@ app.get("/api/phone/voicemails", authRequired, async (req, res) => {
   }
 });
 
-app.post("/api/phone/voicemails/:id/read", authRequired, async (req, res) => {
+app.post("/api/phone/voicemails/:id/read", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
   try {
     const { rows } = await pool.query(
@@ -3923,7 +4203,7 @@ app.post("/api/phone/voicemails/:id/read", authRequired, async (req, res) => {
   }
 });
 
-app.delete("/api/phone/voicemails/:id", authRequired, async (req, res) => {
+app.delete("/api/phone/voicemails/:id", authRequired, requireCapability("messaging.customer.delete"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
   try {
     const { rows } = await pool.query(
@@ -3977,7 +4257,7 @@ app.delete("/api/phone/voicemails/:id", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/phone/voicemails/:id/audio", authRequired, async (req, res) => {
+app.get("/api/phone/voicemails/:id/audio", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
   try {
     const { rows } = await pool.query(
@@ -4005,7 +4285,7 @@ app.get("/api/phone/voicemails/:id/audio", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) => {
+app.get("/api/phone/conversations/:id/messages", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
   try {
     const owned = await pool.query(
@@ -4049,7 +4329,7 @@ app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) 
   }
 });
 
-app.get("/api/phone/messages/:id/media/:index", authRequired, async (req, res) => {
+app.get("/api/phone/messages/:id/media/:index", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "media_not_found" });
   const mediaIndex = Math.max(0, parseInt(req.params.index || "0", 10) || 0);
   try {
@@ -4098,7 +4378,7 @@ app.get("/api/phone/messages/:id/media/:index", authRequired, async (req, res) =
   }
 });
 
-app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res) => {
+app.post("/api/phone/conversations/:id/messages", authRequired, requireCapability("messaging.customer.send"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
 
   const rawBody = req.body?.body;
@@ -4291,7 +4571,7 @@ app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res)
   }
 });
 
-app.delete("/api/phone/messages/:id", authRequired, async (req, res) => {
+app.delete("/api/phone/messages/:id", authRequired, requireCapability("messaging.customer.delete"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "message_not_found" });
   const client = await pool.connect();
   try {
@@ -4336,7 +4616,7 @@ app.delete("/api/phone/messages/:id", authRequired, async (req, res) => {
   }
 });
 
-app.delete("/api/phone/conversations/:id", authRequired, async (req, res) => {
+app.delete("/api/phone/conversations/:id", authRequired, requireCapability("messaging.customer.delete"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
   try {
     const { rows } = await pool.query(
@@ -4475,14 +4755,14 @@ app.patch("/api/profile", authRequired, async (req, res) => {
         RETURNING id, email, role, company_id, display_name, photo_url`,
       [req.userId, displayName || null, photoUrl || null]
     );
-    res.json({ user: userPayload(rows[0], req.permissions, null) });
+    res.json({ user: userPayload(rows[0], req.permissionPayload, null) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "profile_update_failed" });
   }
 });
 
-app.get("/api/company/users", authRequired, async (req, res) => {
+app.get("/api/company/users", authRequired, requireCapability("team.view"), async (req, res) => {
   try {
     if (!req.companyId) {
       const { rows } = await pool.query(
@@ -4506,6 +4786,299 @@ app.get("/api/company/users", authRequired, async (req, res) => {
   }
 });
 
+app.get("/api/permissions/catalog", authRequired, (_req, res) => {
+  res.json(permissionCatalogPayload());
+});
+
+app.get("/api/navigation/tabs", authRequired, async (req, res) => {
+  try {
+    const context = await loadSelfTabNavigationContext(req);
+    if (!context) return res.status(404).json({ error: "user_not_found" });
+    res.json(tabNavigationPayload(context.navigation));
+  } catch (error) {
+    sendTabLayoutError(res, error, "tab_layout_load_failed");
+  }
+});
+
+app.put("/api/navigation/tabs", authRequired, async (req, res) => {
+  let layout;
+  try {
+    layout = validateTabLayout(req.body);
+  } catch (error) {
+    return sendTabLayoutError(res, error, "tab_layout_update_failed");
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const user = await client.query(
+      `SELECT id, company_id FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
+      [req.userId]
+    );
+    if (!user.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "user_not_found" });
+    }
+    if (req.companyId) {
+      await client.query(`SELECT id FROM companies WHERE id = $1 FOR SHARE`, [req.companyId]);
+      await client.query(`SELECT user_id FROM employee_permissions WHERE user_id = $1 FOR SHARE`, [req.userId]);
+    }
+    const current = await loadSelfTabNavigationContext(req, client);
+    if (!current?.navigation.customizable) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "tab_layout_locked", message: "Your company owner manages this tab layout." });
+    }
+    await client.query(
+      `UPDATE users SET tab_preferences = $2::jsonb WHERE id = $1`,
+      [req.userId, JSON.stringify(layout)]
+    );
+    const updated = await loadSelfTabNavigationContext(req, client);
+    await client.query("COMMIT");
+    res.json(tabNavigationPayload(updated.navigation));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    sendTabLayoutError(res, error, "tab_layout_update_failed");
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/navigation/tabs", authRequired, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE users SET tab_preferences = '{}'::jsonb WHERE id = $1 AND deleted_at IS NULL`,
+      [req.userId]
+    );
+    if (!rowCount) return res.status(404).json({ error: "user_not_found" });
+    const updated = await loadSelfTabNavigationContext(req);
+    res.json(tabNavigationPayload(updated.navigation));
+  } catch (error) {
+    sendTabLayoutError(res, error, "tab_layout_reset_failed");
+  }
+});
+
+app.get("/api/company/tab-layouts", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(tab_role_policies, '{}'::jsonb) AS tab_role_policies FROM companies WHERE id = $1`,
+      [req.companyId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "company_not_found" });
+    const policies = rows[0].tab_role_policies || {};
+    const roles = TAB_ROLE_PRESETS.map((preset) => {
+      const access = resolveAccess({ role: "employee", preset: preset.id, overrides: {} });
+      return {
+        ...preset,
+        policy: policies[preset.id] || null,
+        navigation: resolveTabNavigation({
+          role: "employee",
+          preset: preset.id,
+          capabilities: access.capabilities,
+          rolePolicies: policies
+        })
+      };
+    });
+    res.json({ catalog: tabCatalogPayload(), roles });
+  } catch (error) {
+    sendTabLayoutError(res, error, "company_tab_layouts_load_failed");
+  }
+});
+
+app.put("/api/company/tab-layouts/:preset", authRequired, requireEmployer, async (req, res) => {
+  const preset = req.params.preset;
+  if (!isKnownTabRolePreset(preset)) return res.status(400).json({ error: "unknown_permission_preset" });
+  let layout;
+  try {
+    layout = validateTabLayout(req.body, { allowLocked: true });
+  } catch (error) {
+    return sendTabLayoutError(res, error, "role_tab_layout_update_failed");
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const company = await client.query(
+      `SELECT COALESCE(tab_role_policies, '{}'::jsonb) AS policies FROM companies WHERE id = $1 FOR UPDATE`,
+      [req.companyId]
+    );
+    if (!company.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "company_not_found" });
+    }
+    const previousPolicies = company.rows[0].policies || {};
+    const policies = { ...previousPolicies, [preset]: layout };
+    await client.query(`UPDATE companies SET tab_role_policies = $2::jsonb, updated_at = now() WHERE id = $1`, [req.companyId, JSON.stringify(policies)]);
+    await insertTabLayoutAudit(client, {
+      companyId: req.companyId,
+      actorUserId: req.userId,
+      targetType: "role",
+      targetId: preset,
+      previousLayout: previousPolicies[preset],
+      newLayout: layout
+    });
+    await client.query("COMMIT");
+    const access = resolveAccess({ role: "employee", preset, overrides: {} });
+    res.json({
+      catalog: tabCatalogPayload(),
+      preset,
+      policy: layout,
+      navigation: resolveTabNavigation({ role: "employee", preset, capabilities: access.capabilities, rolePolicies: policies })
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    sendTabLayoutError(res, error, "role_tab_layout_update_failed");
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/company/tab-layouts/:preset", authRequired, requireEmployer, async (req, res) => {
+  const preset = req.params.preset;
+  if (!isKnownTabRolePreset(preset)) return res.status(400).json({ error: "unknown_permission_preset" });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const company = await client.query(
+      `SELECT COALESCE(tab_role_policies, '{}'::jsonb) AS policies FROM companies WHERE id = $1 FOR UPDATE`,
+      [req.companyId]
+    );
+    if (!company.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "company_not_found" });
+    }
+    const previousPolicies = company.rows[0].policies || {};
+    const policies = { ...previousPolicies };
+    delete policies[preset];
+    await client.query(`UPDATE companies SET tab_role_policies = $2::jsonb, updated_at = now() WHERE id = $1`, [req.companyId, JSON.stringify(policies)]);
+    await insertTabLayoutAudit(client, {
+      companyId: req.companyId,
+      actorUserId: req.userId,
+      targetType: "role",
+      targetId: preset,
+      previousLayout: previousPolicies[preset],
+      newLayout: {}
+    });
+    await client.query("COMMIT");
+    const access = resolveAccess({ role: "employee", preset, overrides: {} });
+    res.json({
+      catalog: tabCatalogPayload(),
+      preset,
+      policy: null,
+      navigation: resolveTabNavigation({ role: "employee", preset, capabilities: access.capabilities, rolePolicies: policies })
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    sendTabLayoutError(res, error, "role_tab_layout_reset_failed");
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/company/employees/:id/tabs", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const context = await loadEmployeeTabNavigationContext(req.params.id, req.companyId);
+    if (!context) return res.status(404).json({ error: "employee_not_found" });
+    res.json({
+      employee_id: context.row.id,
+      preset: context.access.preset,
+      employee_policy: context.row.tab_policy && Object.keys(context.row.tab_policy).length ? context.row.tab_policy : null,
+      ...tabNavigationPayload(context.navigation)
+    });
+  } catch (error) {
+    sendTabLayoutError(res, error, "employee_tab_layout_load_failed");
+  }
+});
+
+app.put("/api/company/employees/:id/tabs", authRequired, requireEmployer, async (req, res) => {
+  let layout;
+  try {
+    layout = validateTabLayout(req.body, { allowLocked: true });
+  } catch (error) {
+    return sendTabLayoutError(res, error, "employee_tab_layout_update_failed");
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const employee = await client.query(
+      `SELECT id FROM users
+        WHERE id = $1 AND company_id = $2 AND role = 'employee' AND deleted_at IS NULL
+        FOR UPDATE`,
+      [req.params.id, req.companyId]
+    );
+    if (!employee.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "employee_not_found" });
+    }
+    const previous = await client.query(`SELECT tab_policy FROM employee_permissions WHERE user_id = $1`, [req.params.id]);
+    await client.query(
+      `INSERT INTO employee_permissions(user_id, company_id, permission_preset, tab_policy)
+       VALUES($1, $2, 'technician', $3::jsonb)
+       ON CONFLICT(user_id) DO UPDATE
+         SET company_id = EXCLUDED.company_id, tab_policy = EXCLUDED.tab_policy, updated_at = now()`,
+      [req.params.id, req.companyId, JSON.stringify(layout)]
+    );
+    await insertTabLayoutAudit(client, {
+      companyId: req.companyId,
+      actorUserId: req.userId,
+      targetType: "employee",
+      targetId: req.params.id,
+      previousLayout: previous.rows[0]?.tab_policy,
+      newLayout: layout
+    });
+    const context = await loadEmployeeTabNavigationContext(req.params.id, req.companyId, client);
+    await client.query("COMMIT");
+    res.json({
+      employee_id: context.row.id,
+      preset: context.access.preset,
+      employee_policy: layout,
+      ...tabNavigationPayload(context.navigation)
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    sendTabLayoutError(res, error, "employee_tab_layout_update_failed");
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/company/employees/:id/tabs", authRequired, requireEmployer, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const employee = await client.query(
+      `SELECT id FROM users
+        WHERE id = $1 AND company_id = $2 AND role = 'employee' AND deleted_at IS NULL
+        FOR UPDATE`,
+      [req.params.id, req.companyId]
+    );
+    if (!employee.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "employee_not_found" });
+    }
+    const previous = await client.query(`SELECT tab_policy FROM employee_permissions WHERE user_id = $1`, [req.params.id]);
+    await client.query(`UPDATE employee_permissions SET tab_policy = '{}'::jsonb, updated_at = now() WHERE user_id = $1`, [req.params.id]);
+    await insertTabLayoutAudit(client, {
+      companyId: req.companyId,
+      actorUserId: req.userId,
+      targetType: "employee",
+      targetId: req.params.id,
+      previousLayout: previous.rows[0]?.tab_policy,
+      newLayout: {}
+    });
+    const context = await loadEmployeeTabNavigationContext(req.params.id, req.companyId, client);
+    await client.query("COMMIT");
+    res.json({
+      employee_id: context.row.id,
+      preset: context.access.preset,
+      employee_policy: null,
+      ...tabNavigationPayload(context.navigation)
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    sendTabLayoutError(res, error, "employee_tab_layout_reset_failed");
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/company/settings", authRequired, requireEmployer, async (req, res) => {
   try {
     const company = await pool.query(
@@ -4518,6 +5091,7 @@ app.get("/api/company/settings", authRequired, requireEmployer, async (req, res)
               u.email,
               u.display_name,
               u.photo_url,
+              u.role,
               u.deleted_at,
               COALESCE(u.pre_delete_email, u.email) AS original_email,
               COALESCE(p.can_delete_contacts,false) AS can_delete_contacts,
@@ -4541,21 +5115,32 @@ app.get("/api/company/settings", authRequired, requireEmployer, async (req, res)
               COALESCE(p.can_edit_finance_debts,false) AS can_edit_finance_debts,
               COALESCE(p.can_view_finance_settings,false) AS can_view_finance_settings,
               COALESCE(p.can_edit_finance_settings,false) AS can_edit_finance_settings,
-              COALESCE(p.can_manage_company_finance_ai_memories,false) AS can_manage_company_finance_ai_memories
+              COALESCE(p.can_manage_company_finance_ai_memories,false) AS can_manage_company_finance_ai_memories,
+              p.permission_preset,
+              p.permission_overrides
          FROM users u
          LEFT JOIN employee_permissions p ON p.user_id = u.id
         WHERE u.company_id = $1 AND u.role = 'employee'
         ORDER BY u.deleted_at IS NOT NULL, COALESCE(u.display_name, u.email) ASC`,
       [req.companyId]
     );
-    res.json({ company: company.rows[0], employees: employees.rows });
+    const employeeRows = employees.rows.map((employee) => ({
+      ...employee,
+      access: resolveAccess({
+        role: employee.role,
+        preset: employee.permission_preset,
+        overrides: employee.permission_overrides,
+        legacy: employee
+      })
+    }));
+    res.json({ company: company.rows[0], employees: employeeRows });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "company_settings_failed" });
   }
 });
 
-app.patch("/api/company/invoice-settings", authRequired, requireEmployer, async (req, res) => {
+app.patch("/api/company/invoice-settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
   try {
     const logo = (req.body.logo_data_url || "").toString();
     if (logo && logo.length > 350000) return res.status(413).json({ error: "logo_too_large" });
@@ -4585,7 +5170,7 @@ app.patch("/api/company/invoice-settings", authRequired, requireEmployer, async 
   }
 });
 
-app.patch("/api/company/job-notification-settings", authRequired, requireEmployer, async (req, res) => {
+app.patch("/api/company/job-notification-settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
   try {
     const notifyAll = !!req.body.notify_all_members_on_jobs;
     const { rows } = await pool.query(
@@ -4603,7 +5188,7 @@ app.patch("/api/company/job-notification-settings", authRequired, requireEmploye
   }
 });
 
-app.get("/api/company/invoice-settings", authRequired, async (req, res) => {
+app.get("/api/company/invoice-settings", authRequired, requireCapability("settings.view"), async (req, res) => {
   try {
     if (!req.companyId) return res.status(404).json({ error: "company_not_found" });
     const { rows } = await pool.query(
@@ -4618,7 +5203,7 @@ app.get("/api/company/invoice-settings", authRequired, async (req, res) => {
   }
 });
 
-app.put("/api/company/join-code", authRequired, requireEmployer, async (req, res) => {
+app.put("/api/company/join-code", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
   try {
     const code = (req.body.join_code || "").toString().trim();
     if (!companyCodeIsValid(code)) return res.status(400).json({ error: "invalid_company_code" });
@@ -4749,37 +5334,176 @@ app.post("/api/company/employees/:id/restore", authRequired, requireEmployer, as
   }
 });
 
-app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer, async (req, res) => {
+app.put("/api/company/employees/:id/access", authRequired, requireEmployer, async (req, res) => {
+  let requestedAccess;
   try {
-    const canDelete = !!req.body.can_delete_contacts;
-    const financePermissions = {
-      can_view_finance: !!req.body.can_view_finance,
-      can_use_finance_ai: !!req.body.can_use_finance_ai,
-      can_view_finance_transactions: !!req.body.can_view_finance_transactions,
-      can_edit_finance_transactions: !!req.body.can_edit_finance_transactions,
-      can_view_finance_accounts: !!req.body.can_view_finance_accounts,
-      can_create_finance_accounts: !!req.body.can_create_finance_accounts,
-      can_edit_finance_accounts: !!req.body.can_edit_finance_accounts,
-      can_adjust_finance_account_balances: !!req.body.can_adjust_finance_account_balances,
-      can_view_finance_receipts: !!req.body.can_view_finance_receipts,
-      can_edit_finance_receipts: !!req.body.can_edit_finance_receipts,
-      can_view_finance_planning: !!req.body.can_view_finance_planning,
-      can_edit_finance_planning: !!req.body.can_edit_finance_planning,
-      can_view_finance_budgets: !!req.body.can_view_finance_budgets,
-      can_edit_finance_budgets: !!req.body.can_edit_finance_budgets,
-      can_view_finance_goals: !!req.body.can_view_finance_goals,
-      can_edit_finance_goals: !!req.body.can_edit_finance_goals,
-      can_view_finance_debts: !!req.body.can_view_finance_debts,
-      can_edit_finance_debts: !!req.body.can_edit_finance_debts,
-      can_view_finance_settings: !!req.body.can_view_finance_settings,
-      can_edit_finance_settings: !!req.body.can_edit_finance_settings,
-      can_manage_company_finance_ai_memories: !!req.body.can_manage_company_finance_ai_memories
-    };
+    requestedAccess = validateAccessUpdate(req.body);
+  } catch (error) {
+    return res.status(error.statusCode || 400).json({
+      error: error.code || "invalid_permission_document",
+      message: error.message,
+      details: error.details || undefined
+    });
+  }
+
+  const targetId = req.params.id;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const employeeResult = await client.query(
+      `SELECT id, role, deleted_at
+         FROM users
+        WHERE id = $1 AND company_id = $2
+        FOR UPDATE`,
+      [targetId, req.companyId]
+    );
+    const employee = employeeResult.rows[0];
+    if (!employee || employee.role !== "employee") {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "employee_not_found" });
+    }
+    if (employee.deleted_at) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "employee_inactive", message: "Restore the employee before changing access." });
+    }
+
+    const existingResult = await client.query(
+      `SELECT * FROM employee_permissions WHERE user_id = $1 AND company_id = $2`,
+      [targetId, req.companyId]
+    );
+    const existing = existingResult.rows[0] || {};
+    const previousAccess = resolveAccess({
+      role: employee.role,
+      preset: existing.permission_preset,
+      overrides: existing.permission_overrides,
+      legacy: existing
+    });
+    const persisted = await persistEmployeeAccess(client, {
+      employeeUserId: targetId,
+      companyId: req.companyId,
+      access: requestedAccess
+    });
+    await client.query(
+      `INSERT INTO employee_permission_audit(
+         company_id, employee_user_id, changed_by_user_id,
+         previous_preset, previous_overrides, new_preset, new_overrides
+       ) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7::jsonb)`,
+      [
+        req.companyId,
+        targetId,
+        req.userId,
+        previousAccess.preset,
+        JSON.stringify(previousAccess.overrides),
+        requestedAccess.preset,
+        JSON.stringify(requestedAccess.overrides)
+      ]
+    );
+    await client.query("COMMIT");
+
+    try {
+      const changedCapabilities = Object.keys(requestedAccess.capabilities).filter(
+        (key) => requestedAccess.capabilities[key] !== previousAccess.capabilities[key]
+      );
+      await emitAutomationEvent({
+        companyId: req.companyId,
+        eventType: "employee.permission_changed",
+        subjectType: "employee",
+        subjectId: targetId,
+        actorUserId: req.userId,
+        source: "ios",
+        payload: {
+          employee_id: targetId,
+          previous_preset: previousAccess.preset,
+          new_preset: requestedAccess.preset,
+          changed_capabilities: changedCapabilities
+        }
+      });
+    } catch (automationError) {
+      console.warn("[automations] employee access hook failed", automationError?.message || automationError);
+    }
+
+    res.json({
+      id: targetId,
+      access: requestedAccess,
+      permissions: employeePermissionPayload({ ...persisted.row, role: "employee", access: requestedAccess })
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[permissions] employee access update failed", error?.message || error);
+    res.status(500).json({ error: "permissions_update_failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/company/employees/:id/access-audit", authRequired, requireEmployer, async (req, res) => {
+  try {
     const employee = await pool.query(
       `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND role = 'employee'`,
       [req.params.id, req.companyId]
     );
     if (!employee.rowCount) return res.status(404).json({ error: "employee_not_found" });
+    const { rows } = await pool.query(
+      `SELECT a.id,
+              a.employee_user_id,
+              a.changed_by_user_id,
+              actor.display_name AS changed_by_display_name,
+              actor.email AS changed_by_email,
+              a.previous_preset,
+              a.previous_overrides,
+              a.new_preset,
+              a.new_overrides,
+              a.created_at
+         FROM employee_permission_audit a
+         LEFT JOIN users actor ON actor.id = a.changed_by_user_id
+        WHERE a.company_id = $1 AND a.employee_user_id = $2
+        ORDER BY a.created_at DESC
+        LIMIT 100`,
+      [req.companyId, req.params.id]
+    );
+    res.json({ entries: rows });
+  } catch (error) {
+    console.error("[permissions] access audit load failed", error?.message || error);
+    res.status(500).json({ error: "permission_audit_failed" });
+  }
+});
+
+app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer, async (req, res) => {
+  try {
+    const employee = await pool.query(
+      `SELECT u.id, to_jsonb(p) AS permission_record
+         FROM users u
+         LEFT JOIN employee_permissions p ON p.user_id = u.id
+        WHERE u.id = $1 AND u.company_id = $2 AND u.role = 'employee'`,
+      [req.params.id, req.companyId]
+    );
+    if (!employee.rowCount) return res.status(404).json({ error: "employee_not_found" });
+    const existing = employee.rows[0].permission_record || {};
+    const requestedBoolean = (key) => Object.hasOwn(req.body || {}, key) ? !!req.body[key] : !!existing[key];
+    const canDelete = requestedBoolean("can_delete_contacts");
+    const financePermissions = {
+      can_view_finance: requestedBoolean("can_view_finance"),
+      can_use_finance_ai: requestedBoolean("can_use_finance_ai"),
+      can_view_finance_transactions: requestedBoolean("can_view_finance_transactions"),
+      can_edit_finance_transactions: requestedBoolean("can_edit_finance_transactions"),
+      can_view_finance_accounts: requestedBoolean("can_view_finance_accounts"),
+      can_create_finance_accounts: requestedBoolean("can_create_finance_accounts"),
+      can_edit_finance_accounts: requestedBoolean("can_edit_finance_accounts"),
+      can_adjust_finance_account_balances: requestedBoolean("can_adjust_finance_account_balances"),
+      can_view_finance_receipts: requestedBoolean("can_view_finance_receipts"),
+      can_edit_finance_receipts: requestedBoolean("can_edit_finance_receipts"),
+      can_view_finance_planning: requestedBoolean("can_view_finance_planning"),
+      can_edit_finance_planning: requestedBoolean("can_edit_finance_planning"),
+      can_view_finance_budgets: requestedBoolean("can_view_finance_budgets"),
+      can_edit_finance_budgets: requestedBoolean("can_edit_finance_budgets"),
+      can_view_finance_goals: requestedBoolean("can_view_finance_goals"),
+      can_edit_finance_goals: requestedBoolean("can_edit_finance_goals"),
+      can_view_finance_debts: requestedBoolean("can_view_finance_debts"),
+      can_edit_finance_debts: requestedBoolean("can_edit_finance_debts"),
+      can_view_finance_settings: requestedBoolean("can_view_finance_settings"),
+      can_edit_finance_settings: requestedBoolean("can_edit_finance_settings"),
+      can_manage_company_finance_ai_memories: requestedBoolean("can_manage_company_finance_ai_memories")
+    };
     const { rows } = await pool.query(
       `INSERT INTO employee_permissions(
          user_id, company_id, can_delete_contacts,
@@ -4796,7 +5520,8 @@ app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer,
        )
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
        ON CONFLICT(user_id) DO UPDATE
-         SET can_delete_contacts = EXCLUDED.can_delete_contacts,
+         SET company_id = EXCLUDED.company_id,
+             can_delete_contacts = EXCLUDED.can_delete_contacts,
              can_view_finance = EXCLUDED.can_view_finance,
              can_use_finance_ai = EXCLUDED.can_use_finance_ai,
              can_view_finance_transactions = EXCLUDED.can_view_finance_transactions,
@@ -4905,7 +5630,7 @@ app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "notification_read_failed" }); }
 });
 
-app.post("/api/internal/media/upload-url", authRequired, async (req, res) => {
+app.post("/api/internal/media/upload-url", authRequired, requireCapability("communications.send"), async (req, res) => {
   try {
     const cfg = mediaBucketConfig();
     const s3 = getMediaS3Client();
@@ -4937,7 +5662,7 @@ app.post("/api/internal/media/upload-url", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "media_upload_url_failed" }); }
 });
 
-app.get("/api/internal/media/download-url", authRequired, async (req, res) => {
+app.get("/api/internal/media/download-url", authRequired, requireCapability("communications.view"), async (req, res) => {
   try {
     const cfg = mediaBucketConfig();
     const s3 = getMediaS3Client();
@@ -4954,7 +5679,7 @@ app.get("/api/internal/media/download-url", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "media_download_url_failed" }); }
 });
 
-app.get("/api/internal/conversations", authRequired, async (req, res) => {
+app.get("/api/internal/conversations", authRequired, requireCapability("communications.view"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT c.id, c.company_id, c.title, c.is_group, c.created_by, c.created_at, c.updated_at,
@@ -4994,7 +5719,7 @@ app.get("/api/internal/conversations", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "conversation_list_failed" }); }
 });
 
-app.post("/api/internal/conversations/private", authRequired, async (req, res) => {
+app.post("/api/internal/conversations/private", authRequired, requireCapability("communications.send"), async (req, res) => {
   const otherUserId = (req.body.user_id || "").toString();
   if (!otherUserId || otherUserId === req.userId) return res.status(400).json({ error: "invalid_user" });
   try {
@@ -5036,7 +5761,7 @@ app.post("/api/internal/conversations/private", authRequired, async (req, res) =
   } catch (e) { console.error(e); res.status(500).json({ error: "private_conversation_failed" }); }
 });
 
-app.post("/api/internal/conversations/group", authRequired, async (req, res) => {
+app.post("/api/internal/conversations/group", authRequired, requireCapability("communications.send"), async (req, res) => {
   const title = (req.body.title || "Group").toString().trim() || "Group";
   const ids = [...new Set([req.userId, ...((Array.isArray(req.body.participant_ids) ? req.body.participant_ids : []).map(String))])];
   if (ids.length < 2) return res.status(400).json({ error: "group_needs_members" });
@@ -5066,7 +5791,7 @@ app.post("/api/internal/conversations/group", authRequired, async (req, res) => 
   } catch (e) { console.error(e); res.status(500).json({ error: "group_conversation_failed" }); }
 });
 
-app.get("/api/internal/conversations/:id/messages", authRequired, async (req, res) => {
+app.get("/api/internal/conversations/:id/messages", authRequired, requireCapability("communications.view"), async (req, res) => {
   try {
     const member = await pool.query(`SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`, [req.params.id, req.userId]);
     if (!member.rows.length) return res.status(403).json({ error: "not_participant" });
@@ -5084,7 +5809,7 @@ app.get("/api/internal/conversations/:id/messages", authRequired, async (req, re
   } catch (e) { console.error(e); res.status(500).json({ error: "conversation_messages_failed" }); }
 });
 
-app.delete("/api/internal/conversations/:id", authRequired, requireEmployer, async (req, res) => {
+app.delete("/api/internal/conversations/:id", authRequired, requireCapability("communications.manage"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE conversations
@@ -5101,7 +5826,7 @@ app.delete("/api/internal/conversations/:id", authRequired, requireEmployer, asy
   } catch (e) { console.error(e); res.status(500).json({ error: "delete_conversation_failed" }); }
 });
 
-app.post("/api/internal/conversations/:id/messages", authRequired, async (req, res) => {
+app.post("/api/internal/conversations/:id/messages", authRequired, requireCapability("communications.send"), async (req, res) => {
   const body = (req.body.body || "").toString();
   const attachments = parseAttachments(req.body.attachments);
   if (!body.trim() && !attachments.length) return res.status(400).json({ error: "empty_message" });
@@ -5140,7 +5865,7 @@ app.post("/api/internal/conversations/:id/messages", authRequired, async (req, r
   } catch (e) { console.error(e); res.status(500).json({ error: "send_conversation_message_failed" }); }
 });
 
-app.post("/api/internal/conversations/:id/read", authRequired, async (req, res) => {
+app.post("/api/internal/conversations/:id/read", authRequired, requireCapability("communications.view"), async (req, res) => {
   try {
     const result = await pool.query(`UPDATE conversation_participants SET last_read_at = now() WHERE conversation_id = $1 AND user_id = $2 RETURNING conversation_id`, [req.params.id, req.userId]);
     if (result.rowCount && req.companyId) {
@@ -5159,7 +5884,7 @@ app.post("/api/internal/conversations/:id/read", authRequired, async (req, res) 
   } catch (e) { console.error(e); res.status(500).json({ error: "mark_read_failed" }); }
 });
 
-app.get("/api/internal/channels", authRequired, async (req, res) => {
+app.get("/api/internal/channels", authRequired, requireCapability("communications.view"), async (req, res) => {
   try {
     const where = req.companyId ? `company_id = $1` : `created_by = $1`;
     const { rows } = await pool.query(
@@ -5173,7 +5898,7 @@ app.get("/api/internal/channels", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "channels_failed" }); }
 });
 
-app.delete("/api/internal/channels/:id", authRequired, requireEmployer, async (req, res) => {
+app.delete("/api/internal/channels/:id", authRequired, requireCapability("communications.manage"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE channels
@@ -5200,7 +5925,7 @@ app.delete("/api/internal/channels/:id", authRequired, requireEmployer, async (r
   } catch (e) { console.error(e); res.status(500).json({ error: "delete_channel_failed" }); }
 });
 
-app.post("/api/internal/channels", authRequired, async (req, res) => {
+app.post("/api/internal/channels", authRequired, requireCapability("communications.manage"), async (req, res) => {
   const name = (req.body.name || "").toString().trim();
   const description = (req.body.description || "").toString().trim();
   if (!name) return res.status(400).json({ error: "missing_name" });
@@ -5227,7 +5952,7 @@ app.post("/api/internal/channels", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "create_channel_failed" }); }
 });
 
-app.get("/api/internal/channels/:id/messages", authRequired, async (req, res) => {
+app.get("/api/internal/channels/:id/messages", authRequired, requireCapability("communications.view"), async (req, res) => {
   try {
     const channel = await pool.query(
       req.companyId ? `SELECT id FROM channels WHERE id = $1 AND company_id = $2 AND archived_at IS NULL` : `SELECT id FROM channels WHERE id = $1 AND created_by = $2 AND archived_at IS NULL`,
@@ -5248,7 +5973,7 @@ app.get("/api/internal/channels/:id/messages", authRequired, async (req, res) =>
   } catch (e) { console.error(e); res.status(500).json({ error: "channel_messages_failed" }); }
 });
 
-app.post("/api/internal/channels/:id/messages", authRequired, async (req, res) => {
+app.post("/api/internal/channels/:id/messages", authRequired, requireCapability("communications.send"), async (req, res) => {
   const body = (req.body.body || "").toString();
   const attachments = parseAttachments(req.body.attachments);
   if (!body.trim() && !attachments.length) return res.status(400).json({ error: "empty_message" });
@@ -5291,7 +6016,7 @@ app.post("/api/internal/channels/:id/messages", authRequired, async (req, res) =
   } catch (e) { console.error(e); res.status(500).json({ error: "send_channel_message_failed" }); }
 });
 
-app.delete("/api/internal/messages/:id", authRequired, async (req, res) => {
+app.delete("/api/internal/messages/:id", authRequired, requireCapability("communications.manage"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE messages m
@@ -5334,7 +6059,7 @@ app.delete("/api/internal/messages/:id", authRequired, async (req, res) => {
 });
 
 // ---------- TIME CLOCK ----------
-app.get("/api/time-clock/settings", authRequired, async (req, res) => {
+app.get("/api/time-clock/settings", authRequired, requireCapability("time.view_self"), async (req, res) => {
   try {
     if (!req.companyId) return res.json({ week_start: 1 });
     const { rows } = await pool.query(
@@ -5348,7 +6073,7 @@ app.get("/api/time-clock/settings", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "time_settings_failed" }); }
 });
 
-app.put("/api/time-clock/settings", authRequired, requireEmployer, async (req, res) => {
+app.put("/api/time-clock/settings", authRequired, requireCapability("time.manage"), async (req, res) => {
   try {
     const weekStart = Number(req.body.week_start);
     if (!Number.isInteger(weekStart) || weekStart < 0 || weekStart > 6) {
@@ -5367,7 +6092,7 @@ app.put("/api/time-clock/settings", authRequired, requireEmployer, async (req, r
   } catch (e) { console.error(e); res.status(500).json({ error: "time_settings_update_failed" }); }
 });
 
-app.get("/api/time-clock/me", authRequired, async (req, res) => {
+app.get("/api/time-clock/me", authRequired, requireCapability("time.view_self"), async (req, res) => {
   try {
     const range = weekRangeFromQuery(req);
     if (!range) return res.status(400).json({ error: "invalid_week_start" });
@@ -5391,7 +6116,7 @@ app.get("/api/time-clock/me", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "time_me_failed" }); }
 });
 
-app.post("/api/time-clock/clock-in", authRequired, async (req, res) => {
+app.post("/api/time-clock/clock-in", authRequired, requireCapability("time.clock"), async (req, res) => {
   try {
     const existing = await pool.query(
       `SELECT id FROM time_clock_entries WHERE user_id = $1 AND end_at IS NULL LIMIT 1`,
@@ -5420,7 +6145,7 @@ app.post("/api/time-clock/clock-in", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "clock_in_failed" }); }
 });
 
-app.post("/api/time-clock/clock-out", authRequired, async (req, res) => {
+app.post("/api/time-clock/clock-out", authRequired, requireCapability("time.clock"), async (req, res) => {
   try {
     const end = req.body.end_at ? new Date(req.body.end_at) : new Date();
     if (Number.isNaN(end.getTime())) return res.status(400).json({ error: "invalid_end" });
@@ -5457,7 +6182,7 @@ app.post("/api/time-clock/clock-out", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "clock_out_failed" }); }
 });
 
-app.post("/api/time-clock/break-start", authRequired, async (req, res) => {
+app.post("/api/time-clock/break-start", authRequired, requireCapability("time.clock"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE time_clock_entries
@@ -5483,7 +6208,7 @@ app.post("/api/time-clock/break-start", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "break_start_failed" }); }
 });
 
-app.post("/api/time-clock/break-end", authRequired, async (req, res) => {
+app.post("/api/time-clock/break-end", authRequired, requireCapability("time.clock"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE time_clock_entries
@@ -5510,7 +6235,7 @@ app.post("/api/time-clock/break-end", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "break_end_failed" }); }
 });
 
-app.get("/api/time-clock/company", authRequired, requireEmployer, async (req, res) => {
+app.get("/api/time-clock/company", authRequired, requireCapability("time.view_all"), async (req, res) => {
   try {
     const range = weekRangeFromQuery(req);
     if (!range) return res.status(400).json({ error: "invalid_week_start" });
@@ -5530,7 +6255,7 @@ app.get("/api/time-clock/company", authRequired, requireEmployer, async (req, re
   } catch (e) { console.error(e); res.status(500).json({ error: "time_company_failed" }); }
 });
 
-app.get("/api/time-clock/range", authRequired, async (req, res) => {
+app.get("/api/time-clock/range", authRequired, requireCapability("time.view_self"), async (req, res) => {
   try {
     const start = new Date(req.query.start);
     const end = new Date(req.query.end);
@@ -5566,7 +6291,7 @@ app.get("/api/time-clock/range", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "time_range_failed" }); }
 });
 
-app.post("/api/time-clock/entries", authRequired, async (req, res) => {
+app.post("/api/time-clock/entries", authRequired, requireCapability("time.clock"), async (req, res) => {
   try {
     const start = new Date(req.body.start_at);
     const end = req.body.end_at ? new Date(req.body.end_at) : null;
@@ -5594,7 +6319,7 @@ app.post("/api/time-clock/entries", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_create_failed" }); }
 });
 
-app.patch("/api/time-clock/entries/:id", authRequired, async (req, res) => {
+app.patch("/api/time-clock/entries/:id", authRequired, requireAnyCapability("time.clock", "time.manage"), async (req, res) => {
   try {
     const start = new Date(req.body.start_at);
     const end = req.body.end_at ? new Date(req.body.end_at) : null;
@@ -5638,7 +6363,7 @@ app.patch("/api/time-clock/entries/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_update_failed" }); }
 });
 
-app.delete("/api/time-clock/entries/:id", authRequired, async (req, res) => {
+app.delete("/api/time-clock/entries/:id", authRequired, requireAnyCapability("time.clock", "time.manage"), async (req, res) => {
   try {
     const existing = await pool.query(`SELECT start_at FROM time_clock_entries WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
     if (req.role !== "employer") {
@@ -5664,7 +6389,7 @@ app.delete("/api/time-clock/entries/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_delete_failed" }); }
 });
 
-app.get("/api/time-clock/manual-entries", authRequired, requireEmployer, async (req, res) => {
+app.get("/api/time-clock/manual-entries", authRequired, requireCapability("time.manage"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT ${entrySelect("e")}
@@ -5679,7 +6404,7 @@ app.get("/api/time-clock/manual-entries", authRequired, requireEmployer, async (
   } catch (e) { console.error(e); res.status(500).json({ error: "manual_entries_failed" }); }
 });
 
-app.post("/api/time-clock/manual-entries/:id/:status", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/time-clock/manual-entries/:id/:status", authRequired, requireCapability("time.manage"), async (req, res) => {
   try {
     const status = req.params.status === "disapproved" ? "disapproved" : "approved";
     const { rows } = await pool.query(
@@ -5821,7 +6546,7 @@ async function emitJobServiceRouteEvents(companyId, actorUserId, jobId, before, 
 }
 
 // ---------- contacts (AUTH REQUIRED + COMPANY-SCOPED) ----------
-app.get("/api/contacts", authRequired, async (req, res) => {
+app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async (req, res) => {
   const q = (req.query.q || "").toString().trim();
   try {
     const scope = companyOrUserContactWhere(req);
@@ -5857,7 +6582,7 @@ app.get("/api/contacts", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/contacts/:id", authRequired, async (req, res) => {
+app.get("/api/contacts/:id", authRequired, requireCapability("contacts.view"), async (req, res) => {
   try {
     const scope = companyOrUserContactWhere(req);
     const { rows } = await pool.query(
@@ -5974,7 +6699,7 @@ function contactCreateRecommendation(checks) {
   return "Check backend logs for the matching contact_create_failed entry.";
 }
 
-app.post("/api/contacts/create-diagnostics", authRequired, async (req, res) => {
+app.post("/api/contacts/create-diagnostics", authRequired, requireCapability("contacts.create"), async (req, res) => {
   const body = req.body || {};
   if (!body.name) return res.status(400).json({
     error: "name_required",
@@ -6026,7 +6751,7 @@ app.post("/api/contacts/create-diagnostics", authRequired, async (req, res) => {
   }
 });
 
-app.post("/api/contacts", authRequired, async (req, res) => {
+app.post("/api/contacts", authRequired, requireCapability("contacts.create"), async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
@@ -6115,7 +6840,7 @@ app.post("/api/contacts", authRequired, async (req, res) => {
   }
 });
 
-app.put("/api/contacts/:id", authRequired, async (req, res) => {
+app.put("/api/contacts/:id", authRequired, requireCapability("contacts.edit"), async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
@@ -6204,6 +6929,13 @@ function mapRouteRow(row, stops = []) {
     stop_count: Number(row.stop_count || stops.length || 0),
     distance_meters: row.distance_meters,
     travel_time_seconds: row.travel_time_seconds,
+    service_time_seconds: row.service_time_seconds,
+    total_route_time_seconds: row.total_route_time_seconds,
+    estimated_start_at: row.estimated_start_at,
+    estimated_finish_at: row.estimated_finish_at,
+    routing_provider: row.routing_provider,
+    routing_strategy: row.routing_strategy,
+    routing_calculated_at: row.routing_calculated_at,
     created_at: row.created_at,
     updated_at: row.updated_at,
     stops
@@ -6222,8 +6954,24 @@ function mapRouteStopRow(row) {
     status: row.status,
     batch_number: row.batch_number == null ? null : Number(row.batch_number),
     locked_order: row.locked_order == null ? null : Number(row.locked_order),
-    source_type: row.source_type || (row.contact_id ? "contact" : "custom")
+    source_type: row.source_type || (row.contact_id ? "contact" : "custom"),
+    service_duration_seconds: row.service_duration_seconds,
+    leg_distance_meters: row.leg_distance_meters,
+    leg_travel_time_seconds: row.leg_travel_time_seconds,
+    estimated_arrival_at: row.estimated_arrival_at,
+    estimated_departure_at: row.estimated_departure_at
   };
+}
+
+function routeTimestamp(value) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
+}
+
+function routeMetric(value, maximum = Number.MAX_SAFE_INTEGER) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= maximum ? parsed : null;
 }
 
 async function fetchRouteWithStops(req, id) {
@@ -6255,9 +7003,11 @@ async function replaceRouteStops(client, routeId, companyId, stops) {
     await client.query(
       `INSERT INTO crm_route_stops(
          id, route_id, company_id, contact_id, stop_order, name_snapshot, address_snapshot,
-         latitude, longitude, status, batch_number, source_type, locked_order
+         latitude, longitude, status, batch_number, source_type, locked_order,
+         service_duration_seconds, leg_distance_meters, leg_travel_time_seconds,
+         estimated_arrival_at, estimated_departure_at
        )
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
       [
         randomUUID(),
         routeId,
@@ -6271,14 +7021,80 @@ async function replaceRouteStops(client, routeId, companyId, stops) {
         ["not_visited", "arrived", "completed", "skipped"].includes(raw.status) ? raw.status : "not_visited",
         Number.isFinite(Number(raw.batch_number)) ? Number(raw.batch_number) : null,
         ["contact", "custom"].includes(raw.source_type) ? raw.source_type : (raw.contact_id ? "contact" : "custom"),
-        Number.isFinite(Number(raw.locked_order)) && Number(raw.locked_order) > 0 ? Number(raw.locked_order) : null
+        Number.isFinite(Number(raw.locked_order)) && Number(raw.locked_order) > 0 ? Number(raw.locked_order) : null,
+        routeMetric(raw.service_duration_seconds, 86400),
+        routeMetric(raw.leg_distance_meters, 100000000),
+        routeMetric(raw.leg_travel_time_seconds, 604800),
+        routeTimestamp(raw.estimated_arrival_at),
+        routeTimestamp(raw.estimated_departure_at)
       ]
     );
   }
 }
 
+const googleRoutingRateWindows = new Map();
+
+function googleRoutingRateAllowed(req) {
+  const now = Date.now();
+  const windowMs = 60_000;
+  const maximumRequests = 20;
+  const key = req.companyId ? `company:${req.companyId}` : `user:${req.userId}`;
+  const recent = (googleRoutingRateWindows.get(key) || []).filter((timestamp) => timestamp > now - windowMs);
+  if (recent.length >= maximumRequests) {
+    googleRoutingRateWindows.set(key, recent);
+    return false;
+  }
+  recent.push(now);
+  googleRoutingRateWindows.set(key, recent);
+  if (googleRoutingRateWindows.size > 1000) {
+    for (const [candidateKey, timestamps] of googleRoutingRateWindows) {
+      if (!timestamps.some((timestamp) => timestamp > now - windowMs)) googleRoutingRateWindows.delete(candidateKey);
+    }
+  }
+  return true;
+}
+
+app.get("/api/routing/status", authRequired, requireCapability("routes.view"), (_req, res) => {
+  res.json(googleRoutingService.status());
+});
+
+app.post("/api/routing/route-plan", authRequired, requireAnyCapability("routes.create", "routes.edit"), async (req, res) => {
+  if (!googleRoutingRateAllowed(req)) {
+    return res.status(429).json({
+      error: "google_routing_rate_limited",
+      message: "Too many route calculations are already in progress. Try again in a minute.",
+      retryable: true
+    });
+  }
+
+  const controller = new AbortController();
+  const abortWhenDisconnected = () => {
+    if (!res.writableEnded) controller.abort(new Error("client_disconnected"));
+  };
+  res.once("close", abortWhenDisconnected);
+  try {
+    const plan = await googleRoutingService.plan(req.body, { signal: controller.signal });
+    if (!res.headersSent && !res.writableEnded) res.json(plan);
+  } catch (error) {
+    if (res.headersSent || res.writableEnded) return;
+    if (error instanceof GoogleRoutingError) {
+      const statusCode = error.statusCode === 499 ? 408 : error.statusCode;
+      return res.status(statusCode).json({
+        error: error.code,
+        message: error.message,
+        retryable: error.retryable,
+        ...(error.details ? { details: error.details } : {})
+      });
+    }
+    console.error("[google-routing] route calculation failed", error?.code || error?.name || "unknown_error");
+    res.status(500).json({ error: "google_routing_failed", message: "WolfCRM could not calculate this route." });
+  } finally {
+    res.removeListener("close", abortWhenDisconnected);
+  }
+});
+
 // ---------- routes (AUTH REQUIRED + COMPANY-SCOPED) ----------
-app.get("/api/routes", authRequired, async (req, res) => {
+app.get("/api/routes", authRequired, requireCapability("routes.view"), async (req, res) => {
   try {
     const scope = routeScope(req, "r");
     const { rows } = await pool.query(
@@ -6298,7 +7114,7 @@ app.get("/api/routes", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/routes/:id", authRequired, async (req, res) => {
+app.get("/api/routes/:id", authRequired, requireCapability("routes.view"), async (req, res) => {
   try {
     const route = await fetchRouteWithStops(req, req.params.id);
     if (!route) return res.status(404).json({ error: "route_not_found" });
@@ -6309,7 +7125,7 @@ app.get("/api/routes/:id", authRequired, async (req, res) => {
   }
 });
 
-app.post("/api/routes", authRequired, async (req, res) => {
+app.post("/api/routes", authRequired, requireCapability("routes.create"), async (req, res) => {
   const name = (req.body.name || "").toString().trim() || `Route ${new Date().toISOString().slice(0, 10)}`;
   const client = await pool.connect();
   try {
@@ -6318,9 +7134,11 @@ app.post("/api/routes", authRequired, async (req, res) => {
     await client.query(
       `INSERT INTO crm_routes(
          id, company_id, user_id, name, status, start_label, start_latitude, start_longitude,
-         start_mode, ending_behavior, end_label, end_latitude, end_longitude, distance_meters, travel_time_seconds
+         start_mode, ending_behavior, end_label, end_latitude, end_longitude, distance_meters, travel_time_seconds,
+         service_time_seconds, total_route_time_seconds, estimated_start_at, estimated_finish_at,
+         routing_provider, routing_strategy, routing_calculated_at
        )
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
       [
         id,
         req.companyId || null,
@@ -6335,8 +7153,15 @@ app.post("/api/routes", authRequired, async (req, res) => {
         req.body.end_label || null,
         Number.isFinite(Number(req.body.end_latitude)) ? Number(req.body.end_latitude) : null,
         Number.isFinite(Number(req.body.end_longitude)) ? Number(req.body.end_longitude) : null,
-        Number.isFinite(Number(req.body.distance_meters)) ? Number(req.body.distance_meters) : null,
-        Number.isFinite(Number(req.body.travel_time_seconds)) ? Number(req.body.travel_time_seconds) : null
+        routeMetric(req.body.distance_meters, 100000000),
+        routeMetric(req.body.travel_time_seconds, 604800),
+        routeMetric(req.body.service_time_seconds, 8640000),
+        routeMetric(req.body.total_route_time_seconds, 8640000),
+        routeTimestamp(req.body.estimated_start_at),
+        routeTimestamp(req.body.estimated_finish_at),
+        req.body.routing_provider === "google" ? "google" : null,
+        ["route_optimization", "route_matrix", "fixed_order"].includes(req.body.routing_strategy) ? req.body.routing_strategy : null,
+        routeTimestamp(req.body.routing_calculated_at)
       ]
     );
     await replaceRouteStops(client, id, req.companyId, req.body.stops);
@@ -6351,7 +7176,7 @@ app.post("/api/routes", authRequired, async (req, res) => {
   }
 });
 
-app.put("/api/routes/:id", authRequired, async (req, res) => {
+app.put("/api/routes/:id", authRequired, requireCapability("routes.edit"), async (req, res) => {
   const scope = routeScope(req, "r");
   const client = await pool.connect();
   try {
@@ -6375,6 +7200,13 @@ app.put("/api/routes/:id", authRequired, async (req, res) => {
               end_longitude = $11,
               distance_meters = $12,
               travel_time_seconds = $13,
+              service_time_seconds = $14,
+              total_route_time_seconds = $15,
+              estimated_start_at = $16,
+              estimated_finish_at = $17,
+              routing_provider = $18,
+              routing_strategy = $19,
+              routing_calculated_at = $20,
               updated_at = now()
         WHERE id = $1`,
       [
@@ -6389,8 +7221,15 @@ app.put("/api/routes/:id", authRequired, async (req, res) => {
         req.body.end_label || null,
         Number.isFinite(Number(req.body.end_latitude)) ? Number(req.body.end_latitude) : null,
         Number.isFinite(Number(req.body.end_longitude)) ? Number(req.body.end_longitude) : null,
-        Number.isFinite(Number(req.body.distance_meters)) ? Number(req.body.distance_meters) : null,
-        Number.isFinite(Number(req.body.travel_time_seconds)) ? Number(req.body.travel_time_seconds) : null
+        routeMetric(req.body.distance_meters, 100000000),
+        routeMetric(req.body.travel_time_seconds, 604800),
+        routeMetric(req.body.service_time_seconds, 8640000),
+        routeMetric(req.body.total_route_time_seconds, 8640000),
+        routeTimestamp(req.body.estimated_start_at),
+        routeTimestamp(req.body.estimated_finish_at),
+        req.body.routing_provider === "google" ? "google" : null,
+        ["route_optimization", "route_matrix", "fixed_order"].includes(req.body.routing_strategy) ? req.body.routing_strategy : null,
+        routeTimestamp(req.body.routing_calculated_at)
       ]
     );
     await replaceRouteStops(client, req.params.id, req.companyId, req.body.stops);
@@ -6405,7 +7244,7 @@ app.put("/api/routes/:id", authRequired, async (req, res) => {
   }
 });
 
-app.patch("/api/routes/:routeId/stops/:stopId", authRequired, async (req, res) => {
+app.patch("/api/routes/:routeId/stops/:stopId", authRequired, requireCapability("routes.edit"), async (req, res) => {
   try {
     const scope = routeScope(req, "r");
     const allowed = await pool.query(`SELECT r.id FROM crm_routes r WHERE r.id = $2 AND ${scope.sql}`, [...scope.values, req.params.routeId]);
@@ -6430,7 +7269,7 @@ app.patch("/api/routes/:routeId/stops/:stopId", authRequired, async (req, res) =
   }
 });
 
-app.delete("/api/contacts/:id", authRequired, async (req, res) => {
+app.delete("/api/contacts/:id", authRequired, requireCapability("contacts.delete"), async (req, res) => {
   try {
     if (!req.permissions.canDeleteContacts) {
       return res.status(403).json({ error: "permission_denied" });
@@ -6518,7 +7357,7 @@ function sanitizePushCategories(input) {
 }
 
 // GET current token (create if missing)
-app.get("/api/integrations/zapier/token", authRequired, async (req, res) => {
+app.get("/api/integrations/zapier/token", authRequired, requireCapability("integrations.view"), async (req, res) => {
   try {
     let { rows } = await pool.query(
       `SELECT token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields, notification_categories
@@ -6559,7 +7398,7 @@ app.get("/api/integrations/zapier/token", authRequired, async (req, res) => {
 });
 
 // Rotate token
-app.post("/api/integrations/zapier/token/rotate", authRequired, async (req, res) => {
+app.post("/api/integrations/zapier/token/rotate", authRequired, requireCapability("integrations.manage"), async (req, res) => {
   try {
     const token = randomBytes(24).toString("hex");
     const { rows } = await pool.query(
@@ -6580,7 +7419,7 @@ app.post("/api/integrations/zapier/token/rotate", authRequired, async (req, res)
 // This endpoint is intentionally TOLERANT: it never returns 4xx for a stale/missing
 // stage — it silently clears the invalid ref instead. This lets the app self-heal
 // during migrations, deletes, and cross-account edge cases.
-app.put("/api/integrations/zapier/auto-stage", authRequired, async (req, res) => {
+app.put("/api/integrations/zapier/auto-stage", authRequired, requireCapability("integrations.manage"), async (req, res) => {
   const { stage_id } = req.body || {};
   try {
     let effectiveStageId = null;
@@ -6618,7 +7457,7 @@ app.put("/api/integrations/zapier/auto-stage", authRequired, async (req, res) =>
 });
 
 // Toggle whether new imported leads are auto-assigned to a stage at all.
-app.put("/api/integrations/zapier/auto-assign-enabled", authRequired, async (req, res) => {
+app.put("/api/integrations/zapier/auto-assign-enabled", authRequired, requireCapability("integrations.manage"), async (req, res) => {
   const enabled = !!(req.body && req.body.enabled);
   try {
     const { rows } = await pool.query(
@@ -6638,7 +7477,7 @@ app.put("/api/integrations/zapier/auto-assign-enabled", authRequired, async (req
 
 // Push-notification preferences for new-lead alerts.
 // Body: { enabled: bool, fields: [string], categories: object }
-app.put("/api/integrations/zapier/notifications", authRequired, async (req, res) => {
+app.put("/api/integrations/zapier/notifications", authRequired, requireCapability("integrations.manage"), async (req, res) => {
   const enabled = !!(req.body && req.body.enabled);
   const fields = sanitizeNotificationFields(req.body && req.body.fields);
   const categories = sanitizePushCategories(req.body && req.body.categories);
@@ -6688,7 +7527,7 @@ app.post("/api/integrations/device-token", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/integrations/push/diagnostics", authRequired, async (req, res) => {
+app.get("/api/integrations/push/diagnostics", authRequired, requireCapability("integrations.view"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT environment, updated_at, last_registration_error
@@ -6722,7 +7561,7 @@ app.get("/api/integrations/push/diagnostics", authRequired, async (req, res) => 
   }
 });
 
-app.post("/api/integrations/push/test", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/integrations/push/test", authRequired, requireCapability("integrations.manage"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT token, COALESCE(environment, CASE WHEN $2::boolean THEN 'production' ELSE 'sandbox' END) AS environment
@@ -6760,7 +7599,7 @@ app.delete("/api/integrations/device-token", authRequired, async (req, res) => {
 
 // GET pending notifications and mark them delivered.
 // iOS polls this when the app becomes active and fires local notifications.
-app.get("/api/integrations/zapier/pending-notifications", authRequired, async (req, res) => {
+app.get("/api/integrations/zapier/pending-notifications", authRequired, requireCapability("integrations.view"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, title, body, contact_id, created_at
@@ -6787,7 +7626,7 @@ app.get("/api/integrations/zapier/pending-notifications", authRequired, async (r
 // One-shot backfill: re-processes every stored lead_import belonging to this
 // caller and writes Lead Info onto any contact whose lead_info is empty/null.
 // Idempotent — running it twice is safe.
-app.post("/api/integrations/zapier/backfill-lead-info", authRequired, async (req, res) => {
+app.post("/api/integrations/zapier/backfill-lead-info", authRequired, requireCapability("integrations.manage"), async (req, res) => {
   const force = !!(req.body && req.body.force);
   try {
     // Company-scoped when available (so any teammate can trigger the backfill
@@ -6890,7 +7729,7 @@ app.post("/api/integrations/zapier/backfill-lead-info", authRequired, async (req
 });
 
 // ---------- STAGE REMINDERS ----------
-app.get("/api/stage-reminders", authRequired, async (req, res) => {
+app.get("/api/stage-reminders", authRequired, requireCapability("pipeline.view"), async (req, res) => {
   const includeArchived = String(req.query.includeArchived || "").toLowerCase() === "true";
   try {
     const { rows } = await pool.query(
@@ -6904,7 +7743,7 @@ app.get("/api/stage-reminders", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_reminders" }); }
 });
 
-app.post("/api/stage-reminders", authRequired, async (req, res) => {
+app.post("/api/stage-reminders", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
   const { contact_id, opportunity_id, remind_at, note } = req.body || {};
   if (!contact_id || !remind_at) return res.status(400).json({ error: "missing_fields" });
   try {
@@ -6930,7 +7769,7 @@ app.post("/api/stage-reminders", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_create_reminder" }); }
 });
 
-app.put("/api/stage-reminders/:id", authRequired, async (req, res) => {
+app.put("/api/stage-reminders/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
   const { remind_at, note, archived } = req.body || {};
   try {
     const { rows } = await pool.query(
@@ -6959,7 +7798,7 @@ app.put("/api/stage-reminders/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_update_reminder" }); }
 });
 
-app.delete("/api/stage-reminders/:id", authRequired, async (req, res) => {
+app.delete("/api/stage-reminders/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
   try {
     await pool.query(`DELETE FROM stage_reminders WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.userId]);
@@ -7698,7 +8537,7 @@ function quoteScopeSQL(req, alias = "q") {
     : { sql: `${p}user_id = $1`, values: [req.userId] };
 }
 
-app.get("/api/quotes/settings", authRequired, async (req, res) => {
+app.get("/api/quotes/settings", authRequired, requireCapability("quotes.view"), async (req, res) => {
   try {
     if (!req.companyId) return res.status(400).json({ error: "company_required" });
     res.json(await getQuoteSettings(pool, req.companyId));
@@ -7708,7 +8547,7 @@ app.get("/api/quotes/settings", authRequired, async (req, res) => {
   }
 });
 
-app.patch("/api/quotes/settings", authRequired, requireEmployer, async (req, res) => {
+app.patch("/api/quotes/settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
   try {
     if (!req.companyId) return res.status(400).json({ error: "company_required" });
     const taxRate = Number(req.body?.tax_rate_basis_points || 0);
@@ -7747,7 +8586,7 @@ app.patch("/api/quotes/settings", authRequired, requireEmployer, async (req, res
   }
 });
 
-app.get("/api/quotes", authRequired, async (req, res) => {
+app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (req, res) => {
   try {
     const scope = quoteScopeSQL(req);
     const contactID = (req.query.contact_id || "").toString().trim();
@@ -7777,7 +8616,7 @@ app.get("/api/quotes", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/quotes/totals", authRequired, async (req, res) => {
+app.get("/api/quotes/totals", authRequired, requireCapability("quotes.view"), async (req, res) => {
   try {
     const scope = quoteScopeSQL(req);
     const { rows } = await pool.query(
@@ -7794,7 +8633,7 @@ app.get("/api/quotes/totals", authRequired, async (req, res) => {
   }
 });
 
-app.post("/api/quotes", authRequired, async (req, res) => {
+app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async (req, res) => {
   const { contact_id, title, line_items, notes, status, expires_at } = req.body || {};
   if (!contact_id) return res.status(400).json({ error: "contact_id_required" });
   const items = Array.isArray(line_items) ? line_items : [];
@@ -7827,7 +8666,7 @@ app.post("/api/quotes", authRequired, async (req, res) => {
   }
 });
 
-app.put("/api/quotes/:id", authRequired, async (req, res) => {
+app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async (req, res) => {
   const { title, line_items, notes, status, expires_at } = req.body || {};
   const items = Array.isArray(line_items) ? line_items : null;
   const total = items ? computeQuoteTotalCents(items) : null;
@@ -7895,7 +8734,7 @@ app.put("/api/quotes/:id", authRequired, async (req, res) => {
   }
 });
 
-app.delete("/api/quotes/:id", authRequired, async (req, res) => {
+app.delete("/api/quotes/:id", authRequired, requireCapability("quotes.delete"), async (req, res) => {
   try {
     // Fixed placeholder numbering (see PUT above).
     const params = [req.params.id];
@@ -7939,7 +8778,7 @@ app.delete("/api/quotes/:id", authRequired, async (req, res) => {
 // Stages are company-scoped when the user belongs to a company; otherwise they
 // fall back to the individual user. This is the SAME set of rows both the
 // Stages tab and the Integrations "auto-assign" picker read from.
-app.get("/api/stages", authRequired, async (req, res) => {
+app.get("/api/stages", authRequired, requireCapability("pipeline.view"), async (req, res) => {
   try {
     const { rows } = req.companyId
       ? await pool.query(
@@ -7968,7 +8807,7 @@ app.get("/api/stages", authRequired, async (req, res) => {
   }
 });
 
-app.put("/api/stages/:id", authRequired, async (req, res) => {
+app.put("/api/stages/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
   const { name, order_idx } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
   try {
@@ -7999,7 +8838,7 @@ app.put("/api/stages/:id", authRequired, async (req, res) => {
   } catch (e) { console.error("[stages] upsert failed:", e); res.status(500).json({ error: "failed_upsert_stage" }); }
 });
 
-app.delete("/api/stages/:id", authRequired, async (req, res) => {
+app.delete("/api/stages/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
   try {
     // Null out any zapier_tokens auto-assign refs that pointed here so future
     // webhooks don't try to assign to a deleted stage.
@@ -8032,7 +8871,7 @@ app.delete("/api/stages/:id", authRequired, async (req, res) => {
 // ---------- OPPORTUNITIES (each contact has at most one) ----------
 // Company-scoped when the caller belongs to a company; user-scoped otherwise.
 // This is important so webhook-created opportunities show up for every teammate.
-app.get("/api/opportunities", authRequired, async (req, res) => {
+app.get("/api/opportunities", authRequired, requireCapability("pipeline.view"), async (req, res) => {
   try {
     const { rows } = req.companyId
       ? await pool.query(
@@ -8050,7 +8889,7 @@ app.get("/api/opportunities", authRequired, async (req, res) => {
   } catch (e) { console.error("[opportunities] list failed:", e); res.status(500).json({ error: "failed_list_opportunities" }); }
 });
 
-app.put("/api/opportunities/:id", authRequired, async (req, res) => {
+app.put("/api/opportunities/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
   const { contact_id, state, stage_id, created_at, stage_entered_at } = req.body || {};
   if (!contact_id || !state) return res.status(400).json({ error: "missing_params" });
   try {
@@ -8112,7 +8951,7 @@ app.put("/api/opportunities/:id", authRequired, async (req, res) => {
   } catch (e) { console.error("[opportunities] upsert failed:", e); res.status(500).json({ error: "failed_upsert_opportunity" }); }
 });
 
-app.delete("/api/opportunities/:id", authRequired, async (req, res) => {
+app.delete("/api/opportunities/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
   try {
     const before = (await pool.query(
       `DELETE FROM opportunities
@@ -8131,7 +8970,7 @@ app.delete("/api/opportunities/:id", authRequired, async (req, res) => {
 });
 
 // ---------- SCHEDULE EVENTS ----------
-app.get("/api/schedule", authRequired, async (req, res) => {
+app.get("/api/schedule", authRequired, requireCapability("schedule.view"), async (req, res) => {
   try {
     const where = req.companyId
       ? { sql: `company_id = $1`, values: [req.companyId] }
@@ -8147,15 +8986,165 @@ app.get("/api/schedule", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_schedule" }); }
 });
 
-app.put("/api/schedule/:id", authRequired, async (req, res) => {
+app.get("/api/schedule/team", authRequired, requireCapability("schedule.view"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const start = new Date(req.query.start || Date.now());
+  const end = new Date(req.query.end || (start.getTime() + 7 * 86400000));
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start || end - start > 62 * 86400000) {
+    return res.status(400).json({ error: "invalid_schedule_range", message: "Choose a valid range of 62 days or fewer." });
+  }
+  try {
+    const [companyResult, membersResult, availabilityResult, eventsResult] = await Promise.all([
+      pool.query(
+        `SELECT timezone, business_days, business_open_time, business_close_time
+           FROM companies WHERE id = $1`,
+        [req.companyId]
+      ),
+      pool.query(
+        `SELECT id, role, COALESCE(NULLIF(BTRIM(display_name), ''), split_part(email, '@', 1), 'Team member') AS display_name
+           FROM users
+          WHERE company_id = $1 AND deleted_at IS NULL
+          ORDER BY role = 'employer' DESC, display_name ASC NULLS LAST, email ASC`,
+        [req.companyId]
+      ),
+      pool.query(
+        `SELECT user_id, weekdays, start_time, end_time, timezone, enabled, updated_at
+           FROM employee_schedule_availability WHERE company_id = $1`,
+        [req.companyId]
+      ),
+      pool.query(
+        `SELECT id, start_at, end_at, worker_user_ids, finished_at
+           FROM schedule_events
+          WHERE company_id = $1 AND start_at < $3 AND end_at > $2`,
+        [req.companyId, start, end]
+      )
+    ]);
+    if (!companyResult.rows.length) return res.status(404).json({ error: "company_not_found" });
+    const company = companyResult.rows[0];
+    const companyAvailability = {
+      weekdays: Array.isArray(company.business_days) ? company.business_days.map(Number) : [1, 2, 3, 4, 5],
+      start_time: company.business_open_time || "09:00",
+      end_time: company.business_close_time || "17:00",
+      timezone: company.timezone || "America/New_York",
+      enabled: true
+    };
+    const overrides = Object.fromEntries(availabilityResult.rows.map((row) => [row.user_id, row]));
+    const effectiveByUser = Object.fromEntries(membersResult.rows.map((member) => {
+      const override = overrides[member.id];
+      return [member.id, override?.enabled === false ? companyAvailability : (override || companyAvailability)];
+    }));
+    const summary = summarizeScheduleTeam({
+      events: eventsResult.rows,
+      availabilityByUser: effectiveByUser,
+      companyAvailability,
+      timeZone: companyAvailability.timezone
+    });
+    res.json({
+      range_start: start,
+      range_end: end,
+      company_availability: companyAvailability,
+      members: membersResult.rows.map((member) => ({
+        ...member,
+        availability: effectiveByUser[member.id],
+        inherits_company_availability: !overrides[member.id] || overrides[member.id].enabled === false,
+        assigned_minutes: summary.assigned_minutes_by_user[member.id] || 0
+      })),
+      summary
+    });
+  } catch (error) {
+    console.error("[schedule] team load failed", error);
+    res.status(500).json({ error: "schedule_team_load_failed" });
+  }
+});
+
+app.put("/api/schedule/team/:userId/availability", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  let availability;
+  try {
+    availability = validateAvailability(req.body);
+  } catch (error) {
+    if (error instanceof ScheduleTeamError) {
+      return res.status(error.status).json({ error: error.code, message: error.message, details: error.details });
+    }
+    console.error("[schedule] availability validation failed", error);
+    return res.status(500).json({ error: "schedule_availability_update_failed" });
+  }
+  try {
+    const member = await pool.query(
+      `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [req.params.userId, req.companyId]
+    );
+    if (!member.rowCount) return res.status(404).json({ error: "employee_not_found" });
+    const company = await pool.query(`SELECT timezone FROM companies WHERE id = $1`, [req.companyId]);
+    const { rows } = await pool.query(
+      `INSERT INTO employee_schedule_availability
+         (company_id, user_id, weekdays, start_time, end_time, timezone, enabled, updated_by)
+       VALUES($1, $2, $3::jsonb, $4, $5, $6, $7, $8)
+       ON CONFLICT(company_id, user_id) DO UPDATE
+         SET weekdays = EXCLUDED.weekdays,
+             start_time = EXCLUDED.start_time,
+             end_time = EXCLUDED.end_time,
+             timezone = EXCLUDED.timezone,
+             enabled = EXCLUDED.enabled,
+             updated_by = EXCLUDED.updated_by,
+             updated_at = now()
+       RETURNING user_id, weekdays, start_time, end_time, timezone, enabled, updated_at`,
+      [
+        req.companyId,
+        req.params.userId,
+        JSON.stringify(availability.weekdays),
+        availability.start_time,
+        availability.end_time,
+        company.rows[0]?.timezone || "America/New_York",
+        availability.enabled,
+        req.userId
+      ]
+    );
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("[schedule] availability update failed", error);
+    res.status(500).json({ error: "schedule_availability_update_failed" });
+  }
+});
+
+app.delete("/api/schedule/team/:userId/availability", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const member = await pool.query(
+      `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [req.params.userId, req.companyId]
+    );
+    if (!member.rowCount) return res.status(404).json({ error: "employee_not_found" });
+    await pool.query(`DELETE FROM employee_schedule_availability WHERE company_id = $1 AND user_id = $2`, [req.companyId, req.params.userId]);
+    res.json({ reset: true, user_id: req.params.userId });
+  } catch (error) {
+    console.error("[schedule] availability reset failed", error);
+    res.status(500).json({ error: "schedule_availability_reset_failed" });
+  }
+});
+
+app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create", "schedule.edit"), async (req, res) => {
   const {
     title, start, end, color, notes, contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
     sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by
   } = req.body || {};
   if (!title || !start || !end) return res.status(400).json({ error: "missing_params" });
-  const salesIDs = Array.isArray(sales_user_ids) ? sales_user_ids.slice(0, 2) : [req.userId];
-  const workerIDs = Array.isArray(worker_user_ids) ? worker_user_ids : [];
+  const startDate = new Date(start);
+  const endDate = new Date(end);
+  if (!Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime()) || endDate <= startDate) {
+    return res.status(400).json({ error: "invalid_schedule_interval", message: "Job end time must be after its start time." });
+  }
   try {
+    const activeMembers = req.companyId
+      ? await pool.query(`SELECT id FROM users WHERE company_id = $1 AND deleted_at IS NULL`, [req.companyId])
+      : { rows: [{ id: req.userId }] };
+    const assignments = validateAssignments({
+      salesIDs: Array.isArray(sales_user_ids) ? sales_user_ids : [req.userId],
+      workerIDs: Array.isArray(worker_user_ids) ? worker_user_ids : [],
+      activeMemberIDs: activeMembers.rows.map((row) => row.id)
+    });
+    const salesIDs = assignments.sales_user_ids;
+    const workerIDs = assignments.worker_user_ids;
     const previous = await pool.query(
       `SELECT * FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
       [req.params.id, req.userId, req.companyId]
@@ -8250,10 +9239,16 @@ app.put("/api/schedule/:id", authRequired, async (req, res) => {
       await markGoogleSheetsContactDirty(pool, req.companyId, r.rows[0].contact_id, isNewJob ? "job.created" : "job.updated");
     }
     res.json(r.rows[0]);
-  } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_schedule" }); }
+  } catch (e) {
+    if (e instanceof ScheduleTeamError) {
+      return res.status(e.status).json({ error: e.code, message: e.message, details: e.details });
+    }
+    console.error(e);
+    res.status(500).json({ error: "failed_upsert_schedule" });
+  }
 });
 
-app.delete("/api/schedule/:id", authRequired, async (req, res) => {
+app.delete("/api/schedule/:id", authRequired, requireCapability("schedule.delete"), async (req, res) => {
   try {
     const before = req.companyId
       ? (await pool.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0]
@@ -8331,7 +9326,7 @@ function workflowRunPayload(row) {
   };
 }
 
-app.post("/api/jobs/:id/workflow/start", authRequired, async (req, res) => {
+app.post("/api/jobs/:id/workflow/start", authRequired, requireCapability("jobs.work"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const client = await pool.connect();
   try {
@@ -8362,7 +9357,7 @@ app.post("/api/jobs/:id/workflow/start", authRequired, async (req, res) => {
   } finally { client.release(); }
 });
 
-app.get("/api/jobs/:id/workflow", authRequired, async (req, res) => {
+app.get("/api/jobs/:id/workflow", authRequired, requireCapability("jobs.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const row = (await pool.query(`SELECT * FROM job_workflow_runs WHERE company_id = $1 AND job_id = $2`, [req.companyId, req.params.id])).rows[0];
@@ -8371,7 +9366,7 @@ app.get("/api/jobs/:id/workflow", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "job_workflow_load_failed" }); }
 });
 
-app.put("/api/jobs/:id/workflow", authRequired, async (req, res) => {
+app.put("/api/jobs/:id/workflow", authRequired, requireCapability("jobs.work"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const snapshot = Array.isArray(req.body?.snapshot) ? req.body.snapshot : [];
   try {
@@ -8381,7 +9376,7 @@ app.put("/api/jobs/:id/workflow", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "job_workflow_update_failed" }); }
 });
 
-app.post("/api/jobs/:id/workflow/complete", authRequired, async (req, res) => {
+app.post("/api/jobs/:id/workflow/complete", authRequired, requireCapability("jobs.complete"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const snapshot = Array.isArray(req.body?.snapshot) ? req.body.snapshot : [];
   const overrideReason = (req.body?.override_reason || "").toString().trim() || null;
@@ -8423,14 +9418,14 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, async (req, res) => {
   } finally { client.release(); }
 });
 
-app.get("/api/job-workflow-templates", authRequired, requireEmployer, async (req, res) => {
+app.get("/api/job-workflow-templates", authRequired, requireCapability("jobs.manage_templates"), async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT id, name, scope, service_type, enabled, archived_at, sections FROM job_workflow_templates WHERE company_id = $1 AND archived_at IS NULL ORDER BY updated_at DESC`, [req.companyId]);
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "workflow_templates_failed" }); }
 });
 
-app.put("/api/job-workflow-templates/:id", authRequired, requireEmployer, async (req, res) => {
+app.put("/api/job-workflow-templates/:id", authRequired, requireCapability("jobs.manage_templates"), async (req, res) => {
   const { name, scope, service_type, enabled, sections } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
   try {
@@ -8446,14 +9441,14 @@ app.put("/api/job-workflow-templates/:id", authRequired, requireEmployer, async 
   } catch (e) { console.error(e); res.status(500).json({ error: "workflow_template_save_failed" }); }
 });
 
-app.delete("/api/job-workflow-templates/:id", authRequired, requireEmployer, async (req, res) => {
+app.delete("/api/job-workflow-templates/:id", authRequired, requireCapability("jobs.manage_templates"), async (req, res) => {
   try {
     await pool.query(`UPDATE job_workflow_templates SET archived_at = now(), updated_at = now() WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "workflow_template_archive_failed" }); }
 });
 
-app.get("/api/jobs/:id/photos", authRequired, async (req, res) => {
+app.get("/api/jobs/:id/photos", authRequired, requireCapability("jobs.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const allowed = (await pool.query(`SELECT contact_id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
@@ -8463,7 +9458,7 @@ app.get("/api/jobs/:id/photos", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "job_photos_failed" }); }
 });
 
-app.post("/api/jobs/:id/photos", authRequired, async (req, res) => {
+app.post("/api/jobs/:id/photos", authRequired, requireCapability("jobs.work"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const { category, caption, object_key, thumbnail_key, workflow_item_id } = req.body || {};
   if (!object_key) return res.status(400).json({ error: "object_key_required" });
@@ -8482,7 +9477,7 @@ app.post("/api/jobs/:id/photos", authRequired, async (req, res) => {
 });
 
 // ---------- OPERATIONS: EQUIPMENT & MATERIALS ----------
-app.get("/api/operations/inventory/locations", authRequired, async (req, res) => {
+app.get("/api/operations/inventory/locations", authRequired, requireCapability("operations.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     await pool.query(`INSERT INTO inventory_locations(id, company_id, name, kind) VALUES($1, $2, 'Shop', 'shop') ON CONFLICT(id) DO NOTHING`, [`${req.companyId}:shop`, req.companyId]);
@@ -8491,7 +9486,7 @@ app.get("/api/operations/inventory/locations", authRequired, async (req, res) =>
   } catch (e) { console.error(e); res.status(500).json({ error: "inventory_locations_failed" }); }
 });
 
-app.get("/api/operations/inventory/items", authRequired, async (req, res) => {
+app.get("/api/operations/inventory/items", authRequired, requireCapability("operations.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const { rows } = await pool.query(`SELECT id, name, item_type, tracking_mode, category, unit, quantity_on_hand::float8 AS quantity_on_hand, reorder_point::float8 AS reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes FROM inventory_items WHERE company_id = $1 ORDER BY updated_at DESC`, [req.companyId]);
@@ -8499,7 +9494,7 @@ app.get("/api/operations/inventory/items", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "inventory_items_failed" }); }
 });
 
-app.put("/api/operations/inventory/items/:id", authRequired, requireEmployer, async (req, res) => {
+app.put("/api/operations/inventory/items/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const { name, item_type, tracking_mode, category, unit, reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
   try {
@@ -8515,7 +9510,7 @@ app.put("/api/operations/inventory/items/:id", authRequired, requireEmployer, as
   } catch (e) { console.error(e); res.status(500).json({ error: "inventory_item_save_failed" }); }
 });
 
-app.post("/api/operations/inventory/transactions", authRequired, async (req, res) => {
+app.post("/api/operations/inventory/transactions", authRequired, requireCapability("operations.request"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const { item_id, transaction_type, quantity, from_location_id, to_location_id, job_id, note, idempotency_key, reverses_transaction_id } = req.body || {};
   const qty = Number(quantity);
@@ -8554,7 +9549,7 @@ app.post("/api/operations/inventory/transactions", authRequired, async (req, res
   } finally { client.release(); }
 });
 
-app.get("/api/operations/requests", authRequired, async (req, res) => {
+app.get("/api/operations/requests", authRequired, requireCapability("operations.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const { rows } = await pool.query(`SELECT id, request_type, item_id, item_name, quantity::float8 AS quantity, urgency, explanation, status, requester_id, owner_response, created_at FROM equipment_requests WHERE company_id = $1 AND ($2 = true OR requester_id = $3) ORDER BY CASE urgency WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, created_at ASC`, [req.companyId, req.role === "employer", req.userId]);
@@ -8562,7 +9557,7 @@ app.get("/api/operations/requests", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "equipment_requests_failed" }); }
 });
 
-app.post("/api/operations/requests", authRequired, async (req, res) => {
+app.post("/api/operations/requests", authRequired, requireCapability("operations.request"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const { request_type, item_id, item_name, quantity, urgency, explanation } = req.body || {};
   if (!request_type || !explanation) return res.status(400).json({ error: "invalid_request" });
@@ -8572,7 +9567,7 @@ app.post("/api/operations/requests", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "equipment_request_failed" }); }
 });
 
-app.patch("/api/operations/requests/:id", authRequired, requireEmployer, async (req, res) => {
+app.patch("/api/operations/requests/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const { status, owner_response } = req.body || {};
   try {
     const { rows } = await pool.query(`UPDATE equipment_requests SET status = COALESCE($3, status), owner_response = COALESCE($4, owner_response), updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING id, request_type, item_id, item_name, quantity::float8 AS quantity, urgency, explanation, status, requester_id, owner_response, created_at`, [req.params.id, req.companyId, status || null, owner_response || null]);
@@ -8582,7 +9577,7 @@ app.patch("/api/operations/requests/:id", authRequired, requireEmployer, async (
 });
 
 // ---------- OPERATIONS: MILEAGE ----------
-app.get("/api/operations/mileage", authRequired, async (req, res) => {
+app.get("/api/operations/mileage", authRequired, requireCapability("operations.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     await pool.query(`INSERT INTO mileage_company_settings(company_id) VALUES($1) ON CONFLICT(company_id) DO NOTHING`, [req.companyId]);
@@ -8617,7 +9612,7 @@ app.get("/api/operations/mileage", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "mileage_load_failed" }); }
 });
 
-app.put("/api/operations/mileage/settings", authRequired, requireEmployer, async (req, res) => {
+app.put("/api/operations/mileage/settings", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const { enabled, default_rate_cents_per_mile } = req.body || {};
   try {
     const { rows } = await pool.query(`INSERT INTO mileage_company_settings(company_id, enabled, default_rate_cents_per_mile) VALUES($1,$2,$3) ON CONFLICT(company_id) DO UPDATE SET enabled = EXCLUDED.enabled, default_rate_cents_per_mile = EXCLUDED.default_rate_cents_per_mile, updated_at = now() RETURNING enabled, default_rate_cents_per_mile`, [req.companyId, toBool(enabled), Number(default_rate_cents_per_mile) || 0]);
@@ -8625,7 +9620,7 @@ app.put("/api/operations/mileage/settings", authRequired, requireEmployer, async
   } catch (e) { console.error(e); res.status(500).json({ error: "mileage_settings_failed" }); }
 });
 
-app.put("/api/operations/mileage/employees/:id", authRequired, requireEmployer, async (req, res) => {
+app.put("/api/operations/mileage/employees/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const { enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date } = req.body || {};
   try {
     const { rows } = await pool.query(`INSERT INTO mileage_employee_settings(company_id, employee_id, enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(company_id, employee_id) DO UPDATE SET enabled = EXCLUDED.enabled, rate_cents_per_mile = EXCLUDED.rate_cents_per_mile, start_rule = EXCLUDED.start_rule, end_rule = EXCLUDED.end_rule, start_location_id = EXCLUDED.start_location_id, end_location_id = EXCLUDED.end_location_id, vehicle_type = EXCLUDED.vehicle_type, effective_date = EXCLUDED.effective_date, updated_at = now() RETURNING employee_id, enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date::text`, [req.companyId, req.params.id, toBool(enabled), rate_cents_per_mile ?? null, start_rule || "company_location", end_rule || "last_completed_job", start_location_id || null, end_location_id || null, vehicle_type || "not_specified", effective_date || null]);
@@ -8633,7 +9628,7 @@ app.put("/api/operations/mileage/employees/:id", authRequired, requireEmployer, 
   } catch (e) { console.error(e); res.status(500).json({ error: "mileage_employee_settings_failed" }); }
 });
 
-app.post("/api/operations/mileage/employees/:id/calculate", authRequired, async (req, res) => {
+app.post("/api/operations/mileage/employees/:id/calculate", authRequired, requireCapability("operations.request"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const employeeId = req.role === "employer" ? req.params.id : req.userId;
   const day = (req.body?.day || new Date().toISOString().slice(0, 10)).toString().slice(0, 10);
@@ -8706,7 +9701,7 @@ app.post("/api/operations/mileage/employees/:id/calculate", authRequired, async 
   } finally { client.release(); }
 });
 
-app.post("/api/operations/mileage/address-proposals", authRequired, async (req, res) => {
+app.post("/api/operations/mileage/address-proposals", authRequired, requireCapability("operations.request"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const { kind, label, address, lat, lng, explanation } = req.body || {};
   if (!address || !Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) return res.status(400).json({ error: "valid_address_required" });
@@ -8721,7 +9716,7 @@ app.post("/api/operations/mileage/address-proposals", authRequired, async (req, 
   } catch (e) { console.error("[operations] mileage address proposal failed:", e); res.status(500).json({ error: "mileage_address_proposal_failed" }); }
 });
 
-app.post("/api/operations/mileage/address-proposals/:id/review", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/operations/mileage/address-proposals/:id/review", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const action = req.body?.action === "approve" ? "approved" : req.body?.action === "reject" ? "rejected" : null;
   if (!action) return res.status(400).json({ error: "invalid_action" });
   const client = await pool.connect();
@@ -8746,7 +9741,7 @@ app.post("/api/operations/mileage/address-proposals/:id/review", authRequired, r
   } finally { client.release(); }
 });
 
-app.post("/api/operations/mileage/manual-trips", authRequired, async (req, res) => {
+app.post("/api/operations/mileage/manual-trips", authRequired, requireCapability("operations.request"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const employeeId = req.role === "employer" && req.body?.employee_id ? req.body.employee_id : req.userId;
   const day = (req.body?.service_date || new Date().toISOString().slice(0, 10)).toString().slice(0, 10);
@@ -8769,7 +9764,7 @@ app.post("/api/operations/mileage/manual-trips", authRequired, async (req, res) 
   } catch (e) { console.error("[operations] manual trip failed:", e); res.status(500).json({ error: "mileage_manual_trip_failed" }); }
 });
 
-app.post("/api/operations/mileage/manual-trips/:id/review", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/operations/mileage/manual-trips/:id/review", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const status = req.body?.action === "approve" ? "approved" : req.body?.action === "reject" ? "rejected" : null;
   if (!status) return res.status(400).json({ error: "invalid_action" });
   try {
@@ -8786,7 +9781,7 @@ app.post("/api/operations/mileage/manual-trips/:id/review", authRequired, requir
   } catch (e) { console.error("[operations] manual trip review failed:", e); res.status(500).json({ error: "mileage_manual_trip_review_failed" }); }
 });
 
-app.post("/api/operations/mileage/logs/:id/review", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/operations/mileage/logs/:id/review", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const action = cleanString(req.body?.action, 40);
   const nextStatus = action === "approve" ? "approved" : action === "reject" ? "rejected" : action === "request_correction" ? "ready_for_review" : action === "mark_paid" ? "paid" : null;
   if (!nextStatus) return res.status(400).json({ error: "invalid_action" });
@@ -8809,13 +9804,14 @@ app.post("/api/operations/mileage/logs/:id/review", authRequired, requireEmploye
   } catch (e) { console.error("[operations] mileage log review failed:", e); res.status(500).json({ error: "mileage_log_review_failed" }); }
 });
 
-app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
+app.get("/api/reports/weekly-sales", authRequired, requireAnyCapability("sales.view_self", "sales.view_all"), async (req, res) => {
   try {
     const range = statsRange("week", req.query.date);
     if (!range) return res.status(400).json({ error: "invalid_range" });
     const requestedUser = (req.query.user_id || "").toString();
-    const userID = req.role === "employer" && requestedUser ? requestedUser : req.userId;
-    if (req.role === "employer") {
+    const canViewAllSales = hasCapability(req, "sales.view_all");
+    const userID = canViewAllSales && requestedUser ? requestedUser : req.userId;
+    if (canViewAllSales) {
       const allowed = await pool.query(`SELECT id FROM users WHERE id = $1 AND company_id = $2`, [userID, req.companyId]);
       if (!allowed.rowCount) return res.status(404).json({ error: "employee_not_found" });
     }
@@ -9021,7 +10017,7 @@ function filterDashboardDismissed(items, dismissals) {
   return items.filter((item) => !hidden.has(dashboardItemKey(item)));
 }
 
-app.get("/api/dashboard/summary", authRequired, async (req, res) => {
+app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.view"), async (req, res) => {
   try {
     const requestId = dashboardRequestId(req);
     const now = new Date();
@@ -9393,7 +10389,7 @@ app.get("/api/dashboard/summary", authRequired, async (req, res) => {
   }
 });
 
-app.post("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
+app.post("/api/dashboard/items/dismiss", authRequired, requireCapability("dashboard.view"), async (req, res) => {
   const { type, source_id, fingerprint } = req.body || {};
   if (!DASHBOARD_DISMISS_TYPES.has(type) || !source_id) return res.status(400).json({ error: "invalid_dashboard_item" });
   try {
@@ -9411,7 +10407,7 @@ app.post("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
   }
 });
 
-app.delete("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
+app.delete("/api/dashboard/items/dismiss", authRequired, requireCapability("dashboard.view"), async (req, res) => {
   const { type, source_id, fingerprint } = req.query?.type ? req.query : (req.body || {});
   if (!DASHBOARD_DISMISS_TYPES.has(type) || !source_id) return res.status(400).json({ error: "invalid_dashboard_item" });
   try {
@@ -9431,7 +10427,7 @@ app.delete("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
 });
 
 // ---------- MAP PINS ----------
-app.get("/api/map-pins", authRequired, async (req, res) => {
+app.get("/api/map-pins", authRequired, requireCapability("operations.view"), async (req, res) => {
   try {
     const companyScope = req.query.scope === "company" && req.companyId;
     const where = companyScope
@@ -9451,7 +10447,7 @@ app.get("/api/map-pins", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_pins" }); }
 });
 
-app.put("/api/map-pins/:id", authRequired, async (req, res) => {
+app.put("/api/map-pins/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const { latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at } = req.body || {};
   if (typeof latitude !== "number" || typeof longitude !== "number") {
     return res.status(400).json({ error: "missing_coords" });
@@ -9530,7 +10526,7 @@ app.put("/api/map-pins/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_pin" }); }
 });
 
-app.delete("/api/map-pins/:id", authRequired, async (req, res) => {
+app.delete("/api/map-pins/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `DELETE FROM map_pins p
@@ -9570,7 +10566,7 @@ function statsRange(kind, dateValue) {
   return { start, end };
 }
 
-app.get("/api/map-stats", authRequired, async (req, res) => {
+app.get("/api/map-stats", authRequired, requireCapability("operations.view"), async (req, res) => {
   try {
     const period = ["day", "week", "month", "all"].includes(req.query.period) ? req.query.period : "day";
     const range = statsRange(period, req.query.date);
@@ -9621,7 +10617,7 @@ app.get("/api/map-stats", authRequired, async (req, res) => {
 });
 
 // ---------- MEASUREMENTS ----------
-app.get("/api/measurements", authRequired, async (req, res) => {
+app.get("/api/measurements", authRequired, requireCapability("operations.view"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, name, points, created_at, linked_contact_ids, units
@@ -9634,7 +10630,7 @@ app.get("/api/measurements", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_measurements" }); }
 });
 
-app.put("/api/measurements/:id", authRequired, async (req, res) => {
+app.put("/api/measurements/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const { name, points, created_at, linked_contact_ids, units } = req.body || {};
   if (!Array.isArray(points)) {
     return res.status(400).json({ error: "missing_points" });
@@ -9687,7 +10683,7 @@ app.put("/api/measurements/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_measurement" }); }
 });
 
-app.delete("/api/measurements/:id", authRequired, async (req, res) => {
+app.delete("/api/measurements/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   try {
     await pool.query(`DELETE FROM measurements WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.userId]);
@@ -9701,7 +10697,7 @@ app.delete("/api/measurements/:id", authRequired, async (req, res) => {
 });
 
 // ---------- TO-DO: TASKS ----------
-app.get("/api/todo/tasks", authRequired, async (req, res) => {
+app.get("/api/todo/tasks", authRequired, requireCapability("tasks.view"), async (req, res) => {
   try {
     const companyUsers = req.companyId
       ? (await pool.query(`SELECT id FROM users WHERE company_id = $1`, [req.companyId])).rows.map((r) => r.id)
@@ -9721,7 +10717,7 @@ app.get("/api/todo/tasks", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_tasks" }); }
 });
 
-app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
+app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   const {
     title, detail, creator_id, assignee_ids, due_date, priority, status,
     linked_contact_id, linked_job_id, linked_equipment_id,
@@ -9799,7 +10795,7 @@ app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_task" }); }
 });
 
-app.delete("/api/todo/tasks/:id", authRequired, async (req, res) => {
+app.delete("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   try {
     const before = (await pool.query(`DELETE FROM todo_tasks WHERE id = $1 AND user_id = $2 RETURNING *`,
       [req.params.id, req.userId])).rows[0];
@@ -9812,7 +10808,7 @@ app.delete("/api/todo/tasks/:id", authRequired, async (req, res) => {
 });
 
 // ---------- TO-DO: ROUTINES ----------
-app.get("/api/todo/routines", authRequired, async (req, res) => {
+app.get("/api/todo/routines", authRequired, requireCapability("tasks.view"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, title, time, weekdays, reminders, enabled, color_hex
@@ -9823,7 +10819,7 @@ app.get("/api/todo/routines", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_routines" }); }
 });
 
-app.put("/api/todo/routines/:id", authRequired, async (req, res) => {
+app.put("/api/todo/routines/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   const { title, time, weekdays, reminders, enabled, color_hex } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
   try {
@@ -9860,7 +10856,7 @@ app.put("/api/todo/routines/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_routine" }); }
 });
 
-app.delete("/api/todo/routines/:id", authRequired, async (req, res) => {
+app.delete("/api/todo/routines/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   try {
     const before = (await pool.query(`DELETE FROM todo_routines WHERE id = $1 AND user_id = $2 RETURNING *`,
       [req.params.id, req.userId])).rows[0];
@@ -9875,7 +10871,7 @@ app.delete("/api/todo/routines/:id", authRequired, async (req, res) => {
 });
 
 // ---------- TO-DO: PER-DAY ROUTINE COMPLETIONS ----------
-app.get("/api/todo/routine-done", authRequired, async (req, res) => {
+app.get("/api/todo/routine-done", authRequired, requireCapability("tasks.view"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT routine_id, day_key FROM todo_routine_done WHERE user_id = $1`,
@@ -9885,7 +10881,7 @@ app.get("/api/todo/routine-done", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_routine_done" }); }
 });
 
-app.put("/api/todo/routine-done", authRequired, async (req, res) => {
+app.put("/api/todo/routine-done", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   const { routine_id, day_key } = req.body || {};
   if (!routine_id || !day_key) return res.status(400).json({ error: "missing_params" });
   try {
@@ -9902,7 +10898,7 @@ app.put("/api/todo/routine-done", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_mark_routine_done" }); }
 });
 
-app.delete("/api/todo/routine-done", authRequired, async (req, res) => {
+app.delete("/api/todo/routine-done", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   const { routine_id, day_key } = req.query || {};
   if (!routine_id || !day_key) return res.status(400).json({ error: "missing_params" });
   try {
@@ -9916,7 +10912,7 @@ app.delete("/api/todo/routine-done", authRequired, async (req, res) => {
 });
 
 // ---------- TO-DO: CUSTOMER REMINDERS ----------
-app.get("/api/todo/customer-reminders", authRequired, async (req, res) => {
+app.get("/api/todo/customer-reminders", authRequired, requireCapability("tasks.view"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, title, contact_id, contact_name, phone, due_date, completed, color_hex
@@ -9927,7 +10923,7 @@ app.get("/api/todo/customer-reminders", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_customer_reminders" }); }
 });
 
-app.put("/api/todo/customer-reminders/:id", authRequired, async (req, res) => {
+app.put("/api/todo/customer-reminders/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   const { title, contact_id, contact_name, phone, due_date, completed, color_hex } = req.body || {};
   if (!contact_name) return res.status(400).json({ error: "contact_name_required" });
   try {
@@ -9966,7 +10962,7 @@ app.put("/api/todo/customer-reminders/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_customer_reminder" }); }
 });
 
-app.delete("/api/todo/customer-reminders/:id", authRequired, async (req, res) => {
+app.delete("/api/todo/customer-reminders/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   try {
     const before = (await pool.query(
       `DELETE FROM todo_customer_reminders WHERE id = $1 AND user_id = $2 RETURNING *`,
@@ -9981,7 +10977,7 @@ app.delete("/api/todo/customer-reminders/:id", authRequired, async (req, res) =>
 });
 
 // ---------- TO-DO: ACTIVITY LOGS ----------
-app.get("/api/todo/logs", authRequired, async (req, res) => {
+app.get("/api/todo/logs", authRequired, requireCapability("tasks.view"), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, kind, ts AS timestamp, task_id, routine_id, contact_id, note
@@ -9992,7 +10988,7 @@ app.get("/api/todo/logs", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_logs" }); }
 });
 
-app.put("/api/todo/logs/:id", authRequired, async (req, res) => {
+app.put("/api/todo/logs/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   const { kind, timestamp, task_id, routine_id, contact_id, note } = req.body || {};
   if (!kind) return res.status(400).json({ error: "kind_required" });
   try {
@@ -10010,7 +11006,7 @@ app.put("/api/todo/logs/:id", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_log" }); }
 });
 
-app.delete("/api/todo/logs/:id", authRequired, async (req, res) => {
+app.delete("/api/todo/logs/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   try {
     await pool.query(`DELETE FROM todo_logs WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.userId]);
@@ -10024,7 +11020,7 @@ app.delete("/api/todo/logs/:id", authRequired, async (req, res) => {
 // All of these are employer-only. Employees never touch Stripe onboarding
 // or account settings.
 
-app.get("/api/payments/connect/status", authRequired, requireEmployer, async (req, res) => {
+app.get("/api/payments/connect/status", authRequired, requireCapability("payments.manage"), async (req, res) => {
   try {
     const settings = await ensureBusinessSettings(req.userId, req.companyId);
     const stripe = getStripe();
@@ -10065,7 +11061,7 @@ app.get("/api/payments/connect/status", authRequired, requireEmployer, async (re
   }
 });
 
-app.post("/api/payments/connect/create-account", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/payments/connect/create-account", authRequired, requireCapability("payments.manage"), async (req, res) => {
   const stripe = requireStripe(res); if (!stripe) return;
   try {
     const settings = await ensureBusinessSettings(req.userId, req.companyId);
@@ -10093,7 +11089,7 @@ app.post("/api/payments/connect/create-account", authRequired, requireEmployer, 
   }
 });
 
-app.post("/api/payments/connect/create-account-link", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/payments/connect/create-account-link", authRequired, requireCapability("payments.manage"), async (req, res) => {
   const stripe = requireStripe(res); if (!stripe) return;
   try {
     let settings = await ensureBusinessSettings(req.userId, req.companyId);
@@ -10131,7 +11127,7 @@ app.post("/api/payments/connect/create-account-link", authRequired, requireEmplo
   }
 });
 
-app.post("/api/payments/connect/refresh-status", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/payments/connect/refresh-status", authRequired, requireCapability("payments.manage"), async (req, res) => {
   const stripe = requireStripe(res); if (!stripe) return;
   try {
     const settings = await ensureBusinessSettings(req.userId, req.companyId);
@@ -10184,7 +11180,7 @@ app.get("/stripe/connect/refresh", (_req, res) => {
 //                          SERVICE PLAN ROUTES
 // ==========================================================================
 
-app.get("/api/service-plans", authRequired, requireEmployer, async (req, res) => {
+app.get("/api/service-plans", authRequired, requireCapability("payments.view"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -10206,7 +11202,7 @@ app.get("/api/service-plans", authRequired, requireEmployer, async (req, res) =>
   }
 });
 
-app.get("/api/service-plans/dashboard", authRequired, requireEmployer, async (req, res) => {
+app.get("/api/service-plans/dashboard", authRequired, requireCapability("payments.view"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -10289,7 +11285,7 @@ app.get("/api/service-plans/dashboard", authRequired, requireEmployer, async (re
   }
 });
 
-app.get("/api/service-plans/:id", authRequired, async (req, res) => {
+app.get("/api/service-plans/:id", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -10312,7 +11308,7 @@ app.get("/api/service-plans/:id", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/contacts/:contactId/service-plans", authRequired, async (req, res) => {
+app.get("/api/contacts/:contactId/service-plans", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     // verify contact belongs to this employer scope
@@ -10349,7 +11345,7 @@ app.get("/api/contacts/:contactId/service-plans", authRequired, async (req, res)
   }
 });
 
-app.post("/api/service-plans", authRequired, async (req, res) => {
+app.post("/api/service-plans", authRequired, requireCapability("payments.collect"), async (req, res) => {
   if (!canCreateServicePlan(req)) return res.status(403).json({ error: "forbidden" });
   try {
     const {
@@ -10447,7 +11443,7 @@ app.post("/api/service-plans", authRequired, async (req, res) => {
   }
 });
 
-app.put("/api/service-plans/:id", authRequired, requireEmployer, async (req, res) => {
+app.put("/api/service-plans/:id", authRequired, requireCapability("payments.manage"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const b = req.body || {};
@@ -10510,7 +11506,7 @@ app.put("/api/service-plans/:id", authRequired, requireEmployer, async (req, res
 // Start the connected-account subscription. Both employer and employee can
 // call this because the whole point is to collect the customer's first
 // payment at signup time.
-app.post("/api/service-plans/:id/start-connected-subscription", authRequired, async (req, res) => {
+app.post("/api/service-plans/:id/start-connected-subscription", authRequired, requireCapability("payments.collect"), async (req, res) => {
   if (!canCollectServicePlanPayment(req)) return res.status(403).json({ error: "forbidden" });
   const stripe = requireStripe(res); if (!stripe) return;
   try {
@@ -10713,7 +11709,7 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, as
   }
 });
 
-app.post("/api/service-plans/:id/mark-serviced", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/service-plans/:id/mark-serviced", authRequired, requireCapability("payments.manage"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -10762,7 +11758,7 @@ app.post("/api/service-plans/:id/mark-serviced", authRequired, requireEmployer, 
   }
 });
 
-app.post("/api/service-plans/:id/pause", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/service-plans/:id/pause", authRequired, requireCapability("payments.manage"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -10802,7 +11798,7 @@ app.post("/api/service-plans/:id/pause", authRequired, requireEmployer, async (r
   }
 });
 
-app.post("/api/service-plans/:id/cancel", authRequired, requireEmployer, async (req, res) => {
+app.post("/api/service-plans/:id/cancel", authRequired, requireCapability("payments.manage"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -10857,7 +11853,7 @@ app.post("/api/service-plans/:id/cancel", authRequired, requireEmployer, async (
 //                       CONTACT PAYMENT ROUTES
 // ==========================================================================
 
-app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, res) => {
+app.post("/api/contacts/:contactId/payments/start", authRequired, requireCapability("payments.collect"), async (req, res) => {
   if (!canTakeContactPayment(req)) return res.status(403).json({ error: "forbidden" });
   const stripe = requireStripe(res); if (!stripe) return;
   try {
@@ -10964,7 +11960,7 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, re
   }
 });
 
-app.get("/api/contacts/:contactId/payments", authRequired, async (req, res) => {
+app.get("/api/contacts/:contactId/payments", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const c = await pool.query(`SELECT id FROM contacts WHERE id = $1 AND user_id = $2`,
@@ -10992,7 +11988,7 @@ app.get("/api/contacts/:contactId/payments", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/payments", authRequired, async (req, res) => {
+app.get("/api/payments", authRequired, requireCapability("payments.view"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 200);
@@ -11020,7 +12016,7 @@ app.get("/api/payments", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/payments/:id", authRequired, async (req, res) => {
+app.get("/api/payments/:id", authRequired, requireCapability("payments.view"), async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -11390,7 +12386,7 @@ async function startServer() {
     app,
     pool,
     authRequired,
-    requireEmployer,
+    requireEmployer: requireAutomationAccess,
     sendPushToUsers,
     createTwilioClient,
     twilioPublicUrl,
@@ -11401,20 +12397,24 @@ async function startServer() {
     app,
     pool,
     authRequired,
+    requireMessagingView: requireCapability("messaging.customer.view"),
+    requireMessagingSend: requireCapability("messaging.customer.send"),
+    requireIntegrationManage: requireCapability("integrations.manage"),
     sendCompanyPhonePush
   });
   await installFinanceSystem({
     app,
     pool,
     authRequired,
-    requireEmployer
+    requireEmployer: requireFinanceAccess
   });
   await installGoogleSheetsSchema(pool);
   installGoogleSheetsSystem({
     app,
     pool,
     authRequired,
-    requireEmployer
+    requireEmployer: requireCapability("integrations.manage"),
+    requireIntegrationView: requireCapability("integrations.view")
   });
   startGoogleSheetsWorkers(pool);
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));

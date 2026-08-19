@@ -6,12 +6,16 @@
   "scripts": {
     "start": "node index.js",
     "dev": "NODE_ENV=development nodemon index.js",
-    "test": "npm run test:finance && npm run test:google-sheets && npm run test:imessage",
+    "test": "npm run test:permissions && npm run test:navigation-tabs && npm run test:schedule-team && npm run test:routing && npm run test:finance && npm run test:google-sheets && npm run test:imessage",
     "test:automation-core": "node tests/automation-core.integration.js",
     "test:automation": "npm run test:automation-core",
     "test:finance": "node tests/finance-projection.test.js && node tests/finance-planning.test.js && node tests/finance-plaid.test.js && node tests/finance-receipts.test.js && node tests/finance-ai.test.js",
     "test:google-sheets": "node tests/google-sheets.test.js",
-    "test:imessage": "node tests/imessage.test.js"
+    "test:imessage": "node tests/imessage.test.js",
+    "test:routing": "node tests/google-routing.test.js",
+    "test:permissions": "node tests/permissions.test.js",
+    "test:navigation-tabs": "node --test tests/navigation-tabs.test.js",
+    "test:schedule-team": "node --test tests/schedule-team.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",

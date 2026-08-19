@@ -528,10 +528,19 @@ export async function sendAutomatedIMessage({ pool, companyId, userId = null, co
   return sent;
 }
 
-export async function installIMessageSystem({ app, pool, authRequired, sendCompanyPhonePush, fetchImpl = fetch }) {
+export async function installIMessageSystem({
+  app,
+  pool,
+  authRequired,
+  requireMessagingView = (_req, _res, next) => next(),
+  requireMessagingSend = (_req, _res, next) => next(),
+  requireIntegrationManage = (_req, _res, next) => next(),
+  sendCompanyPhonePush,
+  fetchImpl = fetch
+}) {
   await ensureIMessageSchema(pool);
 
-  app.get("/api/imessage/status", authRequired, async (req, res) => {
+  app.get("/api/imessage/status", authRequired, requireMessagingView, async (req, res) => {
     if (!req.companyId) return res.status(400).json({ error: "company_required" });
     if (!textingBlueApiKey()) return res.json({ configured: false, connected: false, provider: "texting_blue", error: "imessage_not_configured" });
     try {
@@ -559,7 +568,7 @@ export async function installIMessageSystem({ app, pool, authRequired, sendCompa
     }
   });
 
-  app.get("/api/imessage/conversations", authRequired, async (req, res) => {
+  app.get("/api/imessage/conversations", authRequired, requireMessagingView, async (req, res) => {
     if (!req.companyId) return res.json([]);
     try {
       const line = await resolveLine(pool, req.companyId, { refresh: true, fetchImpl });
@@ -611,7 +620,7 @@ export async function installIMessageSystem({ app, pool, authRequired, sendCompa
     }
   });
 
-  app.get("/api/imessage/conversations/:id/messages", authRequired, async (req, res) => {
+  app.get("/api/imessage/conversations/:id/messages", authRequired, requireMessagingView, async (req, res) => {
     if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
     try {
       const owned = await pool.query(
@@ -642,7 +651,7 @@ export async function installIMessageSystem({ app, pool, authRequired, sendCompa
     }
   });
 
-  app.post("/api/imessage/conversations/:id/messages", authRequired, async (req, res) => {
+  app.post("/api/imessage/conversations/:id/messages", authRequired, requireMessagingSend, async (req, res) => {
     if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
     try {
       const content = cleanString(req.body?.body, MAX_MESSAGE_LENGTH);
@@ -665,7 +674,7 @@ export async function installIMessageSystem({ app, pool, authRequired, sendCompa
     }
   });
 
-  app.post("/api/imessage/send", authRequired, async (req, res) => {
+  app.post("/api/imessage/send", authRequired, requireMessagingSend, async (req, res) => {
     if (!req.companyId) return res.status(400).json({ error: "company_required" });
     try {
       const to = normalizeIMessageE164(req.body?.to);
@@ -683,7 +692,7 @@ export async function installIMessageSystem({ app, pool, authRequired, sendCompa
     }
   });
 
-  app.post("/api/imessage/sync", authRequired, async (req, res) => {
+  app.post("/api/imessage/sync", authRequired, requireIntegrationManage, async (req, res) => {
     if (!req.companyId) return res.status(400).json({ error: "company_required" });
     try {
       const line = await resolveLine(pool, req.companyId, { refresh: true, fetchImpl });
@@ -695,7 +704,7 @@ export async function installIMessageSystem({ app, pool, authRequired, sendCompa
     }
   });
 
-  app.get("/api/imessage/unread-count", authRequired, async (req, res) => {
+  app.get("/api/imessage/unread-count", authRequired, requireMessagingView, async (req, res) => {
     if (!req.companyId) return res.json({ count: 0 });
     const { rows } = await pool.query(
       `SELECT COUNT(*)::int AS count
