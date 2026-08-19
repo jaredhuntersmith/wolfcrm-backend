@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import {
   installFinanceGeneralLedgerRoutes,
   installFinanceGeneralLedgerSchema,
@@ -52,6 +53,8 @@ test("manual journals normalize exact balanced cents and stable content", () => 
   assert.equal(normalized.total_credits_cents, 12_500);
   assert.equal(normalized.lines[0].position, 0);
   assert.equal(normalized.lines[0].memo, "Supplies");
+  assert.equal(normalized.source_type, "manual");
+  assert.equal(normalized.source_id, null);
   assert.match(normalized.request_fingerprint, /^[0-9a-f]{64}$/);
   assert.equal(normalized.request_fingerprint, normalizeManualJournal({
     body: journalBody(), chartAccounts: [...chart].reverse(), companyToday: "2026-08-19"
@@ -238,6 +241,13 @@ test("schema is additive, tenant-indexed, immutable by API shape, and audit pres
   assert.match(sql, /FOREIGN KEY \(company_id, entry_id\)/);
   assert.match(sql, /FOREIGN KEY \(company_id, chart_account_id\)/);
   assert.match(sql, /entry_kind = 'reversal'.*reversal_of_entry_id IS NOT NULL/);
+  assert.match(sql, /bank_transaction/);
+  assert.match(sql, /bank_transfer/);
+  assert.match(sql, /job_receivable/);
+  assert.match(sql, /finance_transfer_pair/);
+  assert.match(sql, /finance_operational_source/);
+  assert.match(sql, /finance_journal_entries_source_identity_check/);
+  assert.match(sql, /finance_journal_entries_company_source_idx/);
   assert.match(sql, /CHECK \(\(debit_cents > 0 AND credit_cents = 0\)/);
   assert.doesNotMatch(sql, /DROP TABLE|TRUNCATE/);
 });
@@ -261,6 +271,9 @@ test("routes expose bounded reads and only append/reversal mutations", () => {
     ["POST", "/api/finance/accounting/general-ledger/entries"],
     ["POST", "/api/finance/accounting/general-ledger/entries/:entryId/reverse"]
   ]);
+  const source = fs.readFileSync(new URL("../finance-general-ledger.js", import.meta.url), "utf8");
+  assert.match(source, /original\.source_type \|\| "manual"/);
+  assert.match(source, /journal_source_owned/);
 });
 
 let passed = 0;

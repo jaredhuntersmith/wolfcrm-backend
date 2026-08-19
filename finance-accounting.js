@@ -26,6 +26,18 @@ import {
   installFinanceGeneralLedgerRoutes,
   installFinanceGeneralLedgerSchema
 } from "./finance-general-ledger.js";
+import {
+  installFinanceBankSourceRoutes,
+  installFinanceBankSourceSchema
+} from "./finance-bank-sources.js";
+import {
+  installFinanceBankTransferRoutes,
+  installFinanceBankTransferSchema
+} from "./finance-bank-transfers.js";
+import {
+  installFinanceOperationalJournalRoutes,
+  installFinanceOperationalJournalSchema
+} from "./finance-operational-journals.js";
 
 const ACCOUNT_TYPES = new Set(["asset", "liability", "equity", "income", "expense"]);
 const RECONCILIATION_STATUSES = new Set(["unreconciled", "cleared", "reconciled"]);
@@ -443,7 +455,10 @@ export async function installFinanceAccountingSchema(pool) {
       ON finance_transaction_audit(company_id, transaction_id, created_at DESC);
   `);
   await installFinanceGeneralLedgerSchema(pool);
+  await installFinanceBankSourceSchema(pool);
+  await installFinanceBankTransferSchema(pool);
   await installOperationalAccountingSchema(pool);
+  await installFinanceOperationalJournalSchema(pool);
   await installFinanceCostAllocationSchema(pool);
   await installFinanceMileageAllocationSchema(pool);
   await installFinancePayrollCostSchema(pool);
@@ -780,8 +795,23 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     requireFinanceAccess: requireEmployer,
     ensureChartAccounts: ensureDefaultChartAccounts
   });
+  installFinanceBankSourceRoutes({
+    app,
+    pool,
+    authRequired,
+    requireFinanceAccess: requireEmployer,
+    ensureChartAccounts: ensureDefaultChartAccounts
+  });
+  installFinanceBankTransferRoutes({
+    app,
+    pool,
+    authRequired,
+    requireFinanceAccess: requireEmployer,
+    ensureChartAccounts: ensureDefaultChartAccounts
+  });
 
   installOperationalAccountingRoutes({ app, pool, authRequired, requireEmployer });
+  installFinanceOperationalJournalRoutes({ app, pool, authRequired, requireFinanceAccess: requireEmployer, ensureChartAccounts: ensureDefaultChartAccounts });
   installFinanceCostAllocationRoutes({
     app,
     pool,

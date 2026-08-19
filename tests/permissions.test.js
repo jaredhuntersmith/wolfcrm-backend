@@ -168,6 +168,22 @@ function testAdministrativeRouteClassification() {
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/general-ledger/entries/123"), "accounting.view");
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/general-ledger/entries"), "accounting.manage");
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/general-ledger/entries/123/reverse"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/bank-sources"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/bank-sources/accounts/123/mapping"), "accounting.view");
+  assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/bank-sources/accounts/123/mapping"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/bank-sources/transactions/123"), "accounting.view");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/bank-sources/transactions/123/post"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/bank-sources/transactions/123/void"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/transfers"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/transfers/preview"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/transfers/123"), "accounting.view");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/transfers"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/transfers/123/post"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/transfers/123/void"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/operational-journals/receivables"), "accounting.view");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/operational-journals/receivables/123/preview"), "accounting.view");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/operational-journals/receivables/123/post"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/operational-journals/receivables/123/void"), "accounting.manage");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/transactions/123"), "accounting.manage");
 }
 

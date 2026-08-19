@@ -189,6 +189,9 @@ export function normalizeManualJournal({ body = {}, chartAccounts = [], companyT
     description,
     reference: cleanString(body.reference, 120) || null,
     reason,
+    source_type: "manual",
+    source_id: null,
+    source_version: null,
     lines: normalized.lines.map(({ account_type: _accountType, ...line }) => line),
     total_debits_cents: normalized.total_debits_cents,
     total_credits_cents: normalized.total_credits_cents
@@ -245,6 +248,9 @@ export function normalizeJournalReversal({ body = {}, original, originalLines = 
     description: cleanString(`Reversal — ${original.description || "Journal"}`, 200),
     reference: cleanString(body.reference ?? original.reference, 120) || null,
     reason,
+    source_type: "manual",
+    source_id: null,
+    source_version: null,
     reversal_of_entry_id: String(original.id),
     lines: reversed.lines,
     total_debits_cents: reversed.total_debits_cents,
@@ -308,7 +314,7 @@ export async function installFinanceGeneralLedgerSchema(pool) {
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
       entry_date DATE NOT NULL,
-      entry_kind TEXT NOT NULL CHECK (entry_kind IN ('opening_balance','adjustment','transfer','owner_equity','reclassification','reversal')),
+      entry_kind TEXT NOT NULL CHECK (entry_kind IN ('opening_balance','adjustment','transfer','owner_equity','reclassification','bank_transaction','bank_transfer','job_receivable','reversal')),
       status TEXT NOT NULL DEFAULT 'posted' CHECK (status = 'posted'),
       description TEXT NOT NULL,
       reference TEXT,
@@ -316,13 +322,20 @@ export async function installFinanceGeneralLedgerSchema(pool) {
       client_request_id UUID NOT NULL,
       request_fingerprint TEXT NOT NULL CHECK (char_length(request_fingerprint) = 64),
       reason TEXT NOT NULL,
+      source_type TEXT NOT NULL DEFAULT 'manual' CHECK (source_type IN ('manual','finance_transaction','finance_transfer_pair','finance_operational_source')),
+      source_id UUID,
+      source_version INTEGER,
       created_by UUID REFERENCES users(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(company_id, id),
       UNIQUE(company_id, client_request_id),
       FOREIGN KEY (company_id, reversal_of_entry_id)
         REFERENCES finance_journal_entries(company_id, id) ON DELETE RESTRICT,
-      CHECK ((entry_kind = 'reversal') = (reversal_of_entry_id IS NOT NULL))
+      CHECK ((entry_kind = 'reversal') = (reversal_of_entry_id IS NOT NULL)),
+      CONSTRAINT finance_journal_entries_source_identity_check CHECK (
+        (source_type = 'manual' AND source_id IS NULL AND source_version IS NULL)
+        OR (source_type IN ('finance_transaction','finance_transfer_pair','finance_operational_source') AND source_id IS NOT NULL AND source_version > 0)
+      )
     );
     CREATE UNIQUE INDEX IF NOT EXISTS finance_journal_entries_one_reversal_idx
       ON finance_journal_entries(company_id, reversal_of_entry_id) WHERE reversal_of_entry_id IS NOT NULL;
@@ -371,9 +384,22 @@ export async function installFinanceGeneralLedgerSchema(pool) {
     CREATE INDEX IF NOT EXISTS finance_journal_audit_company_entry_idx
       ON finance_journal_audit(company_id, entry_id, created_at DESC);
   `);
+  await pool.query(`ALTER TABLE finance_journal_entries ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'manual'`);
+  await pool.query(`ALTER TABLE finance_journal_entries ADD COLUMN IF NOT EXISTS source_id UUID`);
+  await pool.query(`ALTER TABLE finance_journal_entries ADD COLUMN IF NOT EXISTS source_version INTEGER`);
+  await pool.query(`ALTER TABLE finance_journal_entries DROP CONSTRAINT IF EXISTS finance_journal_entries_entry_kind_check`);
+  await pool.query(`ALTER TABLE finance_journal_entries ADD CONSTRAINT finance_journal_entries_entry_kind_check CHECK (entry_kind IN ('opening_balance','adjustment','transfer','owner_equity','reclassification','bank_transaction','bank_transfer','job_receivable','reversal'))`);
+  await pool.query(`ALTER TABLE finance_journal_entries DROP CONSTRAINT IF EXISTS finance_journal_entries_source_type_check`);
+  await pool.query(`ALTER TABLE finance_journal_entries ADD CONSTRAINT finance_journal_entries_source_type_check CHECK (source_type IN ('manual','finance_transaction','finance_transfer_pair','finance_operational_source'))`);
+  await pool.query(`ALTER TABLE finance_journal_entries DROP CONSTRAINT IF EXISTS finance_journal_entries_source_identity_check`);
+  await pool.query(`ALTER TABLE finance_journal_entries ADD CONSTRAINT finance_journal_entries_source_identity_check CHECK (
+    (source_type = 'manual' AND source_id IS NULL AND source_version IS NULL)
+    OR (source_type IN ('finance_transaction','finance_transfer_pair','finance_operational_source') AND source_id IS NOT NULL AND source_version > 0)
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS finance_journal_entries_company_source_idx ON finance_journal_entries(company_id, source_type, source_id, source_version) WHERE source_id IS NOT NULL`);
 }
 
-async function loadCompanyContext(poolOrClient, companyID) {
+export async function loadCompanyContext(poolOrClient, companyID) {
   const { rows } = await poolOrClient.query(
     `SELECT COALESCE(NULLIF(timezone, ''), 'America/New_York') AS timezone,
             (now() AT TIME ZONE COALESCE(NULLIF(timezone, ''), 'America/New_York'))::date::text AS company_today
@@ -399,6 +425,9 @@ function entrySummaryPayload(row) {
     reference: row.reference || null,
     reversal_of_entry_id: row.reversal_of_entry_id || null,
     reversed_by_entry_id: row.reversed_by_entry_id || null,
+    source_type: row.source_type || "manual",
+    source_id: row.source_id || null,
+    source_version: row.source_version === null || row.source_version === undefined ? null : Number(row.source_version),
     total_debits_cents: storedInteger(row.total_debits_cents ?? 0, "total_debits_cents"),
     total_credits_cents: storedInteger(row.total_credits_cents ?? 0, "total_credits_cents"),
     created_by: row.created_by || null,
@@ -432,7 +461,7 @@ function auditPayload(row) {
   };
 }
 
-async function loadJournalEntry(poolOrClient, companyID, entryID, auditLimit = 50) {
+export async function loadJournalEntry(poolOrClient, companyID, entryID, auditLimit = 50) {
   const entryResult = await poolOrClient.query(
     `SELECT e.*,
             reversed.id AS reversed_by_entry_id,
@@ -467,13 +496,16 @@ async function loadJournalEntry(poolOrClient, companyID, entryID, auditLimit = 5
   };
 }
 
-function snapshotInput(input) {
+export function snapshotInput(input) {
   return {
     entry_date: input.entry_date,
     entry_kind: input.entry_kind,
     description: input.description,
     reference: input.reference,
     reversal_of_entry_id: input.reversal_of_entry_id || null,
+    source_type: input.source_type || "manual",
+    source_id: input.source_id || null,
+    source_version: input.source_version ?? null,
     total_debits_cents: input.total_debits_cents,
     total_credits_cents: input.total_credits_cents,
     lines: input.lines.map((line) => ({
@@ -486,14 +518,15 @@ function snapshotInput(input) {
   };
 }
 
-async function insertJournal(client, companyID, userID, input) {
+export async function insertJournal(client, companyID, userID, input) {
   const entry = (await client.query(
     `INSERT INTO finance_journal_entries (
        company_id, entry_date, entry_kind, description, reference, reversal_of_entry_id,
-       client_request_id, request_fingerprint, reason, created_by
-     ) VALUES ($1,$2::date,$3,$4,$5,$6::uuid,$7::uuid,$8,$9,$10) RETURNING *`,
+       client_request_id, request_fingerprint, reason, source_type, source_id, source_version, created_by
+     ) VALUES ($1,$2::date,$3,$4,$5,$6::uuid,$7::uuid,$8,$9,$10,$11::uuid,$12,$13) RETURNING *`,
     [companyID, input.entry_date, input.entry_kind, input.description, input.reference,
-      input.reversal_of_entry_id || null, input.client_request_id, input.request_fingerprint, input.reason, userID]
+      input.reversal_of_entry_id || null, input.client_request_id, input.request_fingerprint, input.reason,
+      input.source_type || "manual", input.source_id || null, input.source_version ?? null, userID]
   )).rows[0];
   await client.query(
     `INSERT INTO finance_journal_lines (
@@ -584,7 +617,7 @@ async function loadGeneralLedgerReport(poolOrClient, companyID, range, limit) {
   const truncated = entryResult.rows.length > limit;
   const entries = entryResult.rows.slice(0, limit).map(entrySummaryPayload);
   return {
-    basis: "manual_double_entry_journal",
+    basis: "reviewed_double_entry_journal",
     start_date: range.start_date,
     end_date: range.end_date,
     currency: "usd",
@@ -601,8 +634,8 @@ async function loadGeneralLedgerReport(poolOrClient, companyID, range, limit) {
     accounts: trial.accounts,
     entries,
     warnings: [
-      "This trial balance includes explicitly posted manual journals only.",
-      "Bank and Plaid classifications, Finance account balances, operational receivables and customer credits, Stripe activity, jobs, mileage, and supported payroll are not posted here yet.",
+      "This trial balance includes explicitly posted manual journals, reviewed bank-source journals, explicit bank-transfer pairs, and reviewed completed-job receivable journals.",
+      "Unposted or blocked bank activity, unpaired transfers, Finance balances, operational payments/refunds/customer credits, Stripe settlement identity, mileage, and supported payroll are not posted here yet.",
       "Opening-balance and source coverage are not yet complete, so this is not a formal Balance Sheet or Cash Flow statement."
     ]
   };
@@ -703,6 +736,13 @@ export function installFinanceGeneralLedgerRoutes({ app, pool, authRequired, req
       );
       const original = originalResult.rows[0];
       if (!original) throw new GeneralLedgerError("journal_entry_not_found", "Journal entry was not found.", 404);
+      if ((original.source_type || "manual") !== "manual") {
+        throw new GeneralLedgerError(
+          "journal_source_owned",
+          "Source-owned journals can be corrected or voided only from their source review workflow.",
+          409
+        );
+      }
       const originalLines = await client.query(
         `SELECT chart_account_id, debit_cents, credit_cents, memo
            FROM finance_journal_lines WHERE company_id=$1 AND entry_id=$2 ORDER BY line_order FOR SHARE`,
