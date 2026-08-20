@@ -50,6 +50,10 @@ import {
   installFinanceStripeSettlementRoutes,
   installFinanceStripeSettlementSchema
 } from "./finance-stripe-settlements.js";
+import {
+  installFinanceStatementReadinessRoutes,
+  installFinanceStatementReadinessSchema
+} from "./finance-statement-readiness.js";
 
 const ACCOUNT_TYPES = new Set(["asset", "liability", "equity", "income", "expense"]);
 const RECONCILIATION_STATUSES = new Set(["unreconciled", "cleared", "reconciled"]);
@@ -483,6 +487,7 @@ export async function installFinanceAccountingSchema(pool) {
   await installFinancePayrollAuthoritySchema(pool);
   await installFinancePayrollEvaluationSchema(pool);
   await installFinancePayrollJournalSchema(pool);
+  await installFinanceStatementReadinessSchema(pool);
 }
 
 export async function ensureDefaultChartAccounts(poolOrClient, companyId, userId = null) {
@@ -889,5 +894,12 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     requireFinanceAccess: requireEmployer,
     ensureChartAccounts: ensureDefaultChartAccounts,
     getStripe
+  });
+  installFinanceStatementReadinessRoutes({
+    app,
+    pool,
+    authRequired,
+    requireFinanceAccess: requireEmployer,
+    ensureChartAccounts: ensureDefaultChartAccounts
   });
 }
