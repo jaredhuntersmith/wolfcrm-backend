@@ -147,6 +147,8 @@ function testAdministrativeRouteClassification() {
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounts"), "finance.accounts.create");
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounts/123/balance-adjustments"), "finance.accounts.adjust");
   assert.equal(requiredFinanceCapability("PATCH", "/api/finance/ai/memories/123"), "finance.ai.manage_memory");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/receipts/123/detail-audit"), "finance.receipts.view");
+  assert.equal(requiredFinanceCapability("PUT", "/api/finance/receipts/123/details"), "finance.receipts.edit");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/reports/profit-loss"), "accounting.view");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/reports/job-contribution"), "accounting.view");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/time-allocations"), "accounting.view");
@@ -171,6 +173,8 @@ function testAdministrativeRouteClassification() {
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/statement-readiness"), "accounting.view");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/statement-readiness/profile"), "accounting.manage");
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/statement-readiness/period-close"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/statements/balance-sheet"), "accounting.view");
+  assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/statements/balance-sheet/rules"), "accounting.manage");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/bank-sources"), "accounting.view");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/bank-sources/accounts/123/mapping"), "accounting.view");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/bank-sources/accounts/123/mapping"), "accounting.manage");

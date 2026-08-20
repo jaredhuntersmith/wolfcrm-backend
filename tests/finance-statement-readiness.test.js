@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
+  balanceSheetChartSnapshot,
   buildStatementReadiness,
+  evaluateBalanceSheetRules,
   evaluateStatementPeriodClose,
   evaluateOpeningCoverage,
   installFinanceStatementReadinessRoutes,
   installFinanceStatementReadinessSchema,
+  normalizeBalanceSheetRuleReviewRequest,
   normalizeStatementCoverageArea,
   normalizeStatementCoverageProfileRequest,
   normalizeStatementPeriodCloseRequest,
   normalizeStatementWorkflowEvidence,
-  statementReadinessFingerprint
+  statementReadinessFingerprint,
+  summarizeBalanceSheetRows
 } from "../finance-statement-readiness.js";
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
@@ -37,6 +41,33 @@ function accounts() {
     { id: "loan", code: "2200", account_type: "liability", system_key: "loans_payable" },
     { id: "equity", code: "3200", account_type: "equity", system_key: "opening_balance_equity" }
   ];
+}
+
+function reviewedBalanceSheetRules(chartAccounts = [
+  { id: "cash", code: "1000", name: "Cash", account_type: "asset", active: true, system_key: "cash" },
+  { id: "equity", code: "3000", name: "Owner Equity", account_type: "equity", active: true, system_key: "owner_equity" },
+  { id: "revenue", code: "4000", name: "Revenue", account_type: "income", active: true, system_key: "service_revenue" },
+  { id: "expense", code: "5000", name: "Expense", account_type: "expense", active: true, system_key: "materials_supplies" }
+]) {
+  const provisional = {
+    earnings_treatment: "cumulative_since_coverage_start",
+    accountant_reviewed_on: "2026-08-18",
+    accountant_reference: "CPA workpaper BS-1",
+    accountant_review_confirmed: true,
+    chart_fingerprint: "",
+    evidence_fingerprint: ""
+  };
+  const chart = balanceSheetChartSnapshot(chartAccounts);
+  provisional.chart_fingerprint = statementReadinessFingerprint(chart);
+  provisional.evidence_fingerprint = statementReadinessFingerprint({
+    earnings_treatment: provisional.earnings_treatment,
+    accountant_reviewed_on: provisional.accountant_reviewed_on,
+    accountant_reference: provisional.accountant_reference,
+    accountant_review_confirmed: true,
+    chart_fingerprint: provisional.chart_fingerprint,
+    chart
+  });
+  return evaluateBalanceSheetRules({ profile: provisional, chartAccounts });
 }
 
 function openingJournal(overrides = {}) {
@@ -222,13 +253,25 @@ test("statement gates keep close, provider, payroll, and cash-flow limitations e
     profile: { coverage_start_date: "2026-01-01" },
     opening: currentOpening,
     areas: [],
+    balanceSheetRules: reviewedBalanceSheetRules(),
     stripeConnected: false,
     asOfDate: "2026-08-19"
   });
-  assert.equal(clean.statements.balance_sheet.coverage_ready, true);
+  assert.equal(clean.statements.balance_sheet.coverage_ready, false);
   assert.equal(clean.statements.balance_sheet.report_available, false);
+  assert.ok(clean.statements.balance_sheet.blockers.some((item) => item.code === "source_period_close_not_reviewed"));
   assert.equal(clean.statements.cash_flow.coverage_ready, false);
   assert.ok(clean.statements.cash_flow.blockers.some((item) => item.code === "cash_flow_classification_unavailable"));
+
+  const withoutRules = buildStatementReadiness({
+    profile: { coverage_start_date: "2026-01-01" },
+    opening: currentOpening,
+    areas: [],
+    stripeConnected: false,
+    asOfDate: "2026-08-19"
+  });
+  assert.equal(withoutRules.statements.balance_sheet.report_available, false);
+  assert.ok(withoutRules.statements.balance_sheet.blockers.some((item) => item.code === "balance_sheet_rules_not_reviewed"));
 
   const coveredArea = normalizeStatementCoverageArea({
     key: "finance_accounts", label: "Finance accounts",
@@ -239,6 +282,7 @@ test("statement gates keep close, provider, payroll, and cash-flow limitations e
     profile: { coverage_start_date: "2026-01-01" },
     opening: currentOpening,
     areas: [coveredArea],
+    balanceSheetRules: reviewedBalanceSheetRules(),
     stripeConnected: false,
     asOfDate: "2026-08-19"
   });
@@ -254,6 +298,7 @@ test("statement gates keep close, provider, payroll, and cash-flow limitations e
     profile: { coverage_start_date: "2026-01-01" },
     opening: currentOpening,
     areas: [coveredArea, payroll],
+    balanceSheetRules: reviewedBalanceSheetRules(),
     stripeConnected: true,
     asOfDate: "2026-08-19"
   });
@@ -296,7 +341,8 @@ test("a matching local close clears only the local-close blocker and becomes sta
     { workflow: "bank_transaction", authority_id: "source", authority_version: 1,
       stored_fingerprint: "a".repeat(64), live_fingerprint: "a".repeat(64), source_current: true }
   ]);
-  const unclosed = buildStatementReadiness({ profile, opening, areas: [area], workflows, stripeConnected: false, asOfDate: "2026-08-19" });
+  const rules = reviewedBalanceSheetRules();
+  const unclosed = buildStatementReadiness({ profile, opening, areas: [area], workflows, balanceSheetRules: rules, stripeConnected: false, asOfDate: "2026-08-19" });
   assert.ok(unclosed.statements.balance_sheet.blockers.some((item) => item.code === "source_period_close_not_reviewed"));
   const row = {
     id: "close", version: 4, coverage_profile_version: 2,
@@ -307,11 +353,13 @@ test("a matching local close clears only the local-close blocker and becomes sta
     reason: "Reviewed", reviewed_by: "owner", created_at: null
   };
   const closed = buildStatementReadiness({
-    profile, opening, areas: [area], workflows, periodCloseRow: row, latestCloseVersion: 4,
+    profile, opening, areas: [area], workflows, balanceSheetRules: rules, periodCloseRow: row, latestCloseVersion: 4,
     stripeConnected: false, asOfDate: "2026-08-19"
   });
   assert.equal(closed.period_close.status, "current");
   assert.equal(closed.period_close.source_current, true);
+  assert.equal(closed.statements.balance_sheet.report_available, true);
+  assert.equal(closed.statements.balance_sheet.status, "available");
   assert.ok(!closed.statements.balance_sheet.blockers.some((item) => item.code.startsWith("source_period_close_")));
   assert.ok(closed.statements.cash_flow.blockers.some((item) => item.code === "cash_flow_classification_unavailable"));
 
@@ -323,12 +371,109 @@ test("a matching local close clears only the local-close blocker and becomes sta
   assert.ok(stale.blockers.some((item) => item.code === "source_period_close_stale"));
 });
 
+test("Balance Sheet rule review requires fixed treatment and a genuine dated accountant confirmation", () => {
+  const input = normalizeBalanceSheetRuleReviewRequest({
+    companyToday: "2026-08-19",
+    body: {
+      client_request_id: REQUEST_ID,
+      expected_version: 2,
+      as_of_date: "2026-08-19",
+      earnings_treatment: "cumulative_since_coverage_start",
+      accountant_reviewed_on: "2026-08-18",
+      accountant_reference: "CPA workpaper BS-1",
+      accountant_review_confirmed: true,
+      reason: "Reviewed fixed chart presentation"
+    }
+  });
+  assert.equal(input.expected_version, 2);
+  assert.equal(input.as_of_date, "2026-08-19");
+  assert.equal(input.accountant_review_confirmed, true);
+  assert.match(input.request_fingerprint, /^[0-9a-f]{64}$/);
+  assert.throws(() => normalizeBalanceSheetRuleReviewRequest({
+    companyToday: "2026-08-19", body: { ...input, accountant_reviewed_on: "2026-08-20" }
+  }), (error) => error.code === "balance_sheet_accountant_review_future");
+  assert.throws(() => normalizeBalanceSheetRuleReviewRequest({
+    companyToday: "2026-08-19", body: { ...input, accountant_review_confirmed: false }
+  }), (error) => error.code === "balance_sheet_accountant_confirmation_required");
+  assert.throws(() => normalizeBalanceSheetRuleReviewRequest({
+    companyToday: "2026-08-19", body: { ...input, accountant_reference: "" }
+  }), (error) => error.code === "balance_sheet_accountant_reference_required");
+  assert.throws(() => normalizeBalanceSheetRuleReviewRequest({
+    companyToday: "2026-08-19", body: { ...input, earnings_treatment: "current_year" }
+  }), (error) => error.code === "balance_sheet_earnings_treatment_unsupported");
+  assert.throws(() => normalizeBalanceSheetRuleReviewRequest({
+    companyToday: "2026-08-19", body: { ...input, as_of_date: "2026-08-20" }
+  }), (error) => error.code === "statement_as_of_future");
+});
+
+test("Balance Sheet rule evidence fingerprints the complete chart and becomes stale on presentation changes", () => {
+  const current = reviewedBalanceSheetRules();
+  assert.equal(current.status, "current");
+  assert.equal(current.source_current, true);
+  const changed = evaluateBalanceSheetRules({
+    profile: {
+      ...current.snapshot,
+      evidence_fingerprint: current.live_fingerprint,
+      chart_fingerprint: current.chart_fingerprint
+    },
+    chartAccounts: current.snapshot.chart.map((account) => account.id === "cash" ? { ...account, name: "Operating Cash" } : account)
+  });
+  assert.equal(changed.status, "stale");
+  assert.ok(changed.blockers.some((item) => item.code === "balance_sheet_rules_stale"));
+  assert.throws(() => balanceSheetChartSnapshot([
+    { id: "same", code: "1000", name: "Cash", account_type: "asset" },
+    { id: "same", code: "2000", name: "Loan", account_type: "liability" }
+  ]), (error) => error.code === "balance_sheet_chart_duplicate");
+});
+
+test("Balance Sheet math preserves signed balances and exact accumulated earnings equation", () => {
+  const empty = summarizeBalanceSheetRows([], { coverageStartDate: "2026-01-01", asOfDate: "2026-08-19" });
+  assert.equal(empty.total_assets_cents, 0);
+  assert.equal(empty.equation_difference_cents, 0);
+
+  const result = summarizeBalanceSheetRows([
+    { chart_account_id: "cash", code: "1000", name: "Cash", account_type: "asset", debit_cents: 20_000, credit_cents: 0 },
+    { chart_account_id: "ar", code: "1100", name: "Accounts Receivable", account_type: "asset", debit_cents: 5_000, credit_cents: 0 },
+    { chart_account_id: "loan", code: "2200", name: "Loan", account_type: "liability", debit_cents: 0, credit_cents: 8_000 },
+    { chart_account_id: "equity", code: "3000", name: "Owner Equity", account_type: "equity", debit_cents: 0, credit_cents: 10_000 },
+    { chart_account_id: "revenue", code: "4000", name: "Revenue", account_type: "income", debit_cents: 0, credit_cents: 10_000 },
+    { chart_account_id: "expense", code: "5000", name: "Expense", account_type: "expense", debit_cents: 3_000, credit_cents: 0 }
+  ], { coverageStartDate: "2026-01-01", asOfDate: "2026-08-19" });
+  assert.equal(result.total_assets_cents, 25_000);
+  assert.equal(result.total_liabilities_cents, 8_000);
+  assert.equal(result.posted_equity_cents, 10_000);
+  assert.equal(result.accumulated_earnings_cents, 7_000);
+  assert.equal(result.total_liabilities_and_equity_cents, 25_000);
+  assert.equal(result.equation_difference_cents, 0);
+
+  const loss = summarizeBalanceSheetRows([
+    { chart_account_id: "cash", code: "1000", name: "Cash", account_type: "asset", debit_cents: 0, credit_cents: 2_000 },
+    { chart_account_id: "equity", code: "3000", name: "Owner Equity", account_type: "equity", debit_cents: 0, credit_cents: 1_000 },
+    { chart_account_id: "expense", code: "5000", name: "Expense", account_type: "expense", debit_cents: 3_000, credit_cents: 0 }
+  ], { coverageStartDate: "2026-01-01", asOfDate: "2026-08-19" });
+  assert.equal(loss.assets[0].balance_cents, -2_000);
+  assert.equal(loss.accumulated_earnings_cents, -3_000);
+  assert.equal(loss.total_equity_cents, -2_000);
+  assert.equal(loss.equation_difference_cents, 0);
+
+  assert.throws(() => summarizeBalanceSheetRows([
+    { chart_account_id: "cash", code: "1000", name: "Cash", account_type: "asset", debit_cents: 100, credit_cents: 0 }
+  ], { coverageStartDate: "2026-01-01", asOfDate: "2026-08-19" }), (error) => error.code === "balance_sheet_unbalanced");
+  assert.throws(() => summarizeBalanceSheetRows([
+    { chart_account_id: "same", code: "1000", name: "Cash", account_type: "asset", debit_cents: 0, credit_cents: 0 },
+    { chart_account_id: "same", code: "2000", name: "Loan", account_type: "liability", debit_cents: 0, credit_cents: 0 }
+  ], { coverageStartDate: "2026-01-01", asOfDate: "2026-08-19" }), (error) => error.code === "balance_sheet_account_duplicate");
+  assert.throws(() => summarizeBalanceSheetRows([
+    { chart_account_id: "bad", code: "9000", name: "Unsupported", account_type: "memo", debit_cents: 0, credit_cents: 0 }
+  ], { coverageStartDate: "2026-01-01", asOfDate: "2026-08-19" }), (error) => error.code === "balance_sheet_account_type_invalid");
+});
+
 test("fingerprints are canonical and content sensitive", () => {
   assert.equal(statementReadinessFingerprint({ b: 2, a: 1 }), statementReadinessFingerprint({ a: 1, b: 2 }));
   assert.notEqual(statementReadinessFingerprint({ a: 1 }), statementReadinessFingerprint({ a: 2 }));
 });
 
-test("schema is additive, tenant-scoped, audited, and creates no statements", async () => {
+test("schema is additive, tenant-scoped, audited, and caches no statement totals", async () => {
   const calls = [];
   await installFinanceStatementReadinessSchema({ async query(sql) { calls.push(sql); return { rows: [] }; } });
   const sql = calls.join("\n");
@@ -336,6 +481,8 @@ test("schema is additive, tenant-scoped, audited, and creates no statements", as
   assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_statement_coverage_audit/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_statement_period_closes/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_statement_period_close_audit/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_balance_sheet_rule_profiles/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_balance_sheet_rule_audit/);
   assert.match(sql, /FOREIGN KEY \(company_id, opening_journal_entry_id\)/);
   assert.match(sql, /UNIQUE\(company_id, client_request_id\)/);
   assert.match(sql, /company_inception_zero/);
@@ -343,10 +490,11 @@ test("schema is additive, tenant-scoped, audited, and creates no statements", as
   assert.match(sql, /UNIQUE\(company_id, version\)/);
   assert.match(sql, /FOREIGN KEY \(company_id, supersedes_close_id\)/);
   assert.doesNotMatch(sql, /DROP TABLE|TRUNCATE/);
-  assert.doesNotMatch(sql, /finance_balance_sheet|finance_cash_flow/);
+  assert.match(sql, /cumulative_since_coverage_start/);
+  assert.doesNotMatch(sql, /DROP TABLE|TRUNCATE|finance_cash_flow/);
 });
 
-test("routes expose readiness, opening review, and append-only close while retaining live workflow gates", () => {
+test("routes expose readiness, reviewed Balance Sheet rules/report, and append-only local close while retaining live gates", () => {
   const routes = [];
   const app = {
     get(path) { routes.push(["GET", path]); },
@@ -363,7 +511,9 @@ test("routes expose readiness, opening review, and append-only close while retai
   assert.deepEqual(routes, [
     ["GET", "/api/finance/accounting/statement-readiness"],
     ["PUT", "/api/finance/accounting/statement-readiness/profile"],
-    ["POST", "/api/finance/accounting/statement-readiness/period-close"]
+    ["POST", "/api/finance/accounting/statement-readiness/period-close"],
+    ["PUT", "/api/finance/accounting/statements/balance-sheet/rules"],
+    ["GET", "/api/finance/accounting/statements/balance-sheet"]
   ]);
   const source = fs.readFileSync(new URL("../finance-statement-readiness.js", import.meta.url), "utf8");
   assert.match(source, /BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY/);
@@ -375,7 +525,10 @@ test("routes expose readiness, opening review, and append-only close while retai
   assert.match(source, /loadOperationalApplicationCloseEvaluation/);
   assert.match(source, /application\.kind='customer_credit'/);
   assert.match(source, /BEGIN ISOLATION LEVEL REPEATABLE READ/);
-  assert.doesNotMatch(source, /\/balance-sheet|\/cash-flow/);
+  assert.match(source, /\/statements\/balance-sheet/);
+  assert.match(source, /balance_sheet_unavailable/);
+  assert.match(source, /Accumulated Earnings Since Coverage Start/);
+  assert.doesNotMatch(source, /\/cash-flow/);
 });
 
 let passed = 0;

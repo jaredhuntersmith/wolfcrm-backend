@@ -5,6 +5,13 @@ import { chooseReceiptMatch, findReceiptCandidates, normalizeMerchantName } from
 
 const VALID_STATUSES = new Set(["processing", "unmatched", "possible_match", "matched", "manually_matched", "cash_purchase", "processing_failed", "archived"]);
 const VALID_METHODS = new Set(["auto", "manual", "user_direct", "cash_purchase"]);
+const RECEIPT_BUSINESS_USES = new Set(["unknown", "business", "personal"]);
+const RECEIPT_DETAIL_FIELDS = [
+  "merchant_name", "purchase_date", "purchase_time", "amount_cents", "subtotal_cents",
+  "tax_cents", "tip_cents", "currency", "address", "city", "state", "postal_code",
+  "country", "payment_method_text", "card_last_four", "finance_category", "business_use", "note"
+];
+const RECEIPT_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function cleanString(value, maxLength = 300) {
   return (value || "").toString().trim().slice(0, maxLength);
@@ -35,6 +42,154 @@ function parseDateOnly(value, fieldName = "date", { nullable = false } = {}) {
 function parseTime(value) {
   const raw = cleanString(value, 10);
   return /^\d{2}:\d{2}(:\d{2})?$/.test(raw) ? raw : null;
+}
+
+function receiptRequestError(code, message, statusCode = 400, details = {}) {
+  return Object.assign(new Error(message), { code, statusCode, ...details });
+}
+
+function receiptUUID(value, field) {
+  const raw = (value ?? "").toString().trim().toLowerCase();
+  if (!RECEIPT_UUID_PATTERN.test(raw)) {
+    throw receiptRequestError(`${field}_invalid`, `${field.replaceAll("_", " ")} is invalid.`);
+  }
+  return raw;
+}
+
+function exactReceiptInteger(value, field, minimum = 0) {
+  const parsed = typeof value === "string" && /^-?\d+$/.test(value.trim()) ? Number(value.trim()) : value;
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+    throw receiptRequestError(`${field}_invalid`, `${field.replaceAll("_", " ")} is invalid.`);
+  }
+  return parsed;
+}
+
+function optionalReceiptText(value, field, maxLength) {
+  if (value === null || value === undefined) return null;
+  const text = value.toString().trim();
+  if (!text) return null;
+  if (text.length > maxLength) {
+    throw receiptRequestError(`${field}_too_long`, `${field.replaceAll("_", " ")} must be ${maxLength} characters or fewer.`);
+  }
+  return text;
+}
+
+function optionalReceiptCents(value, field) {
+  if (value === null || value === undefined || value === "") return null;
+  return exactReceiptInteger(value, field);
+}
+
+function optionalReceiptDate(value, field = "purchase_date") {
+  if (value === null || value === undefined || value === "") return null;
+  const raw = value instanceof Date ? value.toISOString().slice(0, 10) : value.toString().trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw receiptRequestError(`${field}_invalid`, `${field.replaceAll("_", " ")} is invalid.`);
+  }
+  const [year, month, day] = raw.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) {
+    throw receiptRequestError(`${field}_invalid`, `${field.replaceAll("_", " ")} is invalid.`);
+  }
+  return raw;
+}
+
+function optionalReceiptTime(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const raw = value.toString().trim();
+  const match = raw.match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59 || Number(match[3] || 0) > 59) {
+    throw receiptRequestError("purchase_time_invalid", "Purchase time is invalid.");
+  }
+  return match[3] === undefined ? `${match[1]}:${match[2]}` : raw;
+}
+
+function stableReceiptValue(value) {
+  if (Array.isArray(value)) return value.map(stableReceiptValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableReceiptValue(value[key])]));
+  }
+  return value;
+}
+
+export function receiptDetailFingerprint(value) {
+  return createHash("sha256").update(JSON.stringify(stableReceiptValue(value))).digest("hex");
+}
+
+function normalizedReceiptDetailDocument(source = {}) {
+  const currency = optionalReceiptText(source.currency ?? "usd", "currency", 3)?.toLowerCase();
+  if (!currency || !/^[a-z]{3}$/.test(currency)) {
+    throw receiptRequestError("currency_invalid", "Currency must be a three-letter code.");
+  }
+  const businessUse = optionalReceiptText(source.business_use ?? "unknown", "business_use", 20)?.toLowerCase();
+  if (!businessUse || !RECEIPT_BUSINESS_USES.has(businessUse)) {
+    throw receiptRequestError("business_use_invalid", "Business use is invalid.");
+  }
+  const cardLastFour = optionalReceiptText(source.card_last_four, "card_last_four", 4);
+  if (cardLastFour && !/^\d{4}$/.test(cardLastFour)) {
+    throw receiptRequestError("card_last_four_invalid", "Card last four must contain exactly four digits.");
+  }
+  return {
+    merchant_name: optionalReceiptText(source.merchant_name, "merchant_name", 200),
+    purchase_date: optionalReceiptDate(source.purchase_date),
+    purchase_time: optionalReceiptTime(source.purchase_time),
+    amount_cents: optionalReceiptCents(source.amount_cents, "amount_cents"),
+    subtotal_cents: optionalReceiptCents(source.subtotal_cents, "subtotal_cents"),
+    tax_cents: optionalReceiptCents(source.tax_cents, "tax_cents"),
+    tip_cents: optionalReceiptCents(source.tip_cents, "tip_cents"),
+    currency,
+    address: optionalReceiptText(source.address, "address", 300),
+    city: optionalReceiptText(source.city, "city", 120),
+    state: optionalReceiptText(source.state, "state", 80),
+    postal_code: optionalReceiptText(source.postal_code, "postal_code", 20),
+    country: optionalReceiptText(source.country, "country", 80),
+    payment_method_text: optionalReceiptText(source.payment_method_text, "payment_method_text", 160),
+    card_last_four: cardLastFour,
+    finance_category: optionalReceiptText(source.finance_category ?? "Other", "finance_category", 80) || "Other",
+    business_use: businessUse,
+    note: optionalReceiptText(source.note, "note", 1000)
+  };
+}
+
+export function normalizeReceiptDetailEditRequest({ body = {}, receiptID }) {
+  const reason = (body.reason ?? "").toString().trim();
+  if (!reason) throw receiptRequestError("receipt_detail_reason_required", "An audit reason is required.");
+  if (reason.length > 500) throw receiptRequestError("receipt_detail_reason_too_long", "Audit reason must be 500 characters or fewer.");
+  const input = {
+    receipt_id: receiptUUID(receiptID, "receipt_id"),
+    client_request_id: receiptUUID(body.client_request_id, "client_request_id"),
+    expected_details_version: exactReceiptInteger(body.expected_details_version, "expected_details_version", 1),
+    details: normalizedReceiptDetailDocument(body),
+    reason
+  };
+  return { ...input, request_fingerprint: receiptDetailFingerprint(input) };
+}
+
+export function receiptDetailDocument(row = {}) {
+  return normalizedReceiptDetailDocument(row);
+}
+
+export function receiptDetailChangedFields(before = {}, after = {}) {
+  return RECEIPT_DETAIL_FIELDS.filter((field) => before[field] !== after[field]);
+}
+
+export function receiptDetailAuditSnapshot(document = {}) {
+  return {
+    merchant_name: document.merchant_name || null,
+    purchase_date: document.purchase_date || null,
+    purchase_time: document.purchase_time || null,
+    amount_cents: document.amount_cents ?? null,
+    subtotal_cents: document.subtotal_cents ?? null,
+    tax_cents: document.tax_cents ?? null,
+    tip_cents: document.tip_cents ?? null,
+    currency: document.currency,
+    finance_category: document.finance_category,
+    business_use: document.business_use,
+    country: document.country,
+    address_present: Boolean(document.address || document.city || document.state || document.postal_code),
+    payment_method_present: Boolean(document.payment_method_text),
+    card_last_four_present: Boolean(document.card_last_four),
+    note_present: Boolean(document.note)
+  };
 }
 
 function requireCompany(req, res) {
@@ -137,8 +292,36 @@ function receiptPayload(row) {
     transaction_merchant_name: row.transaction_merchant_name,
     transaction_amount_cents: row.transaction_amount_cents === null || row.transaction_amount_cents === undefined ? null : Number(row.transaction_amount_cents),
     account_name: row.account_name,
-    institution_name: row.institution_name
+    institution_name: row.institution_name,
+    details_version: Number(row.details_version || 1)
   };
+}
+
+function receiptDetailAuditPayload(row) {
+  return {
+    id: String(row.id),
+    receipt_id: String(row.receipt_id),
+    version: Number(row.version),
+    action: row.action,
+    reason: row.reason,
+    changed_fields: Array.isArray(row.changed_fields) ? row.changed_fields : [],
+    actor_user_id: row.actor_user_id || null,
+    actor_email: row.actor_email || null,
+    created_at: row.created_at || null
+  };
+}
+
+async function loadReceiptWithContext(poolOrClient, companyID, receiptID, { lock = false } = {}) {
+  const { rows } = await poolOrClient.query(
+    `SELECT r.*, t.merchant_name AS transaction_merchant_name, t.amount_cents AS transaction_amount_cents,
+            a.name AS account_name, a.institution_name
+       FROM finance_receipts r
+       LEFT JOIN finance_transactions t ON t.id=r.transaction_id AND t.company_id=r.company_id
+       LEFT JOIN finance_accounts a ON a.id=t.account_id AND a.company_id=r.company_id
+      WHERE r.id=$1 AND r.company_id=$2${lock ? " FOR UPDATE OF r" : ""}`,
+    [receiptID, companyID]
+  );
+  return rows[0] || null;
 }
 
 function transactionPayload(row) {
@@ -242,6 +425,21 @@ export async function installReceiptSchema(pool) {
     CREATE INDEX IF NOT EXISTS finance_receipts_transaction_idx ON finance_receipts(company_id, transaction_id);
     CREATE INDEX IF NOT EXISTS finance_receipts_hash_idx ON finance_receipts(company_id, content_sha256) WHERE content_sha256 IS NOT NULL;
 
+    ALTER TABLE finance_receipts
+      ADD COLUMN IF NOT EXISTS details_version INTEGER NOT NULL DEFAULT 1;
+    DO $$
+    BEGIN
+      ALTER TABLE finance_receipts
+        ADD CONSTRAINT finance_receipts_details_version_positive CHECK(details_version > 0);
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+    DO $$
+    BEGIN
+      ALTER TABLE finance_receipts
+        ADD CONSTRAINT finance_receipts_company_id_id_unique UNIQUE(company_id, id);
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+
     CREATE TABLE IF NOT EXISTS finance_receipt_matches (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -255,6 +453,28 @@ export async function installReceiptSchema(pool) {
     );
     CREATE INDEX IF NOT EXISTS finance_receipt_matches_receipt_idx ON finance_receipt_matches(company_id, receipt_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS finance_receipt_matches_transaction_idx ON finance_receipt_matches(company_id, transaction_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS finance_receipt_detail_audit (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      receipt_id UUID NOT NULL,
+      version INTEGER NOT NULL CHECK (version > 1),
+      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL CHECK (action='details_replaced'),
+      reason TEXT NOT NULL CHECK (char_length(reason) BETWEEN 1 AND 500),
+      changed_fields TEXT[] NOT NULL CHECK (cardinality(changed_fields) BETWEEN 1 AND 18),
+      client_request_id UUID NOT NULL,
+      request_fingerprint TEXT NOT NULL CHECK (char_length(request_fingerprint)=64),
+      before_state JSONB NOT NULL,
+      after_state JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, receipt_id, version),
+      UNIQUE(company_id, client_request_id),
+      FOREIGN KEY (company_id, receipt_id)
+        REFERENCES finance_receipts(company_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS finance_receipt_detail_audit_company_receipt_idx
+      ON finance_receipt_detail_audit(company_id, receipt_id, created_at DESC);
   `);
 }
 
@@ -428,6 +648,137 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
     }
   });
 
+  app.get("/api/finance/receipts/:id/detail-audit", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const receiptID = receiptUUID(req.params.id, "receipt_id");
+      const receipt = await pool.query(
+        `SELECT id FROM finance_receipts WHERE id=$1 AND company_id=$2`,
+        [receiptID, req.companyId]
+      );
+      if (!receipt.rows.length) {
+        return res.status(404).json({ error: "finance_receipt_not_found", message: "Receipt was not found." });
+      }
+      const requestedLimit = Number(req.query.limit ?? 50);
+      const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
+      const { rows } = await pool.query(
+        `SELECT audit.id, audit.receipt_id, audit.version, audit.action, audit.reason,
+                audit.changed_fields, audit.actor_user_id, actor.email AS actor_email, audit.created_at
+           FROM finance_receipt_detail_audit audit
+           LEFT JOIN users actor
+             ON actor.id=audit.actor_user_id AND actor.company_id=audit.company_id
+          WHERE audit.company_id=$1 AND audit.receipt_id=$2
+          ORDER BY audit.created_at DESC, audit.id DESC LIMIT $3`,
+        [req.companyId, receiptID, limit]
+      );
+      res.json(rows.map(receiptDetailAuditPayload));
+    } catch (error) {
+      handleReceiptError(res, error, "finance_receipt_detail_audit_failed");
+    }
+  });
+
+  app.put("/api/finance/receipts/:id/details", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    let client;
+    try {
+      const request = normalizeReceiptDetailEditRequest({ body: req.body, receiptID: req.params.id });
+      client = await pool.connect();
+      await client.query("BEGIN");
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, [`${req.companyId}|receipt-details`]);
+      const replay = await client.query(
+        `SELECT * FROM finance_receipt_detail_audit
+          WHERE company_id=$1 AND client_request_id=$2::uuid`,
+        [req.companyId, request.client_request_id]
+      );
+      if (replay.rows.length) {
+        const row = replay.rows[0];
+        if (String(row.receipt_id) !== request.receipt_id || row.request_fingerprint !== request.request_fingerprint) {
+          throw receiptRequestError(
+            "receipt_detail_request_conflict",
+            "That request ID was already used with different receipt details.",
+            409
+          );
+        }
+        const receipt = await loadReceiptWithContext(client, req.companyId, request.receipt_id);
+        await client.query("COMMIT");
+        return res.json({ replayed: true, receipt: receiptPayload(receipt), audit: receiptDetailAuditPayload(row) });
+      }
+      const current = await loadReceiptWithContext(client, req.companyId, request.receipt_id, { lock: true });
+      if (!current) {
+        throw receiptRequestError("finance_receipt_not_found", "Receipt was not found.", 404);
+      }
+      if (current.archived_at || current.status === "archived") {
+        throw receiptRequestError("receipt_details_archived", "Archived receipt details cannot be changed.", 409);
+      }
+      if (current.status === "processing" || current.status === "processing_failed" || !current.object_key) {
+        throw receiptRequestError("receipt_details_processing", "Wait for receipt processing to finish before editing details.", 409);
+      }
+      if (current.status === "cash_purchase") {
+        throw receiptRequestError(
+          "receipt_details_cash_purchase_locked",
+          "Cash-purchase receipt details require a coordinated transaction correction workflow.",
+          409
+        );
+      }
+      const currentVersion = Number(current.details_version || 1);
+      if (request.expected_details_version !== currentVersion) {
+        throw receiptRequestError(
+          "receipt_details_stale",
+          "Receipt details changed after they were loaded.",
+          409,
+          { current_version: currentVersion }
+        );
+      }
+      const before = receiptDetailDocument(current);
+      const after = request.details;
+      const changedFields = receiptDetailChangedFields(before, after);
+      if (!changedFields.length) {
+        throw receiptRequestError("receipt_details_unchanged", "Change at least one receipt detail before saving.", 409);
+      }
+      const nextVersion = currentVersion + 1;
+      if (!Number.isSafeInteger(nextVersion)) {
+        throw receiptRequestError("receipt_details_version_invalid", "Receipt detail version is invalid.", 409);
+      }
+      const updated = (await client.query(
+        `UPDATE finance_receipts
+            SET merchant_name=$3, normalized_merchant_name=$4,
+                purchase_date=$5::date, purchase_time=$6::time,
+                amount_cents=$7, subtotal_cents=$8, tax_cents=$9, tip_cents=$10,
+                currency=$11, address=$12, city=$13, state=$14, postal_code=$15,
+                country=$16, payment_method_text=$17, card_last_four=$18,
+                finance_category=$19, business_use=$20, note=$21,
+                details_version=$22, updated_at=now()
+          WHERE id=$1 AND company_id=$2
+          RETURNING *`,
+        [
+          request.receipt_id, req.companyId, after.merchant_name,
+          after.merchant_name ? normalizeMerchantName(after.merchant_name) : null,
+          after.purchase_date, after.purchase_time, after.amount_cents, after.subtotal_cents,
+          after.tax_cents, after.tip_cents, after.currency, after.address, after.city,
+          after.state, after.postal_code, after.country, after.payment_method_text,
+          after.card_last_four, after.finance_category, after.business_use, after.note, nextVersion
+        ]
+      )).rows[0];
+      const audit = (await client.query(
+        `INSERT INTO finance_receipt_detail_audit (
+           company_id, receipt_id, version, actor_user_id, action, reason, changed_fields,
+           client_request_id, request_fingerprint, before_state, after_state
+         ) VALUES ($1,$2,$3,$4,'details_replaced',$5,$6,$7::uuid,$8,$9,$10)
+         RETURNING *`,
+        [req.companyId, request.receipt_id, nextVersion, req.userId, request.reason, changedFields,
+          request.client_request_id, request.request_fingerprint,
+          JSON.stringify(receiptDetailAuditSnapshot(before)), JSON.stringify(receiptDetailAuditSnapshot(after))]
+      )).rows[0];
+      await client.query("COMMIT");
+      res.json({ replayed: false, receipt: receiptPayload(updated), audit: receiptDetailAuditPayload(audit) });
+    } catch (error) {
+      await client?.query("ROLLBACK").catch(() => {});
+      handleReceiptError(res, error, "finance_receipt_detail_update_failed");
+    } finally {
+      client?.release();
+    }
+  });
+
   app.patch("/api/finance/receipts/:id", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
@@ -468,6 +819,7 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
                 status = COALESCE($31, CASE WHEN transaction_id IS NULL THEN 'unmatched' ELSE status END),
                 updated_at = now()
           WHERE id = $1 AND company_id = $2
+            AND (status IN ('processing','processing_failed') OR (object_key IS NULL AND details_version=1))
           RETURNING *`,
         [
           req.params.id, req.companyId, payload.merchant_name, payload.normalized_merchant_name,
@@ -480,7 +832,19 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
           payload.pixel_height, payload.file_size_bytes, payload.content_sha256, status
         ]
       );
-      if (!rows.length) return res.status(404).json({ error: "finance_receipt_not_found", message: "Receipt was not found." });
+      if (!rows.length) {
+        const existing = await pool.query(
+          `SELECT id FROM finance_receipts WHERE id=$1 AND company_id=$2`,
+          [req.params.id, req.companyId]
+        );
+        if (existing.rows.length) {
+          return res.status(409).json({
+            error: "receipt_details_audited_route_required",
+            message: "Completed receipt details must be changed through the audited detail editor."
+          });
+        }
+        return res.status(404).json({ error: "finance_receipt_not_found", message: "Receipt was not found." });
+      }
       if (!rows[0].transaction_id) {
         const candidates = await findReceiptCandidates(pool, req.companyId, rows[0]);
         const decision = chooseReceiptMatch(rows[0], candidates.map((candidate) => candidate.transaction));

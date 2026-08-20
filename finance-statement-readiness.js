@@ -9,9 +9,12 @@ import { loadStripeSettlementLocalCloseEvaluation } from "./finance-stripe-settl
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const OPENING_METHODS = new Set(["company_inception_zero", "reviewed_journal"]);
+const BALANCE_SHEET_EARNINGS_TREATMENT = "cumulative_since_coverage_start";
+const STATEMENT_ACCOUNT_TYPES = new Set(["asset", "liability", "equity", "income", "expense"]);
 const MAX_OPENING_CANDIDATES = 100;
 const MAX_AUDIT_ROWS = 50;
 const MAX_CLOSE_AUTHORITIES = 1000;
+const MAX_STATEMENT_ACCOUNTS = 250;
 
 export class FinanceStatementReadinessError extends Error {
   constructor(code, message, statusCode = 400, details = {}) {
@@ -151,6 +154,242 @@ function storedCount(value, field) {
     throw new FinanceStatementReadinessError("statement_inventory_inexact", `${field.replaceAll("_", " ")} is invalid.`, 409);
   }
   return parsed;
+}
+
+function storedSignedInteger(value, field) {
+  const parsed = typeof value === "string" && /^-?\d+$/.test(value) ? Number(value) : value;
+  if (!Number.isSafeInteger(parsed)) {
+    throw new FinanceStatementReadinessError("balance_sheet_amount_inexact", `${field.replaceAll("_", " ")} exceeds the exact supported range.`, 409);
+  }
+  return parsed;
+}
+
+function addStatementExact(left, right, field) {
+  const next = left + right;
+  if (!Number.isSafeInteger(next)) {
+    throw new FinanceStatementReadinessError("balance_sheet_amount_inexact", `${field.replaceAll("_", " ")} exceeds the exact supported range.`, 409);
+  }
+  return next;
+}
+
+export function normalizeBalanceSheetRuleReviewRequest({ body = {}, companyToday }) {
+  const today = dateOnly(companyToday, "company_today");
+  const asOfDate = dateOnly(body.as_of_date, "as_of_date");
+  if (asOfDate > today) {
+    throw new FinanceStatementReadinessError("statement_as_of_future", "Balance Sheet rules cannot be reviewed for a future statement boundary.");
+  }
+  const accountantReviewedOn = dateOnly(body.accountant_reviewed_on, "accountant_reviewed_on");
+  if (accountantReviewedOn > today) {
+    throw new FinanceStatementReadinessError("balance_sheet_accountant_review_future", "The accountant review date cannot be in the future.");
+  }
+  const accountantReference = (body.accountant_reference ?? "").toString().trim();
+  if (!accountantReference) {
+    throw new FinanceStatementReadinessError("balance_sheet_accountant_reference_required", "Enter a non-secret accountant review reference.");
+  }
+  if (accountantReference.length > 200) {
+    throw new FinanceStatementReadinessError("balance_sheet_accountant_reference_too_long", "Accountant review reference must be 200 characters or fewer.");
+  }
+  if (body.accountant_review_confirmed !== true) {
+    throw new FinanceStatementReadinessError("balance_sheet_accountant_confirmation_required", "Confirm that a qualified accountant reviewed the fixed Balance Sheet rules.");
+  }
+  const treatment = cleanString(body.earnings_treatment || BALANCE_SHEET_EARNINGS_TREATMENT, 80).toLowerCase();
+  if (treatment !== BALANCE_SHEET_EARNINGS_TREATMENT) {
+    throw new FinanceStatementReadinessError("balance_sheet_earnings_treatment_unsupported", "Choose the supported accumulated-earnings treatment.");
+  }
+  const reason = (body.reason ?? "").toString().trim();
+  if (!reason) throw new FinanceStatementReadinessError("balance_sheet_rule_reason_required", "An audit reason is required.");
+  if (reason.length > 500) throw new FinanceStatementReadinessError("balance_sheet_rule_reason_too_long", "Audit reason must be 500 characters or fewer.");
+  const input = {
+    client_request_id: uuid(body.client_request_id, "client_request_id"),
+    expected_version: exactInteger(body.expected_version ?? 0, "expected_version"),
+    as_of_date: asOfDate,
+    earnings_treatment: treatment,
+    accountant_reviewed_on: accountantReviewedOn,
+    accountant_reference: accountantReference,
+    accountant_review_confirmed: true,
+    reason
+  };
+  return { ...input, request_fingerprint: statementReadinessFingerprint(input) };
+}
+
+export function balanceSheetChartSnapshot(accounts = []) {
+  if (!Array.isArray(accounts)) {
+    throw new FinanceStatementReadinessError("balance_sheet_chart_invalid", "The Balance Sheet chart evidence is invalid.", 409);
+  }
+  if (accounts.length > MAX_STATEMENT_ACCOUNTS) {
+    throw new FinanceStatementReadinessError(
+      "balance_sheet_chart_too_large",
+      `The complete chart exceeds the exact ${MAX_STATEMENT_ACCOUNTS}-account Balance Sheet review bound.`,
+      409
+    );
+  }
+  const seen = new Set();
+  return accounts.map((account) => {
+    const id = cleanString(account?.id, 80);
+    const code = cleanString(account?.code, 40);
+    const name = cleanString(account?.name, 120);
+    const accountType = cleanString(account?.account_type, 30).toLowerCase();
+    if (!id || seen.has(id)) {
+      throw new FinanceStatementReadinessError("balance_sheet_chart_duplicate", "The Balance Sheet chart contains a missing or duplicate account identity.", 409);
+    }
+    seen.add(id);
+    if (!code || !name || !STATEMENT_ACCOUNT_TYPES.has(accountType)) {
+      throw new FinanceStatementReadinessError("balance_sheet_chart_invalid", "The Balance Sheet chart contains an unsupported account definition.", 409);
+    }
+    return {
+      id,
+      code,
+      name,
+      account_type: accountType,
+      active: account.active !== false,
+      system_key: cleanString(account.system_key, 80) || null
+    };
+  }).sort((left, right) => left.id.localeCompare(right.id));
+}
+
+export function evaluateBalanceSheetRules({ profile = null, chartAccounts = [] }) {
+  const chart = balanceSheetChartSnapshot(chartAccounts);
+  const chartFingerprint = statementReadinessFingerprint(chart);
+  if (!profile) {
+    return {
+      status: "unconfigured",
+      source_current: false,
+      live_fingerprint: null,
+      chart_fingerprint: chartFingerprint,
+      snapshot: null,
+      blockers: [blocker(
+        "balance_sheet_rules_not_reviewed",
+        "Record a genuine qualified-accountant review of WolfCRM's fixed Balance Sheet presentation rules for the complete current chart.",
+        "balance_sheet_rules"
+      )]
+    };
+  }
+  const snapshot = {
+    earnings_treatment: cleanString(profile.earnings_treatment, 80),
+    accountant_reviewed_on: dateValue(profile.accountant_reviewed_on),
+    accountant_reference: cleanString(profile.accountant_reference, 200),
+    accountant_review_confirmed: profile.accountant_review_confirmed === true,
+    chart_fingerprint: chartFingerprint,
+    chart
+  };
+  const liveFingerprint = statementReadinessFingerprint(snapshot);
+  const blockers = [];
+  if (snapshot.earnings_treatment !== BALANCE_SHEET_EARNINGS_TREATMENT || !snapshot.accountant_review_confirmed
+      || !snapshot.accountant_reviewed_on || !snapshot.accountant_reference) {
+    blockers.push(blocker(
+      "balance_sheet_rules_invalid",
+      "The stored Balance Sheet presentation-rule review is incomplete or unsupported.",
+      "balance_sheet_rules"
+    ));
+  }
+  if (profile.evidence_fingerprint !== liveFingerprint || profile.chart_fingerprint !== chartFingerprint) {
+    blockers.push(blocker(
+      "balance_sheet_rules_stale",
+      "The company chart or fixed Balance Sheet presentation evidence changed after accountant review.",
+      "balance_sheet_rules"
+    ));
+  }
+  return {
+    status: blockers.length === 0 ? "current" : "stale",
+    source_current: blockers.length === 0,
+    live_fingerprint: liveFingerprint,
+    chart_fingerprint: chartFingerprint,
+    snapshot,
+    blockers: uniqueBlockers(blockers)
+  };
+}
+
+export function summarizeBalanceSheetRows(rows = [], { coverageStartDate, asOfDate } = {}) {
+  const startDate = dateOnly(coverageStartDate, "coverage_start_date");
+  const endDate = dateOnly(asOfDate, "as_of_date");
+  if (endDate < startDate) {
+    throw new FinanceStatementReadinessError("balance_sheet_range_invalid", "Balance Sheet as-of date cannot precede reviewed coverage.");
+  }
+  if (!Array.isArray(rows) || rows.length > MAX_STATEMENT_ACCOUNTS) {
+    throw new FinanceStatementReadinessError("balance_sheet_chart_too_large", `The Balance Sheet exceeds the exact ${MAX_STATEMENT_ACCOUNTS}-account bound.`, 409);
+  }
+  const seen = new Set();
+  const assets = [];
+  const liabilities = [];
+  const postedEquity = [];
+  let totalAssets = 0;
+  let totalLiabilities = 0;
+  let totalPostedEquity = 0;
+  let totalIncome = 0;
+  let totalExpenses = 0;
+  for (const row of rows) {
+    const id = cleanString(row.chart_account_id ?? row.id, 80);
+    const type = cleanString(row.account_type, 30).toLowerCase();
+    if (!id || seen.has(id)) {
+      throw new FinanceStatementReadinessError("balance_sheet_account_duplicate", "The Balance Sheet contains a missing or duplicate account identity.", 409);
+    }
+    seen.add(id);
+    if (!STATEMENT_ACCOUNT_TYPES.has(type)) {
+      throw new FinanceStatementReadinessError("balance_sheet_account_type_invalid", "The Balance Sheet contains an unsupported account type.", 409);
+    }
+    const debit = storedSignedInteger(row.debit_cents ?? 0, "debit_cents");
+    const credit = storedSignedInteger(row.credit_cents ?? 0, "credit_cents");
+    if (debit < 0 || credit < 0) {
+      throw new FinanceStatementReadinessError("balance_sheet_amount_invalid", "Stored Balance Sheet debits and credits must be nonnegative.", 409);
+    }
+    const debitNormal = debit - credit;
+    const creditNormal = credit - debit;
+    if (!Number.isSafeInteger(debitNormal) || !Number.isSafeInteger(creditNormal)) {
+      throw new FinanceStatementReadinessError("balance_sheet_amount_inexact", "An account balance exceeds the exact supported range.", 409);
+    }
+    const account = {
+      chart_account_id: id,
+      code: cleanString(row.code, 40),
+      name: cleanString(row.name, 120) || "Account",
+      account_type: type,
+      active: row.active !== false,
+      balance_cents: type === "asset" || type === "expense" ? debitNormal : creditNormal
+    };
+    if (type === "asset") {
+      if (account.balance_cents !== 0) assets.push(account);
+      totalAssets = addStatementExact(totalAssets, account.balance_cents, "total_assets_cents");
+    } else if (type === "liability") {
+      if (account.balance_cents !== 0) liabilities.push(account);
+      totalLiabilities = addStatementExact(totalLiabilities, account.balance_cents, "total_liabilities_cents");
+    } else if (type === "equity") {
+      if (account.balance_cents !== 0) postedEquity.push(account);
+      totalPostedEquity = addStatementExact(totalPostedEquity, account.balance_cents, "posted_equity_cents");
+    } else if (type === "income") {
+      totalIncome = addStatementExact(totalIncome, account.balance_cents, "total_income_cents");
+    } else {
+      totalExpenses = addStatementExact(totalExpenses, account.balance_cents, "total_expenses_cents");
+    }
+  }
+  const accumulatedEarnings = addStatementExact(totalIncome, -totalExpenses, "accumulated_earnings_cents");
+  const totalEquity = addStatementExact(totalPostedEquity, accumulatedEarnings, "total_equity_cents");
+  const totalLiabilitiesAndEquity = addStatementExact(totalLiabilities, totalEquity, "total_liabilities_and_equity_cents");
+  const equationDifference = addStatementExact(totalAssets, -totalLiabilitiesAndEquity, "equation_difference_cents");
+  if (equationDifference !== 0) {
+    throw new FinanceStatementReadinessError(
+      "balance_sheet_unbalanced",
+      "The reviewed ledger does not satisfy Assets = Liabilities + Equity at this boundary. The Balance Sheet was not produced.",
+      409,
+      { difference_cents: equationDifference }
+    );
+  }
+  const byCode = (left, right) => `${left.code}|${left.name}|${left.chart_account_id}`.localeCompare(`${right.code}|${right.name}|${right.chart_account_id}`);
+  assets.sort(byCode);
+  liabilities.sort(byCode);
+  postedEquity.sort(byCode);
+  return {
+    assets,
+    liabilities,
+    posted_equity: postedEquity,
+    total_assets_cents: totalAssets,
+    total_liabilities_cents: totalLiabilities,
+    posted_equity_cents: totalPostedEquity,
+    income_cents: totalIncome,
+    expense_cents: totalExpenses,
+    accumulated_earnings_cents: accumulatedEarnings,
+    total_equity_cents: totalEquity,
+    total_liabilities_and_equity_cents: totalLiabilitiesAndEquity,
+    equation_difference_cents: equationDifference
+  };
 }
 
 export function normalizeStatementCoverageArea({ key, label, row = {}, blockerCode, blockerMessage, warnings = [] }) {
@@ -381,6 +620,7 @@ export function buildStatementReadiness({
   periodCloseRow = null,
   latestCloseVersion = 0,
   stripeConnected = false,
+  balanceSheetRules = null,
   asOfDate
 }) {
   const sourceInventoryFingerprint = statementReadinessFingerprint({
@@ -422,7 +662,22 @@ export function buildStatementReadiness({
       "payment_clearing"
     ));
   }
-  const balanceSheetBlockers = uniqueBlockers(common);
+  const balanceCloseBlockers = periodClose.source_current || periodClose.blockers.some((item) => item.code.startsWith("source_period_close_"))
+    ? []
+    : [blocker(
+      "source_period_close_not_reviewed",
+      "A formal Balance Sheet requires one current audited local period close at this exact boundary, including when the retained local evidence set is empty.",
+      "source_period_close"
+    )];
+  const balanceSheetBlockers = uniqueBlockers([
+    ...common,
+    ...balanceCloseBlockers,
+    ...(balanceSheetRules?.blockers || [blocker(
+      "balance_sheet_rules_not_reviewed",
+      "Record a genuine qualified-accountant review of WolfCRM's fixed Balance Sheet presentation rules for the complete current chart.",
+      "balance_sheet_rules"
+    )])
+  ]);
   const cashFlowBlockers = uniqueBlockers([
     ...common,
     blocker(
@@ -431,11 +686,11 @@ export function buildStatementReadiness({
       "cash_flow_classification"
     )
   ]);
-  const statementGate = (statement, blockers) => ({
+  const statementGate = (statement, blockers, implemented = false) => ({
     statement,
-    status: blockers.length === 0 ? "coverage_ready" : "blocked",
+    status: blockers.length === 0 ? (implemented ? "available" : "coverage_ready") : "blocked",
     coverage_ready: blockers.length === 0,
-    report_available: false,
+    report_available: implemented && blockers.length === 0,
     blocker_count: blockers.length,
     blockers
   });
@@ -445,7 +700,7 @@ export function buildStatementReadiness({
     workflows,
     period_close: periodClose,
     statements: {
-      balance_sheet: statementGate("balance_sheet", balanceSheetBlockers),
+      balance_sheet: statementGate("balance_sheet", balanceSheetBlockers, true),
       cash_flow: statementGate("cash_flow", cashFlowBlockers)
     }
   };
@@ -539,6 +794,42 @@ export async function installFinanceStatementReadinessSchema(pool) {
     );
     CREATE INDEX IF NOT EXISTS finance_statement_period_close_audit_company_created_idx
       ON finance_statement_period_close_audit(company_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS finance_balance_sheet_rule_profiles (
+      company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+      earnings_treatment TEXT NOT NULL CHECK (earnings_treatment='cumulative_since_coverage_start'),
+      accountant_reviewed_on DATE NOT NULL,
+      accountant_reference TEXT NOT NULL CHECK (char_length(accountant_reference) BETWEEN 1 AND 200),
+      accountant_review_confirmed BOOLEAN NOT NULL CHECK (accountant_review_confirmed=true),
+      version INTEGER NOT NULL CHECK (version > 0),
+      chart_fingerprint TEXT NOT NULL CHECK (char_length(chart_fingerprint)=64),
+      evidence_fingerprint TEXT NOT NULL CHECK (char_length(evidence_fingerprint)=64),
+      evidence_snapshot JSONB NOT NULL,
+      reason TEXT NOT NULL,
+      reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      reviewed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS finance_balance_sheet_rule_profiles_company_review_idx
+      ON finance_balance_sheet_rule_profiles(company_id, accountant_reviewed_on, version DESC);
+
+    CREATE TABLE IF NOT EXISTS finance_balance_sheet_rule_audit (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL CHECK (action IN ('balance_sheet_rules_reviewed','balance_sheet_rules_replaced')),
+      reason TEXT NOT NULL,
+      version INTEGER NOT NULL CHECK (version > 0),
+      client_request_id UUID NOT NULL,
+      request_fingerprint TEXT NOT NULL CHECK (char_length(request_fingerprint)=64),
+      before_state JSONB,
+      after_state JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, client_request_id)
+    );
+    CREATE INDEX IF NOT EXISTS finance_balance_sheet_rule_audit_company_created_idx
+      ON finance_balance_sheet_rule_audit(company_id, created_at DESC);
   `);
 }
 
@@ -590,6 +881,85 @@ async function loadProfile(poolOrClient, companyID, { lock = false } = {}) {
     [companyID]
   );
   return rows[0] || null;
+}
+
+function balanceSheetRuleProfilePayload(row) {
+  if (!row) return null;
+  return {
+    company_id: String(row.company_id),
+    earnings_treatment: row.earnings_treatment,
+    accountant_reviewed_on: dateValue(row.accountant_reviewed_on),
+    accountant_reference: row.accountant_reference,
+    accountant_review_confirmed: row.accountant_review_confirmed === true,
+    version: Number(row.version),
+    chart_fingerprint: row.chart_fingerprint,
+    evidence_fingerprint: row.evidence_fingerprint,
+    reason: row.reason,
+    reviewed_by: row.reviewed_by || null,
+    reviewed_at: timestampValue(row.reviewed_at),
+    updated_at: timestampValue(row.updated_at)
+  };
+}
+
+function balanceSheetRuleProfileSnapshot(row) {
+  const profile = balanceSheetRuleProfilePayload(row);
+  if (!profile) return null;
+  return {
+    earnings_treatment: profile.earnings_treatment,
+    accountant_reviewed_on: profile.accountant_reviewed_on,
+    accountant_reference: profile.accountant_reference,
+    accountant_review_confirmed: profile.accountant_review_confirmed,
+    version: profile.version,
+    chart_fingerprint: profile.chart_fingerprint,
+    evidence_fingerprint: profile.evidence_fingerprint
+  };
+}
+
+async function loadBalanceSheetRuleProfile(poolOrClient, companyID, { lock = false } = {}) {
+  const { rows } = await poolOrClient.query(
+    `SELECT * FROM finance_balance_sheet_rule_profiles WHERE company_id=$1${lock ? " FOR UPDATE" : ""}`,
+    [companyID]
+  );
+  return rows[0] || null;
+}
+
+async function loadBalanceSheetChart(poolOrClient, companyID) {
+  const { rows } = await poolOrClient.query(
+    `SELECT id, code, name, account_type, active, system_key
+       FROM finance_chart_accounts WHERE company_id=$1
+      ORDER BY id LIMIT $2`,
+    [companyID, MAX_STATEMENT_ACCOUNTS + 1]
+  );
+  return rows;
+}
+
+async function loadBalanceSheetRuleState(poolOrClient, companyID, auditLimit = MAX_AUDIT_ROWS) {
+  const [profileRow, chartAccounts, auditResult] = await Promise.all([
+    loadBalanceSheetRuleProfile(poolOrClient, companyID),
+    loadBalanceSheetChart(poolOrClient, companyID),
+    poolOrClient.query(
+      `SELECT id, action, reason, version, actor_user_id, created_at
+         FROM finance_balance_sheet_rule_audit
+        WHERE company_id=$1 ORDER BY created_at DESC LIMIT $2`,
+      [companyID, Math.min(Math.max(Number(auditLimit) || MAX_AUDIT_ROWS, 1), 100)]
+    )
+  ]);
+  const profile = balanceSheetRuleProfilePayload(profileRow);
+  const evaluation = evaluateBalanceSheetRules({ profile, chartAccounts });
+  return {
+    state: {
+      status: evaluation.status,
+      source_current: evaluation.source_current,
+      live_fingerprint: evaluation.live_fingerprint,
+      chart_fingerprint: evaluation.chart_fingerprint,
+      blockers: evaluation.blockers,
+      profile
+    },
+    audit: auditResult.rows.map((row) => ({
+      id: String(row.id), action: row.action, reason: row.reason, version: Number(row.version),
+      actor_user_id: row.actor_user_id || null, created_at: timestampValue(row.created_at)
+    }))
+  };
 }
 
 async function loadOpeningEvidence(poolOrClient, companyID, profile) {
@@ -1100,69 +1470,80 @@ async function loadPeriodCloseState(poolOrClient, companyID, coverageStartDate, 
   };
 }
 
+async function loadStatementReadinessSnapshot(client, companyID, asOfValue, auditLimit) {
+  const context = await loadCompanyContext(client, companyID);
+  const asOfDate = dateOnly(asOfValue || context.company_today, "as_of_date");
+  if (asOfDate > context.company_today) {
+    throw new FinanceStatementReadinessError("statement_as_of_future", "Statement readiness cannot be evaluated after the company's current local day.");
+  }
+  const profileRow = await loadProfile(client, companyID);
+  const profile = profileRow ? { ...profilePayload(profileRow), timezone: context.timezone } : null;
+  if (profile && asOfDate < profile.coverage_start_date) {
+    throw new FinanceStatementReadinessError("statement_as_of_before_coverage", "As-of date must be on or after the reviewed coverage start.");
+  }
+  const [opening, openingCandidates, audit, balanceSheetRuleState] = await Promise.all([
+    loadOpeningEvidence(client, companyID, profile ? { ...profileRow, timezone: context.timezone } : null),
+    loadOpeningCandidates(client, companyID),
+    loadAudit(client, companyID, auditLimit),
+    loadBalanceSheetRuleState(client, companyID, auditLimit)
+  ]);
+  const areas = profile
+    ? await loadInventoryAreas(client, companyID, profile.coverage_start_date, asOfDate, context.timezone)
+    : [];
+  const workflows = profile
+    ? await loadWorkflowEvidence(client, companyID, profile.coverage_start_date, asOfDate, context.timezone)
+    : normalizeStatementWorkflowEvidence([]);
+  const closeState = profile
+    ? await loadPeriodCloseState(client, companyID, profile.coverage_start_date, asOfDate, auditLimit)
+    : { close: null, latest_version: 0, audit: [] };
+  const readiness = buildStatementReadiness({
+    profile,
+    opening,
+    areas,
+    workflows,
+    periodCloseRow: closeState.close,
+    latestCloseVersion: closeState.latest_version,
+    stripeConnected: context.stripe_connected,
+    balanceSheetRules: balanceSheetRuleState.state,
+    asOfDate
+  });
+  return {
+    basis: "formal_statement_coverage_gate",
+    timezone: context.timezone,
+    company_today: context.company_today,
+    as_of_date: asOfDate,
+    currency: "usd",
+    profile,
+    opening: {
+      status: opening.status,
+      source_current: opening.source_current,
+      live_fingerprint: opening.live_fingerprint,
+      blockers: opening.blockers
+    },
+    opening_journal_candidates: openingCandidates.candidates,
+    opening_journal_candidates_truncated: openingCandidates.truncated,
+    audit,
+    period_close_audit: closeState.audit,
+    balance_sheet_rules: balanceSheetRuleState.state,
+    balance_sheet_rule_audit: balanceSheetRuleState.audit,
+    ...readiness,
+    warnings: [
+      "This screen inventories formal-statement coverage. A Balance Sheet is available only after every live Balance Sheet gate and the accountant-reviewed presentation-rule authority are current; Cash Flow remains unavailable.",
+      "A balanced trial balance does not prove opening balances, source completeness, provider-period completeness, payroll settlement, cash-flow classification, tax basis, or audit assurance.",
+      "Phase 1 cash-basis Profit & Loss remains a separate bank-activity report and is not recomputed here."
+    ]
+  };
+}
+
 async function loadStatementReadiness(pool, companyID, asOfValue, auditLimit, ensureChartAccounts) {
   await ensureChartAccounts(pool, companyID);
   await syncOperationalAccountingSources(pool, companyID);
   const client = await pool.connect();
   try {
     await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-    const context = await loadCompanyContext(client, companyID);
-    const asOfDate = dateOnly(asOfValue || context.company_today, "as_of_date");
-    if (asOfDate > context.company_today) {
-      throw new FinanceStatementReadinessError("statement_as_of_future", "Statement readiness cannot be evaluated after the company's current local day.");
-    }
-    const profileRow = await loadProfile(client, companyID);
-    const profile = profileRow ? { ...profilePayload(profileRow), timezone: context.timezone } : null;
-    if (profile && asOfDate < profile.coverage_start_date) {
-      throw new FinanceStatementReadinessError("statement_as_of_before_coverage", "As-of date must be on or after the reviewed coverage start.");
-    }
-    const opening = await loadOpeningEvidence(client, companyID, profile ? { ...profileRow, timezone: context.timezone } : null);
-    const openingCandidates = await loadOpeningCandidates(client, companyID);
-    const audit = await loadAudit(client, companyID, auditLimit);
-    const areas = profile
-      ? await loadInventoryAreas(client, companyID, profile.coverage_start_date, asOfDate, context.timezone)
-      : [];
-    const workflows = profile
-      ? await loadWorkflowEvidence(client, companyID, profile.coverage_start_date, asOfDate, context.timezone)
-      : normalizeStatementWorkflowEvidence([]);
-    const closeState = profile
-      ? await loadPeriodCloseState(client, companyID, profile.coverage_start_date, asOfDate, auditLimit)
-      : { close: null, latest_version: 0, audit: [] };
-    const readiness = buildStatementReadiness({
-      profile,
-      opening,
-      areas,
-      workflows,
-      periodCloseRow: closeState.close,
-      latestCloseVersion: closeState.latest_version,
-      stripeConnected: context.stripe_connected,
-      asOfDate
-    });
+    const payload = await loadStatementReadinessSnapshot(client, companyID, asOfValue, auditLimit);
     await client.query("COMMIT");
-    return {
-      basis: "formal_statement_coverage_gate",
-      timezone: context.timezone,
-      company_today: context.company_today,
-      as_of_date: asOfDate,
-      currency: "usd",
-      profile,
-      opening: {
-        status: opening.status,
-        source_current: opening.source_current,
-        live_fingerprint: opening.live_fingerprint,
-        blockers: opening.blockers
-      },
-      opening_journal_candidates: openingCandidates.candidates,
-      opening_journal_candidates_truncated: openingCandidates.truncated,
-      audit,
-      period_close_audit: closeState.audit,
-      ...readiness,
-      warnings: [
-        "This screen inventories formal-statement coverage; it is not a Balance Sheet or Cash Flow report.",
-        "A balanced trial balance does not prove opening balances, source completeness, provider-period completeness, payroll settlement, or cash-flow classification.",
-        "Phase 1 cash-basis Profit & Loss remains a separate bank-activity report and is not recomputed here."
-      ]
-    };
+    return payload;
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     throw error;
@@ -1171,13 +1552,108 @@ async function loadStatementReadiness(pool, companyID, asOfValue, auditLimit, en
   }
 }
 
+async function loadBalanceSheetReport(client, companyID, readiness) {
+  const coverageStartDate = readiness.profile?.coverage_start_date;
+  if (!coverageStartDate || readiness.statements?.balance_sheet?.report_available !== true) {
+    throw new FinanceStatementReadinessError(
+      "balance_sheet_unavailable",
+      "The Balance Sheet is unavailable until every live coverage and accountant-reviewed presentation-rule blocker is resolved.",
+      409,
+      { blockers: readiness.statements?.balance_sheet?.blockers || [] }
+    );
+  }
+  const integrityResult = await client.query(
+    `SELECT COUNT(*)::int AS invalid_count FROM (
+       SELECT entry.id
+         FROM finance_journal_entries entry
+         LEFT JOIN finance_journal_lines line
+           ON line.company_id=entry.company_id AND line.entry_id=entry.id
+        WHERE entry.company_id=$1 AND entry.entry_date BETWEEN $2::date AND $3::date
+        GROUP BY entry.id
+       HAVING COUNT(line.id) < 2 OR COALESCE(SUM(line.debit_cents),0) <= 0
+          OR COALESCE(SUM(line.debit_cents),0) <> COALESCE(SUM(line.credit_cents),0)
+     ) invalid`,
+    [companyID, coverageStartDate, readiness.as_of_date]
+  );
+  if (Number(integrityResult.rows[0]?.invalid_count || 0) > 0) {
+    throw new FinanceStatementReadinessError(
+      "balance_sheet_journal_integrity_failed",
+      "Stored journal integrity checks failed inside the reviewed statement boundary. The Balance Sheet was not produced.",
+      409
+    );
+  }
+  const accountResult = await client.query(
+    `WITH totals AS (
+       SELECT line.chart_account_id,
+              COALESCE(SUM(line.debit_cents),0) AS debit_cents,
+              COALESCE(SUM(line.credit_cents),0) AS credit_cents
+         FROM finance_journal_lines line
+         JOIN finance_journal_entries entry
+           ON entry.company_id=line.company_id AND entry.id=line.entry_id
+        WHERE line.company_id=$1 AND entry.entry_date BETWEEN $2::date AND $3::date
+        GROUP BY line.chart_account_id
+     )
+     SELECT account.id AS chart_account_id, account.code, account.name, account.account_type,
+            account.active, COALESCE(totals.debit_cents,0) AS debit_cents,
+            COALESCE(totals.credit_cents,0) AS credit_cents
+       FROM finance_chart_accounts account
+       LEFT JOIN totals ON totals.chart_account_id=account.id
+      WHERE account.company_id=$1
+      ORDER BY account.id
+      LIMIT $4`,
+    [companyID, coverageStartDate, readiness.as_of_date, MAX_STATEMENT_ACCOUNTS + 1]
+  );
+  const summary = summarizeBalanceSheetRows(accountResult.rows, {
+    coverageStartDate,
+    asOfDate: readiness.as_of_date
+  });
+  return {
+    basis: "coverage_gated_accrual_double_entry",
+    statement: "balance_sheet",
+    title: "Balance Sheet",
+    timezone: readiness.timezone,
+    company_today: readiness.company_today,
+    coverage_start_date: coverageStartDate,
+    as_of_date: readiness.as_of_date,
+    currency: readiness.currency,
+    source_inventory_fingerprint: readiness.source_inventory_fingerprint,
+    local_close_id: readiness.period_close?.id || null,
+    local_close_version: readiness.period_close?.version || null,
+    rule_version: readiness.balance_sheet_rules?.profile?.version || null,
+    rule_evidence_fingerprint: readiness.balance_sheet_rules?.profile?.evidence_fingerprint || null,
+    earnings_treatment: BALANCE_SHEET_EARNINGS_TREATMENT,
+    sections: {
+      assets: summary.assets,
+      liabilities: summary.liabilities,
+      posted_equity: summary.posted_equity
+    },
+    summary: {
+      total_assets_cents: summary.total_assets_cents,
+      total_liabilities_cents: summary.total_liabilities_cents,
+      posted_equity_cents: summary.posted_equity_cents,
+      income_cents: summary.income_cents,
+      expense_cents: summary.expense_cents,
+      accumulated_earnings_cents: summary.accumulated_earnings_cents,
+      total_equity_cents: summary.total_equity_cents,
+      total_liabilities_and_equity_cents: summary.total_liabilities_and_equity_cents,
+      equation_difference_cents: summary.equation_difference_cents
+    },
+    warnings: [
+      "This is an unclassified, single-date Balance Sheet from exact posted journal authority inside the reviewed coverage boundary.",
+      "Accumulated Earnings Since Coverage Start combines income and expense accounts because WolfCRM has no reviewed fiscal-year or year-end closing authority. It is not labeled Retained Earnings or Current-Period Income and is never posted back to the ledger.",
+      "Accountant review is a company-recorded assertion, not WolfCRM audit assurance, GAAP certification, tax advice, or provider completeness. Cash Flow remains unavailable."
+    ]
+  };
+}
+
 function sendError(res, error, fallback) {
   if (error instanceof FinanceStatementReadinessError || error?.statusCode) {
     return res.status(error.statusCode || 400).json({
       error: error.code || fallback,
       message: error.message,
       current_version: error.current_version,
-      blockers: error.blockers
+      blockers: error.blockers,
+      difference_cents: error.difference_cents
     });
   }
   if (error?.code === "23505") return res.status(409).json({ error: "statement_coverage_conflict", message: "That statement coverage request already exists." });
@@ -1387,6 +1863,117 @@ export function installFinanceStatementReadinessRoutes({ app, pool, authRequired
       sendError(res, error, "statement_period_close_failed");
     } finally {
       client?.release();
+    }
+  });
+
+  app.put("/api/finance/accounting/statements/balance-sheet/rules", authRequired, requireFinanceAccess, async (req, res) => {
+    if (!req.companyId) return res.status(400).json({ error: "company_required", message: "Balance Sheet rules require a company workspace." });
+    await syncOperationalAccountingSources(pool, req.companyId);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, [`${req.companyId}|accounting`]);
+      const context = await loadCompanyContext(client, req.companyId);
+      const request = normalizeBalanceSheetRuleReviewRequest({ body: req.body, companyToday: context.company_today });
+      await ensureChartAccounts(client, req.companyId, req.userId);
+      const replay = await client.query(
+        `SELECT request_fingerprint FROM finance_balance_sheet_rule_audit
+          WHERE company_id=$1 AND client_request_id=$2::uuid FOR UPDATE`,
+        [req.companyId, request.client_request_id]
+      );
+      if (replay.rows.length) {
+        if (replay.rows[0].request_fingerprint !== request.request_fingerprint) {
+          throw new FinanceStatementReadinessError("balance_sheet_rule_request_conflict", "That request ID was already used with different content.", 409);
+        }
+        const payload = await loadStatementReadinessSnapshot(
+          client, req.companyId, request.as_of_date, req.query.audit_limit
+        );
+        await client.query("COMMIT");
+        return res.json({ replayed: true, ...payload });
+      }
+      const current = await loadBalanceSheetRuleProfile(client, req.companyId, { lock: true });
+      const currentVersion = Number(current?.version || 0);
+      if (request.expected_version !== currentVersion) {
+        throw new FinanceStatementReadinessError(
+          "balance_sheet_rule_stale",
+          "Balance Sheet presentation rules changed after they were loaded.",
+          409,
+          { current_version: currentVersion }
+        );
+      }
+      const chart = balanceSheetChartSnapshot(await loadBalanceSheetChart(client, req.companyId));
+      const chartFingerprint = statementReadinessFingerprint(chart);
+      const evidenceSnapshot = {
+        earnings_treatment: request.earnings_treatment,
+        accountant_reviewed_on: request.accountant_reviewed_on,
+        accountant_reference: request.accountant_reference,
+        accountant_review_confirmed: true,
+        chart_fingerprint: chartFingerprint,
+        chart
+      };
+      const evidenceFingerprint = statementReadinessFingerprint(evidenceSnapshot);
+      const nextVersion = currentVersion + 1;
+      const saved = (await client.query(
+        `INSERT INTO finance_balance_sheet_rule_profiles (
+           company_id, earnings_treatment, accountant_reviewed_on, accountant_reference,
+           accountant_review_confirmed, version, chart_fingerprint, evidence_fingerprint,
+           evidence_snapshot, reason, reviewed_by
+         ) VALUES ($1,$2,$3::date,$4,true,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT(company_id) DO UPDATE SET
+           earnings_treatment=EXCLUDED.earnings_treatment,
+           accountant_reviewed_on=EXCLUDED.accountant_reviewed_on,
+           accountant_reference=EXCLUDED.accountant_reference,
+           accountant_review_confirmed=true,
+           version=EXCLUDED.version,
+           chart_fingerprint=EXCLUDED.chart_fingerprint,
+           evidence_fingerprint=EXCLUDED.evidence_fingerprint,
+           evidence_snapshot=EXCLUDED.evidence_snapshot,
+           reason=EXCLUDED.reason,
+           reviewed_by=EXCLUDED.reviewed_by,
+           reviewed_at=now(), updated_at=now()
+         RETURNING *`,
+        [req.companyId, request.earnings_treatment, request.accountant_reviewed_on, request.accountant_reference,
+          nextVersion, chartFingerprint, evidenceFingerprint, JSON.stringify(evidenceSnapshot), request.reason, req.userId]
+      )).rows[0];
+      await client.query(
+        `INSERT INTO finance_balance_sheet_rule_audit (
+           company_id, actor_user_id, action, reason, version, client_request_id,
+           request_fingerprint, before_state, after_state
+         ) VALUES ($1,$2,$3,$4,$5,$6::uuid,$7,$8,$9)`,
+        [req.companyId, req.userId, current ? "balance_sheet_rules_replaced" : "balance_sheet_rules_reviewed",
+          request.reason, nextVersion, request.client_request_id, request.request_fingerprint,
+          current ? JSON.stringify(balanceSheetRuleProfileSnapshot(current)) : null,
+          JSON.stringify(balanceSheetRuleProfileSnapshot(saved))]
+      );
+      const payload = await loadStatementReadinessSnapshot(
+        client, req.companyId, request.as_of_date, req.query.audit_limit
+      );
+      await client.query("COMMIT");
+      res.json({ replayed: false, ...payload });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      sendError(res, error, "balance_sheet_rule_review_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/api/finance/accounting/statements/balance-sheet", authRequired, requireFinanceAccess, async (req, res) => {
+    if (!req.companyId) return res.status(400).json({ error: "company_required", message: "Balance Sheet requires a company workspace." });
+    await ensureChartAccounts(pool, req.companyId);
+    await syncOperationalAccountingSources(pool, req.companyId);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      const readiness = await loadStatementReadinessSnapshot(client, req.companyId, req.query.as_of_date, req.query.audit_limit);
+      const report = await loadBalanceSheetReport(client, req.companyId, readiness);
+      await client.query("COMMIT");
+      res.json(report);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      sendError(res, error, "balance_sheet_load_failed");
+    } finally {
+      client.release();
     }
   });
 }
