@@ -15,6 +15,7 @@ import {
   transactionPayloadFromPlaid
 } from "./finance-plaid-helpers.js";
 import { matchUnmatchedReceiptsForTransactions } from "./finance-receipt-matching.js";
+import { applyReceiptLifecycleTransitionInClient } from "./finance-receipt-lifecycle.js";
 
 const SANDBOX_INSTITUTION_IDS = new Set([
   "ins_109508",
@@ -411,6 +412,15 @@ function transactionPayload(row) {
     iso_currency_code: row.iso_currency_code,
     removed_at: row.removed_at,
     receipt_count: Number(row.receipt_count || 0),
+    accounting_note: row.accounting_note || null,
+    reconciliation_status: row.reconciliation_status || "unreconciled",
+    reconciled_at: row.reconciled_at || null,
+    reconciled_by: row.reconciled_by || null,
+    accounting_version: Number(row.accounting_version || 1),
+    accounting_updated_at: row.accounting_updated_at || null,
+    accounting_updated_by: row.accounting_updated_by || null,
+    accounting_split_count: Number(row.accounting_split_count || 0),
+    accounting_allocated_cents: Number(row.accounting_allocated_cents || 0),
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -640,19 +650,38 @@ async function removePlaidTransactionHistory(pool, companyId, userId, { accountI
     let receiptCount = 0;
     if (transactionIds.length) {
       const receipts = await client.query(
-        `UPDATE finance_receipts
-            SET transaction_id = NULL,
-                status = 'unmatched',
-                match_method = NULL,
-                match_confidence = NULL,
-                matched_at = NULL,
-                updated_at = now()
-          WHERE company_id = $1
-            AND transaction_id = ANY($2::uuid[])
-          RETURNING id`,
+        `SELECT * FROM finance_receipts
+          WHERE company_id=$1 AND transaction_id=ANY($2::uuid[])
+          ORDER BY id
+          FOR UPDATE`,
         [companyId, transactionIds]
       );
       receiptCount = receipts.rows.length;
+      for (const receipt of receipts.rows) {
+        await applyReceiptLifecycleTransitionInClient(client, {
+          companyID: companyId,
+          actorUserID: userId || null,
+          auditAction: "provider_history_unmatched",
+          allowArchived: true,
+          allowIncomplete: true,
+          preserveArchive: true,
+          request: {
+            receipt_id: receipt.id,
+            action: "unmatch",
+            client_request_id: null,
+            expected_lifecycle_version: Number(receipt.lifecycle_version || 1),
+            reason: "Receipt detached because its Plaid transaction history was removed.",
+            transaction_id: null,
+            method: null,
+            confidence_score: null,
+            account_id: null,
+            expected_account_balance_cents: null,
+            amount_cents: null,
+            finance_category: null,
+            request_fingerprint: null
+          }
+        });
+      }
       await client.query(`DELETE FROM finance_receipt_matches WHERE company_id = $1 AND transaction_id = ANY($2::uuid[])`, [companyId, transactionIds]);
       await client.query(`DELETE FROM finance_transaction_provider_refs WHERE company_id = $1 AND transaction_id = ANY($2::uuid[])`, [companyId, transactionIds]);
       await client.query(`DELETE FROM finance_recurring_candidate_transactions WHERE company_id = $1 AND transaction_id = ANY($2::uuid[])`, [companyId, transactionIds]);
@@ -972,6 +1001,38 @@ async function markRemovedTransaction(client, companyId, providerTransactionId) 
       WHERE id = $1 AND company_id = $2`,
     [ref.rows[0].transaction_id, companyId]
   );
+  const receipts = await client.query(
+    `SELECT * FROM finance_receipts
+      WHERE company_id=$1 AND transaction_id=$2
+      ORDER BY id
+      FOR UPDATE`,
+    [companyId, ref.rows[0].transaction_id]
+  );
+  for (const receipt of receipts.rows) {
+    await applyReceiptLifecycleTransitionInClient(client, {
+      companyID: companyId,
+      actorUserID: null,
+      auditAction: "provider_history_unmatched",
+      allowArchived: true,
+      allowIncomplete: true,
+      preserveArchive: true,
+      request: {
+        receipt_id: receipt.id,
+        action: "unmatch",
+        client_request_id: null,
+        expected_lifecycle_version: Number(receipt.lifecycle_version || 1),
+        reason: "Receipt detached because Plaid removed its matched transaction.",
+        transaction_id: null,
+        method: null,
+        confidence_score: null,
+        account_id: null,
+        expected_account_balance_cents: null,
+        amount_cents: null,
+        finance_category: null,
+        request_fingerprint: null
+      }
+    });
+  }
   await client.query(`UPDATE finance_transaction_provider_refs SET is_current = false WHERE id = $1`, [ref.rows[0].id]);
 }
 
@@ -1390,6 +1451,28 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
         conditions.push(`t.direction = $${values.length}`);
       } else if (filter === "pending") {
         conditions.push("t.pending = true");
+      } else if (filter === "unclassified") {
+        conditions.push("t.pending = false");
+        conditions.push("t.status = 'posted'");
+        conditions.push(`(
+          COALESCE((
+            SELECT SUM(s.amount_cents)
+              FROM finance_transaction_splits s
+             WHERE s.company_id = t.company_id AND s.transaction_id = t.id
+          ), 0) <> t.amount_cents
+          OR EXISTS (
+            SELECT 1
+              FROM finance_transaction_splits s
+              JOIN finance_chart_accounts c
+                ON c.id = s.chart_account_id AND c.company_id = s.company_id
+             WHERE s.company_id = t.company_id
+               AND s.transaction_id = t.id
+               AND (
+                 (t.direction = 'income' AND c.account_type NOT IN ('income','asset','liability','equity'))
+                 OR (t.direction = 'expense' AND c.account_type NOT IN ('expense','asset','liability','equity'))
+               )
+          )
+        )`);
       } else if (filter === "missing_receipt") {
         conditions.push("t.direction = 'expense'");
         conditions.push("t.pending = false");
@@ -1398,7 +1481,9 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
       values.push(limit, offset);
       const { rows } = await pool.query(
         `SELECT t.*, a.name AS account_name, a.institution_name,
-                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count
+                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count,
+                (SELECT COUNT(*)::int FROM finance_transaction_splits s WHERE s.company_id = t.company_id AND s.transaction_id = t.id) AS accounting_split_count,
+                (SELECT COALESCE(SUM(s.amount_cents), 0) FROM finance_transaction_splits s WHERE s.company_id = t.company_id AND s.transaction_id = t.id) AS accounting_allocated_cents
            FROM finance_transactions t
            JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
           WHERE ${conditions.join(" AND ")}
@@ -1417,7 +1502,9 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
     try {
       const { rows } = await pool.query(
         `SELECT t.*, a.name AS account_name, a.institution_name,
-                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count
+                (SELECT COUNT(*)::int FROM finance_receipts r WHERE r.company_id = t.company_id AND r.transaction_id = t.id AND r.archived_at IS NULL) AS receipt_count,
+                (SELECT COUNT(*)::int FROM finance_transaction_splits s WHERE s.company_id = t.company_id AND s.transaction_id = t.id) AS accounting_split_count,
+                (SELECT COALESCE(SUM(s.amount_cents), 0) FROM finance_transaction_splits s WHERE s.company_id = t.company_id AND s.transaction_id = t.id) AS accounting_allocated_cents
            FROM finance_transactions t
            JOIN finance_accounts a ON a.id = t.account_id AND a.company_id = t.company_id
           WHERE t.id = $1 AND t.company_id = $2`,

@@ -8,6 +8,10 @@ import { installPlaidRoutes, installPlaidSchema } from "./finance-plaid.js";
 import { totalEffectiveLiquidCashCents } from "./finance-plaid-helpers.js";
 import { installReceiptRoutes, installReceiptSchema } from "./finance-receipts.js";
 import { installFinanceAIRoutes, installFinanceAISchema } from "./finance-ai.js";
+import {
+  installFinanceAccountingRoutes,
+  installFinanceAccountingSchema
+} from "./finance-accounting.js";
 
 const VALID_ACCOUNT_TYPES = new Set(["cash", "checking", "savings", "other"]);
 const VALID_CURRENCIES = new Set(["usd"]);
@@ -481,6 +485,7 @@ async function installFinanceSchema(pool) {
   await installPlaidSchema(pool);
   await installReceiptSchema(pool);
   await installFinanceAISchema(pool);
+  await installFinanceAccountingSchema(pool);
 }
 
 function requireCompany(req, res) {
@@ -913,7 +918,7 @@ export function buildGoalsSummary(goals, startDate = todayDateString()) {
   };
 }
 
-export async function installFinanceSystem({ app, pool, authRequired, requireEmployer }) {
+export async function installFinanceSystem({ app, pool, authRequired, requireEmployer, getStripe }) {
   if (!app || !pool || !authRequired || !requireEmployer) {
     throw new Error("finance_installer_missing_dependencies");
   }
@@ -2015,4 +2020,5 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
   installPlaidRoutes({ app, pool, authRequired, requireEmployer });
   installReceiptRoutes({ app, pool, authRequired, requireEmployer });
   installFinanceAIRoutes({ app, pool, authRequired, requireEmployer });
+  installFinanceAccountingRoutes({ app, pool, authRequired, requireEmployer, getStripe });
 }

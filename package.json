@@ -1,18 +1,29 @@
 {
   "name": "wolfcrm-backend",
   "version": "1.1.0",
-  "_codexTouch": "Receipt automation metadata marker; no runtime behavior.",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "NODE_ENV=development nodemon index.js",
-    "test": "npm run test:finance && npm run test:google-sheets && npm run test:imessage",
+    "test": "npm run test:permissions && npm run test:navigation-tabs && npm run test:dashboard-layout && npm run test:schedule-team && npm run test:on-my-way && npm run test:weather && npm run test:assignment-recommendations && npm run test:smart-contact-lists && npm run test:business-exceptions && npm run test:sales-analytics && npm run test:routing && npm run test:finance && npm run test:google-sheets && npm run test:imessage",
     "test:automation-core": "node tests/automation-core.integration.js",
     "test:automation": "npm run test:automation-core",
-    "test:finance": "node tests/finance-projection.test.js && node tests/finance-planning.test.js && node tests/finance-plaid.test.js && node tests/finance-receipts.test.js && node tests/finance-ai.test.js",
+    "test:finance": "node tests/finance-projection.test.js && node tests/finance-planning.test.js && node tests/finance-plaid.test.js && node tests/finance-receipts.test.js && node tests/finance-accounting.test.js && node tests/finance-general-ledger.test.js && node tests/finance-bank-sources.test.js && node tests/finance-bank-transfers.test.js && node tests/finance-operational-accounting.test.js && node tests/finance-operational-journals.test.js && node tests/finance-operational-applications.test.js && node tests/finance-stripe-settlements.test.js && node tests/finance-statement-readiness.test.js && node tests/finance-cost-allocations.test.js && node tests/finance-mileage-allocations.test.js && node tests/pay-structures.test.js && node tests/finance-payroll-costs.test.js && node tests/finance-payroll-authority.test.js && node tests/finance-payroll-evaluation.test.js && node tests/finance-payroll-journals.test.js && node tests/finance-ai.test.js",
+    "test:finance-receipts-schema": "node tests/finance-receipts-schema.integration.test.js",
     "test:google-sheets": "node tests/google-sheets.test.js",
-    "test:imessage": "node tests/imessage.test.js"
+    "test:imessage": "node tests/imessage.test.js",
+    "test:routing": "node tests/google-routing.test.js",
+    "test:permissions": "node tests/permissions.test.js",
+    "test:navigation-tabs": "node --test tests/navigation-tabs.test.js",
+    "test:dashboard-layout": "node --test tests/dashboard-layout.test.js",
+    "test:schedule-team": "node --test tests/schedule-team.test.js",
+    "test:on-my-way": "node --test tests/on-my-way.test.js",
+    "test:weather": "node --test tests/weather-scheduling.test.js",
+    "test:assignment-recommendations": "node --test tests/assignment-recommendations.test.js",
+    "test:smart-contact-lists": "node --test tests/smart-contact-lists.test.js",
+    "test:business-exceptions": "node --test tests/business-exceptions.test.js",
+    "test:sales-analytics": "node --test tests/sales-analytics.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",
@@ -24,7 +35,8 @@
     "pg": "^8.11.3",
     "plaid": "^45.0.0",
     "stripe": "^17.5.0",
-    "twilio": "^6.0.2"
+    "twilio": "^6.0.2",
+    "tz-lookup": "^6.1.25"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

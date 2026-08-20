@@ -83,7 +83,9 @@ await run("wrong key fails", () => {
 await run("modified ciphertext fails authentication", () => {
   const env = { FINANCE_TOKEN_ENCRYPTION_KEY: keyA };
   const encrypted = encryptAccessToken("secret-token", env);
-  encrypted.access_token_ciphertext = encrypted.access_token_ciphertext.replace(/.$/, "A");
+  const ciphertext = Buffer.from(encrypted.access_token_ciphertext, "base64");
+  ciphertext[0] ^= 0x01;
+  encrypted.access_token_ciphertext = ciphertext.toString("base64");
   assert.throws(() => decryptAccessToken(encrypted, env));
 });
 
@@ -415,4 +417,14 @@ await run("pagination retry guard works", async () => {
     }, "cursor", 1),
     /mutation/
   );
+});
+
+await run("provider transaction and history removals audit receipt unmatches", () => {
+  const removedTransaction = financePlaidSource.match(/async function markRemovedTransaction[\s\S]*?export async function syncPlaidTransactions/)?.[0] || "";
+  assert.match(removedTransaction, /applyReceiptLifecycleTransitionInClient/);
+  assert.match(removedTransaction, /auditAction: "provider_history_unmatched"/);
+  assert.match(removedTransaction, /preserveArchive: true/);
+  const historyRemoval = financePlaidSource.match(/async function removePlaidTransactionHistory[\s\S]*?async function getPlaidItem/)?.[0] || "";
+  assert.match(historyRemoval, /applyReceiptLifecycleTransitionInClient/);
+  assert.ok(historyRemoval.indexOf("applyReceiptLifecycleTransitionInClient") < historyRemoval.indexOf("DELETE FROM finance_receipt_matches"));
 });

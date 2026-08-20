@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { installReceiptSchema } from "../finance-receipts.js";
 
-// Maintenance touchpoint for receipt schema automation tracking; intentionally runtime-neutral.
 const { Pool } = pg;
 const connectionString = process.env.TEST_DATABASE_URL;
 
@@ -51,10 +50,7 @@ async function inSchema(schema, work) {
 async function createPrerequisites(client, transactionIndexDefinition = "") {
   await client.query(`
     CREATE TABLE companies (id UUID PRIMARY KEY);
-    CREATE TABLE users (
-      id UUID PRIMARY KEY,
-      company_id UUID REFERENCES companies(id)
-    );
+    CREATE TABLE users (id UUID PRIMARY KEY, company_id UUID REFERENCES companies(id));
     CREATE TABLE finance_transactions (
       id UUID PRIMARY KEY,
       company_id UUID NOT NULL REFERENCES companies(id)
@@ -63,11 +59,7 @@ async function createPrerequisites(client, transactionIndexDefinition = "") {
   `);
 }
 
-async function createPartiallyMigratedReceiptTable(
-  client,
-  indexDefinition,
-  transactionIndexDefinition = ""
-) {
+async function createPartiallyMigratedReceiptTable(client, indexDefinition, transactionIndexDefinition = "") {
   await createPrerequisites(client, transactionIndexDefinition);
   await client.query(`
     CREATE TABLE finance_receipts (
@@ -93,11 +85,11 @@ async function createPartiallyMigratedReceiptTable(
   return { companyID, receiptID };
 }
 
-async function exactCompositeUniqueIndexCount(client) {
+async function exactCompositeUniqueIndexCount(client, tableName) {
   const result = await client.query(`
     SELECT count(*)::INTEGER AS count
       FROM pg_index candidate
-     WHERE candidate.indrelid='finance_receipts'::REGCLASS
+     WHERE candidate.indrelid=$1::REGCLASS
        AND candidate.indisunique AND candidate.indisvalid AND candidate.indisready
        AND candidate.indpred IS NULL AND candidate.indexprs IS NULL
        AND candidate.indnkeyatts=2
@@ -109,8 +101,16 @@ async function exactCompositeUniqueIndexCount(client) {
              ON attribute.attrelid=candidate.indrelid AND attribute.attnum=key_column.attnum
           WHERE key_column.ordinality <= candidate.indnkeyatts
        ) = ARRAY['company_id','id']::TEXT[]
-  `);
+  `, [tableName]);
   return result.rows[0].count;
+}
+
+async function assertReceiptPreserved(client, fixture) {
+  const preserved = await client.query(
+    "SELECT merchant_name FROM finance_receipts WHERE id=$1 AND company_id=$2",
+    [fixture.receiptID, fixture.companyID]
+  );
+  assert.deepEqual(preserved.rows, [{ merchant_name: "preserve-me" }]);
 }
 
 try {
@@ -126,12 +126,9 @@ try {
       [receiptID, companyID]
     );
     await installReceiptSchema(client);
-    assert.equal(await exactCompositeUniqueIndexCount(client), 1);
-    const preserved = await client.query(
-      "SELECT merchant_name FROM finance_receipts WHERE id=$1 AND company_id=$2",
-      [receiptID, companyID]
-    );
-    assert.deepEqual(preserved.rows, [{ merchant_name: "preserve-me" }]);
+    assert.equal(await exactCompositeUniqueIndexCount(client, "finance_receipts"), 1);
+    assert.equal(await exactCompositeUniqueIndexCount(client, "finance_transactions"), 1);
+    await assertReceiptPreserved(client, { companyID, receiptID });
   });
 
   const equivalentSchema = await createSchema("equivalent_index");
@@ -143,18 +140,15 @@ try {
     );
     await installReceiptSchema(client);
     await installReceiptSchema(client);
-    assert.equal(await exactCompositeUniqueIndexCount(client), 1);
+    assert.equal(await exactCompositeUniqueIndexCount(client, "finance_receipts"), 1);
+    assert.equal(await exactCompositeUniqueIndexCount(client, "finance_transactions"), 1);
     const namedConstraint = await client.query(`
       SELECT 1 FROM pg_constraint
        WHERE conrelid='finance_receipts'::REGCLASS
          AND conname='finance_receipts_company_id_id_unique'
     `);
     assert.equal(namedConstraint.rowCount, 0);
-    const preserved = await client.query(
-      "SELECT merchant_name FROM finance_receipts WHERE id=$1 AND company_id=$2",
-      [fixture.receiptID, fixture.companyID]
-    );
-    assert.deepEqual(preserved.rows, [{ merchant_name: "preserve-me" }]);
+    await assertReceiptPreserved(client, fixture);
   });
 
   const collisionSchema = await createSchema("name_collision");
@@ -166,7 +160,8 @@ try {
     );
     await installReceiptSchema(client);
     await installReceiptSchema(client);
-    assert.equal(await exactCompositeUniqueIndexCount(client), 1);
+    assert.equal(await exactCompositeUniqueIndexCount(client, "finance_receipts"), 1);
+    assert.equal(await exactCompositeUniqueIndexCount(client, "finance_transactions"), 1);
     const alternative = await client.query(`
       SELECT conname FROM pg_constraint
        WHERE conrelid='finance_receipts'::REGCLASS AND contype='u'
@@ -179,11 +174,7 @@ try {
          AND indisunique AND indnkeyatts=2
     `);
     assert.match(transactionAlternative.rows[0].index_name, /^finance_transactions_company_id_key_\d+$/);
-    const preserved = await client.query(
-      "SELECT merchant_name FROM finance_receipts WHERE id=$1 AND company_id=$2",
-      [fixture.receiptID, fixture.companyID]
-    );
-    assert.deepEqual(preserved.rows, [{ merchant_name: "preserve-me" }]);
+    await assertReceiptPreserved(client, fixture);
   });
 
   console.log("PASS finance receipt schema integration (fresh, repeated, equivalent index, name collision, data preservation)");

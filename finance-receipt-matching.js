@@ -1,3 +1,5 @@
+import { executeReceiptLifecycleTransition } from "./finance-receipt-lifecycle.js";
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export function normalizeMerchantName(value) {
@@ -145,19 +147,28 @@ export async function matchUnmatchedReceiptsForTransactions(pool, companyId, tra
     const candidates = await findReceiptCandidates(pool, companyId, receipt, { limit: 5 });
     const decision = chooseReceiptMatch(receipt, candidates.map((candidate) => candidate.transaction));
     if (decision.autoMatch) {
-      await pool.query(
-        `UPDATE finance_receipts
-            SET transaction_id = $3, status = 'matched', match_method = 'auto',
-                match_confidence = $4, matched_at = now(), updated_at = now()
-          WHERE id = $1 AND company_id = $2 AND transaction_id IS NULL`,
-        [receipt.id, companyId, decision.best.transaction.id, decision.best.score]
-      );
-      await pool.query(
-        `INSERT INTO finance_receipt_matches(company_id, receipt_id, transaction_id, method, confidence_score, was_selected)
-         VALUES($1,$2,$3,'auto',$4,true)`,
-        [companyId, receipt.id, decision.best.transaction.id, decision.best.score]
-      );
-      matched += 1;
+      const result = await executeReceiptLifecycleTransition(pool, {
+        companyID: companyId,
+        actorUserID: null,
+        auditAction: "auto_matched",
+        allowNoop: true,
+        request: {
+          receipt_id: receipt.id,
+          action: "match",
+          client_request_id: null,
+          expected_lifecycle_version: Number(receipt.lifecycle_version || 1),
+          reason: "Receipt automatically matched after transaction synchronization.",
+          transaction_id: decision.best.transaction.id,
+          method: "auto",
+          confidence_score: decision.best.score,
+          account_id: null,
+          expected_account_balance_cents: null,
+          amount_cents: null,
+          finance_category: null,
+          request_fingerprint: null
+        }
+      });
+      if (!result.noop) matched += 1;
     } else if (candidates.length) {
       await pool.query(
         `UPDATE finance_receipts SET status = 'possible_match', match_confidence = $3, updated_at = now()

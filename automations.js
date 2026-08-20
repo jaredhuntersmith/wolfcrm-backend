@@ -55,7 +55,7 @@ const CORE_TRIGGERS = new Set([
   "manual",
   "contact.created", "contact.updated", "contact.tag_added", "contact.tag_removed",
   "pipeline.stage_changed", "pipeline.won", "pipeline.lost",
-  "job.created", "job.completed",
+  "job.created", "job.completed", "weather.job_at_risk",
   "task.due",
   "sms.received", "sms.reply_received",
   "imessage.received", "imessage.sent", "imessage.delivered", "imessage.failed",
@@ -250,6 +250,7 @@ const triggerCatalog = [
   ["job.created_from_map", "Job Created from Map", "Schedule & Jobs", "A job was created from map context.", ["job"], ["job.created_from_map"]],
   ["job.created_manually", "Job Created Manually", "Schedule & Jobs", "A job was manually created.", ["job"], ["job.created_manually"]],
   ["job.created_by_automation", "Job Created by Automation", "Schedule & Jobs", "A job was created by an automation action.", ["job"], ["job.created_by_automation"]],
+  ["weather.job_at_risk", "Job Weather Risk Detected", "Schedule & Jobs", "An upcoming outdoor job crossed company weather-risk thresholds.", ["job"], ["weather.job_at_risk"]],
   ["sms.received", "SMS Received", "Phone", "An inbound SMS/MMS was received.", ["sms_conversation", "contact"], ["sms.received"]],
   ["sms.sent", "SMS Sent", "Phone", "An SMS/MMS was sent.", ["sms_conversation", "contact"], ["sms.sent"]],
   ["sms.delivered", "SMS Delivered", "Cellular Messaging", "Twilio reported an outbound message delivered.", ["sms_message", "sms_conversation", "contact"], ["sms.delivered"]],
@@ -7572,7 +7573,7 @@ async function executePaymentRecordManual(run, node, config) {
   const amount = intOrNull(resolveTemplate(config.amount_cents || "", context));
   if (!amount || amount < 1) throw new Error("payment_amount_required");
   const owner = await resolveCompanyUser(run.company_id, config.user_id);
-  const row = (await ctx.pool.query(`INSERT INTO payment_records(user_id, company_id, created_by_user_id, contact_id, payment_type, status, amount_cents, currency, description) VALUES($1,$2,$1,$3,'manual','succeeded',$4,$5,$6) RETURNING *`, [owner, run.company_id, contactId, amount, (config.currency || "usd").toLowerCase(), resolveTemplate(config.description || "Manual payment", context)])).rows[0];
+  const row = (await ctx.pool.query(`INSERT INTO payment_records(user_id, company_id, created_by_user_id, contact_id, payment_type, status, amount_cents, currency, description, paid_at, refund_amount_known) VALUES($1,$2,$1,$3,'manual','succeeded',$4,$5,$6,now(),true) RETURNING *`, [owner, run.company_id, contactId, amount, (config.currency || "usd").toLowerCase(), resolveTemplate(config.description || "Manual payment", context)])).rows[0];
   await setRunVariable(run.id, `idempotency:${node.id}:payment_record_id`, row.id);
   await emitFinancialEvent(run, node, "payment.succeeded", "payment", row.id, paymentPayload(row));
   return { payment_record_id: row.id, amount_cents: amount, status: row.status };

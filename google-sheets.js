@@ -1066,8 +1066,8 @@ async function handleOAuthCallback(pool, query, env = process.env) {
   return rows[0];
 }
 
-export function installGoogleSheetsSystem({ app, pool, authRequired, requireEmployer, env = process.env }) {
-  app.get("/api/integrations/google-sheets/status", authRequired, async (req, res) => {
+export function installGoogleSheetsSystem({ app, pool, authRequired, requireEmployer, requireIntegrationView = requireEmployer, env = process.env }) {
+  app.get("/api/integrations/google-sheets/status", authRequired, requireIntegrationView, async (req, res) => {
     try {
       if (!req.companyId) return res.status(400).json({ error: "company_required" });
       res.json(serializeConnection(await loadConnection(pool, req.companyId)));
@@ -1096,7 +1096,7 @@ export function installGoogleSheetsSystem({ app, pool, authRequired, requireEmpl
     }
   });
 
-  app.get("/api/integrations/google-sheets/tabs", authRequired, async (req, res) => {
+  app.get("/api/integrations/google-sheets/tabs", authRequired, requireIntegrationView, async (req, res) => {
     try {
       if (!req.companyId) return res.status(400).json({ error: "company_required" });
       const connection = await loadConnection(pool, req.companyId);
