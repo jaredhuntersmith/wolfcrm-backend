@@ -39,6 +39,7 @@ import {
   failStripeWebhookEvent,
   normalizeStripeRefundState
 } from "./finance-operational-accounting.js";
+import { captureStripeRefundEvidence } from "./finance-stripe-settlements.js";
 import {
   installGoogleSheetsSchema,
   installGoogleSheetsSystem,
@@ -16591,31 +16592,42 @@ app.post("/stripe/webhook", async (req, res) => {
       const providerRefunded = Number(charge.amount_refunded || 0);
       if (!Number.isSafeInteger(providerRefunded) || providerRefunded < 0) return [];
       const refunded = await pool.query(
-        `UPDATE payment_records
-            SET refunded_amount_cents = GREATEST(refunded_amount_cents, LEAST(amount_cents, $2::bigint)),
+        `WITH candidate AS (
+           SELECT id, refunded_amount_cents AS previous_refunded_amount_cents
+             FROM payment_records
+            WHERE stripe_payment_intent_id = $1
+              AND stripe_connected_account_id IS NOT DISTINCT FROM $6
+            FOR UPDATE
+         ), updated AS (
+           UPDATE payment_records payment
+            SET refunded_amount_cents = GREATEST(payment.refunded_amount_cents, LEAST(payment.amount_cents, $2::bigint)),
                 refund_amount_known = true,
                 status = CASE
-                  WHEN $3::boolean OR GREATEST(refunded_amount_cents, LEAST(amount_cents, $2::bigint)) >= amount_cents THEN 'refunded'
-                  WHEN GREATEST(refunded_amount_cents, LEAST(amount_cents, $2::bigint)) > 0 THEN 'partially_refunded'
-                  ELSE status
+                  WHEN $3::boolean OR GREATEST(payment.refunded_amount_cents, LEAST(payment.amount_cents, $2::bigint)) >= payment.amount_cents THEN 'refunded'
+                  WHEN GREATEST(payment.refunded_amount_cents, LEAST(payment.amount_cents, $2::bigint)) > 0 THEN 'partially_refunded'
+                  ELSE payment.status
                 END,
                 refunded_at = CASE
-                  WHEN LEAST(amount_cents, $2::bigint) >= refunded_amount_cents
-                    THEN GREATEST(COALESCE(refunded_at, $4), $4)
-                  ELSE refunded_at
+                  WHEN LEAST(payment.amount_cents, $2::bigint) >= payment.refunded_amount_cents
+                    THEN GREATEST(COALESCE(payment.refunded_at, $4), $4)
+                  ELSE payment.refunded_at
                 END,
-                stripe_charge_id = COALESCE($5, stripe_charge_id),
+                stripe_charge_id = COALESCE($5, payment.stripe_charge_id),
                 updated_at = now()
-          WHERE stripe_payment_intent_id = $1
-            AND stripe_connected_account_id IS NOT DISTINCT FROM $6
+           FROM candidate
+          WHERE payment.id = candidate.id
             AND (
-              refund_amount_known = false
-              OR LEAST(amount_cents, $2::bigint) > refunded_amount_cents
-              OR ($3::boolean AND status <> 'refunded')
-              OR (refunded_at IS NULL AND $4::timestamptz IS NOT NULL AND LEAST(amount_cents, $2::bigint) >= refunded_amount_cents)
+              payment.refund_amount_known = false
+              OR LEAST(payment.amount_cents, $2::bigint) > payment.refunded_amount_cents
+              OR ($3::boolean AND payment.status <> 'refunded')
+              OR (payment.refunded_at IS NULL AND $4::timestamptz IS NOT NULL AND LEAST(payment.amount_cents, $2::bigint) >= payment.refunded_amount_cents)
             )
-          RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency,
-                    status, refunded_amount_cents, job_id`,
+          RETURNING payment.id, payment.company_id, payment.contact_id, payment.service_plan_id,
+                    payment.amount_cents, payment.currency, payment.status, payment.refunded_amount_cents,
+                    payment.job_id, candidate.previous_refunded_amount_cents
+         )
+         SELECT *, refunded_amount_cents > previous_refunded_amount_cents AS cumulative_transition_observed
+           FROM updated`,
         [paymentIntentId, providerRefunded, Boolean(charge.refunded), eventOccurredAt, charge.id || null, connectedAccountId]
       );
       for (const rec of refunded.rows) {
@@ -16871,7 +16883,17 @@ app.post("/stripe/webhook", async (req, res) => {
         const chargeId = typeof refund.charge === "string" ? refund.charge : refund.charge?.id || null;
         if (chargeId) {
           const charge = await stripe.charges.retrieve(chargeId, {}, { stripeAccount: connectedAccountId || undefined });
-          await applyChargeRefund(charge);
+          const appliedRefunds = await applyChargeRefund(charge);
+          if (connectedAccountId) {
+            await captureStripeRefundEvidence(pool, {
+              connectedAccountID: connectedAccountId,
+              refund,
+              charge,
+              stripeEventID: event.id,
+              observedAt: eventOccurredAt,
+              observedCumulativeTransition: appliedRefunds.length === 1 && appliedRefunds[0].cumulative_transition_observed === true
+            });
+          }
         }
         break;
       }
@@ -16986,7 +17008,8 @@ async function startServer() {
     app,
     pool,
     authRequired,
-    requireEmployer: requireFinanceAccess
+    requireEmployer: requireFinanceAccess,
+    getStripe
   });
   await installGoogleSheetsSchema(pool);
   installGoogleSheetsSystem({

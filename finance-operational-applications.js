@@ -1237,6 +1237,24 @@ export function installFinanceOperationalApplicationRoutes({ app, pool, authRequ
     await syncOperationalAccountingSources(poolOrClient, companyID);
   }
 
+  async function assertApplicationMutationUnsettled(client, companyID, application, action, sourceCurrent) {
+    if (!application?.id || (action === "post" && sourceCurrent)) return;
+    const { rows } = await client.query(
+      `SELECT member.settlement_id
+         FROM finance_stripe_settlement_members member
+        WHERE member.company_id=$1 AND member.operational_application_id=$2 AND member.active
+        LIMIT 1 FOR SHARE`,
+      [companyID, application.id]
+    );
+    if (rows.length) {
+      throw new FinanceOperationalApplicationError(
+        "stripe_settlement_application_locked",
+        "Void the active Stripe settlement before replacing or voiding this payment/refund application.",
+        409
+      );
+    }
+  }
+
   app.get(basePath, authRequired, requireFinanceAccess, async (req, res) => {
     if (!req.companyId) return res.status(400).json({ error: "company_required", message: "Payment applications require a company workspace." });
     try {
@@ -1313,6 +1331,7 @@ export function installFinanceOperationalApplicationRoutes({ app, pool, authRequ
       }
       const bundle = await loadPaymentBundle(client, req.companyId, sourceID, allocation, true);
       if (Number(bundle.source.source_version) !== request.expected_source_version) throw new FinanceOperationalApplicationError("payment_source_stale", "The payment source changed after it was loaded.", 409);
+      await assertApplicationMutationUnsettled(client, req.companyId, bundle.application, action, bundle.evaluation.source_current);
       if (action === "post") {
         await commitApplication({ client, companyID: req.companyId, userID: req.userId, request, kind: "payment", bundle, identity: { operational_source_id: sourceID, job_id: bundle.source.job_id } });
       } else {
@@ -1345,6 +1364,7 @@ export function installFinanceOperationalApplicationRoutes({ app, pool, authRequ
       }
       const bundle = await loadRefundBundle(client, req.companyId, revisionID, allocation, true);
       if (Number(bundle.revision.version) !== request.expected_revision_version) throw new FinanceOperationalApplicationError("refund_revision_stale", "The refund revision changed after it was loaded.", 409);
+      await assertApplicationMutationUnsettled(client, req.companyId, bundle.application, action, bundle.evaluation.source_current);
       if (action === "post") {
         await commitApplication({ client, companyID: req.companyId, userID: req.userId, request, kind: "refund", bundle, identity: { refund_revision_id: revisionID, origin_application_id: bundle.origin?.id, job_id: bundle.origin?.job_id } });
       } else {

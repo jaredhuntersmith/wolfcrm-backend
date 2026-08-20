@@ -46,6 +46,10 @@ import {
   installFinanceOperationalApplicationRoutes,
   installFinanceOperationalApplicationSchema
 } from "./finance-operational-applications.js";
+import {
+  installFinanceStripeSettlementRoutes,
+  installFinanceStripeSettlementSchema
+} from "./finance-stripe-settlements.js";
 
 const ACCOUNT_TYPES = new Set(["asset", "liability", "equity", "income", "expense"]);
 const RECONCILIATION_STATUSES = new Set(["unreconciled", "cleared", "reconciled"]);
@@ -472,6 +476,7 @@ export async function installFinanceAccountingSchema(pool) {
   await installOperationalAccountingSchema(pool);
   await installFinanceOperationalJournalSchema(pool);
   await installFinanceOperationalApplicationSchema(pool);
+  await installFinanceStripeSettlementSchema(pool);
   await installFinanceCostAllocationSchema(pool);
   await installFinanceMileageAllocationSchema(pool);
   await installFinancePayrollCostSchema(pool);
@@ -606,7 +611,7 @@ function normalizeChartInput(body, existing = null) {
   return { code, name, account_type: accountType, subtype, description, active };
 }
 
-export function installFinanceAccountingRoutes({ app, pool, authRequired, requireEmployer }) {
+export function installFinanceAccountingRoutes({ app, pool, authRequired, requireEmployer, getStripe }) {
   app.get("/api/finance/accounting/chart-accounts", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
@@ -683,6 +688,7 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
       await ensureDefaultChartAccounts(client, req.companyId, req.userId);
       const txResult = await client.query(
         `SELECT * FROM finance_transactions WHERE company_id = $1 AND id = $2 FOR UPDATE`,
@@ -696,6 +702,18 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
         [req.companyId, req.params.id]
       );
       const update = normalizeAccountingUpdate({ body: req.body, transaction, chartAccounts: chartResult.rows });
+      const activeSettlement = await client.query(
+        `SELECT id FROM finance_stripe_settlements
+          WHERE company_id=$1 AND bank_transaction_id=$2 AND status='posted' FOR SHARE`,
+        [req.companyId, req.params.id]
+      );
+      if (activeSettlement.rows.length) {
+        throw accountingError(
+          "stripe_settlement_bank_accounting_locked",
+          "Void the active Stripe settlement before changing its bank transaction accounting or reconciliation.",
+          409
+        );
+      }
       const before = transactionAccountingSnapshot(transaction, existingSplits.rows);
 
       await client.query(`DELETE FROM finance_transaction_splits WHERE company_id = $1 AND transaction_id = $2`, [req.companyId, req.params.id]);
@@ -863,5 +881,13 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     authRequired,
     requireFinanceAccess: requireEmployer,
     ensureChartAccounts: ensureDefaultChartAccounts
+  });
+  installFinanceStripeSettlementRoutes({
+    app,
+    pool,
+    authRequired,
+    requireFinanceAccess: requireEmployer,
+    ensureChartAccounts: ensureDefaultChartAccounts,
+    getStripe
   });
 }

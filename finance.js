@@ -918,7 +918,7 @@ export function buildGoalsSummary(goals, startDate = todayDateString()) {
   };
 }
 
-export async function installFinanceSystem({ app, pool, authRequired, requireEmployer }) {
+export async function installFinanceSystem({ app, pool, authRequired, requireEmployer, getStripe }) {
   if (!app || !pool || !authRequired || !requireEmployer) {
     throw new Error("finance_installer_missing_dependencies");
   }
@@ -2020,5 +2020,5 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
   installPlaidRoutes({ app, pool, authRequired, requireEmployer });
   installReceiptRoutes({ app, pool, authRequired, requireEmployer });
   installFinanceAIRoutes({ app, pool, authRequired, requireEmployer });
-  installFinanceAccountingRoutes({ app, pool, authRequired, requireEmployer });
+  installFinanceAccountingRoutes({ app, pool, authRequired, requireEmployer, getStripe });
 }

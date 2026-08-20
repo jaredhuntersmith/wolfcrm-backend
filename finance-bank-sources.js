@@ -958,6 +958,7 @@ export function installFinanceBankSourceRoutes({ app, pool, authRequired, requir
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
       const accountID = uuid(req.params.accountId, "finance_account_id");
       const accountResult = await client.query(`SELECT * FROM finance_accounts WHERE company_id=$1 AND id=$2 FOR UPDATE`, [req.companyId, accountID]);
       const financeAccount = accountResult.rows[0];
@@ -986,6 +987,24 @@ export function installFinanceBankSourceRoutes({ app, pool, authRequired, requir
         currentMapping: current,
         chartAccounts: chart.rows
       });
+      if (input.changed) {
+        const activeSettlement = await client.query(
+          `SELECT settlement.id
+             FROM finance_stripe_settlements settlement
+             JOIN finance_transactions source
+               ON source.company_id=settlement.company_id AND source.id=settlement.bank_transaction_id
+            WHERE settlement.company_id=$1 AND source.account_id=$2 AND settlement.status='posted'
+            LIMIT 1 FOR SHARE OF settlement`,
+          [req.companyId, accountID]
+        );
+        if (activeSettlement.rows.length) {
+          throw new FinanceBankSourceError(
+            "stripe_settlement_bank_mapping_locked",
+            "Void active Stripe settlements on this Finance account before changing its ledger mapping.",
+            409
+          );
+        }
+      }
       const before = mappingSnapshot(current, current?.chart_account_id ? chart.rows.find((item) => String(item.id) === String(current.chart_account_id)) : null);
       let mapping;
       if (!current) {
