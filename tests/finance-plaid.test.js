@@ -418,3 +418,13 @@ await run("pagination retry guard works", async () => {
     /mutation/
   );
 });
+
+await run("provider transaction and history removals audit receipt unmatches", () => {
+  const removedTransaction = financePlaidSource.match(/async function markRemovedTransaction[\s\S]*?export async function syncPlaidTransactions/)?.[0] || "";
+  assert.match(removedTransaction, /applyReceiptLifecycleTransitionInClient/);
+  assert.match(removedTransaction, /auditAction: "provider_history_unmatched"/);
+  assert.match(removedTransaction, /preserveArchive: true/);
+  const historyRemoval = financePlaidSource.match(/async function removePlaidTransactionHistory[\s\S]*?async function getPlaidItem/)?.[0] || "";
+  assert.match(historyRemoval, /applyReceiptLifecycleTransitionInClient/);
+  assert.ok(historyRemoval.indexOf("applyReceiptLifecycleTransitionInClient") < historyRemoval.indexOf("DELETE FROM finance_receipt_matches"));
+});

@@ -15,6 +15,7 @@ import {
   transactionPayloadFromPlaid
 } from "./finance-plaid-helpers.js";
 import { matchUnmatchedReceiptsForTransactions } from "./finance-receipt-matching.js";
+import { applyReceiptLifecycleTransitionInClient } from "./finance-receipt-lifecycle.js";
 
 const SANDBOX_INSTITUTION_IDS = new Set([
   "ins_109508",
@@ -649,19 +650,38 @@ async function removePlaidTransactionHistory(pool, companyId, userId, { accountI
     let receiptCount = 0;
     if (transactionIds.length) {
       const receipts = await client.query(
-        `UPDATE finance_receipts
-            SET transaction_id = NULL,
-                status = 'unmatched',
-                match_method = NULL,
-                match_confidence = NULL,
-                matched_at = NULL,
-                updated_at = now()
-          WHERE company_id = $1
-            AND transaction_id = ANY($2::uuid[])
-          RETURNING id`,
+        `SELECT * FROM finance_receipts
+          WHERE company_id=$1 AND transaction_id=ANY($2::uuid[])
+          ORDER BY id
+          FOR UPDATE`,
         [companyId, transactionIds]
       );
       receiptCount = receipts.rows.length;
+      for (const receipt of receipts.rows) {
+        await applyReceiptLifecycleTransitionInClient(client, {
+          companyID: companyId,
+          actorUserID: userId || null,
+          auditAction: "provider_history_unmatched",
+          allowArchived: true,
+          allowIncomplete: true,
+          preserveArchive: true,
+          request: {
+            receipt_id: receipt.id,
+            action: "unmatch",
+            client_request_id: null,
+            expected_lifecycle_version: Number(receipt.lifecycle_version || 1),
+            reason: "Receipt detached because its Plaid transaction history was removed.",
+            transaction_id: null,
+            method: null,
+            confidence_score: null,
+            account_id: null,
+            expected_account_balance_cents: null,
+            amount_cents: null,
+            finance_category: null,
+            request_fingerprint: null
+          }
+        });
+      }
       await client.query(`DELETE FROM finance_receipt_matches WHERE company_id = $1 AND transaction_id = ANY($2::uuid[])`, [companyId, transactionIds]);
       await client.query(`DELETE FROM finance_transaction_provider_refs WHERE company_id = $1 AND transaction_id = ANY($2::uuid[])`, [companyId, transactionIds]);
       await client.query(`DELETE FROM finance_recurring_candidate_transactions WHERE company_id = $1 AND transaction_id = ANY($2::uuid[])`, [companyId, transactionIds]);
@@ -981,6 +1001,38 @@ async function markRemovedTransaction(client, companyId, providerTransactionId) 
       WHERE id = $1 AND company_id = $2`,
     [ref.rows[0].transaction_id, companyId]
   );
+  const receipts = await client.query(
+    `SELECT * FROM finance_receipts
+      WHERE company_id=$1 AND transaction_id=$2
+      ORDER BY id
+      FOR UPDATE`,
+    [companyId, ref.rows[0].transaction_id]
+  );
+  for (const receipt of receipts.rows) {
+    await applyReceiptLifecycleTransitionInClient(client, {
+      companyID: companyId,
+      actorUserID: null,
+      auditAction: "provider_history_unmatched",
+      allowArchived: true,
+      allowIncomplete: true,
+      preserveArchive: true,
+      request: {
+        receipt_id: receipt.id,
+        action: "unmatch",
+        client_request_id: null,
+        expected_lifecycle_version: Number(receipt.lifecycle_version || 1),
+        reason: "Receipt detached because Plaid removed its matched transaction.",
+        transaction_id: null,
+        method: null,
+        confidence_score: null,
+        account_id: null,
+        expected_account_balance_cents: null,
+        amount_cents: null,
+        finance_category: null,
+        request_fingerprint: null
+      }
+    });
+  }
   await client.query(`UPDATE finance_transaction_provider_refs SET is_current = false WHERE id = $1`, [ref.rows[0].id]);
 }
 

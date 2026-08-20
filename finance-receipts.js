@@ -2,9 +2,19 @@ import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID, createHash } from "node:crypto";
 import { chooseReceiptMatch, findReceiptCandidates, normalizeMerchantName } from "./finance-receipt-matching.js";
+import {
+  appendReceiptLifecycleAudit,
+  executeReceiptLifecycleTransition,
+  findReceiptLifecycleReplay,
+  legacyReceiptLifecycleRequest,
+  normalizeReceiptLifecycleRequest,
+  receiptLifecycleAuditPayload,
+  receiptLifecycleError,
+  receiptLifecycleFingerprint,
+  receiptLifecycleState
+} from "./finance-receipt-lifecycle.js";
 
 const VALID_STATUSES = new Set(["processing", "unmatched", "possible_match", "matched", "manually_matched", "cash_purchase", "processing_failed", "archived"]);
-const VALID_METHODS = new Set(["auto", "manual", "user_direct", "cash_purchase"]);
 const RECEIPT_BUSINESS_USES = new Set(["unknown", "business", "personal"]);
 const RECEIPT_DETAIL_FIELDS = [
   "merchant_name", "purchase_date", "purchase_time", "amount_cents", "subtotal_cents",
@@ -293,7 +303,9 @@ function receiptPayload(row) {
     transaction_amount_cents: row.transaction_amount_cents === null || row.transaction_amount_cents === undefined ? null : Number(row.transaction_amount_cents),
     account_name: row.account_name,
     institution_name: row.institution_name,
-    details_version: Number(row.details_version || 1)
+    details_version: Number(row.details_version || 1),
+    lifecycle_version: Number(row.lifecycle_version || 1),
+    archived_from_status: row.archived_from_status || null
   };
 }
 
@@ -340,6 +352,256 @@ function transactionPayload(row) {
     institution_name: row.institution_name,
     score: row.score
   };
+}
+
+export async function createReceiptCashPurchase({ pool, companyID, actorUserID, request }) {
+  if (request.action !== "cash_purchase") {
+    throw receiptLifecycleError("receipt_lifecycle_action_invalid", "Cash purchase action is invalid.");
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, [`${companyID}|receipt-lifecycle`]);
+    const replay = await findReceiptLifecycleReplay(client, companyID, request);
+    if (replay) {
+      const receipt = await loadReceiptWithContext(client, companyID, request.receipt_id);
+      const transactionID = replay.after_state?.transaction_id;
+      const transaction = transactionID
+        ? (await client.query(`SELECT * FROM finance_transactions WHERE id=$1 AND company_id=$2`, [transactionID, companyID])).rows[0]
+        : null;
+      if (!receipt || !transaction) {
+        throw receiptLifecycleError("receipt_cash_purchase_replay_invalid", "Cash purchase replay evidence is incomplete.", 409);
+      }
+      await client.query("COMMIT");
+      return {
+        replayed: true,
+        receipt,
+        transaction,
+        account_balance_cents: Number(replay.after_state?.account_balance_cents),
+        audit: replay
+      };
+    }
+
+    const receipt = await loadReceiptWithContext(client, companyID, request.receipt_id, { lock: true });
+    if (!receipt) throw receiptLifecycleError("finance_receipt_not_found", "Receipt was not found.", 404);
+    const currentVersion = Number(receipt.lifecycle_version || 1);
+    if (request.expected_lifecycle_version !== null && request.expected_lifecycle_version !== currentVersion) {
+      throw receiptLifecycleError(
+        "receipt_lifecycle_stale",
+        "Receipt lifecycle changed after it was loaded.",
+        409,
+        { current_version: currentVersion }
+      );
+    }
+    if (receipt.archived_at || receipt.status === "archived") {
+      throw receiptLifecycleError("receipt_lifecycle_archived", "Restore the receipt before creating a cash purchase.", 409);
+    }
+    if (!["unmatched", "possible_match"].includes(receipt.status) || receipt.transaction_id) {
+      throw receiptLifecycleError("receipt_cash_purchase_source_invalid", "Only an unmatched completed receipt can create a cash purchase.", 409);
+    }
+    if (!receipt.object_key) {
+      throw receiptLifecycleError("receipt_lifecycle_processing", "Finish or recover receipt capture before creating a cash purchase.", 409);
+    }
+    const sourceAmount = Number(receipt.amount_cents);
+    if (!Number.isSafeInteger(sourceAmount) || sourceAmount <= 0 || request.amount_cents !== sourceAmount) {
+      throw receiptLifecycleError("receipt_cash_purchase_amount_mismatch", "Cash purchase amount must equal the current receipt total.", 409);
+    }
+    const sourceCategory = cleanString(receipt.finance_category || "Other", 80) || "Other";
+    if (request.finance_category !== sourceCategory) {
+      throw receiptLifecycleError("receipt_cash_purchase_category_mismatch", "Save the receipt category before creating the cash purchase.", 409);
+    }
+    const account = (await client.query(
+      `SELECT * FROM finance_accounts
+        WHERE id=$1 AND company_id=$2 AND source='manual' AND account_type='cash' AND archived_at IS NULL
+        FOR UPDATE`,
+      [request.account_id, companyID]
+    )).rows[0];
+    if (!account) throw receiptLifecycleError("cash_account_required", "Choose an active cash account.");
+    const receiptCurrency = (receipt.currency || "usd").toString().toLowerCase();
+    const accountCurrency = (account.currency || "usd").toString().toLowerCase();
+    if (receiptCurrency !== accountCurrency) {
+      throw receiptLifecycleError("receipt_cash_purchase_currency_mismatch", "Receipt and cash account currencies must match.", 409);
+    }
+    const previous = Number(account.current_balance_cents || 0);
+    if (request.expected_account_balance_cents !== null
+      && request.expected_account_balance_cents !== undefined
+      && request.expected_account_balance_cents !== previous) {
+      throw receiptLifecycleError(
+        "receipt_cash_account_stale",
+        "Cash account balance changed after it was loaded.",
+        409,
+        { current_balance_cents: previous }
+      );
+    }
+    const nextBalance = previous - sourceAmount;
+    if (!Number.isSafeInteger(previous) || !Number.isSafeInteger(nextBalance)) {
+      throw receiptLifecycleError("receipt_cash_purchase_balance_invalid", "Cash account balance is outside the supported range.", 409);
+    }
+    const beforeState = receiptLifecycleState(receipt);
+    const transaction = (await client.query(
+      `INSERT INTO finance_transactions (
+         company_id, account_id, source, status, direction, amount_cents, transaction_date,
+         merchant_name, original_name, normalized_category, pending, iso_currency_code, provider_metadata
+       ) VALUES ($1,$2,'manual','posted','expense',$3,$4,$5,$5,$6,false,$7,$8)
+       RETURNING *`,
+      [companyID, request.account_id, sourceAmount,
+        receipt.purchase_date || new Date().toISOString().slice(0, 10),
+        receipt.merchant_name || "Cash Purchase", sourceCategory, receiptCurrency.toUpperCase(),
+        JSON.stringify({ receipt_id: request.receipt_id })]
+    )).rows[0];
+    await client.query(
+      `UPDATE finance_accounts SET current_balance_cents=$3, updated_at=now()
+        WHERE id=$1 AND company_id=$2`,
+      [request.account_id, companyID, nextBalance]
+    );
+    await client.query(
+      `INSERT INTO finance_account_entries(
+         company_id, account_id, entry_type, amount_delta_cents, previous_balance_cents,
+         resulting_balance_cents, currency, note, created_by
+       ) VALUES($1,$2,'receipt_cash_purchase',$3,$4,$5,$6,$7,$8)`,
+      [companyID, request.account_id, -sourceAmount, previous, nextBalance, accountCurrency,
+        `Receipt cash purchase: ${receipt.merchant_name || "Receipt"}`, actorUserID]
+    );
+    const nextVersion = currentVersion + 1;
+    if (!Number.isSafeInteger(nextVersion)) {
+      throw receiptLifecycleError("receipt_lifecycle_version_invalid", "Receipt lifecycle version is invalid.", 409);
+    }
+    const updated = (await client.query(
+      `UPDATE finance_receipts
+          SET transaction_id=$3, status='cash_purchase', match_method='cash_purchase',
+              match_confidence=100, matched_at=now(), lifecycle_version=$4, updated_at=now()
+        WHERE id=$1 AND company_id=$2
+        RETURNING *`,
+      [request.receipt_id, companyID, transaction.id, nextVersion]
+    )).rows[0];
+    await client.query(
+      `INSERT INTO finance_receipt_matches(
+         company_id, receipt_id, transaction_id, method, confidence_score, was_selected, created_by
+       ) VALUES($1,$2,$3,'cash_purchase',100,true,$4)`,
+      [companyID, request.receipt_id, transaction.id, actorUserID]
+    );
+    const afterState = receiptLifecycleState(updated, {
+      account_id: request.account_id,
+      account_balance_cents: nextBalance
+    });
+    const audit = await appendReceiptLifecycleAudit(client, {
+      companyID,
+      receiptID: request.receipt_id,
+      version: nextVersion,
+      actorUserID,
+      action: "cash_purchase_created",
+      reason: request.reason,
+      clientRequestID: request.client_request_id,
+      requestFingerprint: request.request_fingerprint || receiptLifecycleFingerprint(request),
+      beforeState,
+      afterState
+    });
+    await client.query("COMMIT");
+    return { replayed: false, receipt: updated, transaction, account_balance_cents: nextBalance, audit };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function replaceReceiptDetails({ pool, companyID, actorUserID, receiptID, body }) {
+  const request = normalizeReceiptDetailEditRequest({ body, receiptID });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, [`${companyID}|receipt-details`]);
+    const replay = await client.query(
+      `SELECT * FROM finance_receipt_detail_audit
+        WHERE company_id=$1 AND client_request_id=$2::uuid`,
+      [companyID, request.client_request_id]
+    );
+    if (replay.rows.length) {
+      const row = replay.rows[0];
+      if (String(row.receipt_id) !== request.receipt_id || row.request_fingerprint !== request.request_fingerprint) {
+        throw receiptRequestError(
+          "receipt_detail_request_conflict",
+          "That request ID was already used with different receipt details.",
+          409
+        );
+      }
+      const receipt = await loadReceiptWithContext(client, companyID, request.receipt_id);
+      await client.query("COMMIT");
+      return { replayed: true, receipt, audit: row };
+    }
+    const current = await loadReceiptWithContext(client, companyID, request.receipt_id, { lock: true });
+    if (!current) throw receiptRequestError("finance_receipt_not_found", "Receipt was not found.", 404);
+    if (current.archived_at || current.status === "archived") {
+      throw receiptRequestError("receipt_details_archived", "Archived receipt details cannot be changed.", 409);
+    }
+    if (current.status === "processing" || current.status === "processing_failed" || !current.object_key) {
+      throw receiptRequestError("receipt_details_processing", "Wait for receipt processing to finish before editing details.", 409);
+    }
+    if (current.status === "cash_purchase") {
+      throw receiptRequestError(
+        "receipt_details_cash_purchase_locked",
+        "Cash-purchase receipt details require a coordinated transaction correction workflow.",
+        409
+      );
+    }
+    const currentVersion = Number(current.details_version || 1);
+    if (request.expected_details_version !== currentVersion) {
+      throw receiptRequestError(
+        "receipt_details_stale",
+        "Receipt details changed after they were loaded.",
+        409,
+        { current_version: currentVersion }
+      );
+    }
+    const before = receiptDetailDocument(current);
+    const after = request.details;
+    const changedFields = receiptDetailChangedFields(before, after);
+    if (!changedFields.length) {
+      throw receiptRequestError("receipt_details_unchanged", "Change at least one receipt detail before saving.", 409);
+    }
+    const nextVersion = currentVersion + 1;
+    if (!Number.isSafeInteger(nextVersion)) {
+      throw receiptRequestError("receipt_details_version_invalid", "Receipt detail version is invalid.", 409);
+    }
+    const updated = (await client.query(
+      `UPDATE finance_receipts
+          SET merchant_name=$3, normalized_merchant_name=$4,
+              purchase_date=$5::date, purchase_time=$6::time,
+              amount_cents=$7, subtotal_cents=$8, tax_cents=$9, tip_cents=$10,
+              currency=$11, address=$12, city=$13, state=$14, postal_code=$15,
+              country=$16, payment_method_text=$17, card_last_four=$18,
+              finance_category=$19, business_use=$20, note=$21,
+              details_version=$22, updated_at=now()
+        WHERE id=$1 AND company_id=$2
+        RETURNING *`,
+      [
+        request.receipt_id, companyID, after.merchant_name,
+        after.merchant_name ? normalizeMerchantName(after.merchant_name) : null,
+        after.purchase_date, after.purchase_time, after.amount_cents, after.subtotal_cents,
+        after.tax_cents, after.tip_cents, after.currency, after.address, after.city,
+        after.state, after.postal_code, after.country, after.payment_method_text,
+        after.card_last_four, after.finance_category, after.business_use, after.note, nextVersion
+      ]
+    )).rows[0];
+    const audit = (await client.query(
+      `INSERT INTO finance_receipt_detail_audit (
+         company_id, receipt_id, version, actor_user_id, action, reason, changed_fields,
+         client_request_id, request_fingerprint, before_state, after_state
+       ) VALUES ($1,$2,$3,$4,'details_replaced',$5,$6,$7::uuid,$8,$9,$10)
+       RETURNING *`,
+      [companyID, request.receipt_id, nextVersion, actorUserID, request.reason, changedFields,
+        request.client_request_id, request.request_fingerprint,
+        JSON.stringify(receiptDetailAuditSnapshot(before)), JSON.stringify(receiptDetailAuditSnapshot(after))]
+    )).rows[0];
+    await client.query("COMMIT");
+    return { replayed: false, receipt: updated, audit };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 function receiptUpdatePayload(body) {
@@ -427,10 +689,29 @@ export async function installReceiptSchema(pool) {
 
     ALTER TABLE finance_receipts
       ADD COLUMN IF NOT EXISTS details_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE finance_receipts
+      ADD COLUMN IF NOT EXISTS lifecycle_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE finance_receipts
+      ADD COLUMN IF NOT EXISTS archived_from_status TEXT;
     DO $$
     BEGIN
       ALTER TABLE finance_receipts
         ADD CONSTRAINT finance_receipts_details_version_positive CHECK(details_version > 0);
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+    DO $$
+    BEGIN
+      ALTER TABLE finance_receipts
+        ADD CONSTRAINT finance_receipts_lifecycle_version_positive CHECK(lifecycle_version > 0);
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+    DO $$
+    BEGIN
+      ALTER TABLE finance_receipts
+        ADD CONSTRAINT finance_receipts_archived_from_status_check
+        CHECK(archived_from_status IS NULL OR archived_from_status IN (
+          'unmatched','possible_match','matched','manually_matched','cash_purchase','processing_failed'
+        ));
     EXCEPTION WHEN duplicate_object THEN NULL;
     END $$;
     DO $$
@@ -475,6 +756,30 @@ export async function installReceiptSchema(pool) {
     );
     CREATE INDEX IF NOT EXISTS finance_receipt_detail_audit_company_receipt_idx
       ON finance_receipt_detail_audit(company_id, receipt_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS finance_receipt_lifecycle_audit (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      receipt_id UUID NOT NULL,
+      version INTEGER NOT NULL CHECK (version > 1),
+      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL CHECK (action IN (
+        'matched','rematched','auto_matched','unmatched','provider_history_unmatched',
+        'archived','restored','cash_purchase_created'
+      )),
+      reason TEXT NOT NULL CHECK (char_length(reason) BETWEEN 1 AND 500),
+      client_request_id UUID,
+      request_fingerprint TEXT NOT NULL CHECK (char_length(request_fingerprint)=64),
+      before_state JSONB NOT NULL,
+      after_state JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, receipt_id, version),
+      UNIQUE(company_id, client_request_id),
+      FOREIGN KEY (company_id, receipt_id)
+        REFERENCES finance_receipts(company_id, id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS finance_receipt_lifecycle_audit_company_receipt_idx
+      ON finance_receipt_lifecycle_audit(company_id, receipt_id, created_at DESC);
   `);
 }
 
@@ -488,10 +793,11 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
       const offset = Math.max(Number(req.query.offset || 0), 0);
       const conditions = ["r.company_id = $1"];
       const values = [req.companyId];
-      if (filter === "unmatched") conditions.push("r.transaction_id IS NULL AND r.status IN ('unmatched','possible_match','processing_failed')");
-      else if (filter === "matched") conditions.push("r.transaction_id IS NOT NULL");
-      else if (filter === "cash") conditions.push("r.status = 'cash_purchase'");
-      else if (filter === "processing") conditions.push("r.status IN ('processing','processing_failed')");
+      if (filter === "unmatched") conditions.push("r.archived_at IS NULL AND r.transaction_id IS NULL AND r.status IN ('unmatched','possible_match','processing_failed')");
+      else if (filter === "matched") conditions.push("r.archived_at IS NULL AND r.transaction_id IS NOT NULL");
+      else if (filter === "cash") conditions.push("r.archived_at IS NULL AND r.status = 'cash_purchase'");
+      else if (filter === "processing") conditions.push("r.archived_at IS NULL AND r.status IN ('processing','processing_failed')");
+      else if (filter === "archived") conditions.push("r.archived_at IS NOT NULL AND r.status = 'archived'");
       else conditions.push("r.archived_at IS NULL");
       if (search) {
         values.push(`%${search.toLowerCase()}%`);
@@ -677,105 +983,77 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
     }
   });
 
+  app.get("/api/finance/receipts/:id/lifecycle-audit", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const receiptID = receiptUUID(req.params.id, "receipt_id");
+      const receipt = await pool.query(
+        `SELECT id FROM finance_receipts WHERE id=$1 AND company_id=$2`,
+        [receiptID, req.companyId]
+      );
+      if (!receipt.rows.length) {
+        return res.status(404).json({ error: "finance_receipt_not_found", message: "Receipt was not found." });
+      }
+      const requestedLimit = Number(req.query.limit ?? 50);
+      const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
+      const { rows } = await pool.query(
+        `SELECT audit.id, audit.receipt_id, audit.version, audit.action, audit.reason,
+                audit.before_state, audit.after_state, audit.actor_user_id,
+                actor.email AS actor_email, audit.created_at
+           FROM finance_receipt_lifecycle_audit audit
+           LEFT JOIN users actor
+             ON actor.id=audit.actor_user_id AND actor.company_id=audit.company_id
+          WHERE audit.company_id=$1 AND audit.receipt_id=$2
+          ORDER BY audit.created_at DESC, audit.id DESC LIMIT $3`,
+        [req.companyId, receiptID, limit]
+      );
+      res.json(rows.map(receiptLifecycleAuditPayload));
+    } catch (error) {
+      handleReceiptError(res, error, "finance_receipt_lifecycle_audit_failed");
+    }
+  });
+
+  app.post("/api/finance/receipts/:id/lifecycle", authRequired, requireEmployer, async (req, res) => {
+    if (!requireCompany(req, res)) return;
+    try {
+      const request = normalizeReceiptLifecycleRequest({ receiptID: req.params.id, body: req.body });
+      const result = request.action === "cash_purchase"
+        ? await createReceiptCashPurchase({ pool, companyID: req.companyId, actorUserID: req.userId, request })
+        : await executeReceiptLifecycleTransition(pool, {
+          companyID: req.companyId,
+          actorUserID: req.userId,
+          request
+        });
+      const receipt = await loadReceiptWithContext(pool, req.companyId, request.receipt_id);
+      res.json({
+        replayed: result.replayed,
+        receipt: receiptPayload(receipt),
+        audit: receiptLifecycleAuditPayload(result.audit),
+        transaction: result.transaction ? transactionPayload(result.transaction) : null,
+        account_balance_cents: result.account_balance_cents ?? null
+      });
+    } catch (error) {
+      handleReceiptError(res, error, "finance_receipt_lifecycle_update_failed");
+    }
+  });
+
   app.put("/api/finance/receipts/:id/details", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
-    let client;
     try {
-      const request = normalizeReceiptDetailEditRequest({ body: req.body, receiptID: req.params.id });
-      client = await pool.connect();
-      await client.query("BEGIN");
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, [`${req.companyId}|receipt-details`]);
-      const replay = await client.query(
-        `SELECT * FROM finance_receipt_detail_audit
-          WHERE company_id=$1 AND client_request_id=$2::uuid`,
-        [req.companyId, request.client_request_id]
-      );
-      if (replay.rows.length) {
-        const row = replay.rows[0];
-        if (String(row.receipt_id) !== request.receipt_id || row.request_fingerprint !== request.request_fingerprint) {
-          throw receiptRequestError(
-            "receipt_detail_request_conflict",
-            "That request ID was already used with different receipt details.",
-            409
-          );
-        }
-        const receipt = await loadReceiptWithContext(client, req.companyId, request.receipt_id);
-        await client.query("COMMIT");
-        return res.json({ replayed: true, receipt: receiptPayload(receipt), audit: receiptDetailAuditPayload(row) });
-      }
-      const current = await loadReceiptWithContext(client, req.companyId, request.receipt_id, { lock: true });
-      if (!current) {
-        throw receiptRequestError("finance_receipt_not_found", "Receipt was not found.", 404);
-      }
-      if (current.archived_at || current.status === "archived") {
-        throw receiptRequestError("receipt_details_archived", "Archived receipt details cannot be changed.", 409);
-      }
-      if (current.status === "processing" || current.status === "processing_failed" || !current.object_key) {
-        throw receiptRequestError("receipt_details_processing", "Wait for receipt processing to finish before editing details.", 409);
-      }
-      if (current.status === "cash_purchase") {
-        throw receiptRequestError(
-          "receipt_details_cash_purchase_locked",
-          "Cash-purchase receipt details require a coordinated transaction correction workflow.",
-          409
-        );
-      }
-      const currentVersion = Number(current.details_version || 1);
-      if (request.expected_details_version !== currentVersion) {
-        throw receiptRequestError(
-          "receipt_details_stale",
-          "Receipt details changed after they were loaded.",
-          409,
-          { current_version: currentVersion }
-        );
-      }
-      const before = receiptDetailDocument(current);
-      const after = request.details;
-      const changedFields = receiptDetailChangedFields(before, after);
-      if (!changedFields.length) {
-        throw receiptRequestError("receipt_details_unchanged", "Change at least one receipt detail before saving.", 409);
-      }
-      const nextVersion = currentVersion + 1;
-      if (!Number.isSafeInteger(nextVersion)) {
-        throw receiptRequestError("receipt_details_version_invalid", "Receipt detail version is invalid.", 409);
-      }
-      const updated = (await client.query(
-        `UPDATE finance_receipts
-            SET merchant_name=$3, normalized_merchant_name=$4,
-                purchase_date=$5::date, purchase_time=$6::time,
-                amount_cents=$7, subtotal_cents=$8, tax_cents=$9, tip_cents=$10,
-                currency=$11, address=$12, city=$13, state=$14, postal_code=$15,
-                country=$16, payment_method_text=$17, card_last_four=$18,
-                finance_category=$19, business_use=$20, note=$21,
-                details_version=$22, updated_at=now()
-          WHERE id=$1 AND company_id=$2
-          RETURNING *`,
-        [
-          request.receipt_id, req.companyId, after.merchant_name,
-          after.merchant_name ? normalizeMerchantName(after.merchant_name) : null,
-          after.purchase_date, after.purchase_time, after.amount_cents, after.subtotal_cents,
-          after.tax_cents, after.tip_cents, after.currency, after.address, after.city,
-          after.state, after.postal_code, after.country, after.payment_method_text,
-          after.card_last_four, after.finance_category, after.business_use, after.note, nextVersion
-        ]
-      )).rows[0];
-      const audit = (await client.query(
-        `INSERT INTO finance_receipt_detail_audit (
-           company_id, receipt_id, version, actor_user_id, action, reason, changed_fields,
-           client_request_id, request_fingerprint, before_state, after_state
-         ) VALUES ($1,$2,$3,$4,'details_replaced',$5,$6,$7::uuid,$8,$9,$10)
-         RETURNING *`,
-        [req.companyId, request.receipt_id, nextVersion, req.userId, request.reason, changedFields,
-          request.client_request_id, request.request_fingerprint,
-          JSON.stringify(receiptDetailAuditSnapshot(before)), JSON.stringify(receiptDetailAuditSnapshot(after))]
-      )).rows[0];
-      await client.query("COMMIT");
-      res.json({ replayed: false, receipt: receiptPayload(updated), audit: receiptDetailAuditPayload(audit) });
+      const result = await replaceReceiptDetails({
+        pool,
+        companyID: req.companyId,
+        actorUserID: req.userId,
+        receiptID: req.params.id,
+        body: req.body
+      });
+      res.json({
+        replayed: result.replayed,
+        receipt: receiptPayload(result.receipt),
+        audit: receiptDetailAuditPayload(result.audit)
+      });
     } catch (error) {
-      await client?.query("ROLLBACK").catch(() => {});
       handleReceiptError(res, error, "finance_receipt_detail_update_failed");
-    } finally {
-      client?.release();
     }
   });
 
@@ -849,20 +1127,29 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
         const candidates = await findReceiptCandidates(pool, req.companyId, rows[0]);
         const decision = chooseReceiptMatch(rows[0], candidates.map((candidate) => candidate.transaction));
         if (decision.autoMatch) {
-          const matched = await pool.query(
-            `UPDATE finance_receipts
-                SET transaction_id = $3, status = 'matched', match_method = 'auto',
-                    match_confidence = $4, matched_at = now(), updated_at = now()
-              WHERE id = $1 AND company_id = $2
-              RETURNING *`,
-            [req.params.id, req.companyId, decision.best.transaction.id, decision.best.score]
-          );
-          await pool.query(
-            `INSERT INTO finance_receipt_matches(company_id, receipt_id, transaction_id, method, confidence_score, was_selected, created_by)
-             VALUES($1,$2,$3,'auto',$4,true,$5)`,
-            [req.companyId, req.params.id, decision.best.transaction.id, decision.best.score, req.userId]
-          );
-          return res.json(receiptPayload(matched.rows[0]));
+          const matched = await executeReceiptLifecycleTransition(pool, {
+            companyID: req.companyId,
+            actorUserID: null,
+            auditAction: "auto_matched",
+            allowNoop: true,
+            request: {
+              receipt_id: req.params.id,
+              action: "match",
+              client_request_id: null,
+              expected_lifecycle_version: Number(rows[0].lifecycle_version || 1),
+              reason: "Receipt automatically matched after capture processing.",
+              transaction_id: decision.best.transaction.id,
+              method: "auto",
+              confidence_score: decision.best.score,
+              account_id: null,
+              expected_account_balance_cents: null,
+              amount_cents: null,
+              finance_category: null,
+              request_fingerprint: null
+            }
+          });
+          const withContext = await loadReceiptWithContext(pool, req.companyId, req.params.id);
+          return res.json(receiptPayload(withContext || matched.receipt));
         }
         if (candidates.length) {
           const possible = await pool.query(`UPDATE finance_receipts SET status = 'possible_match', match_confidence = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [req.params.id, req.companyId, candidates[0].score]);
@@ -890,26 +1177,19 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
   app.post("/api/finance/receipts/:id/match", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
-      const transactionId = cleanString(req.body?.transaction_id, 80);
-      const confidence = Number.isInteger(req.body?.confidence_score) ? req.body.confidence_score : null;
-      const method = VALID_METHODS.has(req.body?.method) ? req.body.method : "manual";
-      const tx = await pool.query(`SELECT id FROM finance_transactions WHERE id = $1 AND company_id = $2 AND removed_at IS NULL`, [transactionId, req.companyId]);
-      if (!tx.rows.length) return res.status(404).json({ error: "finance_transaction_not_found", message: "Transaction was not found." });
-      const { rows } = await pool.query(
-        `UPDATE finance_receipts
-            SET transaction_id = $3, status = $4, match_method = $5,
-                match_confidence = $6, matched_at = now(), updated_at = now()
-          WHERE id = $1 AND company_id = $2
-          RETURNING *`,
-        [req.params.id, req.companyId, transactionId, method === "user_direct" ? "matched" : "manually_matched", method, confidence]
-      );
-      if (!rows.length) return res.status(404).json({ error: "finance_receipt_not_found", message: "Receipt was not found." });
-      await pool.query(
-        `INSERT INTO finance_receipt_matches(company_id, receipt_id, transaction_id, method, confidence_score, was_selected, created_by)
-         VALUES($1,$2,$3,$4,$5,true,$6)`,
-        [req.companyId, req.params.id, transactionId, method, confidence, req.userId]
-      );
-      res.json(receiptPayload(rows[0]));
+      const request = legacyReceiptLifecycleRequest({
+        receiptID: req.params.id,
+        action: "match",
+        body: req.body,
+        reason: "Receipt matched from a legacy client."
+      });
+      const result = await executeReceiptLifecycleTransition(pool, {
+        companyID: req.companyId,
+        actorUserID: req.userId,
+        request
+      });
+      const receipt = await loadReceiptWithContext(pool, req.companyId, request.receipt_id);
+      res.json(receiptPayload(receipt || result.receipt));
     } catch (error) {
       handleReceiptError(res, error, "finance_receipt_match_failed");
     }
@@ -918,16 +1198,18 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
   app.post("/api/finance/receipts/:id/unmatch", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
-      const { rows } = await pool.query(
-        `UPDATE finance_receipts
-            SET transaction_id = NULL, status = 'unmatched', match_method = NULL,
-                match_confidence = NULL, matched_at = NULL, updated_at = now()
-          WHERE id = $1 AND company_id = $2
-          RETURNING *`,
-        [req.params.id, req.companyId]
-      );
-      if (!rows.length) return res.status(404).json({ error: "finance_receipt_not_found", message: "Receipt was not found." });
-      res.json(receiptPayload(rows[0]));
+      const request = legacyReceiptLifecycleRequest({
+        receiptID: req.params.id,
+        action: "unmatch",
+        reason: "Receipt unmatched from a legacy client."
+      });
+      const result = await executeReceiptLifecycleTransition(pool, {
+        companyID: req.companyId,
+        actorUserID: req.userId,
+        request
+      });
+      const receipt = await loadReceiptWithContext(pool, req.companyId, request.receipt_id);
+      res.json(receiptPayload(receipt || result.receipt));
     } catch (error) {
       handleReceiptError(res, error, "finance_receipt_unmatch_failed");
     }
@@ -936,15 +1218,18 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
   app.post("/api/finance/receipts/:id/archive", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
-      const { rows } = await pool.query(
-        `UPDATE finance_receipts
-            SET status = 'archived', archived_at = COALESCE(archived_at, now()), updated_at = now()
-          WHERE id = $1 AND company_id = $2
-          RETURNING *`,
-        [req.params.id, req.companyId]
-      );
-      if (!rows.length) return res.status(404).json({ error: "finance_receipt_not_found", message: "Receipt was not found." });
-      res.json(receiptPayload(rows[0]));
+      const request = legacyReceiptLifecycleRequest({
+        receiptID: req.params.id,
+        action: "archive",
+        reason: "Receipt archived from a legacy client."
+      });
+      const result = await executeReceiptLifecycleTransition(pool, {
+        companyID: req.companyId,
+        actorUserID: req.userId,
+        request
+      });
+      const receipt = await loadReceiptWithContext(pool, req.companyId, request.receipt_id);
+      res.json(receiptPayload(receipt || result.receipt));
     } catch (error) {
       handleReceiptError(res, error, "finance_receipt_archive_failed");
     }
@@ -952,61 +1237,27 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
 
   app.post("/api/finance/receipts/:id/cash-purchase", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
-    const client = await pool.connect();
     try {
-      const accountId = cleanString(req.body?.account_id, 80);
-      const category = cleanString(req.body?.finance_category || "Other", 80) || "Other";
-      await client.query("BEGIN");
-      const receipt = await client.query(`SELECT * FROM finance_receipts WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId]);
-      if (!receipt.rows.length) throw Object.assign(new Error("Receipt was not found."), { statusCode: 404, code: "finance_receipt_not_found" });
-      const amount = parseCents(req.body?.amount_cents ?? receipt.rows[0].amount_cents, "amount_cents");
-      if (amount <= 0) throw Object.assign(new Error("Receipt amount is required."), { statusCode: 400, code: "receipt_amount_required" });
-      const account = await client.query(`SELECT * FROM finance_accounts WHERE id = $1 AND company_id = $2 AND source = 'manual' AND account_type = 'cash' AND archived_at IS NULL FOR UPDATE`, [accountId, req.companyId]);
-      if (!account.rows.length) throw Object.assign(new Error("Choose an active cash account."), { statusCode: 400, code: "cash_account_required" });
-      const previous = Number(account.rows[0].current_balance_cents || 0);
-      const nextBalance = previous - amount;
-      const tx = await client.query(
-        `INSERT INTO finance_transactions (
-           company_id, account_id, source, status, direction, amount_cents, transaction_date,
-           merchant_name, original_name, normalized_category, pending, iso_currency_code, provider_metadata
-         ) VALUES ($1,$2,'manual','posted','expense',$3,$4,$5,$5,$6,false,'USD',$7)
-         RETURNING *`,
-        [
-          req.companyId,
-          accountId,
-          amount,
-          receipt.rows[0].purchase_date || new Date().toISOString().slice(0, 10),
-          receipt.rows[0].merchant_name || "Cash Purchase",
-          category,
-          JSON.stringify({ receipt_id: req.params.id })
-        ]
-      );
-      await client.query(`UPDATE finance_accounts SET current_balance_cents = $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [accountId, req.companyId, nextBalance]);
-      await client.query(
-        `INSERT INTO finance_account_entries(company_id, account_id, entry_type, amount_delta_cents, previous_balance_cents, resulting_balance_cents, currency, note, created_by)
-         VALUES($1,$2,'receipt_cash_purchase',$3,$4,$5,$6,$7,$8)`,
-        [req.companyId, accountId, -amount, previous, nextBalance, account.rows[0].currency || "usd", `Receipt cash purchase: ${receipt.rows[0].merchant_name || "Receipt"}`, req.userId]
-      );
-      const updated = await client.query(
-        `UPDATE finance_receipts
-            SET transaction_id = $3, status = 'cash_purchase', match_method = 'cash_purchase',
-                match_confidence = 100, finance_category = $4, matched_at = now(), updated_at = now()
-          WHERE id = $1 AND company_id = $2
-          RETURNING *`,
-        [req.params.id, req.companyId, tx.rows[0].id, category]
-      );
-      await client.query(
-        `INSERT INTO finance_receipt_matches(company_id, receipt_id, transaction_id, method, confidence_score, was_selected, created_by)
-         VALUES($1,$2,$3,'cash_purchase',100,true,$4)`,
-        [req.companyId, req.params.id, tx.rows[0].id, req.userId]
-      );
-      await client.query("COMMIT");
-      res.json({ receipt: receiptPayload(updated.rows[0]), transaction: transactionPayload(tx.rows[0]), account_balance_cents: nextBalance });
+      const request = legacyReceiptLifecycleRequest({
+        receiptID: req.params.id,
+        action: "cash_purchase",
+        body: req.body,
+        reason: "Cash purchase created from a legacy client."
+      });
+      const result = await createReceiptCashPurchase({
+        pool,
+        companyID: req.companyId,
+        actorUserID: req.userId,
+        request
+      });
+      const receipt = await loadReceiptWithContext(pool, req.companyId, request.receipt_id);
+      res.json({
+        receipt: receiptPayload(receipt || result.receipt),
+        transaction: transactionPayload(result.transaction),
+        account_balance_cents: result.account_balance_cents
+      });
     } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
       handleReceiptError(res, error, "finance_receipt_cash_purchase_failed");
-    } finally {
-      client.release();
     }
   });
 }
