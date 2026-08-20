@@ -1255,6 +1255,27 @@ async function payrollEvaluationReport(client, companyId, range, context, { lock
   };
 }
 
+export async function loadCurrentPayrollEvaluationPeriod(client, companyId, periodId, { lock = false } = {}) {
+  const periodResult = await client.query(
+    `SELECT id, start_date, end_date FROM finance_payroll_evaluation_periods
+      WHERE company_id = $1 AND id = $2::uuid${lock ? " FOR UPDATE" : ""}`,
+    [companyId, periodId]
+  );
+  if (!periodResult.rows.length) {
+    throw new PayrollEvaluationError("payroll_evaluation_period_not_found", "The supported-payroll period was not found.", 404);
+  }
+  const context = await loadCompanyContext(client, companyId);
+  const range = parsePayrollEvaluationRange(periodResult.rows[0].start_date, periodResult.rows[0].end_date, {
+    companyToday: context.company_today,
+    weekStart: Number(context.week_start)
+  });
+  const report = await payrollEvaluationReport(client, companyId, range, context, { lock });
+  if (!report._recognition || String(report._recognition.id) !== String(periodResult.rows[0].id)) {
+    throw new PayrollEvaluationError("payroll_evaluation_period_changed", "The supported-payroll period changed while it was loaded.", 409);
+  }
+  return report;
+}
+
 function publicEvaluationReport(report, replayed = undefined) {
   const { _preview, _recognition, _baseRecognition, ...payload } = report;
   return replayed == null ? payload : { ...payload, replayed };
@@ -1461,6 +1482,7 @@ export function installFinancePayrollEvaluationRoutes({ app, pool, authRequired,
     try {
       await client.query("BEGIN");
       await client.query(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, [`${req.companyId}|supported-payroll`]);
+      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
       const context = await loadCompanyContext(client, req.companyId);
       const range = parsePayrollEvaluationRange(req.body?.start_date, req.body?.end_date, {
         companyToday: context.company_today,
@@ -1481,6 +1503,20 @@ export function installFinancePayrollEvaluationRoutes({ app, pool, authRequired,
         preview: report._preview,
         overlappingRecognitionCount: overlapResult.rowCount
       });
+      if (plan.mode !== "replay" && report._recognition) {
+        const postingResult = await client.query(
+          `SELECT id FROM finance_payroll_journal_postings
+            WHERE company_id=$1 AND evaluation_period_id=$2 AND status='posted' FOR UPDATE`,
+          [req.companyId, report._recognition.id]
+        );
+        if (postingResult.rows.length) {
+          throw new PayrollEvaluationError(
+            "payroll_evaluation_journal_active",
+            "Void the current supported-payroll accrual journal before clearing or refreshing this recognition.",
+            409
+          );
+        }
+      }
       if (plan.mode === "replay") {
         await client.query("COMMIT");
         return res.json(publicEvaluationReport(report, true));

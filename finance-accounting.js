@@ -23,6 +23,10 @@ import {
   installFinancePayrollEvaluationSchema
 } from "./finance-payroll-evaluation.js";
 import {
+  installFinancePayrollJournalRoutes,
+  installFinancePayrollJournalSchema
+} from "./finance-payroll-journals.js";
+import {
   installFinanceGeneralLedgerRoutes,
   installFinanceGeneralLedgerSchema
 } from "./finance-general-ledger.js";
@@ -57,6 +61,7 @@ export const DEFAULT_CHART_ACCOUNTS = Object.freeze([
   { code: "2100", name: "Credit Cards", account_type: "liability", subtype: "credit_card", system_key: "credit_cards" },
   { code: "2200", name: "Loans Payable", account_type: "liability", subtype: "loans_payable", system_key: "loans_payable" },
   { code: "2300", name: "Customer Credits", account_type: "liability", subtype: "customer_credits", system_key: "customer_credits" },
+  { code: "2350", name: "Payroll Accrual Clearing", account_type: "liability", subtype: "payroll_accrual", system_key: "payroll_accrual_clearing" },
   { code: "3000", name: "Owner Equity", account_type: "equity", subtype: "owner_equity", system_key: "owner_equity" },
   { code: "3100", name: "Owner Distributions", account_type: "equity", subtype: "owner_distributions", system_key: "owner_distributions" },
   { code: "3200", name: "Opening Balance Equity", account_type: "equity", subtype: "opening_balance_equity", system_key: "opening_balance_equity" },
@@ -66,6 +71,8 @@ export const DEFAULT_CHART_ACCOUNTS = Object.freeze([
   { code: "5000", name: "Materials & Supplies", account_type: "expense", subtype: "materials", system_key: "materials_supplies" },
   { code: "5100", name: "Direct Labor", account_type: "expense", subtype: "direct_labor", system_key: "direct_labor" },
   { code: "5200", name: "Subcontractors", account_type: "expense", subtype: "subcontractors", system_key: "subcontractors" },
+  { code: "5300", name: "Payroll Wages Expense", account_type: "expense", subtype: "payroll_wages", system_key: "payroll_wages_expense" },
+  { code: "5400", name: "Employer Payroll Burden", account_type: "expense", subtype: "payroll_burden", system_key: "payroll_burden_expense" },
   { code: "6000", name: "Advertising & Marketing", account_type: "expense", subtype: "advertising", system_key: "advertising_marketing" },
   { code: "6100", name: "Vehicle & Mileage", account_type: "expense", subtype: "vehicle", system_key: "vehicle_mileage" },
   { code: "6200", name: "Insurance", account_type: "expense", subtype: "insurance", system_key: "insurance" },
@@ -470,6 +477,7 @@ export async function installFinanceAccountingSchema(pool) {
   await installFinancePayrollCostSchema(pool);
   await installFinancePayrollAuthoritySchema(pool);
   await installFinancePayrollEvaluationSchema(pool);
+  await installFinancePayrollJournalSchema(pool);
 }
 
 export async function ensureDefaultChartAccounts(poolOrClient, companyId, userId = null) {
@@ -848,5 +856,12 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     pool,
     authRequired,
     requireFinanceAccess: requireEmployer
+  });
+  installFinancePayrollJournalRoutes({
+    app,
+    pool,
+    authRequired,
+    requireFinanceAccess: requireEmployer,
+    ensureChartAccounts: ensureDefaultChartAccounts
   });
 }

@@ -250,6 +250,8 @@ test("schema is additive, tenant-indexed, immutable by API shape, and audit pres
   assert.match(sql, /finance_transfer_pair/);
   assert.match(sql, /finance_operational_source/);
   assert.match(sql, /finance_operational_application/);
+  assert.match(sql, /finance_payroll_evaluation/);
+  assert.match(sql, /payroll_recognition/);
   assert.match(sql, /finance_journal_entries_source_identity_check/);
   assert.match(sql, /finance_journal_entries_company_source_idx/);
   assert.match(sql, /CHECK \(\(debit_cents > 0 AND credit_cents = 0\)/);
