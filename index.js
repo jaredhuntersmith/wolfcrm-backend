@@ -3,14 +3,13 @@
 /* Railway deploy smoke-test touch: 2026-08-12 */
 import express from "express";
 import cors from "cors";
-import { createHash, randomUUID, randomBytes, scryptSync, timingSafeEqual } from "crypto";
+import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import pkg from "pg";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Stripe from "stripe";
 import apn from "@parse/node-apn";
 import twilio from "twilio";
-import tzLookup from "tz-lookup";
 import {
   installAutomationSystem,
   emitAutomationEvent,
@@ -31,15 +30,6 @@ import {
   syncAutomationSchedulesForTimeEntry
 } from "./automations.js";
 import { installFinanceSystem, loadProjection } from "./finance.js";
-import { installPayStructureSystem } from "./pay-structures.js";
-import { mapStripePaymentIntentStatus } from "./stripe-payment-sync.js";
-import {
-  claimStripeWebhookEvent,
-  completeStripeWebhookEvent,
-  failStripeWebhookEvent,
-  normalizeStripeRefundState
-} from "./finance-operational-accounting.js";
-import { captureStripeRefundEvidence } from "./finance-stripe-settlements.js";
 import {
   installGoogleSheetsSchema,
   installGoogleSheetsSystem,
@@ -47,100 +37,10 @@ import {
   startGoogleSheetsWorkers
 } from "./google-sheets.js";
 import { installIMessageSystem, sendAutomatedIMessage } from "./imessage.js";
-import { createGoogleRoutingService, GoogleRoutingError } from "./google-routing.js";
-import {
-  hasCapability,
-  legacyColumnsForCapabilities,
-  permissionCatalogPayload,
-  requiredAutomationCapability,
-  requiredFinanceCapability,
-  resolveAccess,
-  validateAccessUpdate
-} from "./permissions.js";
-import {
-  TAB_ROLE_PRESETS,
-  isKnownTabRolePreset,
-  resolveTabNavigation,
-  tabCatalogPayload,
-  validateTabLayout
-} from "./navigation-tabs.js";
-import {
-  DASHBOARD_LAYOUT_ROLE_PRESETS,
-  dashboardCardCatalogPayload,
-  isKnownDashboardRolePreset,
-  resolveDashboardLayout,
-  validateDashboardLayout
-} from "./dashboard-layout.js";
-import {
-  ScheduleTeamError,
-  requiredScheduleWriteCapability,
-  summarizeScheduleTeam,
-  validateAssignments,
-  validateAvailability
-} from "./schedule-team.js";
-import {
-  DEFAULT_ON_MY_WAY_TEMPLATE,
-  OnMyWayError,
-  normalizeOnMyWayChannel,
-  parseOnMyWayCoordinate,
-  renderOnMyWayTemplate,
-  validateOnMyWayMessage,
-  validateOnMyWayTemplate
-} from "./on-my-way.js";
-import {
-  WeatherSchedulingError,
-  buildWeatherRiskReport,
-  createGoogleWeatherService,
-  normalizeWeatherExposure,
-  planWeatherReschedule,
-  renderWeatherRescheduleMessage,
-  resolveWeatherSettings,
-  validateWeatherNotificationTemplate,
-  validateWeatherExpectedIntervals,
-  validateWeatherSettings
-} from "./weather-scheduling.js";
-import {
-  AssignmentRecommendationError,
-  buildAssignmentRecommendations,
-  planAssignmentApplication
-} from "./assignment-recommendations.js";
-import {
-  SMART_CONTACT_LIST_LIMITS,
-  SmartContactListError,
-  buildSmartContactPreview,
-  evaluateSmartContactSMSEligibility,
-  prepareSmartContactListPersistence,
-  renderSmartContactSMSTemplate,
-  renderSmartContactTaskTemplate,
-  smartContactSMSRequestSnapshot,
-  validateSmartContactSMSPreview,
-  validateSmartContactSMSSend,
-  validateSmartContactTaskAction,
-  validateSmartContactListName,
-  validateSmartContactFilters
-} from "./smart-contact-lists.js";
-import {
-  BUSINESS_EXCEPTION_LIMITS,
-  BUSINESS_EXCEPTION_TYPES,
-  BusinessExceptionError,
-  buildBusinessExceptionEvaluation,
-  compareBusinessExceptions,
-  validateBusinessExceptionMutation
-} from "./business-exceptions.js";
-import {
-  SALES_ANALYTICS_LIMITS,
-  SalesAnalyticsError,
-  buildSalesSummary,
-  normalizeSalesBreakdown,
-  normalizeSalesTrend,
-  validateSalesAnalyticsQuery
-} from "./sales-analytics.js";
 
 const { Pool } = pkg;
 const app = express();
 const PORT = process.env.PORT || 8080;
-const googleRoutingService = createGoogleRoutingService();
-const googleWeatherService = createGoogleWeatherService();
 
 const useSSL =
   process.env.DB_SSL === "true" ||
@@ -820,8 +720,6 @@ async function bootstrap() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_by UUID;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS pre_delete_email TEXT;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS tab_preferences JSONB NOT NULL DEFAULT '{}'::jsonb;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS dashboard_preferences JSONB NOT NULL DEFAULT '{}'::jsonb;
     CREATE INDEX IF NOT EXISTS users_deleted_at_idx ON users(deleted_at);
 
     CREATE TABLE IF NOT EXISTS companies (
@@ -838,8 +736,6 @@ async function bootstrap() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS companies_join_code_idx ON companies(join_code);
-    ALTER TABLE companies ADD COLUMN IF NOT EXISTS tab_role_policies JSONB NOT NULL DEFAULT '{}'::jsonb;
-    ALTER TABLE companies ADD COLUMN IF NOT EXISTS dashboard_role_policies JSONB NOT NULL DEFAULT '{}'::jsonb;
 
     CREATE TABLE IF NOT EXISTS employee_permissions (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -866,53 +762,8 @@ async function bootstrap() {
       can_view_finance_settings BOOLEAN NOT NULL DEFAULT false,
       can_edit_finance_settings BOOLEAN NOT NULL DEFAULT false,
       can_manage_company_finance_ai_memories BOOLEAN NOT NULL DEFAULT false,
-      permission_preset TEXT NOT NULL DEFAULT 'legacy_employee',
-      permission_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
-      tab_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
-      dashboard_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS dashboard_policy JSONB NOT NULL DEFAULT '{}'::jsonb;
-
-    CREATE TABLE IF NOT EXISTS employee_permission_audit (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      employee_user_id UUID NOT NULL,
-      changed_by_user_id UUID NOT NULL,
-      previous_preset TEXT,
-      previous_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
-      new_preset TEXT NOT NULL,
-      new_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS employee_permission_audit_employee_idx
-      ON employee_permission_audit(company_id, employee_user_id, created_at DESC);
-
-    CREATE TABLE IF NOT EXISTS tab_layout_audit (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      changed_by_user_id UUID NOT NULL,
-      target_type TEXT NOT NULL CHECK (target_type IN ('role', 'employee')),
-      target_id TEXT NOT NULL,
-      previous_layout JSONB NOT NULL DEFAULT '{}'::jsonb,
-      new_layout JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS tab_layout_audit_target_idx
-      ON tab_layout_audit(company_id, target_type, target_id, created_at DESC);
-
-    CREATE TABLE IF NOT EXISTS dashboard_layout_audit (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      changed_by_user_id UUID NOT NULL,
-      target_type TEXT NOT NULL CHECK (target_type IN ('role', 'employee')),
-      target_id TEXT NOT NULL,
-      previous_layout JSONB NOT NULL DEFAULT '{}'::jsonb,
-      new_layout JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS dashboard_layout_audit_target_idx
-      ON dashboard_layout_audit(company_id, target_type, target_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS password_reset_codes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -963,108 +814,6 @@ async function bootstrap() {
     CREATE INDEX IF NOT EXISTS contacts_updated_idx ON contacts(updated_at DESC);
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS lead_info JSONB;
 
-    CREATE TABLE IF NOT EXISTS smart_contact_lists (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      name TEXT NOT NULL,
-      mode TEXT NOT NULL CHECK (mode IN ('dynamic', 'snapshot')),
-      filters JSONB NOT NULL DEFAULT '{}'::jsonb,
-      filter_version INTEGER NOT NULL DEFAULT 1,
-      origin_redacted BOOLEAN NOT NULL DEFAULT false,
-      last_matched_count INTEGER,
-      last_previewed_at TIMESTAMPTZ,
-      archived_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS smart_contact_lists_active_name_uidx
-      ON smart_contact_lists(company_id, lower(name))
-      WHERE archived_at IS NULL;
-    CREATE INDEX IF NOT EXISTS smart_contact_lists_company_updated_idx
-      ON smart_contact_lists(company_id, archived_at, updated_at DESC);
-
-    CREATE TABLE IF NOT EXISTS smart_contact_list_members (
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      list_id UUID NOT NULL REFERENCES smart_contact_lists(id) ON DELETE CASCADE,
-      contact_id UUID NOT NULL,
-      source TEXT NOT NULL DEFAULT 'snapshot' CHECK (source IN ('snapshot', 'manual')),
-      added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      removed_at TIMESTAMPTZ,
-      PRIMARY KEY(list_id, contact_id)
-    );
-    CREATE INDEX IF NOT EXISTS smart_contact_list_members_company_contact_idx
-      ON smart_contact_list_members(company_id, contact_id, removed_at);
-    CREATE INDEX IF NOT EXISTS smart_contact_list_members_active_idx
-      ON smart_contact_list_members(company_id, list_id, added_at)
-      WHERE removed_at IS NULL;
-
-    CREATE TABLE IF NOT EXISTS smart_contact_action_batches (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      source_list_id UUID REFERENCES smart_contact_lists(id) ON DELETE SET NULL,
-      action_type TEXT NOT NULL,
-      idempotency_key TEXT NOT NULL,
-      request_hash TEXT NOT NULL,
-      filter_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-      request_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-      status TEXT NOT NULL DEFAULT 'processing',
-      selected_count INTEGER NOT NULL DEFAULT 0,
-      success_count INTEGER NOT NULL DEFAULT 0,
-      failure_count INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      completed_at TIMESTAMPTZ,
-      UNIQUE(company_id, action_type, idempotency_key)
-    );
-    CREATE INDEX IF NOT EXISTS smart_contact_action_batches_company_idx
-      ON smart_contact_action_batches(company_id, action_type, created_at DESC);
-    ALTER TABLE smart_contact_action_batches
-      ADD COLUMN IF NOT EXISTS excluded_count INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE smart_contact_action_batches
-      ADD COLUMN IF NOT EXISTS delivery_unknown_count INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE smart_contact_action_batches
-      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-
-    CREATE TABLE IF NOT EXISTS smart_contact_action_items (
-      batch_id UUID NOT NULL REFERENCES smart_contact_action_batches(id) ON DELETE CASCADE,
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      contact_id TEXT NOT NULL,
-      outcome TEXT NOT NULL,
-      subject_id TEXT,
-      error_code TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY(batch_id, contact_id)
-    );
-    CREATE INDEX IF NOT EXISTS smart_contact_action_items_contact_idx
-      ON smart_contact_action_items(company_id, contact_id, created_at DESC);
-    ALTER TABLE smart_contact_action_items ADD COLUMN IF NOT EXISTS recipient_phone TEXT;
-    ALTER TABLE smart_contact_action_items ADD COLUMN IF NOT EXISTS recipient_timezone TEXT;
-    ALTER TABLE smart_contact_action_items ADD COLUMN IF NOT EXISTS message_snapshot TEXT;
-    ALTER TABLE smart_contact_action_items ADD COLUMN IF NOT EXISTS provider_message_sid TEXT;
-    ALTER TABLE smart_contact_action_items ADD COLUMN IF NOT EXISTS provider_status TEXT;
-    ALTER TABLE smart_contact_action_items ADD COLUMN IF NOT EXISTS sms_conversation_id UUID;
-    ALTER TABLE smart_contact_action_items ADD COLUMN IF NOT EXISTS sms_message_id UUID;
-    ALTER TABLE smart_contact_action_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-
-    CREATE TABLE IF NOT EXISTS smart_contact_campaign_previews (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      source_list_id UUID REFERENCES smart_contact_lists(id) ON DELETE SET NULL,
-      request_hash TEXT NOT NULL,
-      filter_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-      request_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-      eligibility_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb,
-      eligible_count INTEGER NOT NULL DEFAULT 0,
-      excluded_count INTEGER NOT NULL DEFAULT 0,
-      expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '15 minutes'),
-      consumed_batch_id UUID REFERENCES smart_contact_action_batches(id) ON DELETE SET NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS smart_contact_campaign_previews_actor_expiry_idx
-      ON smart_contact_campaign_previews(company_id, created_by, expires_at DESC);
-
     CREATE TABLE IF NOT EXISTS crm_routes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       company_id UUID,
@@ -1081,13 +830,6 @@ async function bootstrap() {
       end_longitude DOUBLE PRECISION,
       distance_meters DOUBLE PRECISION,
       travel_time_seconds DOUBLE PRECISION,
-      service_time_seconds DOUBLE PRECISION,
-      total_route_time_seconds DOUBLE PRECISION,
-      estimated_start_at TIMESTAMPTZ,
-      estimated_finish_at TIMESTAMPTZ,
-      routing_provider TEXT,
-      routing_strategy TEXT,
-      routing_calculated_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -1108,11 +850,6 @@ async function bootstrap() {
       batch_number INTEGER,
       locked_order INTEGER,
       source_type TEXT NOT NULL DEFAULT 'contact',
-      service_duration_seconds DOUBLE PRECISION,
-      leg_distance_meters DOUBLE PRECISION,
-      leg_travel_time_seconds DOUBLE PRECISION,
-      estimated_arrival_at TIMESTAMPTZ,
-      estimated_departure_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -1122,20 +859,8 @@ async function bootstrap() {
     ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_label TEXT;
     ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_latitude DOUBLE PRECISION;
     ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS end_longitude DOUBLE PRECISION;
-    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS service_time_seconds DOUBLE PRECISION;
-    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS total_route_time_seconds DOUBLE PRECISION;
-    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS estimated_start_at TIMESTAMPTZ;
-    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS estimated_finish_at TIMESTAMPTZ;
-    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS routing_provider TEXT;
-    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS routing_strategy TEXT;
-    ALTER TABLE crm_routes ADD COLUMN IF NOT EXISTS routing_calculated_at TIMESTAMPTZ;
     ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'contact';
     ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS locked_order INTEGER;
-    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS service_duration_seconds DOUBLE PRECISION;
-    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS leg_distance_meters DOUBLE PRECISION;
-    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS leg_travel_time_seconds DOUBLE PRECISION;
-    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS estimated_arrival_at TIMESTAMPTZ;
-    ALTER TABLE crm_route_stops ADD COLUMN IF NOT EXISTS estimated_departure_at TIMESTAMPTZ;
 
     CREATE TABLE IF NOT EXISTS zapier_tokens (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -1474,134 +1199,12 @@ async function bootstrap() {
       started_by UUID,
       finished_at TIMESTAMPTZ,
       finished_by UUID,
-      weather_exposure TEXT NOT NULL DEFAULT 'auto',
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS schedule_user_start_idx
       ON schedule_events(user_id, start_at);
     CREATE INDEX IF NOT EXISTS schedule_events_quote_idx
       ON schedule_events(quote_id);
-
-    CREATE TABLE IF NOT EXISTS employee_schedule_availability (
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      weekdays JSONB NOT NULL DEFAULT '[1,2,3,4,5]'::jsonb,
-      start_time TEXT NOT NULL DEFAULT '09:00',
-      end_time TEXT NOT NULL DEFAULT '17:00',
-      timezone TEXT NOT NULL DEFAULT 'America/New_York',
-      enabled BOOLEAN NOT NULL DEFAULT true,
-      updated_by UUID,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY(company_id, user_id)
-    );
-    CREATE INDEX IF NOT EXISTS employee_schedule_availability_company_idx
-      ON employee_schedule_availability(company_id, user_id);
-
-    CREATE TABLE IF NOT EXISTS weather_risk_observations (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      job_id TEXT NOT NULL,
-      job_start_at TIMESTAMPTZ NOT NULL,
-      severity TEXT NOT NULL,
-      snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-      first_detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      last_detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      resolved_at TIMESTAMPTZ,
-      UNIQUE(company_id, job_id, job_start_at)
-    );
-    CREATE INDEX IF NOT EXISTS weather_risk_observations_active_idx
-      ON weather_risk_observations(company_id, resolved_at, last_detected_at DESC);
-
-    CREATE TABLE IF NOT EXISTS weather_reschedule_batches (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      idempotency_key TEXT NOT NULL,
-      replacement_start_at TIMESTAMPTZ NOT NULL,
-      notify_customers BOOLEAN NOT NULL DEFAULT false,
-      notification_template TEXT,
-      status TEXT NOT NULL DEFAULT 'processing',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE(company_id, idempotency_key)
-    );
-    CREATE INDEX IF NOT EXISTS weather_reschedule_batches_company_idx
-      ON weather_reschedule_batches(company_id, created_at DESC);
-
-    CREATE TABLE IF NOT EXISTS weather_reschedule_items (
-      batch_id UUID NOT NULL REFERENCES weather_reschedule_batches(id) ON DELETE CASCADE,
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      job_id TEXT NOT NULL,
-      contact_id TEXT,
-      contact_name TEXT,
-      recipient_phone TEXT,
-      job_title TEXT NOT NULL,
-      old_start_at TIMESTAMPTZ NOT NULL,
-      old_end_at TIMESTAMPTZ NOT NULL,
-      new_start_at TIMESTAMPTZ NOT NULL,
-      new_end_at TIMESTAMPTZ NOT NULL,
-      notification_status TEXT NOT NULL DEFAULT 'not_requested',
-      notification_message TEXT,
-      sms_conversation_id UUID REFERENCES sms_conversations(id) ON DELETE SET NULL,
-      sms_message_id UUID REFERENCES sms_messages(id) ON DELETE SET NULL,
-      provider_message_sid TEXT,
-      error_code TEXT,
-      error_message TEXT,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY(batch_id, job_id)
-    );
-    CREATE INDEX IF NOT EXISTS weather_reschedule_items_job_idx
-      ON weather_reschedule_items(company_id, job_id, updated_at DESC);
-
-    CREATE TABLE IF NOT EXISTS job_assignment_recommendation_applications (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      job_id TEXT NOT NULL,
-      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      selected_worker_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      assignment_mode TEXT NOT NULL,
-      idempotency_key TEXT NOT NULL,
-      expected_job_updated_at TIMESTAMPTZ NOT NULL,
-      applied_job_updated_at TIMESTAMPTZ NOT NULL,
-      previous_worker_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
-      new_worker_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
-      recommendation_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE(company_id, idempotency_key)
-    );
-    CREATE INDEX IF NOT EXISTS job_assignment_applications_job_idx
-      ON job_assignment_recommendation_applications(company_id, job_id, created_at DESC);
-
-    CREATE TABLE IF NOT EXISTS job_on_my_way_events (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      job_id TEXT NOT NULL,
-      contact_id TEXT,
-      contact_name TEXT,
-      recipient_phone TEXT NOT NULL,
-      employee_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      employee_name TEXT NOT NULL,
-      channel TEXT NOT NULL DEFAULT 'sms',
-      message_body TEXT NOT NULL,
-      eta_seconds INTEGER,
-      eta_source TEXT NOT NULL DEFAULT 'unavailable',
-      status TEXT NOT NULL DEFAULT 'sending',
-      sms_conversation_id UUID REFERENCES sms_conversations(id) ON DELETE SET NULL,
-      sms_message_id UUID REFERENCES sms_messages(id) ON DELETE SET NULL,
-      provider_message_sid TEXT,
-      error_code TEXT,
-      error_message TEXT,
-      idempotency_key TEXT NOT NULL,
-      explicit_resend BOOLEAN NOT NULL DEFAULT false,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE(company_id, idempotency_key)
-    );
-    CREATE INDEX IF NOT EXISTS job_on_my_way_events_job_idx
-      ON job_on_my_way_events(company_id, job_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS job_on_my_way_events_contact_idx
-      ON job_on_my_way_events(company_id, contact_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS map_pins (
       id TEXT PRIMARY KEY,
@@ -2044,62 +1647,6 @@ async function bootstrap() {
       ON dashboard_dismissals(user_id, item_type, source_id, fingerprint);
     CREATE INDEX IF NOT EXISTS dashboard_dismissals_user_idx
       ON dashboard_dismissals(user_id, dismissed_at DESC);
-
-    CREATE TABLE IF NOT EXISTS business_exceptions (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      type TEXT NOT NULL,
-      severity TEXT NOT NULL CHECK (severity IN ('critical','high','medium','low')),
-      source_type TEXT NOT NULL,
-      source_id TEXT NOT NULL,
-      fingerprint TEXT NOT NULL,
-      title TEXT NOT NULL,
-      explanation TEXT NOT NULL,
-      recommended_action TEXT NOT NULL,
-      destination JSONB,
-      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-      due_at TIMESTAMPTZ,
-      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','snoozed','dismissed','resolved')),
-      snoozed_until TIMESTAMPTZ,
-      detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      last_detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      status_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      status_updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      resolved_at TIMESTAMPTZ,
-      resolution_source TEXT CHECK (resolution_source IS NULL OR resolution_source IN ('manual','automatic')),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE(company_id, type, source_type, source_id)
-    );
-    CREATE INDEX IF NOT EXISTS business_exceptions_company_status_idx
-      ON business_exceptions(company_id, status, severity, last_detected_at DESC);
-    CREATE INDEX IF NOT EXISTS business_exceptions_source_idx
-      ON business_exceptions(company_id, source_type, source_id);
-    ALTER TABLE business_exceptions ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ;
-    ALTER TABLE business_exceptions ADD COLUMN IF NOT EXISTS resolution_source TEXT;
-
-    -- Quote lifecycle columns are used by reporting during bootstrap, before the
-    -- automation subsystem repeats these idempotent upgrades.
-    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'draft';
-    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
-    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
-    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;
-    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS declined_at TIMESTAMPTZ;
-    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS converted_job_id UUID;
-
-    CREATE INDEX IF NOT EXISTS contacts_company_created_idx
-      ON contacts(company_id, created_at) WHERE deleted_at IS NULL;
-    CREATE INDEX IF NOT EXISTS contacts_company_lead_submitted_idx
-      ON contacts(company_id, lead_submitted_at) WHERE deleted_at IS NULL AND lead_submitted_at IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS quotes_company_created_idx ON quotes(company_id, created_at);
-    CREATE INDEX IF NOT EXISTS quotes_company_sent_idx ON quotes(company_id, sent_at) WHERE sent_at IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS quotes_company_accepted_idx ON quotes(company_id, accepted_at) WHERE accepted_at IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS schedule_events_company_finished_idx
-      ON schedule_events(company_id, finished_at) WHERE finished_at IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS opportunities_company_contact_state_idx
-      ON opportunities(company_id, contact_id, state, stage_entered_at);
-    CREATE INDEX IF NOT EXISTS phone_calls_company_contact_started_idx
-      ON phone_calls(company_id, contact_id, started_at) WHERE direction = 'outbound';
   `);
 
   // Schedule events extra fields (services + price)
@@ -2109,7 +1656,6 @@ async function bootstrap() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS tab_preferences JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS notify_all_members_on_jobs BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS manual_entry BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE time_clock_entries ADD COLUMN IF NOT EXISTS manual_status TEXT NOT NULL DEFAULT 'approved';
@@ -2125,11 +1671,6 @@ async function bootstrap() {
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_days JSONB NOT NULL DEFAULT '[1,2,3,4,5]'::jsonb;
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_open_time TEXT NOT NULL DEFAULT '09:00';
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS business_close_time TEXT NOT NULL DEFAULT '17:00';
-    ALTER TABLE companies ADD COLUMN IF NOT EXISTS tab_role_policies JSONB NOT NULL DEFAULT '{}'::jsonb;
-    ALTER TABLE companies ADD COLUMN IF NOT EXISTS on_my_way_message_template TEXT NOT NULL DEFAULT 'Hi {{customer_first_name}}, {{employee_name}} from {{company_name}} is on the way. Estimated arrival: {{eta}}.';
-    ALTER TABLE companies ADD COLUMN IF NOT EXISTS weather_settings JSONB NOT NULL DEFAULT '{}'::jsonb;
-    ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS weather_exposure TEXT NOT NULL DEFAULT 'auto';
-    ALTER TABLE weather_reschedule_items ADD COLUMN IF NOT EXISTS recipient_phone TEXT;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_use_finance_ai BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_transactions BOOLEAN NOT NULL DEFAULT false;
@@ -2151,9 +1692,6 @@ async function bootstrap() {
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_view_finance_settings BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_edit_finance_settings BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS can_manage_company_finance_ai_memories BOOLEAN NOT NULL DEFAULT false;
-    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS permission_preset TEXT NOT NULL DEFAULT 'legacy_employee';
-    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS permission_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
-    ALTER TABLE employee_permissions ADD COLUMN IF NOT EXISTS tab_policy JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS service_items JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS price_cents INTEGER;
@@ -2428,8 +1966,7 @@ async function authRequired(req, res, next) {
                 COALESCE(p.can_edit_finance_debts, u.role = 'employer') AS can_edit_finance_debts,
                 COALESCE(p.can_view_finance_settings, u.role = 'employer') AS can_view_finance_settings,
                 COALESCE(p.can_edit_finance_settings, u.role = 'employer') AS can_edit_finance_settings,
-                COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories,
-                p.permission_preset, p.permission_overrides`,
+                COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories`,
     [token]
   );
   if (!rows.length) return res.status(401).json({ error: "unauthorized" });
@@ -2437,12 +1974,6 @@ async function authRequired(req, res, next) {
   req.userEmail = rows[0].email;
   req.role = rows[0].role;
   req.companyId = rows[0].company_id;
-  const access = resolveAccess({
-    role: rows[0].role,
-    preset: rows[0].permission_preset,
-    overrides: rows[0].permission_overrides,
-    legacy: rows[0]
-  });
   req.permissions = {
     canDeleteContacts: !!rows[0].can_delete_contacts,
     canViewFinance: !!rows[0].can_view_finance,
@@ -2465,64 +1996,14 @@ async function authRequired(req, res, next) {
     canEditFinanceDebts: !!rows[0].can_edit_finance_debts,
     canViewFinanceSettings: !!rows[0].can_view_finance_settings,
     canEditFinanceSettings: !!rows[0].can_edit_finance_settings,
-    canManageCompanyFinanceAiMemories: !!rows[0].can_manage_company_finance_ai_memories,
-    preset: access.preset,
-    overrides: access.overrides,
-    capabilities: access.capabilities
+    canManageCompanyFinanceAiMemories: !!rows[0].can_manage_company_finance_ai_memories
   };
-  req.permissionPayload = employeePermissionPayload({ ...rows[0], access });
   req.sessionToken = token;
   next();
 }
 
 function requireEmployer(req, res, next) {
   if (req.role !== "employer") return res.status(403).json({ error: "employer_required" });
-  next();
-}
-
-function requireCapability(capability) {
-  return (req, res, next) => {
-    if (!hasCapability(req, capability)) {
-      return res.status(403).json({ error: "permission_denied", required_capability: capability });
-    }
-    next();
-  };
-}
-
-function requireAnyCapability(...capabilities) {
-  return (req, res, next) => {
-    if (!capabilities.some((capability) => hasCapability(req, capability))) {
-      return res.status(403).json({ error: "permission_denied", required_capabilities: capabilities });
-    }
-    next();
-  };
-}
-
-function requireAllCapabilities(...capabilities) {
-  return (req, res, next) => {
-    const missing = capabilities.filter((capability) => !hasCapability(req, capability));
-    if (missing.length) {
-      return res.status(403).json({ error: "permission_denied", required_capabilities: capabilities, missing_capabilities: missing });
-    }
-    next();
-  };
-}
-
-function requireAutomationAccess(req, res, next) {
-  const capability = requiredAutomationCapability(req.method, req.path);
-  if (!hasCapability(req, capability)) {
-    return res.status(403).json({ error: "permission_denied", required_capability: capability });
-  }
-  next();
-}
-
-function requireFinanceAccess(req, res, next) {
-  const isRead = req.method === "GET";
-  const capability = requiredFinanceCapability(req.method, req.path);
-  const mayUseManagementOverride = !isRead && hasCapability(req, "finance.manage");
-  if (!hasCapability(req, capability) && !mayUseManagementOverride) {
-    return res.status(403).json({ error: "permission_denied", required_capability: capability });
-  }
   next();
 }
 
@@ -2691,14 +2172,6 @@ function sanitizePaymentRecord(row, { employeeSafe = false } = {}) {
     amount_cents: row.amount_cents,
     currency: row.currency,
     description: row.description,
-    job_id: row.job_id || null,
-    paid_at: row.paid_at || null,
-    refunded_amount_cents: row.refund_amount_known === false ? null : Number(row.refunded_amount_cents || 0),
-    refunded_at: row.refunded_at || null,
-    refund_amount_known: row.refund_amount_known !== false,
-    accounting_link_version: Number(row.accounting_link_version || 1),
-    accounting_linked_at: row.accounting_linked_at || null,
-    accounting_linked_by: row.accounting_linked_by || null,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -2724,240 +2197,35 @@ function userPayload(user, permissions = null, company = null) {
     display_name: user.display_name,
     photo_url: user.photo_url,
     company,
-    permissions: permissions || employeePermissionPayload(user)
+    permissions: permissions || { can_delete_contacts: user.role === "employer" }
   };
 }
 
 function employeePermissionPayload(row = {}) {
-  const access = row.access || resolveAccess({
-    role: row.role,
-    preset: row.permission_preset,
-    overrides: row.permission_overrides,
-    legacy: row
-  });
-  const legacy = row.role === "employer" ? legacyColumnsForCapabilities(access.capabilities) : row;
   return {
-    can_delete_contacts: !!legacy.can_delete_contacts,
-    can_view_finance: !!legacy.can_view_finance,
-    can_use_finance_ai: !!legacy.can_use_finance_ai,
-    can_view_finance_transactions: !!legacy.can_view_finance_transactions,
-    can_edit_finance_transactions: !!legacy.can_edit_finance_transactions,
-    can_view_finance_accounts: !!legacy.can_view_finance_accounts,
-    can_create_finance_accounts: !!legacy.can_create_finance_accounts,
-    can_edit_finance_accounts: !!legacy.can_edit_finance_accounts,
-    can_adjust_finance_account_balances: !!legacy.can_adjust_finance_account_balances,
-    can_view_finance_receipts: !!legacy.can_view_finance_receipts,
-    can_edit_finance_receipts: !!legacy.can_edit_finance_receipts,
-    can_view_finance_planning: !!legacy.can_view_finance_planning,
-    can_edit_finance_planning: !!legacy.can_edit_finance_planning,
-    can_view_finance_budgets: !!legacy.can_view_finance_budgets,
-    can_edit_finance_budgets: !!legacy.can_edit_finance_budgets,
-    can_view_finance_goals: !!legacy.can_view_finance_goals,
-    can_edit_finance_goals: !!legacy.can_edit_finance_goals,
-    can_view_finance_debts: !!legacy.can_view_finance_debts,
-    can_edit_finance_debts: !!legacy.can_edit_finance_debts,
-    can_view_finance_settings: !!legacy.can_view_finance_settings,
-    can_edit_finance_settings: !!legacy.can_edit_finance_settings,
-    can_manage_company_finance_ai_memories: !!legacy.can_manage_company_finance_ai_memories,
-    preset: access.preset,
-    overrides: access.overrides,
-    capabilities: access.capabilities
+    can_delete_contacts: !!row.can_delete_contacts,
+    can_view_finance: !!row.can_view_finance,
+    can_use_finance_ai: !!row.can_use_finance_ai,
+    can_view_finance_transactions: !!row.can_view_finance_transactions,
+    can_edit_finance_transactions: !!row.can_edit_finance_transactions,
+    can_view_finance_accounts: !!row.can_view_finance_accounts,
+    can_create_finance_accounts: !!row.can_create_finance_accounts,
+    can_edit_finance_accounts: !!row.can_edit_finance_accounts,
+    can_adjust_finance_account_balances: !!row.can_adjust_finance_account_balances,
+    can_view_finance_receipts: !!row.can_view_finance_receipts,
+    can_edit_finance_receipts: !!row.can_edit_finance_receipts,
+    can_view_finance_planning: !!row.can_view_finance_planning,
+    can_edit_finance_planning: !!row.can_edit_finance_planning,
+    can_view_finance_budgets: !!row.can_view_finance_budgets,
+    can_edit_finance_budgets: !!row.can_edit_finance_budgets,
+    can_view_finance_goals: !!row.can_view_finance_goals,
+    can_edit_finance_goals: !!row.can_edit_finance_goals,
+    can_view_finance_debts: !!row.can_view_finance_debts,
+    can_edit_finance_debts: !!row.can_edit_finance_debts,
+    can_view_finance_settings: !!row.can_view_finance_settings,
+    can_edit_finance_settings: !!row.can_edit_finance_settings,
+    can_manage_company_finance_ai_memories: !!row.can_manage_company_finance_ai_memories
   };
-}
-
-async function persistEmployeeAccess(client, { employeeUserId, companyId, access }) {
-  const legacy = legacyColumnsForCapabilities(access.capabilities);
-  const legacyColumns = Object.keys(legacy);
-  const insertColumns = ["user_id", "company_id", "permission_preset", "permission_overrides", ...legacyColumns];
-  const values = [employeeUserId, companyId, access.preset, JSON.stringify(access.overrides), ...legacyColumns.map((key) => legacy[key])];
-  const placeholders = values.map((_, index) => index === 3 ? `$${index + 1}::jsonb` : `$${index + 1}`);
-  const updates = [
-    "company_id = EXCLUDED.company_id",
-    "permission_preset = EXCLUDED.permission_preset",
-    "permission_overrides = EXCLUDED.permission_overrides",
-    ...legacyColumns.map((column) => `${column} = EXCLUDED.${column}`),
-    "updated_at = now()"
-  ];
-  const { rows } = await client.query(
-    `INSERT INTO employee_permissions(${insertColumns.join(", ")})
-     VALUES(${placeholders.join(", ")})
-     ON CONFLICT(user_id) DO UPDATE SET ${updates.join(", ")}
-     RETURNING *`,
-    values
-  );
-  return { row: rows[0], legacy };
-}
-
-function tabNavigationPayload(navigation) {
-  return { catalog: tabCatalogPayload(), ...navigation };
-}
-
-async function loadSelfTabNavigationContext(req, db = pool) {
-  const { rows } = await db.query(
-    `SELECT u.tab_preferences,
-            COALESCE(p.tab_policy, '{}'::jsonb) AS tab_policy,
-            COALESCE(c.tab_role_policies, '{}'::jsonb) AS tab_role_policies
-       FROM users u
-       LEFT JOIN employee_permissions p ON p.user_id = u.id
-       LEFT JOIN companies c ON c.id = u.company_id
-      WHERE u.id = $1 AND u.deleted_at IS NULL`,
-    [req.userId]
-  );
-  if (!rows.length) return null;
-  return {
-    row: rows[0],
-    navigation: resolveTabNavigation({
-      role: req.role,
-      preset: req.permissions.preset,
-      capabilities: req.permissions.capabilities,
-      userPreferences: rows[0].tab_preferences,
-      employeePolicy: rows[0].tab_policy,
-      rolePolicies: rows[0].tab_role_policies
-    })
-  };
-}
-
-async function loadEmployeeTabNavigationContext(employeeUserId, companyId, db = pool) {
-  const { rows } = await db.query(
-    `SELECT u.id, u.role, u.deleted_at, u.tab_preferences,
-            p.*,
-            COALESCE(c.tab_role_policies, '{}'::jsonb) AS tab_role_policies
-       FROM users u
-       LEFT JOIN employee_permissions p ON p.user_id = u.id
-       LEFT JOIN companies c ON c.id = u.company_id
-      WHERE u.id = $1 AND u.company_id = $2 AND u.role = 'employee'`,
-    [employeeUserId, companyId]
-  );
-  if (!rows.length || rows[0].deleted_at) return null;
-  const access = resolveAccess({
-    role: rows[0].role,
-    preset: rows[0].permission_preset,
-    overrides: rows[0].permission_overrides,
-    legacy: rows[0]
-  });
-  return {
-    row: rows[0],
-    access,
-    navigation: resolveTabNavigation({
-      role: rows[0].role,
-      preset: access.preset,
-      capabilities: access.capabilities,
-      userPreferences: rows[0].tab_preferences,
-      employeePolicy: rows[0].tab_policy,
-      rolePolicies: rows[0].tab_role_policies
-    })
-  };
-}
-
-async function insertTabLayoutAudit(client, { companyId, actorUserId, targetType, targetId, previousLayout, newLayout }) {
-  await client.query(
-    `INSERT INTO tab_layout_audit
-       (id, company_id, changed_by_user_id, target_type, target_id, previous_layout, new_layout)
-     VALUES($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)`,
-    [
-      randomUUID(),
-      companyId,
-      actorUserId,
-      targetType,
-      targetId,
-      JSON.stringify(previousLayout || {}),
-      JSON.stringify(newLayout || {})
-    ]
-  );
-}
-
-function sendTabLayoutError(res, error, fallbackCode) {
-  if (error?.code === "invalid_tab_layout") {
-    return res.status(error.status || 400).json({ error: error.code, message: error.message, details: error.details || {} });
-  }
-  console.error(`[tabs] ${fallbackCode}`, error);
-  return res.status(500).json({ error: fallbackCode });
-}
-
-function dashboardLayoutPayload(layout) {
-  return { catalog: dashboardCardCatalogPayload(), ...layout };
-}
-
-async function loadSelfDashboardLayoutContext(req, db = pool) {
-  const { rows } = await db.query(
-    `SELECT u.dashboard_preferences,
-            COALESCE(p.dashboard_policy, '{}'::jsonb) AS dashboard_policy,
-            COALESCE(c.dashboard_role_policies, '{}'::jsonb) AS dashboard_role_policies
-       FROM users u
-       LEFT JOIN employee_permissions p ON p.user_id = u.id
-       LEFT JOIN companies c ON c.id = u.company_id
-      WHERE u.id = $1 AND u.deleted_at IS NULL`,
-    [req.userId]
-  );
-  if (!rows.length) return null;
-  return {
-    row: rows[0],
-    layout: resolveDashboardLayout({
-      role: req.role,
-      preset: req.permissions.preset,
-      capabilities: req.permissions.capabilities,
-      userPreferences: rows[0].dashboard_preferences,
-      employeePolicy: rows[0].dashboard_policy,
-      rolePolicies: rows[0].dashboard_role_policies
-    })
-  };
-}
-
-async function loadEmployeeDashboardLayoutContext(employeeUserId, companyId, db = pool) {
-  const { rows } = await db.query(
-    `SELECT u.id, u.role, u.deleted_at, u.dashboard_preferences,
-            p.*,
-            COALESCE(c.dashboard_role_policies, '{}'::jsonb) AS dashboard_role_policies
-       FROM users u
-       LEFT JOIN employee_permissions p ON p.user_id = u.id
-       LEFT JOIN companies c ON c.id = u.company_id
-      WHERE u.id = $1 AND u.company_id = $2 AND u.role = 'employee'`,
-    [employeeUserId, companyId]
-  );
-  if (!rows.length || rows[0].deleted_at) return null;
-  const access = resolveAccess({
-    role: rows[0].role,
-    preset: rows[0].permission_preset,
-    overrides: rows[0].permission_overrides,
-    legacy: rows[0]
-  });
-  return {
-    row: rows[0],
-    access,
-    layout: resolveDashboardLayout({
-      role: rows[0].role,
-      preset: access.preset,
-      capabilities: access.capabilities,
-      userPreferences: rows[0].dashboard_preferences,
-      employeePolicy: rows[0].dashboard_policy,
-      rolePolicies: rows[0].dashboard_role_policies
-    })
-  };
-}
-
-async function insertDashboardLayoutAudit(client, { companyId, actorUserId, targetType, targetId, previousLayout, newLayout }) {
-  await client.query(
-    `INSERT INTO dashboard_layout_audit
-       (id, company_id, changed_by_user_id, target_type, target_id, previous_layout, new_layout)
-     VALUES($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)`,
-    [
-      randomUUID(),
-      companyId,
-      actorUserId,
-      targetType,
-      targetId,
-      JSON.stringify(previousLayout || {}),
-      JSON.stringify(newLayout || {})
-    ]
-  );
-}
-
-function sendDashboardLayoutError(res, error, fallbackCode) {
-  if (error?.code === "invalid_dashboard_layout") {
-    return res.status(error.status || 400).json({ error: error.code, message: error.message, details: error.details || {} });
-  }
-  console.error(`[dashboard-layout] ${fallbackCode}`, error);
-  return res.status(500).json({ error: fallbackCode });
 }
 
 async function createNotification(userId, companyId, kind, title, body, data = {}) {
@@ -3085,13 +2353,8 @@ app.post("/auth/signup", async (req, res) => {
       await pool.query(`UPDATE companies SET owner_user_id = $1 WHERE id = $2`, [user.id, company.id]);
     } else {
       await pool.query(
-        `INSERT INTO employee_permissions(user_id, company_id, can_delete_contacts, permission_preset, permission_overrides)
-         VALUES($1,$2,false,'technician','{}'::jsonb)
-         ON CONFLICT(user_id) DO UPDATE
-           SET company_id = EXCLUDED.company_id,
-               permission_preset = 'technician',
-               permission_overrides = '{}'::jsonb,
-               updated_at = now()`,
+        `INSERT INTO employee_permissions(user_id, company_id, can_delete_contacts)
+         VALUES($1,$2,false)`,
         [user.id, company.id]
       );
     }
@@ -3107,14 +2370,7 @@ app.post("/auth/signup", async (req, res) => {
 
     const token = randomUUID();
     await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, user.id]);
-    res.json({
-      token,
-      user: userPayload(
-        { ...user, permission_preset: role === "employee" ? "technician" : null },
-        null,
-        { id: company.id, name: company.name, join_code: company.join_code }
-      )
-    });
+    res.json({ token, user: userPayload(user, { can_delete_contacts: role === "employer" }, { id: company.id, name: company.name, join_code: company.join_code }) });
   } catch (e) {
     if (e.code === "23505") return res.status(409).json({ error: "company_code_taken" });
     console.error(e);
@@ -3127,7 +2383,7 @@ app.post("/auth/login", async (req, res) => {
     const email = normalizeEmail(req.body.email);
     const password = (req.body.password || "").toString();
     const { rows } = await pool.query(
-      `SELECT u.*, c.name AS company_name, c.join_code, to_jsonb(p) AS permission_record
+      `SELECT u.*, c.name AS company_name, c.join_code, COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts
          FROM users u
          LEFT JOIN companies c ON c.id = u.company_id
          LEFT JOIN employee_permissions p ON p.user_id = u.id
@@ -3141,14 +2397,14 @@ app.post("/auth/login", async (req, res) => {
       // Account was revoked by the employer.
       return res.status(403).json({ error: "account_disabled", message: "This account has been removed. Contact your employer to restore access." });
     }
-    const u = { ...rows[0], ...(rows[0].permission_record || {}) };
+    const u = rows[0];
     const token = randomUUID();
     await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, u.id]);
     res.json({
       token,
       user: userPayload(
         u,
-        employeePermissionPayload(u),
+        { can_delete_contacts: !!u.can_delete_contacts },
         u.company_id ? { id: u.company_id, name: u.company_name, join_code: u.join_code } : null
       )
     });
@@ -3309,8 +2565,7 @@ app.get("/me", authRequired, async (req, res) => {
             COALESCE(p.can_edit_finance_debts, u.role = 'employer') AS can_edit_finance_debts,
             COALESCE(p.can_view_finance_settings, u.role = 'employer') AS can_view_finance_settings,
             COALESCE(p.can_edit_finance_settings, u.role = 'employer') AS can_edit_finance_settings,
-            COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories,
-            p.permission_preset, p.permission_overrides
+            COALESCE(p.can_manage_company_finance_ai_memories, u.role = 'employer') AS can_manage_company_finance_ai_memories
        FROM users u
        LEFT JOIN companies c ON c.id = u.company_id
        LEFT JOIN employee_permissions p ON p.user_id = u.id
@@ -3328,7 +2583,7 @@ app.get("/me", authRequired, async (req, res) => {
 });
 
 // ---------- Twilio diagnostics ----------
-app.get("/api/twilio/status", authRequired, requireCapability("integrations.view"), async (_req, res) => {
+app.get("/api/twilio/status", authRequired, async (_req, res) => {
   const { configured, accountSid } = twilioConfig();
   if (!configured) {
     return res.json({
@@ -3597,7 +2852,7 @@ app.post("/webhooks/twilio/sms", async (req, res) => {
   }
 });
 
-app.get("/api/phone/conversations", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/conversations", authRequired, async (req, res) => {
   if (!req.companyId) return res.json([]);
   try {
     const { rows } = await pool.query(
@@ -3648,7 +2903,7 @@ app.get("/api/phone/conversations", authRequired, requireCapability("messaging.c
   }
 });
 
-app.get("/api/phone/lines", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/lines", authRequired, async (req, res) => {
   if (!req.companyId) return res.json([]);
   try {
     const { rows } = await pool.query(
@@ -3672,7 +2927,7 @@ app.get("/api/phone/lines", authRequired, requireCapability("messaging.customer.
   }
 });
 
-app.post("/api/phone/lines/attach-existing", authRequired, requireCapability("integrations.manage"), async (req, res) => {
+app.post("/api/phone/lines/attach-existing", authRequired, requireEmployer, async (req, res) => {
   if (!req.companyId) return res.status(400).json({ error: "company_required" });
 
   const phoneNumber = normalizeE164Phone(req.body?.phoneNumber);
@@ -3729,7 +2984,7 @@ app.post("/api/phone/lines/attach-existing", authRequired, requireCapability("in
   }
 });
 
-app.get("/api/voice/token", authRequired, requireCapability("messaging.customer.send"), async (req, res) => {
+app.get("/api/voice/token", authRequired, async (req, res) => {
   if (!req.userId || !req.companyId) {
     return res.status(400).json({ error: "company_required" });
   }
@@ -3786,7 +3041,7 @@ app.get("/api/voice/token", authRequired, requireCapability("messaging.customer.
   }
 });
 
-app.get("/api/voice/diagnostics", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/voice/diagnostics", authRequired, async (req, res) => {
   const { configured, twimlAppSid, pushCredentialSid } = twilioVoiceConfig();
   const voiceIdentity = voiceIdentityForUserID(req.userId);
   try {
@@ -4544,7 +3799,7 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
   }
 });
 
-app.get("/api/phone/calls", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/calls", authRequired, async (req, res) => {
   if (!req.companyId) return res.json([]);
   const limit = Math.min(Math.max(parseInt(req.query.limit || "100", 10) || 100, 1), 200);
   try {
@@ -4587,7 +3842,7 @@ app.get("/api/phone/calls", authRequired, requireCapability("messaging.customer.
   }
 });
 
-app.get("/api/phone/unread-count", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/unread-count", authRequired, async (req, res) => {
   if (!req.companyId) return res.json({ count: 0 });
   try {
     res.json({ count: await phoneUnreadBadgeCount(req.companyId) });
@@ -4597,7 +3852,7 @@ app.get("/api/phone/unread-count", authRequired, requireCapability("messaging.cu
   }
 });
 
-app.get("/api/phone/voicemails", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/voicemails", authRequired, async (req, res) => {
   if (!req.companyId) return res.json([]);
   const limit = Math.min(Math.max(parseInt(req.query.limit || "100", 10) || 100, 1), 200);
   try {
@@ -4627,7 +3882,7 @@ app.get("/api/phone/voicemails", authRequired, requireCapability("messaging.cust
   }
 });
 
-app.post("/api/phone/voicemails/:id/read", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.post("/api/phone/voicemails/:id/read", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
   try {
     const { rows } = await pool.query(
@@ -4668,7 +3923,7 @@ app.post("/api/phone/voicemails/:id/read", authRequired, requireCapability("mess
   }
 });
 
-app.delete("/api/phone/voicemails/:id", authRequired, requireCapability("messaging.customer.delete"), async (req, res) => {
+app.delete("/api/phone/voicemails/:id", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
   try {
     const { rows } = await pool.query(
@@ -4722,7 +3977,7 @@ app.delete("/api/phone/voicemails/:id", authRequired, requireCapability("messagi
   }
 });
 
-app.get("/api/phone/voicemails/:id/audio", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/voicemails/:id/audio", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
   try {
     const { rows } = await pool.query(
@@ -4750,7 +4005,7 @@ app.get("/api/phone/voicemails/:id/audio", authRequired, requireCapability("mess
   }
 });
 
-app.get("/api/phone/conversations/:id/messages", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/conversations/:id/messages", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
   try {
     const owned = await pool.query(
@@ -4794,7 +4049,7 @@ app.get("/api/phone/conversations/:id/messages", authRequired, requireCapability
   }
 });
 
-app.get("/api/phone/messages/:id/media/:index", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/messages/:id/media/:index", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "media_not_found" });
   const mediaIndex = Math.max(0, parseInt(req.params.index || "0", 10) || 0);
   try {
@@ -4843,7 +4098,7 @@ app.get("/api/phone/messages/:id/media/:index", authRequired, requireCapability(
   }
 });
 
-app.post("/api/phone/conversations/:id/messages", authRequired, requireCapability("messaging.customer.send"), async (req, res) => {
+app.post("/api/phone/conversations/:id/messages", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
 
   const rawBody = req.body?.body;
@@ -5036,7 +4291,7 @@ app.post("/api/phone/conversations/:id/messages", authRequired, requireCapabilit
   }
 });
 
-app.delete("/api/phone/messages/:id", authRequired, requireCapability("messaging.customer.delete"), async (req, res) => {
+app.delete("/api/phone/messages/:id", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "message_not_found" });
   const client = await pool.connect();
   try {
@@ -5081,7 +4336,7 @@ app.delete("/api/phone/messages/:id", authRequired, requireCapability("messaging
   }
 });
 
-app.delete("/api/phone/conversations/:id", authRequired, requireCapability("messaging.customer.delete"), async (req, res) => {
+app.delete("/api/phone/conversations/:id", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "conversation_not_found" });
   try {
     const { rows } = await pool.query(
@@ -5220,14 +4475,14 @@ app.patch("/api/profile", authRequired, async (req, res) => {
         RETURNING id, email, role, company_id, display_name, photo_url`,
       [req.userId, displayName || null, photoUrl || null]
     );
-    res.json({ user: userPayload(rows[0], req.permissionPayload, null) });
+    res.json({ user: userPayload(rows[0], req.permissions, null) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "profile_update_failed" });
   }
 });
 
-app.get("/api/company/users", authRequired, requireCapability("team.view"), async (req, res) => {
+app.get("/api/company/users", authRequired, async (req, res) => {
   try {
     if (!req.companyId) {
       const { rows } = await pool.query(
@@ -5251,619 +4506,10 @@ app.get("/api/company/users", authRequired, requireCapability("team.view"), asyn
   }
 });
 
-app.get("/api/permissions/catalog", authRequired, (_req, res) => {
-  res.json(permissionCatalogPayload());
-});
-
-app.get("/api/navigation/tabs", authRequired, async (req, res) => {
-  try {
-    const context = await loadSelfTabNavigationContext(req);
-    if (!context) return res.status(404).json({ error: "user_not_found" });
-    res.json(tabNavigationPayload(context.navigation));
-  } catch (error) {
-    sendTabLayoutError(res, error, "tab_layout_load_failed");
-  }
-});
-
-app.put("/api/navigation/tabs", authRequired, async (req, res) => {
-  let layout;
-  try {
-    layout = validateTabLayout(req.body);
-  } catch (error) {
-    return sendTabLayoutError(res, error, "tab_layout_update_failed");
-  }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const user = await client.query(
-      `SELECT id, company_id FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
-      [req.userId]
-    );
-    if (!user.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "user_not_found" });
-    }
-    if (req.companyId) {
-      await client.query(`SELECT id FROM companies WHERE id = $1 FOR SHARE`, [req.companyId]);
-      await client.query(`SELECT user_id FROM employee_permissions WHERE user_id = $1 FOR SHARE`, [req.userId]);
-    }
-    const current = await loadSelfTabNavigationContext(req, client);
-    if (!current?.navigation.customizable) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "tab_layout_locked", message: "Your company owner manages this tab layout." });
-    }
-    await client.query(
-      `UPDATE users SET tab_preferences = $2::jsonb WHERE id = $1`,
-      [req.userId, JSON.stringify(layout)]
-    );
-    const updated = await loadSelfTabNavigationContext(req, client);
-    await client.query("COMMIT");
-    res.json(tabNavigationPayload(updated.navigation));
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendTabLayoutError(res, error, "tab_layout_update_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.delete("/api/navigation/tabs", authRequired, async (req, res) => {
-  try {
-    const { rowCount } = await pool.query(
-      `UPDATE users SET tab_preferences = '{}'::jsonb WHERE id = $1 AND deleted_at IS NULL`,
-      [req.userId]
-    );
-    if (!rowCount) return res.status(404).json({ error: "user_not_found" });
-    const updated = await loadSelfTabNavigationContext(req);
-    res.json(tabNavigationPayload(updated.navigation));
-  } catch (error) {
-    sendTabLayoutError(res, error, "tab_layout_reset_failed");
-  }
-});
-
-app.get("/api/dashboard/layout", authRequired, requireCapability("dashboard.view"), async (req, res) => {
-  try {
-    const context = await loadSelfDashboardLayoutContext(req);
-    if (!context) return res.status(404).json({ error: "user_not_found" });
-    res.json(dashboardLayoutPayload(context.layout));
-  } catch (error) {
-    sendDashboardLayoutError(res, error, "dashboard_layout_load_failed");
-  }
-});
-
-app.put("/api/dashboard/layout", authRequired, requireCapability("dashboard.view"), async (req, res) => {
-  let layout;
-  try {
-    layout = validateDashboardLayout(req.body);
-  } catch (error) {
-    return sendDashboardLayoutError(res, error, "dashboard_layout_update_failed");
-  }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const user = await client.query(`SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [req.userId]);
-    if (!user.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "user_not_found" });
-    }
-    const current = await loadSelfDashboardLayoutContext(req, client);
-    if (!current?.layout.customizable) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "dashboard_layout_locked", message: "Your company owner manages this Dashboard layout." });
-    }
-    await client.query(
-      `UPDATE users SET dashboard_preferences = $2::jsonb WHERE id = $1`,
-      [req.userId, JSON.stringify(layout)]
-    );
-    const updated = await loadSelfDashboardLayoutContext(req, client);
-    await client.query("COMMIT");
-    res.json(dashboardLayoutPayload(updated.layout));
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendDashboardLayoutError(res, error, "dashboard_layout_update_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.delete("/api/dashboard/layout", authRequired, requireCapability("dashboard.view"), async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const user = await client.query(
-      `SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
-      [req.userId]
-    );
-    if (!user.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "user_not_found" });
-    }
-    if (req.companyId) {
-      await client.query(`SELECT id FROM companies WHERE id = $1 FOR SHARE`, [req.companyId]);
-      await client.query(`SELECT user_id FROM employee_permissions WHERE user_id = $1 FOR SHARE`, [req.userId]);
-    }
-    const current = await loadSelfDashboardLayoutContext(req, client);
-    if (!current.layout.customizable) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "dashboard_layout_locked", message: "Your company owner manages this Dashboard layout." });
-    }
-    await client.query(`UPDATE users SET dashboard_preferences = '{}'::jsonb WHERE id = $1`, [req.userId]);
-    const updated = await loadSelfDashboardLayoutContext(req, client);
-    await client.query("COMMIT");
-    res.json(dashboardLayoutPayload(updated.layout));
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendDashboardLayoutError(res, error, "dashboard_layout_reset_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/api/company/dashboard-layouts", authRequired, requireEmployer, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT COALESCE(dashboard_role_policies, '{}'::jsonb) AS dashboard_role_policies
-         FROM companies WHERE id = $1`,
-      [req.companyId]
-    );
-    if (!rows.length) return res.status(404).json({ error: "company_not_found" });
-    const policies = rows[0].dashboard_role_policies || {};
-    const roles = DASHBOARD_LAYOUT_ROLE_PRESETS.map((preset) => {
-      const access = resolveAccess({ role: "employee", preset: preset.id, overrides: {} });
-      return {
-        ...preset,
-        policy: policies[preset.id] || null,
-        layout: resolveDashboardLayout({
-          role: "employee",
-          preset: preset.id,
-          capabilities: access.capabilities,
-          rolePolicies: policies
-        })
-      };
-    });
-    res.json({ catalog: dashboardCardCatalogPayload(), roles });
-  } catch (error) {
-    sendDashboardLayoutError(res, error, "company_dashboard_layouts_load_failed");
-  }
-});
-
-app.put("/api/company/dashboard-layouts/:preset", authRequired, requireEmployer, async (req, res) => {
-  const preset = req.params.preset;
-  if (!isKnownDashboardRolePreset(preset)) return res.status(400).json({ error: "unknown_permission_preset" });
-  let layout;
-  try {
-    layout = validateDashboardLayout(req.body, { allowLocked: true });
-  } catch (error) {
-    return sendDashboardLayoutError(res, error, "role_dashboard_layout_update_failed");
-  }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const company = await client.query(
-      `SELECT COALESCE(dashboard_role_policies, '{}'::jsonb) AS policies
-         FROM companies WHERE id = $1 FOR UPDATE`,
-      [req.companyId]
-    );
-    if (!company.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "company_not_found" });
-    }
-    const previousPolicies = company.rows[0].policies || {};
-    const policies = { ...previousPolicies, [preset]: layout };
-    await client.query(
-      `UPDATE companies SET dashboard_role_policies = $2::jsonb, updated_at = now() WHERE id = $1`,
-      [req.companyId, JSON.stringify(policies)]
-    );
-    await insertDashboardLayoutAudit(client, {
-      companyId: req.companyId,
-      actorUserId: req.userId,
-      targetType: "role",
-      targetId: preset,
-      previousLayout: previousPolicies[preset],
-      newLayout: layout
-    });
-    await client.query("COMMIT");
-    const access = resolveAccess({ role: "employee", preset, overrides: {} });
-    res.json({
-      catalog: dashboardCardCatalogPayload(),
-      preset,
-      policy: layout,
-      layout: resolveDashboardLayout({ role: "employee", preset, capabilities: access.capabilities, rolePolicies: policies })
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendDashboardLayoutError(res, error, "role_dashboard_layout_update_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.delete("/api/company/dashboard-layouts/:preset", authRequired, requireEmployer, async (req, res) => {
-  const preset = req.params.preset;
-  if (!isKnownDashboardRolePreset(preset)) return res.status(400).json({ error: "unknown_permission_preset" });
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const company = await client.query(
-      `SELECT COALESCE(dashboard_role_policies, '{}'::jsonb) AS policies
-         FROM companies WHERE id = $1 FOR UPDATE`,
-      [req.companyId]
-    );
-    if (!company.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "company_not_found" });
-    }
-    const previousPolicies = company.rows[0].policies || {};
-    const policies = { ...previousPolicies };
-    delete policies[preset];
-    await client.query(
-      `UPDATE companies SET dashboard_role_policies = $2::jsonb, updated_at = now() WHERE id = $1`,
-      [req.companyId, JSON.stringify(policies)]
-    );
-    await insertDashboardLayoutAudit(client, {
-      companyId: req.companyId,
-      actorUserId: req.userId,
-      targetType: "role",
-      targetId: preset,
-      previousLayout: previousPolicies[preset],
-      newLayout: {}
-    });
-    await client.query("COMMIT");
-    const access = resolveAccess({ role: "employee", preset, overrides: {} });
-    res.json({
-      catalog: dashboardCardCatalogPayload(),
-      preset,
-      policy: null,
-      layout: resolveDashboardLayout({ role: "employee", preset, capabilities: access.capabilities, rolePolicies: policies })
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendDashboardLayoutError(res, error, "role_dashboard_layout_reset_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/api/company/employees/:id/dashboard-layout", authRequired, requireEmployer, async (req, res) => {
-  try {
-    const context = await loadEmployeeDashboardLayoutContext(req.params.id, req.companyId);
-    if (!context) return res.status(404).json({ error: "employee_not_found" });
-    res.json({
-      employee_id: context.row.id,
-      preset: context.access.preset,
-      employee_policy: context.row.dashboard_policy && Object.keys(context.row.dashboard_policy).length
-        ? context.row.dashboard_policy
-        : null,
-      ...dashboardLayoutPayload(context.layout)
-    });
-  } catch (error) {
-    sendDashboardLayoutError(res, error, "employee_dashboard_layout_load_failed");
-  }
-});
-
-app.put("/api/company/employees/:id/dashboard-layout", authRequired, requireEmployer, async (req, res) => {
-  let layout;
-  try {
-    layout = validateDashboardLayout(req.body, { allowLocked: true });
-  } catch (error) {
-    return sendDashboardLayoutError(res, error, "employee_dashboard_layout_update_failed");
-  }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const employee = await client.query(
-      `SELECT id FROM users
-        WHERE id = $1 AND company_id = $2 AND role = 'employee' AND deleted_at IS NULL
-        FOR UPDATE`,
-      [req.params.id, req.companyId]
-    );
-    if (!employee.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "employee_not_found" });
-    }
-    const previous = await client.query(`SELECT dashboard_policy FROM employee_permissions WHERE user_id = $1`, [req.params.id]);
-    await client.query(
-      `INSERT INTO employee_permissions(user_id, company_id, permission_preset, dashboard_policy)
-       VALUES($1, $2, 'technician', $3::jsonb)
-       ON CONFLICT(user_id) DO UPDATE
-         SET company_id = EXCLUDED.company_id, dashboard_policy = EXCLUDED.dashboard_policy, updated_at = now()`,
-      [req.params.id, req.companyId, JSON.stringify(layout)]
-    );
-    await insertDashboardLayoutAudit(client, {
-      companyId: req.companyId,
-      actorUserId: req.userId,
-      targetType: "employee",
-      targetId: req.params.id,
-      previousLayout: previous.rows[0]?.dashboard_policy,
-      newLayout: layout
-    });
-    const context = await loadEmployeeDashboardLayoutContext(req.params.id, req.companyId, client);
-    await client.query("COMMIT");
-    res.json({
-      employee_id: context.row.id,
-      preset: context.access.preset,
-      employee_policy: layout,
-      ...dashboardLayoutPayload(context.layout)
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendDashboardLayoutError(res, error, "employee_dashboard_layout_update_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.delete("/api/company/employees/:id/dashboard-layout", authRequired, requireEmployer, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const employee = await client.query(
-      `SELECT id FROM users
-        WHERE id = $1 AND company_id = $2 AND role = 'employee' AND deleted_at IS NULL
-        FOR UPDATE`,
-      [req.params.id, req.companyId]
-    );
-    if (!employee.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "employee_not_found" });
-    }
-    const previous = await client.query(`SELECT dashboard_policy FROM employee_permissions WHERE user_id = $1`, [req.params.id]);
-    await client.query(
-      `UPDATE employee_permissions SET dashboard_policy = '{}'::jsonb, updated_at = now() WHERE user_id = $1`,
-      [req.params.id]
-    );
-    await insertDashboardLayoutAudit(client, {
-      companyId: req.companyId,
-      actorUserId: req.userId,
-      targetType: "employee",
-      targetId: req.params.id,
-      previousLayout: previous.rows[0]?.dashboard_policy,
-      newLayout: {}
-    });
-    const context = await loadEmployeeDashboardLayoutContext(req.params.id, req.companyId, client);
-    await client.query("COMMIT");
-    res.json({
-      employee_id: context.row.id,
-      preset: context.access.preset,
-      employee_policy: null,
-      ...dashboardLayoutPayload(context.layout)
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendDashboardLayoutError(res, error, "employee_dashboard_layout_reset_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/api/company/tab-layouts", authRequired, requireEmployer, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT COALESCE(tab_role_policies, '{}'::jsonb) AS tab_role_policies FROM companies WHERE id = $1`,
-      [req.companyId]
-    );
-    if (!rows.length) return res.status(404).json({ error: "company_not_found" });
-    const policies = rows[0].tab_role_policies || {};
-    const roles = TAB_ROLE_PRESETS.map((preset) => {
-      const access = resolveAccess({ role: "employee", preset: preset.id, overrides: {} });
-      return {
-        ...preset,
-        policy: policies[preset.id] || null,
-        navigation: resolveTabNavigation({
-          role: "employee",
-          preset: preset.id,
-          capabilities: access.capabilities,
-          rolePolicies: policies
-        })
-      };
-    });
-    res.json({ catalog: tabCatalogPayload(), roles });
-  } catch (error) {
-    sendTabLayoutError(res, error, "company_tab_layouts_load_failed");
-  }
-});
-
-app.put("/api/company/tab-layouts/:preset", authRequired, requireEmployer, async (req, res) => {
-  const preset = req.params.preset;
-  if (!isKnownTabRolePreset(preset)) return res.status(400).json({ error: "unknown_permission_preset" });
-  let layout;
-  try {
-    layout = validateTabLayout(req.body, { allowLocked: true });
-  } catch (error) {
-    return sendTabLayoutError(res, error, "role_tab_layout_update_failed");
-  }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const company = await client.query(
-      `SELECT COALESCE(tab_role_policies, '{}'::jsonb) AS policies FROM companies WHERE id = $1 FOR UPDATE`,
-      [req.companyId]
-    );
-    if (!company.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "company_not_found" });
-    }
-    const previousPolicies = company.rows[0].policies || {};
-    const policies = { ...previousPolicies, [preset]: layout };
-    await client.query(`UPDATE companies SET tab_role_policies = $2::jsonb, updated_at = now() WHERE id = $1`, [req.companyId, JSON.stringify(policies)]);
-    await insertTabLayoutAudit(client, {
-      companyId: req.companyId,
-      actorUserId: req.userId,
-      targetType: "role",
-      targetId: preset,
-      previousLayout: previousPolicies[preset],
-      newLayout: layout
-    });
-    await client.query("COMMIT");
-    const access = resolveAccess({ role: "employee", preset, overrides: {} });
-    res.json({
-      catalog: tabCatalogPayload(),
-      preset,
-      policy: layout,
-      navigation: resolveTabNavigation({ role: "employee", preset, capabilities: access.capabilities, rolePolicies: policies })
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendTabLayoutError(res, error, "role_tab_layout_update_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.delete("/api/company/tab-layouts/:preset", authRequired, requireEmployer, async (req, res) => {
-  const preset = req.params.preset;
-  if (!isKnownTabRolePreset(preset)) return res.status(400).json({ error: "unknown_permission_preset" });
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const company = await client.query(
-      `SELECT COALESCE(tab_role_policies, '{}'::jsonb) AS policies FROM companies WHERE id = $1 FOR UPDATE`,
-      [req.companyId]
-    );
-    if (!company.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "company_not_found" });
-    }
-    const previousPolicies = company.rows[0].policies || {};
-    const policies = { ...previousPolicies };
-    delete policies[preset];
-    await client.query(`UPDATE companies SET tab_role_policies = $2::jsonb, updated_at = now() WHERE id = $1`, [req.companyId, JSON.stringify(policies)]);
-    await insertTabLayoutAudit(client, {
-      companyId: req.companyId,
-      actorUserId: req.userId,
-      targetType: "role",
-      targetId: preset,
-      previousLayout: previousPolicies[preset],
-      newLayout: {}
-    });
-    await client.query("COMMIT");
-    const access = resolveAccess({ role: "employee", preset, overrides: {} });
-    res.json({
-      catalog: tabCatalogPayload(),
-      preset,
-      policy: null,
-      navigation: resolveTabNavigation({ role: "employee", preset, capabilities: access.capabilities, rolePolicies: policies })
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendTabLayoutError(res, error, "role_tab_layout_reset_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/api/company/employees/:id/tabs", authRequired, requireEmployer, async (req, res) => {
-  try {
-    const context = await loadEmployeeTabNavigationContext(req.params.id, req.companyId);
-    if (!context) return res.status(404).json({ error: "employee_not_found" });
-    res.json({
-      employee_id: context.row.id,
-      preset: context.access.preset,
-      employee_policy: context.row.tab_policy && Object.keys(context.row.tab_policy).length ? context.row.tab_policy : null,
-      ...tabNavigationPayload(context.navigation)
-    });
-  } catch (error) {
-    sendTabLayoutError(res, error, "employee_tab_layout_load_failed");
-  }
-});
-
-app.put("/api/company/employees/:id/tabs", authRequired, requireEmployer, async (req, res) => {
-  let layout;
-  try {
-    layout = validateTabLayout(req.body, { allowLocked: true });
-  } catch (error) {
-    return sendTabLayoutError(res, error, "employee_tab_layout_update_failed");
-  }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const employee = await client.query(
-      `SELECT id FROM users
-        WHERE id = $1 AND company_id = $2 AND role = 'employee' AND deleted_at IS NULL
-        FOR UPDATE`,
-      [req.params.id, req.companyId]
-    );
-    if (!employee.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "employee_not_found" });
-    }
-    const previous = await client.query(`SELECT tab_policy FROM employee_permissions WHERE user_id = $1`, [req.params.id]);
-    await client.query(
-      `INSERT INTO employee_permissions(user_id, company_id, permission_preset, tab_policy)
-       VALUES($1, $2, 'technician', $3::jsonb)
-       ON CONFLICT(user_id) DO UPDATE
-         SET company_id = EXCLUDED.company_id, tab_policy = EXCLUDED.tab_policy, updated_at = now()`,
-      [req.params.id, req.companyId, JSON.stringify(layout)]
-    );
-    await insertTabLayoutAudit(client, {
-      companyId: req.companyId,
-      actorUserId: req.userId,
-      targetType: "employee",
-      targetId: req.params.id,
-      previousLayout: previous.rows[0]?.tab_policy,
-      newLayout: layout
-    });
-    const context = await loadEmployeeTabNavigationContext(req.params.id, req.companyId, client);
-    await client.query("COMMIT");
-    res.json({
-      employee_id: context.row.id,
-      preset: context.access.preset,
-      employee_policy: layout,
-      ...tabNavigationPayload(context.navigation)
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendTabLayoutError(res, error, "employee_tab_layout_update_failed");
-  } finally {
-    client.release();
-  }
-});
-
-app.delete("/api/company/employees/:id/tabs", authRequired, requireEmployer, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const employee = await client.query(
-      `SELECT id FROM users
-        WHERE id = $1 AND company_id = $2 AND role = 'employee' AND deleted_at IS NULL
-        FOR UPDATE`,
-      [req.params.id, req.companyId]
-    );
-    if (!employee.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "employee_not_found" });
-    }
-    const previous = await client.query(`SELECT tab_policy FROM employee_permissions WHERE user_id = $1`, [req.params.id]);
-    await client.query(`UPDATE employee_permissions SET tab_policy = '{}'::jsonb, updated_at = now() WHERE user_id = $1`, [req.params.id]);
-    await insertTabLayoutAudit(client, {
-      companyId: req.companyId,
-      actorUserId: req.userId,
-      targetType: "employee",
-      targetId: req.params.id,
-      previousLayout: previous.rows[0]?.tab_policy,
-      newLayout: {}
-    });
-    const context = await loadEmployeeTabNavigationContext(req.params.id, req.companyId, client);
-    await client.query("COMMIT");
-    res.json({
-      employee_id: context.row.id,
-      preset: context.access.preset,
-      employee_policy: null,
-      ...tabNavigationPayload(context.navigation)
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendTabLayoutError(res, error, "employee_tab_layout_reset_failed");
-  } finally {
-    client.release();
-  }
-});
-
 app.get("/api/company/settings", authRequired, requireEmployer, async (req, res) => {
   try {
     const company = await pool.query(
-      `SELECT id, name, join_code, logo_data_url, website, address, phone, email,
-              notify_all_members_on_jobs, on_my_way_message_template
+      `SELECT id, name, join_code, logo_data_url, website, address, phone, email, notify_all_members_on_jobs
          FROM companies WHERE id = $1`,
       [req.companyId]
     );
@@ -5872,7 +4518,6 @@ app.get("/api/company/settings", authRequired, requireEmployer, async (req, res)
               u.email,
               u.display_name,
               u.photo_url,
-              u.role,
               u.deleted_at,
               COALESCE(u.pre_delete_email, u.email) AS original_email,
               COALESCE(p.can_delete_contacts,false) AS can_delete_contacts,
@@ -5896,32 +4541,21 @@ app.get("/api/company/settings", authRequired, requireEmployer, async (req, res)
               COALESCE(p.can_edit_finance_debts,false) AS can_edit_finance_debts,
               COALESCE(p.can_view_finance_settings,false) AS can_view_finance_settings,
               COALESCE(p.can_edit_finance_settings,false) AS can_edit_finance_settings,
-              COALESCE(p.can_manage_company_finance_ai_memories,false) AS can_manage_company_finance_ai_memories,
-              p.permission_preset,
-              p.permission_overrides
+              COALESCE(p.can_manage_company_finance_ai_memories,false) AS can_manage_company_finance_ai_memories
          FROM users u
          LEFT JOIN employee_permissions p ON p.user_id = u.id
         WHERE u.company_id = $1 AND u.role = 'employee'
         ORDER BY u.deleted_at IS NOT NULL, COALESCE(u.display_name, u.email) ASC`,
       [req.companyId]
     );
-    const employeeRows = employees.rows.map((employee) => ({
-      ...employee,
-      access: resolveAccess({
-        role: employee.role,
-        preset: employee.permission_preset,
-        overrides: employee.permission_overrides,
-        legacy: employee
-      })
-    }));
-    res.json({ company: company.rows[0], employees: employeeRows });
+    res.json({ company: company.rows[0], employees: employees.rows });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "company_settings_failed" });
   }
 });
 
-app.patch("/api/company/invoice-settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
+app.patch("/api/company/invoice-settings", authRequired, requireEmployer, async (req, res) => {
   try {
     const logo = (req.body.logo_data_url || "").toString();
     if (logo && logo.length > 350000) return res.status(413).json({ error: "logo_too_large" });
@@ -5934,8 +4568,7 @@ app.patch("/api/company/invoice-settings", authRequired, requireCapability("sett
               email = $6,
               updated_at = now()
         WHERE id = $1
-        RETURNING id, name, join_code, logo_data_url, website, address, phone, email,
-                  notify_all_members_on_jobs, on_my_way_message_template`,
+        RETURNING id, name, join_code, logo_data_url, website, address, phone, email`,
       [
         req.companyId,
         logo || null,
@@ -5952,7 +4585,7 @@ app.patch("/api/company/invoice-settings", authRequired, requireCapability("sett
   }
 });
 
-app.patch("/api/company/job-notification-settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
+app.patch("/api/company/job-notification-settings", authRequired, requireEmployer, async (req, res) => {
   try {
     const notifyAll = !!req.body.notify_all_members_on_jobs;
     const { rows } = await pool.query(
@@ -5960,8 +4593,7 @@ app.patch("/api/company/job-notification-settings", authRequired, requireCapabil
           SET notify_all_members_on_jobs = $2,
               updated_at = now()
         WHERE id = $1
-        RETURNING id, name, join_code, logo_data_url, website, address, phone, email,
-                  notify_all_members_on_jobs, on_my_way_message_template`,
+        RETURNING id, name, join_code, logo_data_url, website, address, phone, email, notify_all_members_on_jobs`,
       [req.companyId, notifyAll]
     );
     res.json({ company: rows[0] });
@@ -5971,37 +4603,11 @@ app.patch("/api/company/job-notification-settings", authRequired, requireCapabil
   }
 });
 
-app.patch("/api/company/on-my-way-settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
-  try {
-    const template = validateOnMyWayTemplate(req.body?.message_template);
-    const { rows } = await pool.query(
-      `UPDATE companies
-          SET on_my_way_message_template = $2,
-              updated_at = now()
-        WHERE id = $1
-        RETURNING id, name, join_code, logo_data_url, website, address, phone, email,
-                  notify_all_members_on_jobs, on_my_way_message_template`,
-      [req.companyId, template]
-    );
-    res.json({ company: rows[0] });
-  } catch (error) {
-    if (error instanceof OnMyWayError) {
-      return res.status(error.statusCode).json({
-        error: error.code,
-        message: error.message
-      });
-    }
-    console.error("[on-my-way/settings] failed:", { code: error?.code, message: error?.message });
-    res.status(500).json({ error: "on_my_way_settings_update_failed", message: "Couldn't save the On My Way template." });
-  }
-});
-
-app.get("/api/company/invoice-settings", authRequired, requireCapability("settings.view"), async (req, res) => {
+app.get("/api/company/invoice-settings", authRequired, async (req, res) => {
   try {
     if (!req.companyId) return res.status(404).json({ error: "company_not_found" });
     const { rows } = await pool.query(
-      `SELECT id, name, join_code, logo_data_url, website, address, phone, email,
-              notify_all_members_on_jobs, on_my_way_message_template
+      `SELECT id, name, join_code, logo_data_url, website, address, phone, email, notify_all_members_on_jobs
          FROM companies WHERE id = $1`,
       [req.companyId]
     );
@@ -6012,7 +4618,7 @@ app.get("/api/company/invoice-settings", authRequired, requireCapability("settin
   }
 });
 
-app.put("/api/company/join-code", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
+app.put("/api/company/join-code", authRequired, requireEmployer, async (req, res) => {
   try {
     const code = (req.body.join_code || "").toString().trim();
     if (!companyCodeIsValid(code)) return res.status(400).json({ error: "invalid_company_code" });
@@ -6143,176 +4749,37 @@ app.post("/api/company/employees/:id/restore", authRequired, requireEmployer, as
   }
 });
 
-app.put("/api/company/employees/:id/access", authRequired, requireEmployer, async (req, res) => {
-  let requestedAccess;
+app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer, async (req, res) => {
   try {
-    requestedAccess = validateAccessUpdate(req.body);
-  } catch (error) {
-    return res.status(error.statusCode || 400).json({
-      error: error.code || "invalid_permission_document",
-      message: error.message,
-      details: error.details || undefined
-    });
-  }
-
-  const targetId = req.params.id;
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const employeeResult = await client.query(
-      `SELECT id, role, deleted_at
-         FROM users
-        WHERE id = $1 AND company_id = $2
-        FOR UPDATE`,
-      [targetId, req.companyId]
-    );
-    const employee = employeeResult.rows[0];
-    if (!employee || employee.role !== "employee") {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "employee_not_found" });
-    }
-    if (employee.deleted_at) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "employee_inactive", message: "Restore the employee before changing access." });
-    }
-
-    const existingResult = await client.query(
-      `SELECT * FROM employee_permissions WHERE user_id = $1 AND company_id = $2`,
-      [targetId, req.companyId]
-    );
-    const existing = existingResult.rows[0] || {};
-    const previousAccess = resolveAccess({
-      role: employee.role,
-      preset: existing.permission_preset,
-      overrides: existing.permission_overrides,
-      legacy: existing
-    });
-    const persisted = await persistEmployeeAccess(client, {
-      employeeUserId: targetId,
-      companyId: req.companyId,
-      access: requestedAccess
-    });
-    await client.query(
-      `INSERT INTO employee_permission_audit(
-         company_id, employee_user_id, changed_by_user_id,
-         previous_preset, previous_overrides, new_preset, new_overrides
-       ) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7::jsonb)`,
-      [
-        req.companyId,
-        targetId,
-        req.userId,
-        previousAccess.preset,
-        JSON.stringify(previousAccess.overrides),
-        requestedAccess.preset,
-        JSON.stringify(requestedAccess.overrides)
-      ]
-    );
-    await client.query("COMMIT");
-
-    try {
-      const changedCapabilities = Object.keys(requestedAccess.capabilities).filter(
-        (key) => requestedAccess.capabilities[key] !== previousAccess.capabilities[key]
-      );
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "employee.permission_changed",
-        subjectType: "employee",
-        subjectId: targetId,
-        actorUserId: req.userId,
-        source: "ios",
-        payload: {
-          employee_id: targetId,
-          previous_preset: previousAccess.preset,
-          new_preset: requestedAccess.preset,
-          changed_capabilities: changedCapabilities
-        }
-      });
-    } catch (automationError) {
-      console.warn("[automations] employee access hook failed", automationError?.message || automationError);
-    }
-
-    res.json({
-      id: targetId,
-      access: requestedAccess,
-      permissions: employeePermissionPayload({ ...persisted.row, role: "employee", access: requestedAccess })
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("[permissions] employee access update failed", error?.message || error);
-    res.status(500).json({ error: "permissions_update_failed" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/api/company/employees/:id/access-audit", authRequired, requireEmployer, async (req, res) => {
-  try {
+    const canDelete = !!req.body.can_delete_contacts;
+    const financePermissions = {
+      can_view_finance: !!req.body.can_view_finance,
+      can_use_finance_ai: !!req.body.can_use_finance_ai,
+      can_view_finance_transactions: !!req.body.can_view_finance_transactions,
+      can_edit_finance_transactions: !!req.body.can_edit_finance_transactions,
+      can_view_finance_accounts: !!req.body.can_view_finance_accounts,
+      can_create_finance_accounts: !!req.body.can_create_finance_accounts,
+      can_edit_finance_accounts: !!req.body.can_edit_finance_accounts,
+      can_adjust_finance_account_balances: !!req.body.can_adjust_finance_account_balances,
+      can_view_finance_receipts: !!req.body.can_view_finance_receipts,
+      can_edit_finance_receipts: !!req.body.can_edit_finance_receipts,
+      can_view_finance_planning: !!req.body.can_view_finance_planning,
+      can_edit_finance_planning: !!req.body.can_edit_finance_planning,
+      can_view_finance_budgets: !!req.body.can_view_finance_budgets,
+      can_edit_finance_budgets: !!req.body.can_edit_finance_budgets,
+      can_view_finance_goals: !!req.body.can_view_finance_goals,
+      can_edit_finance_goals: !!req.body.can_edit_finance_goals,
+      can_view_finance_debts: !!req.body.can_view_finance_debts,
+      can_edit_finance_debts: !!req.body.can_edit_finance_debts,
+      can_view_finance_settings: !!req.body.can_view_finance_settings,
+      can_edit_finance_settings: !!req.body.can_edit_finance_settings,
+      can_manage_company_finance_ai_memories: !!req.body.can_manage_company_finance_ai_memories
+    };
     const employee = await pool.query(
       `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND role = 'employee'`,
       [req.params.id, req.companyId]
     );
     if (!employee.rowCount) return res.status(404).json({ error: "employee_not_found" });
-    const { rows } = await pool.query(
-      `SELECT a.id,
-              a.employee_user_id,
-              a.changed_by_user_id,
-              actor.display_name AS changed_by_display_name,
-              actor.email AS changed_by_email,
-              a.previous_preset,
-              a.previous_overrides,
-              a.new_preset,
-              a.new_overrides,
-              a.created_at
-         FROM employee_permission_audit a
-         LEFT JOIN users actor ON actor.id = a.changed_by_user_id
-        WHERE a.company_id = $1 AND a.employee_user_id = $2
-        ORDER BY a.created_at DESC
-        LIMIT 100`,
-      [req.companyId, req.params.id]
-    );
-    res.json({ entries: rows });
-  } catch (error) {
-    console.error("[permissions] access audit load failed", error?.message || error);
-    res.status(500).json({ error: "permission_audit_failed" });
-  }
-});
-
-app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer, async (req, res) => {
-  try {
-    const employee = await pool.query(
-      `SELECT u.id, to_jsonb(p) AS permission_record
-         FROM users u
-         LEFT JOIN employee_permissions p ON p.user_id = u.id
-        WHERE u.id = $1 AND u.company_id = $2 AND u.role = 'employee'`,
-      [req.params.id, req.companyId]
-    );
-    if (!employee.rowCount) return res.status(404).json({ error: "employee_not_found" });
-    const existing = employee.rows[0].permission_record || {};
-    const requestedBoolean = (key) => Object.hasOwn(req.body || {}, key) ? !!req.body[key] : !!existing[key];
-    const canDelete = requestedBoolean("can_delete_contacts");
-    const financePermissions = {
-      can_view_finance: requestedBoolean("can_view_finance"),
-      can_use_finance_ai: requestedBoolean("can_use_finance_ai"),
-      can_view_finance_transactions: requestedBoolean("can_view_finance_transactions"),
-      can_edit_finance_transactions: requestedBoolean("can_edit_finance_transactions"),
-      can_view_finance_accounts: requestedBoolean("can_view_finance_accounts"),
-      can_create_finance_accounts: requestedBoolean("can_create_finance_accounts"),
-      can_edit_finance_accounts: requestedBoolean("can_edit_finance_accounts"),
-      can_adjust_finance_account_balances: requestedBoolean("can_adjust_finance_account_balances"),
-      can_view_finance_receipts: requestedBoolean("can_view_finance_receipts"),
-      can_edit_finance_receipts: requestedBoolean("can_edit_finance_receipts"),
-      can_view_finance_planning: requestedBoolean("can_view_finance_planning"),
-      can_edit_finance_planning: requestedBoolean("can_edit_finance_planning"),
-      can_view_finance_budgets: requestedBoolean("can_view_finance_budgets"),
-      can_edit_finance_budgets: requestedBoolean("can_edit_finance_budgets"),
-      can_view_finance_goals: requestedBoolean("can_view_finance_goals"),
-      can_edit_finance_goals: requestedBoolean("can_edit_finance_goals"),
-      can_view_finance_debts: requestedBoolean("can_view_finance_debts"),
-      can_edit_finance_debts: requestedBoolean("can_edit_finance_debts"),
-      can_view_finance_settings: requestedBoolean("can_view_finance_settings"),
-      can_edit_finance_settings: requestedBoolean("can_edit_finance_settings"),
-      can_manage_company_finance_ai_memories: requestedBoolean("can_manage_company_finance_ai_memories")
-    };
     const { rows } = await pool.query(
       `INSERT INTO employee_permissions(
          user_id, company_id, can_delete_contacts,
@@ -6329,8 +4796,7 @@ app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer,
        )
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
        ON CONFLICT(user_id) DO UPDATE
-         SET company_id = EXCLUDED.company_id,
-             can_delete_contacts = EXCLUDED.can_delete_contacts,
+         SET can_delete_contacts = EXCLUDED.can_delete_contacts,
              can_view_finance = EXCLUDED.can_view_finance,
              can_use_finance_ai = EXCLUDED.can_use_finance_ai,
              can_view_finance_transactions = EXCLUDED.can_view_finance_transactions,
@@ -6439,7 +4905,7 @@ app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: "notification_read_failed" }); }
 });
 
-app.post("/api/internal/media/upload-url", authRequired, requireCapability("communications.send"), async (req, res) => {
+app.post("/api/internal/media/upload-url", authRequired, async (req, res) => {
   try {
     const cfg = mediaBucketConfig();
     const s3 = getMediaS3Client();
@@ -6471,7 +4937,7 @@ app.post("/api/internal/media/upload-url", authRequired, requireCapability("comm
   } catch (e) { console.error(e); res.status(500).json({ error: "media_upload_url_failed" }); }
 });
 
-app.get("/api/internal/media/download-url", authRequired, requireCapability("communications.view"), async (req, res) => {
+app.get("/api/internal/media/download-url", authRequired, async (req, res) => {
   try {
     const cfg = mediaBucketConfig();
     const s3 = getMediaS3Client();
@@ -6488,7 +4954,7 @@ app.get("/api/internal/media/download-url", authRequired, requireCapability("com
   } catch (e) { console.error(e); res.status(500).json({ error: "media_download_url_failed" }); }
 });
 
-app.get("/api/internal/conversations", authRequired, requireCapability("communications.view"), async (req, res) => {
+app.get("/api/internal/conversations", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT c.id, c.company_id, c.title, c.is_group, c.created_by, c.created_at, c.updated_at,
@@ -6528,7 +4994,7 @@ app.get("/api/internal/conversations", authRequired, requireCapability("communic
   } catch (e) { console.error(e); res.status(500).json({ error: "conversation_list_failed" }); }
 });
 
-app.post("/api/internal/conversations/private", authRequired, requireCapability("communications.send"), async (req, res) => {
+app.post("/api/internal/conversations/private", authRequired, async (req, res) => {
   const otherUserId = (req.body.user_id || "").toString();
   if (!otherUserId || otherUserId === req.userId) return res.status(400).json({ error: "invalid_user" });
   try {
@@ -6570,7 +5036,7 @@ app.post("/api/internal/conversations/private", authRequired, requireCapability(
   } catch (e) { console.error(e); res.status(500).json({ error: "private_conversation_failed" }); }
 });
 
-app.post("/api/internal/conversations/group", authRequired, requireCapability("communications.send"), async (req, res) => {
+app.post("/api/internal/conversations/group", authRequired, async (req, res) => {
   const title = (req.body.title || "Group").toString().trim() || "Group";
   const ids = [...new Set([req.userId, ...((Array.isArray(req.body.participant_ids) ? req.body.participant_ids : []).map(String))])];
   if (ids.length < 2) return res.status(400).json({ error: "group_needs_members" });
@@ -6600,7 +5066,7 @@ app.post("/api/internal/conversations/group", authRequired, requireCapability("c
   } catch (e) { console.error(e); res.status(500).json({ error: "group_conversation_failed" }); }
 });
 
-app.get("/api/internal/conversations/:id/messages", authRequired, requireCapability("communications.view"), async (req, res) => {
+app.get("/api/internal/conversations/:id/messages", authRequired, async (req, res) => {
   try {
     const member = await pool.query(`SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`, [req.params.id, req.userId]);
     if (!member.rows.length) return res.status(403).json({ error: "not_participant" });
@@ -6618,7 +5084,7 @@ app.get("/api/internal/conversations/:id/messages", authRequired, requireCapabil
   } catch (e) { console.error(e); res.status(500).json({ error: "conversation_messages_failed" }); }
 });
 
-app.delete("/api/internal/conversations/:id", authRequired, requireCapability("communications.manage"), async (req, res) => {
+app.delete("/api/internal/conversations/:id", authRequired, requireEmployer, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE conversations
@@ -6635,7 +5101,7 @@ app.delete("/api/internal/conversations/:id", authRequired, requireCapability("c
   } catch (e) { console.error(e); res.status(500).json({ error: "delete_conversation_failed" }); }
 });
 
-app.post("/api/internal/conversations/:id/messages", authRequired, requireCapability("communications.send"), async (req, res) => {
+app.post("/api/internal/conversations/:id/messages", authRequired, async (req, res) => {
   const body = (req.body.body || "").toString();
   const attachments = parseAttachments(req.body.attachments);
   if (!body.trim() && !attachments.length) return res.status(400).json({ error: "empty_message" });
@@ -6674,7 +5140,7 @@ app.post("/api/internal/conversations/:id/messages", authRequired, requireCapabi
   } catch (e) { console.error(e); res.status(500).json({ error: "send_conversation_message_failed" }); }
 });
 
-app.post("/api/internal/conversations/:id/read", authRequired, requireCapability("communications.view"), async (req, res) => {
+app.post("/api/internal/conversations/:id/read", authRequired, async (req, res) => {
   try {
     const result = await pool.query(`UPDATE conversation_participants SET last_read_at = now() WHERE conversation_id = $1 AND user_id = $2 RETURNING conversation_id`, [req.params.id, req.userId]);
     if (result.rowCount && req.companyId) {
@@ -6693,7 +5159,7 @@ app.post("/api/internal/conversations/:id/read", authRequired, requireCapability
   } catch (e) { console.error(e); res.status(500).json({ error: "mark_read_failed" }); }
 });
 
-app.get("/api/internal/channels", authRequired, requireCapability("communications.view"), async (req, res) => {
+app.get("/api/internal/channels", authRequired, async (req, res) => {
   try {
     const where = req.companyId ? `company_id = $1` : `created_by = $1`;
     const { rows } = await pool.query(
@@ -6707,7 +5173,7 @@ app.get("/api/internal/channels", authRequired, requireCapability("communication
   } catch (e) { console.error(e); res.status(500).json({ error: "channels_failed" }); }
 });
 
-app.delete("/api/internal/channels/:id", authRequired, requireCapability("communications.manage"), async (req, res) => {
+app.delete("/api/internal/channels/:id", authRequired, requireEmployer, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE channels
@@ -6734,7 +5200,7 @@ app.delete("/api/internal/channels/:id", authRequired, requireCapability("commun
   } catch (e) { console.error(e); res.status(500).json({ error: "delete_channel_failed" }); }
 });
 
-app.post("/api/internal/channels", authRequired, requireCapability("communications.manage"), async (req, res) => {
+app.post("/api/internal/channels", authRequired, async (req, res) => {
   const name = (req.body.name || "").toString().trim();
   const description = (req.body.description || "").toString().trim();
   if (!name) return res.status(400).json({ error: "missing_name" });
@@ -6761,7 +5227,7 @@ app.post("/api/internal/channels", authRequired, requireCapability("communicatio
   } catch (e) { console.error(e); res.status(500).json({ error: "create_channel_failed" }); }
 });
 
-app.get("/api/internal/channels/:id/messages", authRequired, requireCapability("communications.view"), async (req, res) => {
+app.get("/api/internal/channels/:id/messages", authRequired, async (req, res) => {
   try {
     const channel = await pool.query(
       req.companyId ? `SELECT id FROM channels WHERE id = $1 AND company_id = $2 AND archived_at IS NULL` : `SELECT id FROM channels WHERE id = $1 AND created_by = $2 AND archived_at IS NULL`,
@@ -6782,7 +5248,7 @@ app.get("/api/internal/channels/:id/messages", authRequired, requireCapability("
   } catch (e) { console.error(e); res.status(500).json({ error: "channel_messages_failed" }); }
 });
 
-app.post("/api/internal/channels/:id/messages", authRequired, requireCapability("communications.send"), async (req, res) => {
+app.post("/api/internal/channels/:id/messages", authRequired, async (req, res) => {
   const body = (req.body.body || "").toString();
   const attachments = parseAttachments(req.body.attachments);
   if (!body.trim() && !attachments.length) return res.status(400).json({ error: "empty_message" });
@@ -6825,7 +5291,7 @@ app.post("/api/internal/channels/:id/messages", authRequired, requireCapability(
   } catch (e) { console.error(e); res.status(500).json({ error: "send_channel_message_failed" }); }
 });
 
-app.delete("/api/internal/messages/:id", authRequired, requireCapability("communications.manage"), async (req, res) => {
+app.delete("/api/internal/messages/:id", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE messages m
@@ -6868,7 +5334,7 @@ app.delete("/api/internal/messages/:id", authRequired, requireCapability("commun
 });
 
 // ---------- TIME CLOCK ----------
-app.get("/api/time-clock/settings", authRequired, requireCapability("time.view_self"), async (req, res) => {
+app.get("/api/time-clock/settings", authRequired, async (req, res) => {
   try {
     if (!req.companyId) return res.json({ week_start: 1 });
     const { rows } = await pool.query(
@@ -6882,7 +5348,7 @@ app.get("/api/time-clock/settings", authRequired, requireCapability("time.view_s
   } catch (e) { console.error(e); res.status(500).json({ error: "time_settings_failed" }); }
 });
 
-app.put("/api/time-clock/settings", authRequired, requireCapability("time.manage"), async (req, res) => {
+app.put("/api/time-clock/settings", authRequired, requireEmployer, async (req, res) => {
   try {
     const weekStart = Number(req.body.week_start);
     if (!Number.isInteger(weekStart) || weekStart < 0 || weekStart > 6) {
@@ -6901,7 +5367,7 @@ app.put("/api/time-clock/settings", authRequired, requireCapability("time.manage
   } catch (e) { console.error(e); res.status(500).json({ error: "time_settings_update_failed" }); }
 });
 
-app.get("/api/time-clock/me", authRequired, requireCapability("time.view_self"), async (req, res) => {
+app.get("/api/time-clock/me", authRequired, async (req, res) => {
   try {
     const range = weekRangeFromQuery(req);
     if (!range) return res.status(400).json({ error: "invalid_week_start" });
@@ -6925,7 +5391,7 @@ app.get("/api/time-clock/me", authRequired, requireCapability("time.view_self"),
   } catch (e) { console.error(e); res.status(500).json({ error: "time_me_failed" }); }
 });
 
-app.post("/api/time-clock/clock-in", authRequired, requireCapability("time.clock"), async (req, res) => {
+app.post("/api/time-clock/clock-in", authRequired, async (req, res) => {
   try {
     const existing = await pool.query(
       `SELECT id FROM time_clock_entries WHERE user_id = $1 AND end_at IS NULL LIMIT 1`,
@@ -6954,7 +5420,7 @@ app.post("/api/time-clock/clock-in", authRequired, requireCapability("time.clock
   } catch (e) { console.error(e); res.status(500).json({ error: "clock_in_failed" }); }
 });
 
-app.post("/api/time-clock/clock-out", authRequired, requireCapability("time.clock"), async (req, res) => {
+app.post("/api/time-clock/clock-out", authRequired, async (req, res) => {
   try {
     const end = req.body.end_at ? new Date(req.body.end_at) : new Date();
     if (Number.isNaN(end.getTime())) return res.status(400).json({ error: "invalid_end" });
@@ -6991,7 +5457,7 @@ app.post("/api/time-clock/clock-out", authRequired, requireCapability("time.cloc
   } catch (e) { console.error(e); res.status(500).json({ error: "clock_out_failed" }); }
 });
 
-app.post("/api/time-clock/break-start", authRequired, requireCapability("time.clock"), async (req, res) => {
+app.post("/api/time-clock/break-start", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE time_clock_entries
@@ -7017,7 +5483,7 @@ app.post("/api/time-clock/break-start", authRequired, requireCapability("time.cl
   } catch (e) { console.error(e); res.status(500).json({ error: "break_start_failed" }); }
 });
 
-app.post("/api/time-clock/break-end", authRequired, requireCapability("time.clock"), async (req, res) => {
+app.post("/api/time-clock/break-end", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE time_clock_entries
@@ -7044,7 +5510,7 @@ app.post("/api/time-clock/break-end", authRequired, requireCapability("time.cloc
   } catch (e) { console.error(e); res.status(500).json({ error: "break_end_failed" }); }
 });
 
-app.get("/api/time-clock/company", authRequired, requireCapability("time.view_all"), async (req, res) => {
+app.get("/api/time-clock/company", authRequired, requireEmployer, async (req, res) => {
   try {
     const range = weekRangeFromQuery(req);
     if (!range) return res.status(400).json({ error: "invalid_week_start" });
@@ -7064,7 +5530,7 @@ app.get("/api/time-clock/company", authRequired, requireCapability("time.view_al
   } catch (e) { console.error(e); res.status(500).json({ error: "time_company_failed" }); }
 });
 
-app.get("/api/time-clock/range", authRequired, requireCapability("time.view_self"), async (req, res) => {
+app.get("/api/time-clock/range", authRequired, async (req, res) => {
   try {
     const start = new Date(req.query.start);
     const end = new Date(req.query.end);
@@ -7100,7 +5566,7 @@ app.get("/api/time-clock/range", authRequired, requireCapability("time.view_self
   } catch (e) { console.error(e); res.status(500).json({ error: "time_range_failed" }); }
 });
 
-app.post("/api/time-clock/entries", authRequired, requireCapability("time.clock"), async (req, res) => {
+app.post("/api/time-clock/entries", authRequired, async (req, res) => {
   try {
     const start = new Date(req.body.start_at);
     const end = req.body.end_at ? new Date(req.body.end_at) : null;
@@ -7128,7 +5594,7 @@ app.post("/api/time-clock/entries", authRequired, requireCapability("time.clock"
   } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_create_failed" }); }
 });
 
-app.patch("/api/time-clock/entries/:id", authRequired, requireAnyCapability("time.clock", "time.manage"), async (req, res) => {
+app.patch("/api/time-clock/entries/:id", authRequired, async (req, res) => {
   try {
     const start = new Date(req.body.start_at);
     const end = req.body.end_at ? new Date(req.body.end_at) : null;
@@ -7172,56 +5638,22 @@ app.patch("/api/time-clock/entries/:id", authRequired, requireAnyCapability("tim
   } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_update_failed" }); }
 });
 
-app.delete("/api/time-clock/entries/:id", authRequired, requireAnyCapability("time.clock", "time.manage"), async (req, res) => {
-  let client;
+app.delete("/api/time-clock/entries/:id", authRequired, async (req, res) => {
   try {
-    client = await pool.connect();
-    await client.query("BEGIN");
-    const existing = await client.query(
-      req.role === "employer"
-        ? `SELECT start_at FROM time_clock_entries WHERE id = $1 AND company_id = $2 FOR UPDATE`
-        : `SELECT start_at FROM time_clock_entries WHERE id = $1 AND user_id = $2 FOR UPDATE`,
-      [req.params.id, req.role === "employer" ? req.companyId : req.userId]
-    );
-    if (!existing.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "entry_not_found" });
-    }
+    const existing = await pool.query(`SELECT start_at FROM time_clock_entries WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
     if (req.role !== "employer") {
+      if (!existing.rowCount) return res.status(404).json({ error: "entry_not_found" });
       if (!canEmployeeChangeTimeEntry(existing.rows[0].start_at)) {
-        await client.query("ROLLBACK");
         return res.status(403).json({ error: "Cannot change previous week time cards at this Time" });
       }
     }
-    const linkedEvidence = await client.query(
-      `SELECT 1
-         FROM finance_time_job_links l
-        WHERE l.company_id = $1 AND l.time_entry_id = $2
-          AND (l.job_id IS NOT NULL OR EXISTS (
-            SELECT 1 FROM finance_time_allocation_lines al
-             WHERE al.company_id = l.company_id AND al.link_id = l.id
-          ))
-        LIMIT 1`,
-      [req.companyId, req.params.id]
-    );
-    if (linkedEvidence.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        error: "accounting_time_linked",
-        message: "A manager must unlink this time entry in Finance > Accounting before it can be deleted."
-      });
-    }
-    const { rowCount } = await client.query(
+    const { rowCount } = await pool.query(
       req.role === "employer"
         ? `DELETE FROM time_clock_entries WHERE id = $1 AND company_id = $2`
         : `DELETE FROM time_clock_entries WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.role === "employer" ? req.companyId : req.userId]
     );
-    if (!rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "entry_not_found" });
-    }
-    await client.query("COMMIT");
+    if (!rowCount) return res.status(404).json({ error: "entry_not_found" });
     try {
       await cancelAutomationSchedulesForSubject(req.companyId, "time_entry", req.params.id);
       await emitAutomationEvent({ companyId: req.companyId, eventType: "time_clock.shift_updated", subjectType: "time_entry", subjectId: req.params.id, actorUserId: req.userId, source: "ios", payload: { time_entry_id: req.params.id, deleted: true } });
@@ -7229,16 +5661,10 @@ app.delete("/api/time-clock/entries/:id", authRequired, requireAnyCapability("ti
       console.warn("[automations] time delete hook failed", automationErr?.message || automationErr);
     }
     res.status(204).end();
-  } catch (e) {
-    await client?.query("ROLLBACK").catch(() => {});
-    console.error(e);
-    res.status(500).json({ error: "time_entry_delete_failed" });
-  } finally {
-    client?.release();
-  }
+  } catch (e) { console.error(e); res.status(500).json({ error: "time_entry_delete_failed" }); }
 });
 
-app.get("/api/time-clock/manual-entries", authRequired, requireCapability("time.manage"), async (req, res) => {
+app.get("/api/time-clock/manual-entries", authRequired, requireEmployer, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT ${entrySelect("e")}
@@ -7253,7 +5679,7 @@ app.get("/api/time-clock/manual-entries", authRequired, requireCapability("time.
   } catch (e) { console.error(e); res.status(500).json({ error: "manual_entries_failed" }); }
 });
 
-app.post("/api/time-clock/manual-entries/:id/:status", authRequired, requireCapability("time.manage"), async (req, res) => {
+app.post("/api/time-clock/manual-entries/:id/:status", authRequired, requireEmployer, async (req, res) => {
   try {
     const status = req.params.status === "disapproved" ? "disapproved" : "approved";
     const { rows } = await pool.query(
@@ -7395,7 +5821,7 @@ async function emitJobServiceRouteEvents(companyId, actorUserId, jobId, before, 
 }
 
 // ---------- contacts (AUTH REQUIRED + COMPANY-SCOPED) ----------
-app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async (req, res) => {
+app.get("/api/contacts", authRequired, async (req, res) => {
   const q = (req.query.q || "").toString().trim();
   try {
     const scope = companyOrUserContactWhere(req);
@@ -7431,7 +5857,7 @@ app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async
   }
 });
 
-app.get("/api/contacts/:id", authRequired, requireCapability("contacts.view"), async (req, res) => {
+app.get("/api/contacts/:id", authRequired, async (req, res) => {
   try {
     const scope = companyOrUserContactWhere(req);
     const { rows } = await pool.query(
@@ -7548,7 +5974,7 @@ function contactCreateRecommendation(checks) {
   return "Check backend logs for the matching contact_create_failed entry.";
 }
 
-app.post("/api/contacts/create-diagnostics", authRequired, requireCapability("contacts.create"), async (req, res) => {
+app.post("/api/contacts/create-diagnostics", authRequired, async (req, res) => {
   const body = req.body || {};
   if (!body.name) return res.status(400).json({
     error: "name_required",
@@ -7600,7 +6026,7 @@ app.post("/api/contacts/create-diagnostics", authRequired, requireCapability("co
   }
 });
 
-app.post("/api/contacts", authRequired, requireCapability("contacts.create"), async (req, res) => {
+app.post("/api/contacts", authRequired, async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
@@ -7689,7 +6115,7 @@ app.post("/api/contacts", authRequired, requireCapability("contacts.create"), as
   }
 });
 
-app.put("/api/contacts/:id", authRequired, requireCapability("contacts.edit"), async (req, res) => {
+app.put("/api/contacts/:id", authRequired, async (req, res) => {
   const {
     name, phone, email, address,
     value_cents, lat, lng, tags, job_type,
@@ -7757,1263 +6183,6 @@ app.put("/api/contacts/:id", authRequired, requireCapability("contacts.edit"), a
   }
 });
 
-async function loadSmartContactFacts(companyId, { contactIDs = null, queryable = pool } = {}) {
-  const scopedContactIDs = Array.isArray(contactIDs) ? [...new Set(contactIDs.map(String))] : null;
-  const sourceLimit = scopedContactIDs
-    ? SMART_CONTACT_LIST_LIMITS.maximumSnapshotContacts
-    : SMART_CONTACT_LIST_LIMITS.maximumSourceContacts + 1;
-  const scopedContactClause = scopedContactIDs ? "AND id = ANY($3::uuid[])" : "";
-  const queryValues = scopedContactIDs ? [companyId, sourceLimit, scopedContactIDs] : [companyId, sourceLimit];
-  const contactRows = (await queryable.query(
-    `WITH scoped_contacts AS (
-       SELECT *
-         FROM contacts
-        WHERE company_id = $1 AND deleted_at IS NULL
-          ${scopedContactClause}
-        ORDER BY updated_at DESC, id
-        LIMIT $2
-     ),
-     job_facts AS (
-       SELECT contact_id,
-              COUNT(*)::int AS job_count,
-              COUNT(*) FILTER (WHERE finished_at IS NOT NULL)::int AS completed_job_count,
-              MAX(finished_at) AS latest_completed_at
-         FROM schedule_events
-        WHERE company_id = $1 AND contact_id IS NOT NULL
-        GROUP BY contact_id
-     ),
-     quote_facts AS (
-       SELECT contact_id, COUNT(*)::int AS quote_count, MAX(created_at) AS latest_quote_at
-         FROM quotes
-        WHERE company_id = $1
-        GROUP BY contact_id
-     ),
-     latest_opportunities AS (
-       SELECT DISTINCT ON (contact_id) contact_id, state, stage_id
-         FROM opportunities
-        WHERE company_id = $1
-        ORDER BY contact_id, updated_at DESC, id
-     )
-     SELECT c.*,
-            CASE WHEN o.state = 'stage' AND o.stage_id IS NOT NULL THEN jsonb_build_array(o.stage_id) ELSE '[]'::jsonb END AS stage_ids,
-            (o.state = 'lost') AS lost_lead,
-            COALESCE(j.job_count, 0)::int AS job_count,
-            COALESCE(j.completed_job_count, 0)::int AS completed_job_count,
-            j.latest_completed_at,
-            COALESCE(q.quote_count, 0)::int AS quote_count,
-            q.latest_quote_at
-       FROM scoped_contacts c
-       LEFT JOIN job_facts j ON j.contact_id = c.id::text
-       LEFT JOIN quote_facts q ON q.contact_id = c.id::text
-       LEFT JOIN latest_opportunities o ON o.contact_id = c.id::text
-      ORDER BY c.updated_at DESC, c.id`,
-    queryValues
-  )).rows;
-  const sourceTruncated = !scopedContactIDs && contactRows.length > SMART_CONTACT_LIST_LIMITS.maximumSourceContacts;
-  const contacts = scopedContactIDs ? contactRows : contactRows.slice(0, SMART_CONTACT_LIST_LIMITS.maximumSourceContacts);
-  const loadedContactIDs = contacts.map((contact) => String(contact.id));
-  const communicationCoverage = { sms: true, calls: true, consent: true };
-  const [smsResult, callsResult] = await Promise.all([
-    queryable.query(
-      `SELECT sc.contact_id::text AS contact_id, MAX(sc.last_message_at) AS last_sms_at
-         FROM sms_conversations sc
-         JOIN phone_lines pl ON pl.id = sc.phone_line_id AND pl.company_id = $1
-        WHERE sc.deleted_at IS NULL AND sc.contact_id::text = ANY($2::text[])
-        GROUP BY sc.contact_id`,
-      [companyId, loadedContactIDs]
-    ).catch((error) => {
-      communicationCoverage.sms = false;
-      console.warn("[smart-contacts] SMS evidence unavailable", error?.code || error?.message);
-      return { rows: [] };
-    }),
-    queryable.query(
-      `SELECT contact_id::text AS contact_id,
-              MAX(COALESCE(ended_at, answered_at, started_at)) AS last_call_at
-         FROM phone_calls
-        WHERE company_id = $1 AND contact_id::text = ANY($2::text[])
-        GROUP BY contact_id`,
-      [companyId, loadedContactIDs]
-    ).catch((error) => {
-      communicationCoverage.calls = false;
-      console.warn("[smart-contacts] call evidence unavailable", error?.code || error?.message);
-      return { rows: [] };
-    })
-  ]);
-  const lastSMSByContact = new Map(smsResult.rows.map((row) => [String(row.contact_id), row.last_sms_at]));
-  const lastCallByContact = new Map(callsResult.rows.map((row) => [String(row.contact_id), row.last_call_at]));
-  const normalizedPhoneByContact = new Map();
-  const normalizedPhones = [];
-  for (const contact of contacts) {
-    const phone = normalizeE164Phone(contact.phone);
-    normalizedPhoneByContact.set(String(contact.id), phone);
-    if (isUsableE164(phone)) normalizedPhones.push(phone);
-  }
-  const optedOut = new Set();
-  if (normalizedPhones.length) {
-    const result = await queryable.query(
-      `SELECT normalized_phone FROM phone_opt_outs
-        WHERE company_id = $1 AND channel = 'sms' AND status = 'opted_out'
-          AND normalized_phone = ANY($2::text[])`,
-      [companyId, [...new Set(normalizedPhones)]]
-    ).catch((error) => {
-      communicationCoverage.consent = false;
-      console.warn("[smart-contacts] consent evidence unavailable", error?.code || error?.message);
-      return { rows: [] };
-    });
-    for (const row of result.rows) optedOut.add(String(row.normalized_phone));
-  }
-  return {
-    contacts: contacts.map((contact) => {
-      const id = String(contact.id);
-      const normalizedPhone = normalizedPhoneByContact.get(id);
-      return {
-        ...contact,
-        last_sms_at: lastSMSByContact.get(id) || null,
-        last_call_at: lastCallByContact.get(id) || null,
-        sms_phone_valid: isUsableE164(normalizedPhone),
-        sms_opted_out: optedOut.has(normalizedPhone)
-      };
-    }),
-    sourceTruncated,
-    communicationCoverage
-  };
-}
-
-function sendSmartContactError(res, error) {
-  if (error instanceof SmartContactListError) {
-    return res.status(error.statusCode || 400).json({
-      error: error.code,
-      message: error.message,
-      ...(error.details ? { details: error.details } : {})
-    });
-  }
-  console.error("[smart-contacts] request failed", { code: error?.code, message: error?.message });
-  return res.status(500).json({ error: "smart_contacts_request_failed", message: "WolfCRM couldn't finish this smart contact list request." });
-}
-
-async function validateSmartContactStages(companyId, rawFilters, queryable = pool) {
-  const filters = validateSmartContactFilters(rawFilters);
-  const requestedStageIDs = [...new Set([...filters.stage_ids, ...filters.not_stage_ids])];
-  if (!requestedStageIDs.length) return filters;
-  const known = (await queryable.query(
-    `SELECT id FROM stages WHERE company_id = $1 AND id = ANY($2::text[])`,
-    [companyId, requestedStageIDs]
-  )).rows.map((row) => String(row.id));
-  const unknown = requestedStageIDs.filter((id) => !known.includes(id));
-  if (unknown.length) {
-    throw new SmartContactListError(
-      "smart_contacts_stage_not_found",
-      "One or more selected Pipeline stages no longer exist. Refresh the filters and try again.",
-      { statusCode: 409, details: { stage_ids: unknown.join(",") } }
-    );
-  }
-  return filters;
-}
-
-function assertSmartContactListRequest(body, allowedKeys) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    throw new SmartContactListError("smart_contact_list_request_invalid", "The saved-list request is invalid.");
-  }
-  const unknown = Object.keys(body).filter((key) => !allowedKeys.includes(key));
-  if (unknown.length) {
-    throw new SmartContactListError(
-      "smart_contact_list_request_invalid",
-      `Unsupported saved-list field: ${unknown[0]}.`,
-      { details: { fields: unknown.join(",") } }
-    );
-  }
-}
-
-function smartContactListFilters(value) {
-  if (value && typeof value === "object" && !Array.isArray(value)) return value;
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
-    } catch (_) {}
-  }
-  return {};
-}
-
-function mapSmartContactList(row) {
-  return {
-    id: String(row.id),
-    name: row.name,
-    mode: row.mode,
-    filters: smartContactListFilters(row.filters),
-    filter_version: Number(row.filter_version || 1),
-    origin_redacted: Boolean(row.origin_redacted),
-    snapshot_member_count: Number(row.snapshot_member_count || 0),
-    last_matched_count: row.last_matched_count == null ? null : Number(row.last_matched_count),
-    last_previewed_at: row.last_previewed_at || null,
-    created_by: row.created_by ? String(row.created_by) : null,
-    created_at: row.created_at,
-    updated_at: row.updated_at
-  };
-}
-
-async function loadSavedSmartContactList(companyId, listID, { queryable = pool, forUpdate = false } = {}) {
-  const { rows } = await queryable.query(
-    `SELECT scl.*,
-            (SELECT COUNT(*)::int
-               FROM smart_contact_list_members member
-              WHERE member.company_id = scl.company_id
-                AND member.list_id = scl.id
-                AND member.removed_at IS NULL) AS snapshot_member_count
-       FROM smart_contact_lists scl
-      WHERE scl.company_id = $1 AND scl.id = $2 AND scl.archived_at IS NULL
-      ${forUpdate ? "FOR UPDATE OF scl" : ""}`,
-    [companyId, listID]
-  );
-  if (!rows.length) {
-    throw new SmartContactListError(
-      "smart_contact_list_not_found",
-      "That saved contact list no longer exists.",
-      { statusCode: 404 }
-    );
-  }
-  return rows[0];
-}
-
-async function buildSavedSmartContactListPreview(companyId, listRow, queryable = pool) {
-  const filters = smartContactListFilters(listRow.filters);
-  if (listRow.mode === "dynamic") {
-    await validateSmartContactStages(companyId, filters, queryable);
-    const facts = await loadSmartContactFacts(companyId, { queryable });
-    return buildSmartContactPreview({
-      contacts: facts.contacts,
-      filters,
-      sourceTruncated: facts.sourceTruncated,
-      communicationCoverage: facts.communicationCoverage
-    });
-  }
-
-  const memberRows = (await queryable.query(
-    `SELECT contact_id::text AS contact_id
-       FROM smart_contact_list_members
-      WHERE company_id = $1 AND list_id = $2 AND removed_at IS NULL
-      ORDER BY added_at, contact_id`,
-    [companyId, listRow.id]
-  )).rows;
-  const contactIDs = memberRows.map((row) => String(row.contact_id));
-  const facts = await loadSmartContactFacts(companyId, { contactIDs, queryable });
-  const report = buildSmartContactPreview({
-    contacts: facts.contacts,
-    filters: { version: 1, sort: "name", limit: SMART_CONTACT_LIST_LIMITS.maximumSnapshotContacts },
-    communicationCoverage: facts.communicationCoverage
-  });
-  report.filters = filters;
-  report.snapshot_member_count = contactIDs.length;
-  report.contacts = report.contacts.map((contact) => ({ ...contact, match_reasons: ["snapshot_member"] }));
-  const missingContacts = Math.max(0, contactIDs.length - report.matched_count);
-  if (missingContacts) report.warnings.push(`${missingContacts} saved snapshot contact${missingContacts === 1 ? " is" : "s are"} no longer available.`);
-  if (listRow.origin_redacted) report.warnings.push("The transient geographic origin was not stored with this snapshot.");
-  return report;
-}
-
-async function previewSavedSmartContactList(companyId, listID) {
-  const row = await loadSavedSmartContactList(companyId, listID);
-  const report = await buildSavedSmartContactListPreview(companyId, row);
-  const updated = (await pool.query(
-    `UPDATE smart_contact_lists
-        SET last_matched_count = $3, last_previewed_at = now()
-      WHERE company_id = $1 AND id = $2 AND archived_at IS NULL
-      RETURNING *`,
-    [companyId, listID, report.matched_count]
-  )).rows[0];
-  return {
-    list: mapSmartContactList({ ...updated, snapshot_member_count: row.snapshot_member_count }),
-    report
-  };
-}
-
-app.post("/api/smart-contact-lists/preview", authRequired, requireCapability("contacts.view"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const rawFilters = req.body?.filters || req.body || {};
-    await validateSmartContactStages(req.companyId, rawFilters);
-    const facts = await loadSmartContactFacts(req.companyId);
-    const report = buildSmartContactPreview({
-      contacts: facts.contacts,
-      filters: rawFilters,
-      sourceTruncated: facts.sourceTruncated,
-      communicationCoverage: facts.communicationCoverage
-    });
-    res.json(report);
-  } catch (error) {
-    sendSmartContactError(res, error);
-  }
-});
-
-app.get("/api/smart-contact-lists", authRequired, requireCapability("contacts.view"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const { rows } = await pool.query(
-      `SELECT scl.*,
-              (SELECT COUNT(*)::int
-                 FROM smart_contact_list_members member
-                WHERE member.company_id = scl.company_id
-                  AND member.list_id = scl.id
-                  AND member.removed_at IS NULL) AS snapshot_member_count
-         FROM smart_contact_lists scl
-        WHERE scl.company_id = $1 AND scl.archived_at IS NULL
-        ORDER BY scl.updated_at DESC, lower(scl.name), scl.id
-        LIMIT $2`,
-      [req.companyId, SMART_CONTACT_LIST_LIMITS.maximumSavedLists]
-    );
-    res.json(rows.map(mapSmartContactList));
-  } catch (error) {
-    sendSmartContactError(res, error);
-  }
-});
-
-app.post("/api/smart-contact-lists", authRequired, requireCapability("contacts.edit"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const client = await pool.connect();
-  try {
-    assertSmartContactListRequest(req.body, ["name", "mode", "filters", "contact_ids", "origin_policy"]);
-    const name = validateSmartContactListName(req.body.name);
-    const prepared = prepareSmartContactListPersistence(req.body);
-    await validateSmartContactStages(req.companyId, prepared.filters, client);
-    let dynamicReport = null;
-    if (prepared.mode === "dynamic") {
-      const facts = await loadSmartContactFacts(req.companyId, { queryable: client });
-      dynamicReport = buildSmartContactPreview({
-        contacts: facts.contacts,
-        filters: prepared.filters,
-        sourceTruncated: facts.sourceTruncated,
-        communicationCoverage: facts.communicationCoverage
-      });
-    }
-
-    await client.query("BEGIN");
-    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [req.companyId]);
-    const activeCount = Number((await client.query(
-      `SELECT COUNT(*)::int AS count FROM smart_contact_lists WHERE company_id = $1 AND archived_at IS NULL`,
-      [req.companyId]
-    )).rows[0]?.count || 0);
-    if (activeCount >= SMART_CONTACT_LIST_LIMITS.maximumSavedLists) {
-      throw new SmartContactListError(
-        "smart_contact_list_limit_reached",
-        `A company may keep up to ${SMART_CONTACT_LIST_LIMITS.maximumSavedLists} active smart lists. Archive one before creating another.`,
-        { statusCode: 409 }
-      );
-    }
-
-    if (prepared.mode === "snapshot") {
-      const known = (await client.query(
-        `SELECT id::text AS id FROM contacts
-          WHERE company_id = $1 AND deleted_at IS NULL AND id = ANY($2::uuid[])`,
-        [req.companyId, prepared.contact_ids]
-      )).rows.map((row) => String(row.id));
-      const missing = prepared.contact_ids.filter((id) => !known.includes(id));
-      if (missing.length) {
-        throw new SmartContactListError(
-          "smart_contact_list_contacts_stale",
-          "One or more selected contacts no longer exist. Refresh the results and try again.",
-          { statusCode: 409, details: { contact_ids: missing.join(",") } }
-        );
-      }
-    }
-
-    const lastMatchedCount = dynamicReport?.matched_count ?? prepared.contact_ids.length;
-    const row = (await client.query(
-      `INSERT INTO smart_contact_lists(
-         company_id, created_by, name, mode, filters, filter_version,
-         origin_redacted, last_matched_count, last_previewed_at
-       ) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,now())
-       RETURNING *`,
-      [
-        req.companyId, req.userId, name, prepared.mode, JSON.stringify(prepared.filters),
-        prepared.filter_version, prepared.origin_redacted, lastMatchedCount
-      ]
-    )).rows[0];
-    if (prepared.mode === "snapshot") {
-      await client.query(
-        `INSERT INTO smart_contact_list_members(company_id, list_id, contact_id, source)
-         SELECT $1, $2, selected.contact_id, 'snapshot'
-           FROM unnest($3::uuid[]) AS selected(contact_id)`,
-        [req.companyId, row.id, prepared.contact_ids]
-      );
-    }
-    await client.query("COMMIT");
-    res.status(201).json(mapSmartContactList({ ...row, snapshot_member_count: prepared.contact_ids.length }));
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    if (error?.code === "23505") {
-      return sendSmartContactError(res, new SmartContactListError(
-        "smart_contact_list_name_conflict",
-        "An active smart list already uses that name.",
-        { statusCode: 409 }
-      ));
-    }
-    sendSmartContactError(res, error);
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/api/smart-contact-lists/:id", authRequired, requireCapability("contacts.view"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    res.json(await previewSavedSmartContactList(req.companyId, req.params.id));
-  } catch (error) {
-    sendSmartContactError(res, error);
-  }
-});
-
-app.post("/api/smart-contact-lists/:id/preview", authRequired, requireCapability("contacts.view"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    assertSmartContactListRequest(req.body || {}, []);
-    res.json(await previewSavedSmartContactList(req.companyId, req.params.id));
-  } catch (error) {
-    sendSmartContactError(res, error);
-  }
-});
-
-app.put("/api/smart-contact-lists/:id", authRequired, requireCapability("contacts.edit"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const client = await pool.connect();
-  try {
-    assertSmartContactListRequest(req.body, ["name", "filters", "origin_policy"]);
-    const hasName = Object.prototype.hasOwnProperty.call(req.body, "name");
-    const hasFilters = Object.prototype.hasOwnProperty.call(req.body, "filters");
-    if (!hasName && !hasFilters) {
-      throw new SmartContactListError("smart_contact_list_request_invalid", "Change the list name or its filters before saving.");
-    }
-    await client.query("BEGIN");
-    const existing = await loadSavedSmartContactList(req.companyId, req.params.id, { queryable: client, forUpdate: true });
-    const name = hasName ? validateSmartContactListName(req.body.name) : existing.name;
-    let filters = smartContactListFilters(existing.filters);
-    let filterVersion = Number(existing.filter_version || 1);
-    let originRedacted = Boolean(existing.origin_redacted);
-    let lastMatchedCount = existing.last_matched_count;
-    let refreshPreview = false;
-    if (hasFilters) {
-      if (existing.mode !== "dynamic") {
-        throw new SmartContactListError(
-          "smart_contact_list_snapshot_filters_immutable",
-          "Snapshot membership is fixed. Create a new list to use different filters.",
-          { statusCode: 409 }
-        );
-      }
-      const prepared = prepareSmartContactListPersistence({
-        mode: "dynamic",
-        filters: req.body.filters,
-        origin_policy: req.body.origin_policy || "transient"
-      });
-      filters = prepared.filters;
-      filterVersion = prepared.filter_version;
-      originRedacted = prepared.origin_redacted;
-      await validateSmartContactStages(req.companyId, filters, client);
-      const facts = await loadSmartContactFacts(req.companyId, { queryable: client });
-      const report = buildSmartContactPreview({
-        contacts: facts.contacts,
-        filters,
-        sourceTruncated: facts.sourceTruncated,
-        communicationCoverage: facts.communicationCoverage
-      });
-      lastMatchedCount = report.matched_count;
-      refreshPreview = true;
-    }
-    const row = (await client.query(
-      `UPDATE smart_contact_lists
-          SET name = $3,
-              filters = $4::jsonb,
-              filter_version = $5,
-              origin_redacted = $6,
-              last_matched_count = $7,
-              last_previewed_at = CASE WHEN $8 THEN now() ELSE last_previewed_at END,
-              updated_at = now()
-        WHERE company_id = $1 AND id = $2 AND archived_at IS NULL
-        RETURNING *`,
-      [
-        req.companyId, req.params.id, name, JSON.stringify(filters), filterVersion,
-        originRedacted, lastMatchedCount, refreshPreview
-      ]
-    )).rows[0];
-    await client.query("COMMIT");
-    res.json(mapSmartContactList({ ...row, snapshot_member_count: existing.snapshot_member_count }));
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    if (error?.code === "23505") {
-      return sendSmartContactError(res, new SmartContactListError(
-        "smart_contact_list_name_conflict",
-        "An active smart list already uses that name.",
-        { statusCode: 409 }
-      ));
-    }
-    sendSmartContactError(res, error);
-  } finally {
-    client.release();
-  }
-});
-
-app.delete("/api/smart-contact-lists/:id", authRequired, requireCapability("contacts.edit"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const row = (await client.query(
-      `UPDATE smart_contact_lists
-          SET archived_at = now(), updated_at = now()
-        WHERE company_id = $1 AND id = $2 AND archived_at IS NULL
-        RETURNING id`,
-      [req.companyId, req.params.id]
-    )).rows[0];
-    if (!row) {
-      throw new SmartContactListError(
-        "smart_contact_list_not_found",
-        "That saved contact list no longer exists.",
-        { statusCode: 404 }
-      );
-    }
-    await client.query(
-      `UPDATE smart_contact_list_members
-          SET removed_at = COALESCE(removed_at, now())
-        WHERE company_id = $1 AND list_id = $2`,
-      [req.companyId, req.params.id]
-    );
-    await client.query("COMMIT");
-    res.status(204).end();
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    sendSmartContactError(res, error);
-  } finally {
-    client.release();
-  }
-});
-
-function mapSmartContactTaskBatch(row, items, replayed = false) {
-  return {
-    batch: {
-      id: String(row.id),
-      action_type: row.action_type,
-      status: row.status,
-      selected_count: Number(row.selected_count || 0),
-      success_count: Number(row.success_count || 0),
-      failure_count: Number(row.failure_count || 0),
-      created_at: row.created_at,
-      completed_at: row.completed_at || null
-    },
-    items: items.map((item) => ({
-      contact_id: String(item.contact_id),
-      outcome: item.outcome,
-      task_id: item.subject_id ? String(item.subject_id) : null,
-      error_code: item.error_code || null
-    })),
-    replayed
-  };
-}
-
-async function loadSmartContactTaskBatch(queryable, companyId, batchId, replayed = false) {
-  const row = (await queryable.query(
-    `SELECT * FROM smart_contact_action_batches
-      WHERE company_id = $1 AND id = $2 AND action_type = 'tasks'`,
-    [companyId, batchId]
-  )).rows[0];
-  const items = (await queryable.query(
-    `SELECT contact_id, outcome, subject_id, error_code
-       FROM smart_contact_action_items
-      WHERE company_id = $1 AND batch_id = $2
-      ORDER BY created_at, contact_id`,
-    [companyId, batchId]
-  )).rows;
-  return mapSmartContactTaskBatch(row, items, replayed);
-}
-
-app.post("/api/smart-contact-lists/actions/tasks", authRequired, requireCapability("tasks.manage"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  let action;
-  try {
-    action = validateSmartContactTaskAction(req.body);
-  } catch (error) {
-    return sendSmartContactError(res, error);
-  }
-
-  const requestSnapshot = {
-    contact_ids: action.contact_ids,
-    title_template: action.title_template,
-    detail_template: action.detail_template,
-    due_date: action.due_date,
-    priority: action.priority,
-    assignee_ids: action.assignee_ids,
-    source_list_id: action.source_list_id,
-    filters: action.filters
-  };
-  const requestHash = createHash("sha256").update(JSON.stringify(requestSnapshot)).digest("hex");
-  const client = await pool.connect();
-  let batchId;
-  let completedPayload;
-  const createdTasks = [];
-  try {
-    await client.query("BEGIN");
-    await client.query(
-      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
-      [`smart-contact-tasks:${req.companyId}:${action.idempotency_key}`]
-    );
-    const existing = (await client.query(
-      `SELECT id, request_hash
-         FROM smart_contact_action_batches
-        WHERE company_id = $1 AND action_type = 'tasks' AND idempotency_key = $2
-        LIMIT 1`,
-      [req.companyId, action.idempotency_key]
-    )).rows[0];
-    if (existing) {
-      if (existing.request_hash !== requestHash) {
-        throw new SmartContactListError(
-          "smart_contact_task_idempotency_conflict",
-          "This task confirmation key was already used for different content. Reload and review the batch again.",
-          { statusCode: 409 }
-        );
-      }
-      completedPayload = await loadSmartContactTaskBatch(client, req.companyId, existing.id, true);
-      await client.query("COMMIT");
-      return res.json(completedPayload);
-    }
-
-    if (action.source_list_id) {
-      const sourceExists = (await client.query(
-        `SELECT 1 FROM smart_contact_lists
-          WHERE company_id = $1 AND id = $2 AND archived_at IS NULL`,
-        [req.companyId, action.source_list_id]
-      )).rowCount > 0;
-      if (!sourceExists) {
-        throw new SmartContactListError(
-          "smart_contact_task_source_list_not_found",
-          "The source Smart List no longer exists. Refresh it before creating tasks.",
-          { statusCode: 409 }
-        );
-      }
-    }
-
-    if (action.assignee_ids.length) {
-      const knownAssignees = (await client.query(
-        `SELECT id::text AS id FROM users WHERE company_id = $1 AND id = ANY($2::uuid[])`,
-        [req.companyId, action.assignee_ids]
-      )).rows.map((row) => String(row.id));
-      const missingAssignees = action.assignee_ids.filter((id) => !knownAssignees.includes(id));
-      if (missingAssignees.length) {
-        throw new SmartContactListError(
-          "smart_contact_task_assignee_not_found",
-          "One or more assignees no longer belong to this company. Refresh the employee list and try again.",
-          { statusCode: 409, details: { assignee_ids: missingAssignees.join(",") } }
-        );
-      }
-    }
-
-    const contactRows = (await client.query(
-      `SELECT id::text AS id, name
-         FROM contacts
-        WHERE company_id = $1 AND deleted_at IS NULL AND id = ANY($2::uuid[])`,
-      [req.companyId, action.contact_ids]
-    )).rows;
-    const contactsByID = new Map(contactRows.map((row) => [String(row.id), row]));
-    batchId = randomUUID();
-    await client.query(
-      `INSERT INTO smart_contact_action_batches(
-         id, company_id, created_by, source_list_id, action_type, idempotency_key,
-         request_hash, filter_snapshot, request_snapshot, status, selected_count
-       ) VALUES($1,$2,$3,$4,'tasks',$5,$6,$7::jsonb,$8::jsonb,'processing',$9)`,
-      [
-        batchId, req.companyId, req.userId, action.source_list_id, action.idempotency_key,
-        requestHash, JSON.stringify(action.filters), JSON.stringify(requestSnapshot), action.contact_ids.length
-      ]
-    );
-
-    let successCount = 0;
-    let failureCount = 0;
-    for (const contactID of action.contact_ids) {
-      const contact = contactsByID.get(contactID);
-      if (!contact) {
-        failureCount += 1;
-        await client.query(
-          `INSERT INTO smart_contact_action_items(batch_id, company_id, contact_id, outcome, error_code)
-           VALUES($1,$2,$3,'failed','contact_not_found')`,
-          [batchId, req.companyId, contactID]
-        );
-        continue;
-      }
-      const taskID = randomUUID();
-      const title = renderSmartContactTaskTemplate(action.title_template, contact.name);
-      const detail = action.detail_template
-        ? renderSmartContactTaskTemplate(action.detail_template, contact.name)
-        : null;
-      const task = (await client.query(
-        `INSERT INTO todo_tasks(
-           id, user_id, title, detail, creator_id, assignee_ids, due_date, priority, status,
-           linked_contact_id, reminders, subtasks, completed
-         ) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,'open',$9,'[]'::jsonb,'[]'::jsonb,false)
-         RETURNING *`,
-        [
-          taskID, req.userId, title, detail, req.userId, JSON.stringify(action.assignee_ids),
-          action.due_date, action.priority, contactID
-        ]
-      )).rows[0];
-      createdTasks.push(task);
-      successCount += 1;
-      await client.query(
-        `INSERT INTO smart_contact_action_items(batch_id, company_id, contact_id, outcome, subject_id)
-         VALUES($1,$2,$3,'created',$4)`,
-        [batchId, req.companyId, contactID, taskID]
-      );
-    }
-
-    const status = failureCount === 0 ? "completed" : successCount === 0 ? "failed" : "partial";
-    await client.query(
-      `UPDATE smart_contact_action_batches
-          SET status = $3, success_count = $4, failure_count = $5, completed_at = now()
-        WHERE company_id = $1 AND id = $2`,
-      [req.companyId, batchId, status, successCount, failureCount]
-    );
-    completedPayload = await loadSmartContactTaskBatch(client, req.companyId, batchId, false);
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    return sendSmartContactError(res, error);
-  } finally {
-    client.release();
-  }
-
-  for (const task of createdTasks) {
-    try {
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "task.created",
-        subjectType: "task",
-        subjectId: task.id,
-        actorUserId: req.userId,
-        source: "smart_contact_list",
-        dedupeKey: `task.created:${task.id}`,
-        payload: { task_id: task.id, title: task.title, due_date: task.due_date, contact_id: task.linked_contact_id }
-      });
-      await syncAutomationSchedulesForTask(req.companyId, task);
-    } catch (automationError) {
-      console.warn("[smart-contacts] task automation hook failed", automationError?.message || automationError);
-    }
-  }
-  res.status(201).json(completedPayload);
-});
-
-function smartContactSMSRequestHash(action) {
-  return createHash("sha256").update(JSON.stringify(smartContactSMSRequestSnapshot(action))).digest("hex");
-}
-
-function smartContactRecipientTimeZone(contact) {
-  if (contact?.lat == null || contact?.lng == null) return null;
-  const latitude = Number(contact?.lat);
-  const longitude = Number(contact?.lng);
-  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90
-      || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return null;
-  try {
-    return tzLookup(latitude, longitude) || null;
-  } catch (_) {
-    return null;
-  }
-}
-
-async function loadSmartContactSMSContext(queryable, companyId, action, now = new Date()) {
-  if (action.source_list_id) {
-    const sourceExists = (await queryable.query(
-      `SELECT 1 FROM smart_contact_lists
-        WHERE company_id = $1 AND id = $2 AND archived_at IS NULL`,
-      [companyId, action.source_list_id]
-    )).rowCount > 0;
-    if (!sourceExists) {
-      throw new SmartContactListError(
-        "smart_contact_sms_source_list_not_found",
-        "The source Smart List no longer exists. Refresh it before sending.",
-        { statusCode: 409 }
-      );
-    }
-  }
-  const company = (await queryable.query(
-    `SELECT id, name FROM companies WHERE id = $1 LIMIT 1`,
-    [companyId]
-  )).rows[0];
-  if (!company) {
-    throw new SmartContactListError("company_not_found", "The company workspace is no longer available.", { statusCode: 404 });
-  }
-  const line = (await queryable.query(
-    `SELECT id, phone_number
-       FROM phone_lines
-      WHERE company_id = $1 AND active = true AND lower(status) = 'active'
-      ORDER BY created_at ASC
-      LIMIT 1`,
-    [companyId]
-  )).rows[0];
-  const lineReady = Boolean(line && isUsableE164(normalizeE164Phone(line.phone_number)));
-  const twilioReady = Boolean(createTwilioClient());
-  const providerReady = lineReady && twilioReady;
-  const providerError = !lineReady ? "phone_line_inactive" : !twilioReady ? "twilio_not_configured" : null;
-  const contacts = (await queryable.query(
-    `SELECT id::text AS id, name, phone, lat, lng
-       FROM contacts
-      WHERE company_id = $1 AND deleted_at IS NULL AND id = ANY($2::uuid[])`,
-    [companyId, action.contact_ids]
-  )).rows;
-  const contactsByID = new Map(contacts.map((contact) => [String(contact.id), contact]));
-  const phonesByID = new Map();
-  const normalizedPhones = [];
-  for (const contact of contacts) {
-    const phone = normalizeE164Phone(contact.phone);
-    phonesByID.set(String(contact.id), phone);
-    if (isUsableE164(phone)) normalizedPhones.push(phone);
-  }
-  const consentRows = normalizedPhones.length ? (await queryable.query(
-    `SELECT normalized_phone, status, source, updated_at
-       FROM phone_opt_outs
-      WHERE company_id = $1 AND channel = 'sms'
-        AND normalized_phone = ANY($2::text[])`,
-    [companyId, [...new Set(normalizedPhones)]]
-  )).rows : [];
-  const consentByPhone = new Map(consentRows.map((row) => [String(row.normalized_phone), row]));
-  const seenRecipientPhones = new Set();
-  const items = action.contact_ids.map((contactID) => {
-    const contact = contactsByID.get(contactID);
-    const recipientPhone = contact ? phonesByID.get(contactID) : null;
-    const consent = recipientPhone ? consentByPhone.get(recipientPhone) : null;
-    const recipientTimeZone = contact ? smartContactRecipientTimeZone(contact) : null;
-    const message = contact ? renderSmartContactSMSTemplate(action.message_template, {
-      contactName: contact.name,
-      companyName: company.name
-    }) : null;
-    let eligibility = evaluateSmartContactSMSEligibility({
-      contactExists: Boolean(contact),
-      phoneValid: isUsableE164(recipientPhone),
-      consentStatus: consent?.status || null,
-      recipientTimeZone,
-      providerReady,
-      now
-    });
-    if (eligibility.eligible && message.length > SMART_CONTACT_LIST_LIMITS.maximumSMSBodyLength) {
-      eligibility = { eligible: false, reason: "rendered_message_too_long" };
-    }
-    if (eligibility.eligible && seenRecipientPhones.has(recipientPhone)) {
-      eligibility = { eligible: false, reason: "duplicate_recipient" };
-    }
-    if (isUsableE164(recipientPhone)) seenRecipientPhones.add(recipientPhone);
-    return {
-      contact_id: contactID,
-      contact_name: contact?.name || "Unavailable contact",
-      recipient_phone: isUsableE164(recipientPhone) ? recipientPhone : null,
-      recipient_timezone: recipientTimeZone,
-      consent_status: consent?.status || "unknown",
-      eligible: eligibility.eligible,
-      exclusion_reason: eligibility.reason === "provider_unavailable" ? providerError : eligibility.reason,
-      message
-    };
-  });
-  return {
-    company,
-    provider: { ready: providerReady, error_code: providerError },
-    items,
-    eligible_count: items.filter((item) => item.eligible).length,
-    excluded_count: items.filter((item) => !item.eligible).length
-  };
-}
-
-function mapSmartContactSMSBatch(row, items, replayed = false) {
-  return {
-    batch: {
-      id: String(row.id),
-      action_type: row.action_type,
-      status: row.status,
-      selected_count: Number(row.selected_count || 0),
-      success_count: Number(row.success_count || 0),
-      failure_count: Number(row.failure_count || 0),
-      excluded_count: Number(row.excluded_count || 0),
-      delivery_unknown_count: Number(row.delivery_unknown_count || 0),
-      created_at: row.created_at,
-      completed_at: row.completed_at || null
-    },
-    items: items.map((item) => ({
-      contact_id: String(item.contact_id),
-      outcome: item.outcome,
-      error_code: item.error_code || null,
-      provider_status: item.provider_status || null,
-      provider_message_sid: item.provider_message_sid || null,
-      sms_conversation_id: item.sms_conversation_id ? String(item.sms_conversation_id) : null,
-      sms_message_id: item.sms_message_id ? String(item.sms_message_id) : null
-    })),
-    replayed
-  };
-}
-
-async function loadSmartContactSMSBatch(queryable, companyId, batchId, replayed = false) {
-  const row = (await queryable.query(
-    `SELECT * FROM smart_contact_action_batches
-      WHERE company_id = $1 AND id = $2 AND action_type = 'sms_campaign'`,
-    [companyId, batchId]
-  )).rows[0];
-  if (!row) return null;
-  const items = (await queryable.query(
-    `SELECT contact_id, outcome, error_code, provider_status, provider_message_sid,
-            sms_conversation_id, sms_message_id
-       FROM smart_contact_action_items
-      WHERE company_id = $1 AND batch_id = $2
-      ORDER BY created_at, contact_id`,
-    [companyId, batchId]
-  )).rows;
-  return mapSmartContactSMSBatch(row, items, replayed);
-}
-
-app.post(
-  "/api/smart-contact-lists/actions/sms/preview",
-  authRequired,
-  requireAllCapabilities("communications.view", "messaging.customer.send"),
-  async (req, res) => {
-    if (!req.companyId) return res.status(403).json({ error: "company_required" });
-    try {
-      const action = validateSmartContactSMSPreview(req.body);
-      const requestSnapshot = smartContactSMSRequestSnapshot(action);
-      const requestHash = smartContactSMSRequestHash(action);
-      const context = await loadSmartContactSMSContext(pool, req.companyId, action);
-      const eligibilitySnapshot = context.items.map((item) => ({
-        contact_id: item.contact_id,
-        eligible: item.eligible,
-        exclusion_reason: item.exclusion_reason,
-        recipient_timezone: item.recipient_timezone
-      }));
-      const preview = (await pool.query(
-        `INSERT INTO smart_contact_campaign_previews(
-           company_id, created_by, source_list_id, request_hash, filter_snapshot,
-           request_snapshot, eligibility_snapshot, eligible_count, excluded_count
-         ) VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8,$9)
-         RETURNING id, expires_at, created_at`,
-        [
-          req.companyId, req.userId, action.source_list_id, requestHash,
-          JSON.stringify(action.filters), JSON.stringify(requestSnapshot), JSON.stringify(eligibilitySnapshot),
-          context.eligible_count, context.excluded_count
-        ]
-      )).rows[0];
-      res.json({
-        preview_id: String(preview.id),
-        campaign_type: "marketing",
-        generated_at: preview.created_at,
-        expires_at: preview.expires_at,
-        provider: context.provider,
-        selected_count: action.contact_ids.length,
-        eligible_count: context.eligible_count,
-        excluded_count: context.excluded_count,
-        items: context.items
-      });
-    } catch (error) {
-      sendSmartContactError(res, error);
-    }
-  }
-);
-
-async function finalizeSmartContactSMSBatch(companyId, batchId) {
-  const counts = (await pool.query(
-    `SELECT COUNT(*) FILTER (WHERE outcome = 'sent')::int AS success_count,
-            COUNT(*) FILTER (WHERE outcome = 'excluded')::int AS excluded_count,
-            COUNT(*) FILTER (WHERE outcome = 'failed')::int AS failed_count,
-            COUNT(*) FILTER (WHERE outcome = 'delivery_unknown')::int AS delivery_unknown_count,
-            COUNT(*) FILTER (WHERE outcome IN ('pending','sending','provider_accepted'))::int AS processing_count
-       FROM smart_contact_action_items
-      WHERE company_id = $1 AND batch_id = $2`,
-    [companyId, batchId]
-  )).rows[0];
-  const successCount = Number(counts?.success_count || 0);
-  const excludedCount = Number(counts?.excluded_count || 0);
-  const failedCount = Number(counts?.failed_count || 0);
-  const deliveryUnknownCount = Number(counts?.delivery_unknown_count || 0);
-  const processingCount = Number(counts?.processing_count || 0);
-  const failureCount = failedCount + deliveryUnknownCount;
-  const status = processingCount > 0
-    ? "processing"
-    : failureCount === 0
-      ? "completed"
-      : successCount === 0
-        ? "failed"
-        : "partial";
-  await pool.query(
-    `UPDATE smart_contact_action_batches
-        SET status = $3, success_count = $4, failure_count = $5, excluded_count = $6,
-            delivery_unknown_count = $7, completed_at = CASE WHEN $8 = 0 THEN now() ELSE NULL END,
-            updated_at = now()
-      WHERE company_id = $1 AND id = $2`,
-    [companyId, batchId, status, successCount, failureCount, excludedCount, deliveryUnknownCount, processingCount]
-  );
-}
-
-async function processSmartContactSMSBatch(companyId, actorUserId, batchId, action) {
-  const pendingItems = (await pool.query(
-    `SELECT contact_id FROM smart_contact_action_items
-      WHERE company_id = $1 AND batch_id = $2 AND outcome = 'pending'
-      ORDER BY created_at, contact_id`,
-    [companyId, batchId]
-  )).rows;
-  for (const pendingItem of pendingItems) {
-    const contactID = String(pendingItem.contact_id);
-    const claimed = await pool.query(
-      `UPDATE smart_contact_action_items
-          SET outcome = 'sending', updated_at = now()
-        WHERE company_id = $1 AND batch_id = $2 AND contact_id = $3 AND outcome = 'pending'
-        RETURNING contact_id`,
-      [companyId, batchId, contactID]
-    );
-    if (!claimed.rowCount) continue;
-
-    let current;
-    try {
-      current = (await loadSmartContactSMSContext(pool, companyId, {
-        ...action,
-        contact_ids: [contactID],
-        source_list_id: null
-      })).items[0];
-    } catch (error) {
-      await pool.query(
-        `UPDATE smart_contact_action_items
-            SET outcome = 'failed', error_code = $4, updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND contact_id = $3`,
-        [companyId, batchId, contactID, error?.code || "eligibility_recheck_failed"]
-      );
-      continue;
-    }
-    if (!current?.eligible) {
-      await pool.query(
-        `UPDATE smart_contact_action_items
-            SET outcome = 'excluded', error_code = $4, recipient_phone = $5,
-                recipient_timezone = $6, message_snapshot = $7, updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND contact_id = $3`,
-        [
-          companyId, batchId, contactID, current?.exclusion_reason || "contact_not_found",
-          current?.recipient_phone || null, current?.recipient_timezone || null, current?.message || null
-        ]
-      );
-      continue;
-    }
-    const duplicateRecipient = (await pool.query(
-      `SELECT 1 FROM smart_contact_action_items
-        WHERE company_id = $1 AND batch_id = $2 AND contact_id <> $3
-          AND recipient_phone = $4
-          AND outcome IN ('sending','provider_accepted','sent','failed','delivery_unknown')
-        LIMIT 1`,
-      [companyId, batchId, contactID, current.recipient_phone]
-    )).rowCount > 0;
-    if (duplicateRecipient) {
-      await pool.query(
-        `UPDATE smart_contact_action_items
-            SET outcome = 'excluded', error_code = 'duplicate_recipient', recipient_phone = $4,
-                recipient_timezone = $5, message_snapshot = $6, updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND contact_id = $3`,
-        [companyId, batchId, contactID, current.recipient_phone, current.recipient_timezone, current.message]
-      );
-      continue;
-    }
-
-    let delivery;
-    try {
-      delivery = await deliverCustomerWorkflowMessage({
-        channel: "sms",
-        companyId,
-        contactId: contactID,
-        recipientPhone: current.recipient_phone,
-        body: current.message,
-        requireExplicitOptIn: true
-      });
-    } catch (error) {
-      const exclusion = ["customer_sms_opted_out", "customer_sms_marketing_consent_required"].includes(error?.code);
-      if (error?.code === "customer_sms_opted_out") {
-        await recordPhoneSmsConsent(companyId, current.recipient_phone, "opted_out", "smart_contact_campaign").catch(() => {});
-      }
-      await pool.query(
-        `UPDATE smart_contact_action_items
-            SET outcome = $4, error_code = $5, recipient_phone = $6,
-                recipient_timezone = $7, message_snapshot = $8, updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND contact_id = $3`,
-        [
-          companyId, batchId, contactID, exclusion ? "excluded" : "failed",
-          error?.code || "twilio_send_failed", current.recipient_phone,
-          current.recipient_timezone, current.message
-        ]
-      );
-      continue;
-    }
-
-    await pool.query(
-      `UPDATE smart_contact_action_items
-          SET outcome = 'provider_accepted', provider_message_sid = $4, provider_status = $5,
-              recipient_phone = $6, recipient_timezone = $7, message_snapshot = $8, updated_at = now()
-        WHERE company_id = $1 AND batch_id = $2 AND contact_id = $3`,
-      [
-        companyId, batchId, contactID, delivery.providerMessageSid, delivery.status,
-        delivery.toNumber, current.recipient_timezone, current.message
-      ]
-    ).catch(() => {});
-
-    const persistence = await pool.connect();
-    let storedMessage;
-    try {
-      await persistence.query("BEGIN");
-      storedMessage = (await persistence.query(
-        `INSERT INTO sms_messages(
-           conversation_id, twilio_message_sid, direction, from_number, to_number,
-           body, message_status, media_count, media
-         ) VALUES($1,$2,'outbound',$3,$4,$5,$6,0,'[]'::jsonb)
-         RETURNING *`,
-        [
-          delivery.conversationId, delivery.providerMessageSid, delivery.fromNumber,
-          delivery.toNumber, current.message, delivery.status
-        ]
-      )).rows[0];
-      await persistence.query(
-        `UPDATE sms_conversations SET last_message_at = now(), updated_at = now() WHERE id = $1`,
-        [delivery.conversationId]
-      );
-      await persistence.query(
-        `UPDATE smart_contact_action_items
-            SET outcome = 'sent', subject_id = $4, provider_message_sid = $5,
-                provider_status = $6, sms_conversation_id = $7, sms_message_id = $4,
-                error_code = NULL, updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND contact_id = $3`,
-        [
-          companyId, batchId, contactID, storedMessage.id, delivery.providerMessageSid,
-          delivery.status, delivery.conversationId
-        ]
-      );
-      await persistence.query("COMMIT");
-    } catch (error) {
-      await persistence.query("ROLLBACK").catch(() => {});
-      await pool.query(
-        `UPDATE smart_contact_action_items
-            SET outcome = 'delivery_unknown', provider_message_sid = $4, provider_status = $5,
-                error_code = 'message_store_failed', updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND contact_id = $3`,
-        [companyId, batchId, contactID, delivery.providerMessageSid, delivery.status]
-      ).catch(() => {});
-      continue;
-    } finally {
-      persistence.release();
-    }
-    await emitCustomerWorkflowSmsHooks({
-      companyId,
-      actorUserId,
-      contactId: contactID,
-      storedMessage,
-      recipientPhone: delivery.toNumber,
-      fromNumber: delivery.fromNumber,
-      workflow: "smart_contact_campaign",
-      dirtyReason: "sms.smart_contact_campaign"
-    });
-  }
-  await finalizeSmartContactSMSBatch(companyId, batchId);
-}
-
-app.post(
-  "/api/smart-contact-lists/actions/sms/send",
-  authRequired,
-  requireCapability("messaging.customer.send"),
-  async (req, res) => {
-    if (!req.companyId) return res.status(403).json({ error: "company_required" });
-    let action;
-    try {
-      action = validateSmartContactSMSSend(req.body);
-    } catch (error) {
-      return sendSmartContactError(res, error);
-    }
-    const requestHash = smartContactSMSRequestHash(action);
-    const requestSnapshot = smartContactSMSRequestSnapshot(action);
-    const client = await pool.connect();
-    let batchId;
-    try {
-      await client.query("BEGIN");
-      await client.query(
-        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
-        [`smart-contact-sms:${req.companyId}:${action.idempotency_key}`]
-      );
-      const existing = (await client.query(
-        `SELECT id, request_hash FROM smart_contact_action_batches
-          WHERE company_id = $1 AND action_type = 'sms_campaign' AND idempotency_key = $2
-          LIMIT 1`,
-        [req.companyId, action.idempotency_key]
-      )).rows[0];
-      if (existing) {
-        if (existing.request_hash !== requestHash) {
-          throw new SmartContactListError(
-            "smart_contact_sms_idempotency_conflict",
-            "This campaign confirmation key was already used for different content. Preview the campaign again.",
-            { statusCode: 409 }
-          );
-        }
-        const replay = await loadSmartContactSMSBatch(client, req.companyId, existing.id, true);
-        await client.query("COMMIT");
-        return res.json(replay);
-      }
-      const preview = (await client.query(
-        `SELECT * FROM smart_contact_campaign_previews
-          WHERE company_id = $1 AND id = $2 AND created_by = $3
-          FOR UPDATE`,
-        [req.companyId, action.preview_id, req.userId]
-      )).rows[0];
-      if (!preview) {
-        throw new SmartContactListError("smart_contact_sms_preview_not_found", "Preview this campaign again before sending.", { statusCode: 409 });
-      }
-      if (preview.consumed_batch_id) {
-        throw new SmartContactListError("smart_contact_sms_preview_consumed", "This campaign preview was already used. Create a fresh preview.", { statusCode: 409 });
-      }
-      if (new Date(preview.expires_at).getTime() <= Date.now()) {
-        throw new SmartContactListError("smart_contact_sms_preview_expired", "This campaign preview expired. Review the current recipients again.", { statusCode: 409 });
-      }
-      if (preview.request_hash !== requestHash) {
-        throw new SmartContactListError("smart_contact_sms_preview_changed", "The recipients or message changed after preview. Preview the campaign again.", { statusCode: 409 });
-      }
-
-      const context = await loadSmartContactSMSContext(client, req.companyId, action);
-      batchId = randomUUID();
-      await client.query(
-        `INSERT INTO smart_contact_action_batches(
-           id, company_id, created_by, source_list_id, action_type, idempotency_key,
-           request_hash, filter_snapshot, request_snapshot, status, selected_count, excluded_count
-         ) VALUES($1,$2,$3,$4,'sms_campaign',$5,$6,$7::jsonb,$8::jsonb,'processing',$9,$10)`,
-        [
-          batchId, req.companyId, req.userId, action.source_list_id, action.idempotency_key,
-          requestHash, JSON.stringify(action.filters), JSON.stringify(requestSnapshot),
-          action.contact_ids.length, context.excluded_count
-        ]
-      );
-      for (const item of context.items) {
-        await client.query(
-          `INSERT INTO smart_contact_action_items(
-             batch_id, company_id, contact_id, outcome, error_code, recipient_phone,
-             recipient_timezone, message_snapshot
-           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [
-            batchId, req.companyId, item.contact_id, item.eligible ? "pending" : "excluded",
-            item.exclusion_reason, item.recipient_phone, item.recipient_timezone, item.message
-          ]
-        );
-      }
-      await client.query(
-        `UPDATE smart_contact_campaign_previews SET consumed_batch_id = $4
-          WHERE company_id = $1 AND id = $2 AND created_by = $3`,
-        [req.companyId, action.preview_id, req.userId, batchId]
-      );
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
-      return sendSmartContactError(res, error);
-    } finally {
-      client.release();
-    }
-
-    try {
-      await processSmartContactSMSBatch(req.companyId, req.userId, batchId, action);
-      const payload = await loadSmartContactSMSBatch(pool, req.companyId, batchId, false);
-      res.status(201).json(payload);
-    } catch (error) {
-      console.error("[smart-contacts/sms] campaign processing failed", { batchId, code: error?.code, message: error?.message });
-      await finalizeSmartContactSMSBatch(req.companyId, batchId).catch(() => {});
-      const payload = await loadSmartContactSMSBatch(pool, req.companyId, batchId, false).catch(() => null);
-      if (payload) return res.status(202).json(payload);
-      sendSmartContactError(res, error);
-    }
-  }
-);
-
 function routeScope(req, alias = "r") {
   if (req.companyId) return { sql: `${alias}.company_id = $1`, values: [req.companyId] };
   return { sql: `${alias}.user_id = $1`, values: [req.userId] };
@@ -9035,13 +6204,6 @@ function mapRouteRow(row, stops = []) {
     stop_count: Number(row.stop_count || stops.length || 0),
     distance_meters: row.distance_meters,
     travel_time_seconds: row.travel_time_seconds,
-    service_time_seconds: row.service_time_seconds,
-    total_route_time_seconds: row.total_route_time_seconds,
-    estimated_start_at: row.estimated_start_at,
-    estimated_finish_at: row.estimated_finish_at,
-    routing_provider: row.routing_provider,
-    routing_strategy: row.routing_strategy,
-    routing_calculated_at: row.routing_calculated_at,
     created_at: row.created_at,
     updated_at: row.updated_at,
     stops
@@ -9060,24 +6222,8 @@ function mapRouteStopRow(row) {
     status: row.status,
     batch_number: row.batch_number == null ? null : Number(row.batch_number),
     locked_order: row.locked_order == null ? null : Number(row.locked_order),
-    source_type: row.source_type || (row.contact_id ? "contact" : "custom"),
-    service_duration_seconds: row.service_duration_seconds,
-    leg_distance_meters: row.leg_distance_meters,
-    leg_travel_time_seconds: row.leg_travel_time_seconds,
-    estimated_arrival_at: row.estimated_arrival_at,
-    estimated_departure_at: row.estimated_departure_at
+    source_type: row.source_type || (row.contact_id ? "contact" : "custom")
   };
-}
-
-function routeTimestamp(value) {
-  if (!value) return null;
-  const parsed = new Date(value);
-  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
-}
-
-function routeMetric(value, maximum = Number.MAX_SAFE_INTEGER) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 && parsed <= maximum ? parsed : null;
 }
 
 async function fetchRouteWithStops(req, id) {
@@ -9109,11 +6255,9 @@ async function replaceRouteStops(client, routeId, companyId, stops) {
     await client.query(
       `INSERT INTO crm_route_stops(
          id, route_id, company_id, contact_id, stop_order, name_snapshot, address_snapshot,
-         latitude, longitude, status, batch_number, source_type, locked_order,
-         service_duration_seconds, leg_distance_meters, leg_travel_time_seconds,
-         estimated_arrival_at, estimated_departure_at
+         latitude, longitude, status, batch_number, source_type, locked_order
        )
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [
         randomUUID(),
         routeId,
@@ -9127,80 +6271,14 @@ async function replaceRouteStops(client, routeId, companyId, stops) {
         ["not_visited", "arrived", "completed", "skipped"].includes(raw.status) ? raw.status : "not_visited",
         Number.isFinite(Number(raw.batch_number)) ? Number(raw.batch_number) : null,
         ["contact", "custom"].includes(raw.source_type) ? raw.source_type : (raw.contact_id ? "contact" : "custom"),
-        Number.isFinite(Number(raw.locked_order)) && Number(raw.locked_order) > 0 ? Number(raw.locked_order) : null,
-        routeMetric(raw.service_duration_seconds, 86400),
-        routeMetric(raw.leg_distance_meters, 100000000),
-        routeMetric(raw.leg_travel_time_seconds, 604800),
-        routeTimestamp(raw.estimated_arrival_at),
-        routeTimestamp(raw.estimated_departure_at)
+        Number.isFinite(Number(raw.locked_order)) && Number(raw.locked_order) > 0 ? Number(raw.locked_order) : null
       ]
     );
   }
 }
 
-const googleRoutingRateWindows = new Map();
-
-function googleRoutingRateAllowed(req) {
-  const now = Date.now();
-  const windowMs = 60_000;
-  const maximumRequests = 20;
-  const key = req.companyId ? `company:${req.companyId}` : `user:${req.userId}`;
-  const recent = (googleRoutingRateWindows.get(key) || []).filter((timestamp) => timestamp > now - windowMs);
-  if (recent.length >= maximumRequests) {
-    googleRoutingRateWindows.set(key, recent);
-    return false;
-  }
-  recent.push(now);
-  googleRoutingRateWindows.set(key, recent);
-  if (googleRoutingRateWindows.size > 1000) {
-    for (const [candidateKey, timestamps] of googleRoutingRateWindows) {
-      if (!timestamps.some((timestamp) => timestamp > now - windowMs)) googleRoutingRateWindows.delete(candidateKey);
-    }
-  }
-  return true;
-}
-
-app.get("/api/routing/status", authRequired, requireCapability("routes.view"), (_req, res) => {
-  res.json(googleRoutingService.status());
-});
-
-app.post("/api/routing/route-plan", authRequired, requireAnyCapability("routes.create", "routes.edit"), async (req, res) => {
-  if (!googleRoutingRateAllowed(req)) {
-    return res.status(429).json({
-      error: "google_routing_rate_limited",
-      message: "Too many route calculations are already in progress. Try again in a minute.",
-      retryable: true
-    });
-  }
-
-  const controller = new AbortController();
-  const abortWhenDisconnected = () => {
-    if (!res.writableEnded) controller.abort(new Error("client_disconnected"));
-  };
-  res.once("close", abortWhenDisconnected);
-  try {
-    const plan = await googleRoutingService.plan(req.body, { signal: controller.signal });
-    if (!res.headersSent && !res.writableEnded) res.json(plan);
-  } catch (error) {
-    if (res.headersSent || res.writableEnded) return;
-    if (error instanceof GoogleRoutingError) {
-      const statusCode = error.statusCode === 499 ? 408 : error.statusCode;
-      return res.status(statusCode).json({
-        error: error.code,
-        message: error.message,
-        retryable: error.retryable,
-        ...(error.details ? { details: error.details } : {})
-      });
-    }
-    console.error("[google-routing] route calculation failed", error?.code || error?.name || "unknown_error");
-    res.status(500).json({ error: "google_routing_failed", message: "WolfCRM could not calculate this route." });
-  } finally {
-    res.removeListener("close", abortWhenDisconnected);
-  }
-});
-
 // ---------- routes (AUTH REQUIRED + COMPANY-SCOPED) ----------
-app.get("/api/routes", authRequired, requireCapability("routes.view"), async (req, res) => {
+app.get("/api/routes", authRequired, async (req, res) => {
   try {
     const scope = routeScope(req, "r");
     const { rows } = await pool.query(
@@ -9220,7 +6298,7 @@ app.get("/api/routes", authRequired, requireCapability("routes.view"), async (re
   }
 });
 
-app.get("/api/routes/:id", authRequired, requireCapability("routes.view"), async (req, res) => {
+app.get("/api/routes/:id", authRequired, async (req, res) => {
   try {
     const route = await fetchRouteWithStops(req, req.params.id);
     if (!route) return res.status(404).json({ error: "route_not_found" });
@@ -9231,7 +6309,7 @@ app.get("/api/routes/:id", authRequired, requireCapability("routes.view"), async
   }
 });
 
-app.post("/api/routes", authRequired, requireCapability("routes.create"), async (req, res) => {
+app.post("/api/routes", authRequired, async (req, res) => {
   const name = (req.body.name || "").toString().trim() || `Route ${new Date().toISOString().slice(0, 10)}`;
   const client = await pool.connect();
   try {
@@ -9240,11 +6318,9 @@ app.post("/api/routes", authRequired, requireCapability("routes.create"), async 
     await client.query(
       `INSERT INTO crm_routes(
          id, company_id, user_id, name, status, start_label, start_latitude, start_longitude,
-         start_mode, ending_behavior, end_label, end_latitude, end_longitude, distance_meters, travel_time_seconds,
-         service_time_seconds, total_route_time_seconds, estimated_start_at, estimated_finish_at,
-         routing_provider, routing_strategy, routing_calculated_at
+         start_mode, ending_behavior, end_label, end_latitude, end_longitude, distance_meters, travel_time_seconds
        )
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
       [
         id,
         req.companyId || null,
@@ -9259,15 +6335,8 @@ app.post("/api/routes", authRequired, requireCapability("routes.create"), async 
         req.body.end_label || null,
         Number.isFinite(Number(req.body.end_latitude)) ? Number(req.body.end_latitude) : null,
         Number.isFinite(Number(req.body.end_longitude)) ? Number(req.body.end_longitude) : null,
-        routeMetric(req.body.distance_meters, 100000000),
-        routeMetric(req.body.travel_time_seconds, 604800),
-        routeMetric(req.body.service_time_seconds, 8640000),
-        routeMetric(req.body.total_route_time_seconds, 8640000),
-        routeTimestamp(req.body.estimated_start_at),
-        routeTimestamp(req.body.estimated_finish_at),
-        req.body.routing_provider === "google" ? "google" : null,
-        ["route_optimization", "route_matrix", "fixed_order"].includes(req.body.routing_strategy) ? req.body.routing_strategy : null,
-        routeTimestamp(req.body.routing_calculated_at)
+        Number.isFinite(Number(req.body.distance_meters)) ? Number(req.body.distance_meters) : null,
+        Number.isFinite(Number(req.body.travel_time_seconds)) ? Number(req.body.travel_time_seconds) : null
       ]
     );
     await replaceRouteStops(client, id, req.companyId, req.body.stops);
@@ -9282,7 +6351,7 @@ app.post("/api/routes", authRequired, requireCapability("routes.create"), async 
   }
 });
 
-app.put("/api/routes/:id", authRequired, requireCapability("routes.edit"), async (req, res) => {
+app.put("/api/routes/:id", authRequired, async (req, res) => {
   const scope = routeScope(req, "r");
   const client = await pool.connect();
   try {
@@ -9306,13 +6375,6 @@ app.put("/api/routes/:id", authRequired, requireCapability("routes.edit"), async
               end_longitude = $11,
               distance_meters = $12,
               travel_time_seconds = $13,
-              service_time_seconds = $14,
-              total_route_time_seconds = $15,
-              estimated_start_at = $16,
-              estimated_finish_at = $17,
-              routing_provider = $18,
-              routing_strategy = $19,
-              routing_calculated_at = $20,
               updated_at = now()
         WHERE id = $1`,
       [
@@ -9327,15 +6389,8 @@ app.put("/api/routes/:id", authRequired, requireCapability("routes.edit"), async
         req.body.end_label || null,
         Number.isFinite(Number(req.body.end_latitude)) ? Number(req.body.end_latitude) : null,
         Number.isFinite(Number(req.body.end_longitude)) ? Number(req.body.end_longitude) : null,
-        routeMetric(req.body.distance_meters, 100000000),
-        routeMetric(req.body.travel_time_seconds, 604800),
-        routeMetric(req.body.service_time_seconds, 8640000),
-        routeMetric(req.body.total_route_time_seconds, 8640000),
-        routeTimestamp(req.body.estimated_start_at),
-        routeTimestamp(req.body.estimated_finish_at),
-        req.body.routing_provider === "google" ? "google" : null,
-        ["route_optimization", "route_matrix", "fixed_order"].includes(req.body.routing_strategy) ? req.body.routing_strategy : null,
-        routeTimestamp(req.body.routing_calculated_at)
+        Number.isFinite(Number(req.body.distance_meters)) ? Number(req.body.distance_meters) : null,
+        Number.isFinite(Number(req.body.travel_time_seconds)) ? Number(req.body.travel_time_seconds) : null
       ]
     );
     await replaceRouteStops(client, req.params.id, req.companyId, req.body.stops);
@@ -9350,7 +6405,7 @@ app.put("/api/routes/:id", authRequired, requireCapability("routes.edit"), async
   }
 });
 
-app.patch("/api/routes/:routeId/stops/:stopId", authRequired, requireCapability("routes.edit"), async (req, res) => {
+app.patch("/api/routes/:routeId/stops/:stopId", authRequired, async (req, res) => {
   try {
     const scope = routeScope(req, "r");
     const allowed = await pool.query(`SELECT r.id FROM crm_routes r WHERE r.id = $2 AND ${scope.sql}`, [...scope.values, req.params.routeId]);
@@ -9375,7 +6430,7 @@ app.patch("/api/routes/:routeId/stops/:stopId", authRequired, requireCapability(
   }
 });
 
-app.delete("/api/contacts/:id", authRequired, requireCapability("contacts.delete"), async (req, res) => {
+app.delete("/api/contacts/:id", authRequired, async (req, res) => {
   try {
     if (!req.permissions.canDeleteContacts) {
       return res.status(403).json({ error: "permission_denied" });
@@ -9463,7 +6518,7 @@ function sanitizePushCategories(input) {
 }
 
 // GET current token (create if missing)
-app.get("/api/integrations/zapier/token", authRequired, requireCapability("integrations.view"), async (req, res) => {
+app.get("/api/integrations/zapier/token", authRequired, async (req, res) => {
   try {
     let { rows } = await pool.query(
       `SELECT token, auto_stage_id, auto_assign_stage_enabled, notifications_enabled, notification_fields, notification_categories
@@ -9504,7 +6559,7 @@ app.get("/api/integrations/zapier/token", authRequired, requireCapability("integ
 });
 
 // Rotate token
-app.post("/api/integrations/zapier/token/rotate", authRequired, requireCapability("integrations.manage"), async (req, res) => {
+app.post("/api/integrations/zapier/token/rotate", authRequired, async (req, res) => {
   try {
     const token = randomBytes(24).toString("hex");
     const { rows } = await pool.query(
@@ -9525,7 +6580,7 @@ app.post("/api/integrations/zapier/token/rotate", authRequired, requireCapabilit
 // This endpoint is intentionally TOLERANT: it never returns 4xx for a stale/missing
 // stage — it silently clears the invalid ref instead. This lets the app self-heal
 // during migrations, deletes, and cross-account edge cases.
-app.put("/api/integrations/zapier/auto-stage", authRequired, requireCapability("integrations.manage"), async (req, res) => {
+app.put("/api/integrations/zapier/auto-stage", authRequired, async (req, res) => {
   const { stage_id } = req.body || {};
   try {
     let effectiveStageId = null;
@@ -9563,7 +6618,7 @@ app.put("/api/integrations/zapier/auto-stage", authRequired, requireCapability("
 });
 
 // Toggle whether new imported leads are auto-assigned to a stage at all.
-app.put("/api/integrations/zapier/auto-assign-enabled", authRequired, requireCapability("integrations.manage"), async (req, res) => {
+app.put("/api/integrations/zapier/auto-assign-enabled", authRequired, async (req, res) => {
   const enabled = !!(req.body && req.body.enabled);
   try {
     const { rows } = await pool.query(
@@ -9583,7 +6638,7 @@ app.put("/api/integrations/zapier/auto-assign-enabled", authRequired, requireCap
 
 // Push-notification preferences for new-lead alerts.
 // Body: { enabled: bool, fields: [string], categories: object }
-app.put("/api/integrations/zapier/notifications", authRequired, requireCapability("integrations.manage"), async (req, res) => {
+app.put("/api/integrations/zapier/notifications", authRequired, async (req, res) => {
   const enabled = !!(req.body && req.body.enabled);
   const fields = sanitizeNotificationFields(req.body && req.body.fields);
   const categories = sanitizePushCategories(req.body && req.body.categories);
@@ -9633,7 +6688,7 @@ app.post("/api/integrations/device-token", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/integrations/push/diagnostics", authRequired, requireCapability("integrations.view"), async (req, res) => {
+app.get("/api/integrations/push/diagnostics", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT environment, updated_at, last_registration_error
@@ -9667,7 +6722,7 @@ app.get("/api/integrations/push/diagnostics", authRequired, requireCapability("i
   }
 });
 
-app.post("/api/integrations/push/test", authRequired, requireCapability("integrations.manage"), async (req, res) => {
+app.post("/api/integrations/push/test", authRequired, requireEmployer, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT token, COALESCE(environment, CASE WHEN $2::boolean THEN 'production' ELSE 'sandbox' END) AS environment
@@ -9705,7 +6760,7 @@ app.delete("/api/integrations/device-token", authRequired, async (req, res) => {
 
 // GET pending notifications and mark them delivered.
 // iOS polls this when the app becomes active and fires local notifications.
-app.get("/api/integrations/zapier/pending-notifications", authRequired, requireCapability("integrations.view"), async (req, res) => {
+app.get("/api/integrations/zapier/pending-notifications", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, title, body, contact_id, created_at
@@ -9732,7 +6787,7 @@ app.get("/api/integrations/zapier/pending-notifications", authRequired, requireC
 // One-shot backfill: re-processes every stored lead_import belonging to this
 // caller and writes Lead Info onto any contact whose lead_info is empty/null.
 // Idempotent — running it twice is safe.
-app.post("/api/integrations/zapier/backfill-lead-info", authRequired, requireCapability("integrations.manage"), async (req, res) => {
+app.post("/api/integrations/zapier/backfill-lead-info", authRequired, async (req, res) => {
   const force = !!(req.body && req.body.force);
   try {
     // Company-scoped when available (so any teammate can trigger the backfill
@@ -9835,7 +6890,7 @@ app.post("/api/integrations/zapier/backfill-lead-info", authRequired, requireCap
 });
 
 // ---------- STAGE REMINDERS ----------
-app.get("/api/stage-reminders", authRequired, requireCapability("pipeline.view"), async (req, res) => {
+app.get("/api/stage-reminders", authRequired, async (req, res) => {
   const includeArchived = String(req.query.includeArchived || "").toLowerCase() === "true";
   try {
     const { rows } = await pool.query(
@@ -9849,7 +6904,7 @@ app.get("/api/stage-reminders", authRequired, requireCapability("pipeline.view")
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_reminders" }); }
 });
 
-app.post("/api/stage-reminders", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
+app.post("/api/stage-reminders", authRequired, async (req, res) => {
   const { contact_id, opportunity_id, remind_at, note } = req.body || {};
   if (!contact_id || !remind_at) return res.status(400).json({ error: "missing_fields" });
   try {
@@ -9875,7 +6930,7 @@ app.post("/api/stage-reminders", authRequired, requireCapability("pipeline.manag
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_create_reminder" }); }
 });
 
-app.put("/api/stage-reminders/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
+app.put("/api/stage-reminders/:id", authRequired, async (req, res) => {
   const { remind_at, note, archived } = req.body || {};
   try {
     const { rows } = await pool.query(
@@ -9904,7 +6959,7 @@ app.put("/api/stage-reminders/:id", authRequired, requireCapability("pipeline.ma
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_update_reminder" }); }
 });
 
-app.delete("/api/stage-reminders/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
+app.delete("/api/stage-reminders/:id", authRequired, async (req, res) => {
   try {
     await pool.query(`DELETE FROM stage_reminders WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.userId]);
@@ -10643,7 +7698,7 @@ function quoteScopeSQL(req, alias = "q") {
     : { sql: `${p}user_id = $1`, values: [req.userId] };
 }
 
-app.get("/api/quotes/settings", authRequired, requireCapability("quotes.view"), async (req, res) => {
+app.get("/api/quotes/settings", authRequired, async (req, res) => {
   try {
     if (!req.companyId) return res.status(400).json({ error: "company_required" });
     res.json(await getQuoteSettings(pool, req.companyId));
@@ -10653,7 +7708,7 @@ app.get("/api/quotes/settings", authRequired, requireCapability("quotes.view"), 
   }
 });
 
-app.patch("/api/quotes/settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
+app.patch("/api/quotes/settings", authRequired, requireEmployer, async (req, res) => {
   try {
     if (!req.companyId) return res.status(400).json({ error: "company_required" });
     const taxRate = Number(req.body?.tax_rate_basis_points || 0);
@@ -10692,7 +7747,7 @@ app.patch("/api/quotes/settings", authRequired, requireCapability("settings.mana
   }
 });
 
-app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (req, res) => {
+app.get("/api/quotes", authRequired, async (req, res) => {
   try {
     const scope = quoteScopeSQL(req);
     const contactID = (req.query.contact_id || "").toString().trim();
@@ -10722,7 +7777,7 @@ app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (re
   }
 });
 
-app.get("/api/quotes/totals", authRequired, requireCapability("quotes.view"), async (req, res) => {
+app.get("/api/quotes/totals", authRequired, async (req, res) => {
   try {
     const scope = quoteScopeSQL(req);
     const { rows } = await pool.query(
@@ -10739,21 +7794,17 @@ app.get("/api/quotes/totals", authRequired, requireCapability("quotes.view"), as
   }
 });
 
-app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async (req, res) => {
+app.post("/api/quotes", authRequired, async (req, res) => {
   const { contact_id, title, line_items, notes, status, expires_at } = req.body || {};
   if (!contact_id) return res.status(400).json({ error: "contact_id_required" });
   const items = Array.isArray(line_items) ? line_items : [];
   const total = computeQuoteTotalCents(items);
-  const initialStatus = ["draft","sent","accepted","declined","expired","converted"].includes(status) ? status : "draft";
   try {
     const { rows } = await pool.query(
-      `INSERT INTO quotes (user_id, company_id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9,
-         CASE WHEN $8 = 'sent' THEN now() END,
-         CASE WHEN $8 = 'accepted' THEN now() END,
-         CASE WHEN $8 = 'declined' THEN now() END)
+      `INSERT INTO quotes (user_id, company_id, contact_id, title, line_items, total_cents, notes, status, expires_at)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
        RETURNING id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
-      [req.userId, req.companyId || null, contact_id, title || null, JSON.stringify(items), total, notes || null, initialStatus, expires_at || null]
+      [req.userId, req.companyId || null, contact_id, title || null, JSON.stringify(items), total, notes || null, ["draft","sent","accepted","declined","expired","converted"].includes(status) ? status : "draft", expires_at || null]
     );
     if (req.companyId) {
       await emitAutomationEvent({
@@ -10766,19 +7817,6 @@ app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async 
         dedupeKey: `quote.created:${rows[0].id}`,
         payload: { quote_id: rows[0].id, contact_id, status: rows[0].status, total_cents: rows[0].total_cents, line_item_count: items.length, expires_at: rows[0].expires_at }
       });
-      const lifecycleEvent = { sent: "quote.sent", accepted: "quote.accepted", declined: "quote.declined", expired: "quote.expired" }[rows[0].status];
-      if (lifecycleEvent) {
-        await emitAutomationEvent({
-          companyId: req.companyId,
-          eventType: lifecycleEvent,
-          subjectType: "quote",
-          subjectId: rows[0].id,
-          actorUserId: req.userId,
-          source: "quotes.api",
-          dedupeKey: `${lifecycleEvent}:${rows[0].id}`,
-          payload: { quote_id: rows[0].id, contact_id, status: rows[0].status, total_cents: rows[0].total_cents, line_item_count: items.length, expires_at: rows[0].expires_at }
-        });
-      }
       await syncAutomationSchedulesForQuote(req.companyId, rows[0]);
       await markGoogleSheetsContactDirty(pool, req.companyId, contact_id, "quote.created");
     }
@@ -10789,7 +7827,7 @@ app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async 
   }
 });
 
-app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async (req, res) => {
+app.put("/api/quotes/:id", authRequired, async (req, res) => {
   const { title, line_items, notes, status, expires_at } = req.body || {};
   const items = Array.isArray(line_items) ? line_items : null;
   const total = items ? computeQuoteTotalCents(items) : null;
@@ -10857,7 +7895,7 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
   }
 });
 
-app.delete("/api/quotes/:id", authRequired, requireCapability("quotes.delete"), async (req, res) => {
+app.delete("/api/quotes/:id", authRequired, async (req, res) => {
   try {
     // Fixed placeholder numbering (see PUT above).
     const params = [req.params.id];
@@ -10901,7 +7939,7 @@ app.delete("/api/quotes/:id", authRequired, requireCapability("quotes.delete"), 
 // Stages are company-scoped when the user belongs to a company; otherwise they
 // fall back to the individual user. This is the SAME set of rows both the
 // Stages tab and the Integrations "auto-assign" picker read from.
-app.get("/api/stages", authRequired, requireCapability("pipeline.view"), async (req, res) => {
+app.get("/api/stages", authRequired, async (req, res) => {
   try {
     const { rows } = req.companyId
       ? await pool.query(
@@ -10930,7 +7968,7 @@ app.get("/api/stages", authRequired, requireCapability("pipeline.view"), async (
   }
 });
 
-app.put("/api/stages/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
+app.put("/api/stages/:id", authRequired, async (req, res) => {
   const { name, order_idx } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
   try {
@@ -10961,7 +7999,7 @@ app.put("/api/stages/:id", authRequired, requireCapability("pipeline.manage"), a
   } catch (e) { console.error("[stages] upsert failed:", e); res.status(500).json({ error: "failed_upsert_stage" }); }
 });
 
-app.delete("/api/stages/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
+app.delete("/api/stages/:id", authRequired, async (req, res) => {
   try {
     // Null out any zapier_tokens auto-assign refs that pointed here so future
     // webhooks don't try to assign to a deleted stage.
@@ -10994,7 +8032,7 @@ app.delete("/api/stages/:id", authRequired, requireCapability("pipeline.manage")
 // ---------- OPPORTUNITIES (each contact has at most one) ----------
 // Company-scoped when the caller belongs to a company; user-scoped otherwise.
 // This is important so webhook-created opportunities show up for every teammate.
-app.get("/api/opportunities", authRequired, requireCapability("pipeline.view"), async (req, res) => {
+app.get("/api/opportunities", authRequired, async (req, res) => {
   try {
     const { rows } = req.companyId
       ? await pool.query(
@@ -11012,7 +8050,7 @@ app.get("/api/opportunities", authRequired, requireCapability("pipeline.view"), 
   } catch (e) { console.error("[opportunities] list failed:", e); res.status(500).json({ error: "failed_list_opportunities" }); }
 });
 
-app.put("/api/opportunities/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
+app.put("/api/opportunities/:id", authRequired, async (req, res) => {
   const { contact_id, state, stage_id, created_at, stage_entered_at } = req.body || {};
   if (!contact_id || !state) return res.status(400).json({ error: "missing_params" });
   try {
@@ -11074,7 +8112,7 @@ app.put("/api/opportunities/:id", authRequired, requireCapability("pipeline.mana
   } catch (e) { console.error("[opportunities] upsert failed:", e); res.status(500).json({ error: "failed_upsert_opportunity" }); }
 });
 
-app.delete("/api/opportunities/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
+app.delete("/api/opportunities/:id", authRequired, async (req, res) => {
   try {
     const before = (await pool.query(
       `DELETE FROM opportunities
@@ -11093,7 +8131,7 @@ app.delete("/api/opportunities/:id", authRequired, requireCapability("pipeline.m
 });
 
 // ---------- SCHEDULE EVENTS ----------
-app.get("/api/schedule", authRequired, requireCapability("schedule.view"), async (req, res) => {
+app.get("/api/schedule", authRequired, async (req, res) => {
   try {
     const where = req.companyId
       ? { sql: `company_id = $1`, values: [req.companyId] }
@@ -11101,8 +8139,7 @@ app.get("/api/schedule", authRequired, requireCapability("schedule.view"), async
     const { rows } = await pool.query(
       `SELECT id, title, start_at AS start, end_at AS "end", color, notes,
               contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
-              company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
-              weather_exposure
+              company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by
        FROM schedule_events WHERE ${where.sql} ORDER BY start_at ASC`,
       where.values
     );
@@ -11110,186 +8147,28 @@ app.get("/api/schedule", authRequired, requireCapability("schedule.view"), async
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_schedule" }); }
 });
 
-app.get("/api/schedule/team", authRequired, requireCapability("schedule.view"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const start = new Date(req.query.start || Date.now());
-  const end = new Date(req.query.end || (start.getTime() + 7 * 86400000));
-  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start || end - start > 62 * 86400000) {
-    return res.status(400).json({ error: "invalid_schedule_range", message: "Choose a valid range of 62 days or fewer." });
-  }
-  try {
-    const [companyResult, membersResult, availabilityResult, eventsResult] = await Promise.all([
-      pool.query(
-        `SELECT timezone, business_days, business_open_time, business_close_time
-           FROM companies WHERE id = $1`,
-        [req.companyId]
-      ),
-      pool.query(
-        `SELECT id, role, COALESCE(NULLIF(BTRIM(display_name), ''), split_part(email, '@', 1), 'Team member') AS display_name
-           FROM users
-          WHERE company_id = $1 AND deleted_at IS NULL
-          ORDER BY role = 'employer' DESC, display_name ASC NULLS LAST, email ASC`,
-        [req.companyId]
-      ),
-      pool.query(
-        `SELECT user_id, weekdays, start_time, end_time, timezone, enabled, updated_at
-           FROM employee_schedule_availability WHERE company_id = $1`,
-        [req.companyId]
-      ),
-      pool.query(
-        `SELECT id, start_at, end_at, worker_user_ids, finished_at
-           FROM schedule_events
-          WHERE company_id = $1 AND start_at < $3 AND end_at > $2`,
-        [req.companyId, start, end]
-      )
-    ]);
-    if (!companyResult.rows.length) return res.status(404).json({ error: "company_not_found" });
-    const company = companyResult.rows[0];
-    const companyAvailability = {
-      weekdays: Array.isArray(company.business_days) ? company.business_days.map(Number) : [1, 2, 3, 4, 5],
-      start_time: company.business_open_time || "09:00",
-      end_time: company.business_close_time || "17:00",
-      timezone: company.timezone || "America/New_York",
-      enabled: true
-    };
-    const overrides = Object.fromEntries(availabilityResult.rows.map((row) => [row.user_id, row]));
-    const effectiveByUser = Object.fromEntries(membersResult.rows.map((member) => {
-      const override = overrides[member.id];
-      return [member.id, override?.enabled === false ? companyAvailability : (override || companyAvailability)];
-    }));
-    const summary = summarizeScheduleTeam({
-      events: eventsResult.rows,
-      availabilityByUser: effectiveByUser,
-      companyAvailability,
-      timeZone: companyAvailability.timezone
-    });
-    res.json({
-      range_start: start,
-      range_end: end,
-      company_availability: companyAvailability,
-      members: membersResult.rows.map((member) => ({
-        ...member,
-        availability: effectiveByUser[member.id],
-        inherits_company_availability: !overrides[member.id] || overrides[member.id].enabled === false,
-        assigned_minutes: summary.assigned_minutes_by_user[member.id] || 0
-      })),
-      summary
-    });
-  } catch (error) {
-    console.error("[schedule] team load failed", error);
-    res.status(500).json({ error: "schedule_team_load_failed" });
-  }
-});
-
-app.put("/api/schedule/team/:userId/availability", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  let availability;
-  try {
-    availability = validateAvailability(req.body);
-  } catch (error) {
-    if (error instanceof ScheduleTeamError) {
-      return res.status(error.status).json({ error: error.code, message: error.message, details: error.details });
-    }
-    console.error("[schedule] availability validation failed", error);
-    return res.status(500).json({ error: "schedule_availability_update_failed" });
-  }
-  try {
-    const member = await pool.query(
-      `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
-      [req.params.userId, req.companyId]
-    );
-    if (!member.rowCount) return res.status(404).json({ error: "employee_not_found" });
-    const company = await pool.query(`SELECT timezone FROM companies WHERE id = $1`, [req.companyId]);
-    const { rows } = await pool.query(
-      `INSERT INTO employee_schedule_availability
-         (company_id, user_id, weekdays, start_time, end_time, timezone, enabled, updated_by)
-       VALUES($1, $2, $3::jsonb, $4, $5, $6, $7, $8)
-       ON CONFLICT(company_id, user_id) DO UPDATE
-         SET weekdays = EXCLUDED.weekdays,
-             start_time = EXCLUDED.start_time,
-             end_time = EXCLUDED.end_time,
-             timezone = EXCLUDED.timezone,
-             enabled = EXCLUDED.enabled,
-             updated_by = EXCLUDED.updated_by,
-             updated_at = now()
-       RETURNING user_id, weekdays, start_time, end_time, timezone, enabled, updated_at`,
-      [
-        req.companyId,
-        req.params.userId,
-        JSON.stringify(availability.weekdays),
-        availability.start_time,
-        availability.end_time,
-        company.rows[0]?.timezone || "America/New_York",
-        availability.enabled,
-        req.userId
-      ]
-    );
-    res.json(rows[0]);
-  } catch (error) {
-    console.error("[schedule] availability update failed", error);
-    res.status(500).json({ error: "schedule_availability_update_failed" });
-  }
-});
-
-app.delete("/api/schedule/team/:userId/availability", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const member = await pool.query(
-      `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
-      [req.params.userId, req.companyId]
-    );
-    if (!member.rowCount) return res.status(404).json({ error: "employee_not_found" });
-    await pool.query(`DELETE FROM employee_schedule_availability WHERE company_id = $1 AND user_id = $2`, [req.companyId, req.params.userId]);
-    res.json({ reset: true, user_id: req.params.userId });
-  } catch (error) {
-    console.error("[schedule] availability reset failed", error);
-    res.status(500).json({ error: "schedule_availability_reset_failed" });
-  }
-});
-
-app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create", "schedule.edit"), async (req, res) => {
+app.put("/api/schedule/:id", authRequired, async (req, res) => {
   const {
     title, start, end, color, notes, contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
-    sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by, weather_exposure
+    sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by
   } = req.body || {};
   if (!title || !start || !end) return res.status(400).json({ error: "missing_params" });
-  const startDate = new Date(start);
-  const endDate = new Date(end);
-  if (!Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime()) || endDate <= startDate) {
-    return res.status(400).json({ error: "invalid_schedule_interval", message: "Job end time must be after its start time." });
-  }
+  const salesIDs = Array.isArray(sales_user_ids) ? sales_user_ids.slice(0, 2) : [req.userId];
+  const workerIDs = Array.isArray(worker_user_ids) ? worker_user_ids : [];
   try {
     const previous = await pool.query(
       `SELECT * FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
       [req.params.id, req.userId, req.companyId]
     );
-    const requiredCapability = requiredScheduleWriteCapability(previous.rowCount > 0);
-    if (!hasCapability(req, requiredCapability)) {
-      return res.status(403).json({ error: "permission_denied", required_capability: requiredCapability });
-    }
-    const activeMembers = req.companyId
-      ? await pool.query(`SELECT id FROM users WHERE company_id = $1 AND deleted_at IS NULL`, [req.companyId])
-      : { rows: [{ id: req.userId }] };
-    const assignments = validateAssignments({
-      salesIDs: Array.isArray(sales_user_ids) ? sales_user_ids : [req.userId],
-      workerIDs: Array.isArray(worker_user_ids) ? worker_user_ids : [],
-      activeMemberIDs: activeMembers.rows.map((row) => row.id)
-    });
-    const salesIDs = assignments.sales_user_ids;
-    const workerIDs = assignments.worker_user_ids;
     const oldWorkerIDs = previous.rows.length && Array.isArray(previous.rows[0].worker_user_ids)
       ? previous.rows[0].worker_user_ids
       : [];
     const isNewJob = previous.rowCount === 0;
-    const weatherExposure = weather_exposure == null && previous.rowCount
-      ? normalizeWeatherExposure(previous.rows[0].weather_exposure || "auto")
-      : normalizeWeatherExposure(weather_exposure);
     const r = await pool.query(
       `INSERT INTO schedule_events
         (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, quote_id,
-         reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
-         weather_exposure)
-       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $16::jsonb, $17::jsonb, $18, $19, $20, $21, $22)
+         reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by)
+       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $16::jsonb, $17::jsonb, $18, $19, $20, $21)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              start_at = EXCLUDED.start_at,
@@ -11310,13 +8189,11 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
              started_by = EXCLUDED.started_by,
              finished_at = EXCLUDED.finished_at,
              finished_by = EXCLUDED.finished_by,
-             weather_exposure = EXCLUDED.weather_exposure,
              updated_at = now()
        WHERE schedule_events.user_id = $2 OR schedule_events.company_id = $3
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
                  contact_id, quote_id, reminder_minutes, services, price_cents, material_cost_cents,
-                 service_items, company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
-                 weather_exposure`,
+                 service_items, company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by`,
       [
         req.params.id, req.userId, req.companyId, title, start, end,
         color || '#3478F6', notes || null, contact_id || null, quote_id || null,
@@ -11330,8 +8207,7 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
         started_at || null,
         started_by || null,
         finished_at || null,
-        finished_by || null,
-        weatherExposure
+        finished_by || null
       ]
     );
     const addedWorkers = workerIDs.filter((id) => !oldWorkerIDs.includes(id));
@@ -11374,19 +8250,10 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
       await markGoogleSheetsContactDirty(pool, req.companyId, r.rows[0].contact_id, isNewJob ? "job.created" : "job.updated");
     }
     res.json(r.rows[0]);
-  } catch (e) {
-    if (e instanceof ScheduleTeamError) {
-      return res.status(e.status).json({ error: e.code, message: e.message, details: e.details });
-    }
-    if (e instanceof WeatherSchedulingError) {
-      return res.status(e.statusCode).json({ error: e.code, message: e.message, details: e.details });
-    }
-    console.error(e);
-    res.status(500).json({ error: "failed_upsert_schedule" });
-  }
+  } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_schedule" }); }
 });
 
-app.delete("/api/schedule/:id", authRequired, requireCapability("schedule.delete"), async (req, res) => {
+app.delete("/api/schedule/:id", authRequired, async (req, res) => {
   try {
     const before = req.companyId
       ? (await pool.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0]
@@ -11405,1455 +8272,6 @@ app.delete("/api/schedule/:id", authRequired, requireCapability("schedule.delete
     }
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_schedule" }); }
-});
-
-// ---------- WEATHER-AWARE SCHEDULING ----------
-function sendWeatherError(res, error, fallbackCode = "weather_scheduling_failed") {
-  if (error instanceof WeatherSchedulingError || error instanceof OnMyWayError) {
-    return res.status(error.statusCode || 400).json({
-      error: error.code,
-      message: error.message,
-      ...(error.details ? { details: error.details } : {})
-    });
-  }
-  console.error("[weather] failed:", { code: error?.code, message: error?.message });
-  return res.status(500).json({ error: fallbackCode, message: "WolfCRM couldn't complete the weather workflow." });
-}
-
-function normalizeWeatherJobIDs(raw) {
-  if (!Array.isArray(raw) || !raw.length || raw.length > 50) {
-    throw new WeatherSchedulingError("invalid_weather_reschedule_jobs", "Choose between 1 and 50 jobs.");
-  }
-  const ids = raw.map((value) => String(value || "").trim());
-  if (ids.some((id) => !id || id.length > 160) || new Set(ids).size !== ids.length) {
-    throw new WeatherSchedulingError("invalid_weather_reschedule_jobs", "Every selected job must be unique.");
-  }
-  return ids;
-}
-
-async function loadWeatherCompany(queryable, companyId) {
-  const company = (await queryable.query(
-    `SELECT id, name, timezone, weather_settings
-       FROM companies
-      WHERE id = $1
-      LIMIT 1`,
-    [companyId]
-  )).rows[0];
-  if (!company) throw new WeatherSchedulingError("company_not_found", "Company is no longer available.", { statusCode: 404 });
-  return { ...company, settings: resolveWeatherSettings(company.weather_settings) };
-}
-
-const WEATHER_JOB_SELECT = `
-  SELECT se.id, se.title, se.start_at, se.end_at, se.services, se.service_items,
-         se.worker_user_ids, se.sales_user_ids, se.weather_exposure, se.started_at, se.finished_at,
-         se.contact_id, se.updated_at, COUNT(*) OVER()::int AS weather_query_total,
-         c.name AS contact_name, c.phone AS contact_phone, c.address AS contact_address,
-         c.lat AS contact_latitude, c.lng AS contact_longitude, c.job_type AS contact_job_type
-    FROM schedule_events se
-    LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id`;
-
-async function loadUpcomingWeatherJobs(queryable, companyId, settings) {
-  const horizon = new Date(Date.now() + settings.lookahead_days * 86_400_000);
-  return (await queryable.query(
-    `${WEATHER_JOB_SELECT}
-      WHERE se.company_id = $1
-        AND se.finished_at IS NULL
-        AND se.end_at > now()
-        AND se.start_at < $2
-      ORDER BY se.start_at ASC
-      LIMIT 200`,
-    [companyId, horizon]
-  )).rows;
-}
-
-async function loadSelectedWeatherJobs(queryable, companyId, ids, { forUpdate = false } = {}) {
-  const result = await queryable.query(
-    `${WEATHER_JOB_SELECT}
-      WHERE se.company_id = $1 AND se.id = ANY($2::text[])
-        AND se.started_at IS NULL
-        AND se.finished_at IS NULL
-        AND se.end_at > now()
-      ORDER BY se.start_at ASC, se.id ASC
-      ${forUpdate ? "FOR UPDATE OF se" : ""}`,
-    [companyId, ids]
-  );
-  if (result.rows.length !== ids.length) {
-    const found = new Set(result.rows.map((row) => String(row.id)));
-    throw new WeatherSchedulingError("weather_jobs_changed", "One or more selected jobs are no longer available. Reload and review the selection.", {
-      statusCode: 409,
-      details: { missing_job_ids: ids.filter((id) => !found.has(id)) }
-    });
-  }
-  return result.rows;
-}
-
-async function createWeatherRiskReport(companyId) {
-  const company = await loadWeatherCompany(pool, companyId);
-  const jobs = await loadUpcomingWeatherJobs(pool, companyId, company.settings);
-  return buildWeatherRiskReport({ jobs, settings: company.settings, weatherService: googleWeatherService });
-}
-
-async function syncWeatherRiskObservations(companyId, report, { actorUserId = null, source = "weather.monitor" } = {}) {
-  if (!report.monitoring_enabled || !report.provider_configured) return [];
-  const fresh = [];
-  const evaluatedIDs = new Set((report.observation_resolution_job_ids || report.evaluated_job_ids || []).map(String));
-  const activeKeys = new Set(report.risks.map((risk) => `${risk.job_id}:${new Date(risk.start_at).toISOString()}`));
-  const db = await pool.connect();
-  try {
-    await db.query("BEGIN");
-    await db.query(
-      `UPDATE weather_risk_observations o
-          SET resolved_at = COALESCE(resolved_at, now())
-        WHERE o.company_id = $1 AND o.resolved_at IS NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM schedule_events se
-             WHERE se.company_id = o.company_id AND se.id = o.job_id
-               AND se.start_at = o.job_start_at AND se.started_at IS NULL
-               AND se.finished_at IS NULL AND se.end_at > now()
-          )`,
-      [companyId]
-    );
-    for (const risk of report.risks) {
-      const inserted = await db.query(
-        `INSERT INTO weather_risk_observations(company_id, job_id, job_start_at, severity, snapshot)
-         VALUES($1,$2,$3,$4,$5::jsonb)
-         ON CONFLICT(company_id, job_id, job_start_at) DO NOTHING
-         RETURNING id`,
-        [companyId, risk.job_id, risk.start_at, risk.severity, JSON.stringify(risk)]
-      );
-      if (inserted.rowCount) fresh.push(risk);
-      else {
-        await db.query(
-          `UPDATE weather_risk_observations
-              SET severity = $4, snapshot = $5::jsonb, last_detected_at = now(), resolved_at = NULL
-            WHERE company_id = $1 AND job_id = $2 AND job_start_at = $3`,
-          [companyId, risk.job_id, risk.start_at, risk.severity, JSON.stringify(risk)]
-        );
-      }
-    }
-    const active = await db.query(
-      `SELECT id, job_id, job_start_at FROM weather_risk_observations
-        WHERE company_id = $1 AND resolved_at IS NULL`,
-      [companyId]
-    );
-    const resolvedIDs = active.rows
-      .filter((row) => evaluatedIDs.has(String(row.job_id)))
-      .filter((row) => !activeKeys.has(`${row.job_id}:${new Date(row.job_start_at).toISOString()}`))
-      .map((row) => row.id);
-    if (resolvedIDs.length) {
-      await db.query(`UPDATE weather_risk_observations SET resolved_at = now() WHERE company_id = $1 AND id = ANY($2::uuid[])`, [companyId, resolvedIDs]);
-    }
-    await db.query("COMMIT");
-  } catch (error) {
-    await db.query("ROLLBACK").catch(() => {});
-    throw error;
-  } finally {
-    db.release();
-  }
-  for (const risk of fresh) {
-    await emitAutomationEvent({
-      companyId,
-      eventType: "weather.job_at_risk",
-      subjectType: "job",
-      subjectId: risk.job_id,
-      actorUserId,
-      source,
-      dedupeKey: `weather.job_at_risk:${risk.job_id}:${risk.start_at}`,
-      payload: { job_id: risk.job_id, contact_id: risk.contact_id, start_at: risk.start_at, severity: risk.severity, summary: risk.summary, risk }
-    }).catch((error) => console.error("[weather] automation event failed", error?.message || error));
-  }
-  return fresh;
-}
-
-function weatherServiceName(job) {
-  const items = Array.isArray(job.service_items) ? job.service_items : [];
-  return String(items[0]?.name || items[0] || (Array.isArray(job.services) ? job.services[0] : "") || job.title || "service").trim();
-}
-
-async function weatherNotificationPreviews(queryable, company, jobs, plan, template) {
-  const phonesByJob = new Map();
-  const normalizedPhones = [];
-  for (const job of jobs) {
-    const phone = normalizeE164Phone(job.contact_phone);
-    phonesByJob.set(String(job.id), phone);
-    if (isUsableE164(phone)) normalizedPhones.push(phone);
-  }
-  const optedOutRows = normalizedPhones.length ? (await queryable.query(
-    `SELECT normalized_phone FROM phone_opt_outs
-      WHERE company_id = $1 AND channel = 'sms' AND status = 'opted_out'
-        AND normalized_phone = ANY($2::text[])`,
-    [company.id, [...new Set(normalizedPhones)]]
-  )).rows : [];
-  const optedOut = new Set(optedOutRows.map((row) => row.normalized_phone));
-  const jobsByID = new Map(jobs.map((job) => [String(job.id), job]));
-  return plan.items.map((item) => {
-    const job = jobsByID.get(item.job_id);
-    const recipientPhone = phonesByJob.get(item.job_id);
-    let blockReason = null;
-    if (!job.contact_id || !job.contact_name) blockReason = "linked_contact_required";
-    else if (!isUsableE164(recipientPhone)) blockReason = "valid_customer_phone_required";
-    else if (optedOut.has(recipientPhone)) blockReason = "customer_sms_opted_out";
-    const message = renderWeatherRescheduleMessage(template, {
-      customerName: job.contact_name,
-      companyName: company.name,
-      serviceName: weatherServiceName(job),
-      oldTime: item.old_start_at,
-      newTime: item.new_start_at,
-      timeZone: company.timezone
-    });
-    return {
-      ...item,
-      recipient_phone: isUsableE164(recipientPhone) ? recipientPhone : null,
-      notification_eligible: blockReason == null,
-      notification_block_reason: blockReason,
-      notification_message: message
-    };
-  });
-}
-
-async function loadWeatherBatch(queryable, companyId, batchId) {
-  const batch = (await queryable.query(
-    `SELECT * FROM weather_reschedule_batches WHERE company_id = $1 AND id = $2 LIMIT 1`,
-    [companyId, batchId]
-  )).rows[0];
-  if (!batch) return null;
-  const items = (await queryable.query(
-    `SELECT * FROM weather_reschedule_items WHERE company_id = $1 AND batch_id = $2 ORDER BY new_start_at ASC, job_id ASC`,
-    [companyId, batchId]
-  )).rows;
-  return { ...batch, items };
-}
-
-async function processWeatherBatchNotifications(companyId, actorUserId, batchId) {
-  const pending = (await pool.query(
-    `SELECT * FROM weather_reschedule_items
-      WHERE company_id = $1 AND batch_id = $2 AND notification_status = 'pending'
-      ORDER BY new_start_at ASC`,
-    [companyId, batchId]
-  )).rows;
-  for (const item of pending) {
-    const claimed = await pool.query(
-      `UPDATE weather_reschedule_items
-          SET notification_status = 'sending', updated_at = now()
-        WHERE company_id = $1 AND batch_id = $2 AND job_id = $3 AND notification_status = 'pending'
-        RETURNING *`,
-      [companyId, batchId, item.job_id]
-    );
-    if (!claimed.rowCount) continue;
-    let delivery;
-    try {
-      delivery = await deliverCustomerWorkflowMessage({
-        channel: "sms",
-        companyId,
-        contactId: item.contact_id,
-        recipientPhone: item.recipient_phone,
-        body: item.notification_message
-      });
-    } catch (error) {
-      if (error?.code === "customer_sms_opted_out") {
-        await recordPhoneSmsConsent(companyId, item.recipient_phone, "opted_out", "weather.reschedule").catch(() => {});
-      }
-      await pool.query(
-        `UPDATE weather_reschedule_items
-            SET notification_status = 'failed', error_code = $4, error_message = $5, updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND job_id = $3`,
-        [companyId, batchId, item.job_id, error?.code || "customer_message_send_failed", error?.message || "Customer message failed."]
-      );
-      continue;
-    }
-
-    const persistence = await pool.connect();
-    let storedMessage;
-    try {
-      await persistence.query("BEGIN");
-      await persistence.query(
-        `UPDATE weather_reschedule_items
-            SET notification_status = 'provider_accepted', provider_message_sid = $4, updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND job_id = $3`,
-        [companyId, batchId, item.job_id, delivery.providerMessageSid]
-      );
-      storedMessage = (await persistence.query(
-        `INSERT INTO sms_messages(
-           conversation_id, twilio_message_sid, direction, from_number, to_number,
-           body, message_status, media_count, media
-         ) VALUES($1,$2,'outbound',$3,$4,$5,$6,0,'[]'::jsonb)
-         RETURNING *`,
-        [delivery.conversationId, delivery.providerMessageSid, delivery.fromNumber, delivery.toNumber, item.notification_message, delivery.status]
-      )).rows[0];
-      await persistence.query(`UPDATE sms_conversations SET last_message_at = now(), updated_at = now() WHERE id = $1`, [delivery.conversationId]);
-      await persistence.query(
-        `UPDATE weather_reschedule_items
-            SET notification_status = $4, sms_conversation_id = $5, sms_message_id = $6,
-                provider_message_sid = $7, updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND job_id = $3`,
-        [companyId, batchId, item.job_id, delivery.status, delivery.conversationId, storedMessage.id, delivery.providerMessageSid]
-      );
-      await persistence.query("COMMIT");
-    } catch (error) {
-      await persistence.query("ROLLBACK").catch(() => {});
-      await pool.query(
-        `UPDATE weather_reschedule_items
-            SET notification_status = 'delivery_unknown', provider_message_sid = $4,
-                error_code = 'message_store_failed',
-                error_message = 'Provider accepted the message but local persistence did not finish.', updated_at = now()
-          WHERE company_id = $1 AND batch_id = $2 AND job_id = $3`,
-        [companyId, batchId, item.job_id, delivery.providerMessageSid]
-      ).catch(() => {});
-      continue;
-    } finally {
-      persistence.release();
-    }
-    await emitCustomerWorkflowSmsHooks({
-      companyId,
-      actorUserId,
-      contactId: item.contact_id,
-      storedMessage,
-      recipientPhone: delivery.toNumber,
-      fromNumber: delivery.fromNumber,
-      workflow: "weather.reschedule",
-      dirtyReason: "sms.weather_reschedule"
-    });
-  }
-  const counts = (await pool.query(
-    `SELECT COUNT(*) FILTER (WHERE notification_status IN ('failed','delivery_unknown'))::int AS failed_count,
-            COUNT(*) FILTER (WHERE notification_status IN ('pending','sending','provider_accepted'))::int AS pending_count
-       FROM weather_reschedule_items
-      WHERE company_id = $1 AND batch_id = $2`,
-    [companyId, batchId]
-  )).rows[0];
-  const status = Number(counts?.pending_count || 0) > 0 ? "processing" : Number(counts?.failed_count || 0) > 0 ? "partial" : "complete";
-  await pool.query(`UPDATE weather_reschedule_batches SET status = $3, updated_at = now() WHERE company_id = $1 AND id = $2`, [companyId, batchId, status]);
-}
-
-app.get("/api/weather/status", authRequired, requireCapability("schedule.view"), async (req, res) => {
-  try {
-    const company = await loadWeatherCompany(pool, req.companyId);
-    res.json({ ...googleWeatherService.status(), monitoring_enabled: company.settings.enabled });
-  } catch (error) {
-    sendWeatherError(res, error, "weather_status_failed");
-  }
-});
-
-app.get("/api/weather/settings", authRequired, requireCapability("schedule.view"), async (req, res) => {
-  try {
-    const company = await loadWeatherCompany(pool, req.companyId);
-    res.json(company.settings);
-  } catch (error) {
-    sendWeatherError(res, error, "weather_settings_load_failed");
-  }
-});
-
-app.put("/api/weather/settings", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
-  try {
-    const settings = validateWeatherSettings(req.body);
-    const saved = await pool.query(
-      `UPDATE companies SET weather_settings = $2::jsonb, updated_at = now() WHERE id = $1 RETURNING weather_settings`,
-      [req.companyId, JSON.stringify(settings)]
-    );
-    if (!saved.rowCount) return res.status(404).json({ error: "company_not_found" });
-    res.json(resolveWeatherSettings(saved.rows[0].weather_settings));
-  } catch (error) {
-    sendWeatherError(res, error, "weather_settings_update_failed");
-  }
-});
-
-app.get("/api/weather/risks", authRequired, requireCapability("schedule.view"), async (req, res) => {
-  try {
-    const report = await createWeatherRiskReport(req.companyId);
-    await syncWeatherRiskObservations(req.companyId, report, { actorUserId: req.userId, source: "weather.ios_refresh" });
-    res.json(report);
-  } catch (error) {
-    sendWeatherError(res, error, "weather_risks_failed");
-  }
-});
-
-app.post("/api/weather/reschedule/preview", authRequired, requireCapability("schedule.edit"), async (req, res) => {
-  try {
-    const ids = normalizeWeatherJobIDs(req.body?.job_ids);
-    const [company, jobs] = await Promise.all([
-      loadWeatherCompany(pool, req.companyId),
-      loadSelectedWeatherJobs(pool, req.companyId, ids)
-    ]);
-    const plan = planWeatherReschedule(jobs, req.body?.replacement_start_at);
-    const template = req.body?.notification_template == null
-      ? company.settings.notification_template
-      : validateWeatherNotificationTemplate(req.body.notification_template);
-    let items = await weatherNotificationPreviews(pool, company, jobs, plan, template);
-    const canNotifyCustomers = hasCapability(req, "messaging.customer.send");
-    if (!canNotifyCustomers) {
-      items = items.map((item) => ({
-        ...item,
-        recipient_phone: null,
-        notification_eligible: false,
-        notification_block_reason: "permission_denied"
-      }));
-    }
-    res.json({ ...plan, notification_template: template, can_notify_customers: canNotifyCustomers, items });
-  } catch (error) {
-    sendWeatherError(res, error, "weather_reschedule_preview_failed");
-  }
-});
-
-app.post("/api/weather/reschedule", authRequired, requireCapability("schedule.edit"), async (req, res) => {
-  const idempotencyKey = String(req.body?.idempotency_key || "").trim().toLowerCase();
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) {
-    return res.status(400).json({ error: "weather_idempotency_key_required", message: "Reload the reschedule preview and try again." });
-  }
-  const notifyCustomers = req.body?.notify_customers === true;
-  if (notifyCustomers && !hasCapability(req, "messaging.customer.send")) {
-    return res.status(403).json({ error: "permission_denied", required_capability: "messaging.customer.send" });
-  }
-  let batchId;
-  let replayed = false;
-  let beforeJobs = [];
-  let updatedJobs = [];
-  const db = await pool.connect();
-  try {
-    const ids = normalizeWeatherJobIDs(req.body?.job_ids);
-    await db.query("BEGIN");
-    await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`weather-reschedule:${req.companyId}:${idempotencyKey}`]);
-    const existing = (await db.query(
-      `SELECT id FROM weather_reschedule_batches WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1`,
-      [req.companyId, idempotencyKey]
-    )).rows[0];
-    if (existing) {
-      batchId = existing.id;
-      replayed = true;
-      await db.query("COMMIT");
-    } else {
-      const company = await loadWeatherCompany(db, req.companyId);
-      beforeJobs = await loadSelectedWeatherJobs(db, req.companyId, ids, { forUpdate: true });
-      validateWeatherExpectedIntervals(beforeJobs, req.body?.expected_intervals);
-      const plan = planWeatherReschedule(beforeJobs, req.body?.replacement_start_at);
-      const template = req.body?.notification_template == null
-        ? company.settings.notification_template
-        : validateWeatherNotificationTemplate(req.body.notification_template);
-      const previews = await weatherNotificationPreviews(db, company, beforeJobs, plan, template);
-      batchId = randomUUID();
-      await db.query(
-        `INSERT INTO weather_reschedule_batches(
-           id, company_id, created_by, idempotency_key, replacement_start_at,
-           notify_customers, notification_template, status
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,'processing')`,
-        [batchId, req.companyId, req.userId, idempotencyKey, plan.replacement_start_at, notifyCustomers, template]
-      );
-      for (const item of previews) {
-        const notificationStatus = !notifyCustomers ? "not_requested" : item.notification_eligible ? "pending" : "failed";
-        await db.query(
-          `INSERT INTO weather_reschedule_items(
-             batch_id, company_id, job_id, contact_id, contact_name, recipient_phone, job_title,
-             old_start_at, old_end_at, new_start_at, new_end_at,
-             notification_status, notification_message, error_code, error_message
-           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-          [batchId, req.companyId, item.job_id, item.contact_id, item.contact_name, item.recipient_phone, item.title,
-            item.old_start_at, item.old_end_at, item.new_start_at, item.new_end_at,
-            notificationStatus, item.notification_message,
-            notifyCustomers && !item.notification_eligible ? item.notification_block_reason : null,
-            notifyCustomers && !item.notification_eligible ? "Customer notification was not eligible." : null]
-        );
-        const updated = (await db.query(
-          `UPDATE schedule_events
-              SET start_at = $3, end_at = $4, updated_at = now()
-            WHERE company_id = $1 AND id = $2
-            RETURNING *`,
-          [req.companyId, item.job_id, item.new_start_at, item.new_end_at]
-        )).rows[0];
-        if (!updated) throw new WeatherSchedulingError("weather_jobs_changed", "A selected job changed before the move completed.", { statusCode: 409 });
-        updatedJobs.push(updated);
-      }
-      await db.query("COMMIT");
-    }
-  } catch (error) {
-    await db.query("ROLLBACK").catch(() => {});
-    return sendWeatherError(res, error, "weather_reschedule_failed");
-  } finally {
-    db.release();
-  }
-
-  if (!replayed) {
-    for (let index = 0; index < updatedJobs.length; index += 1) {
-      const before = beforeJobs.find((job) => String(job.id) === String(updatedJobs[index].id));
-      const after = updatedJobs[index];
-      await emitJobRouteEvents(req.companyId, req.userId, before, after, "weather.reschedule").catch((error) => console.error("[weather] job event failed", error?.message || error));
-      await syncAutomationSchedulesForJob(req.companyId, after).catch((error) => console.error("[weather] job schedule sync failed", error?.message || error));
-      await markGoogleSheetsContactDirty(pool, req.companyId, after.contact_id, "job.weather_rescheduled").catch(() => {});
-    }
-    if (notifyCustomers) await processWeatherBatchNotifications(req.companyId, req.userId, batchId);
-    else await pool.query(`UPDATE weather_reschedule_batches SET status = 'complete', updated_at = now() WHERE company_id = $1 AND id = $2`, [req.companyId, batchId]);
-  } else {
-    await pool.query(
-      `UPDATE weather_reschedule_items
-          SET notification_status = 'delivery_unknown', error_code = 'interrupted_send',
-              error_message = 'A prior request ended while the provider result was unknown.', updated_at = now()
-        WHERE company_id = $1 AND batch_id = $2 AND notification_status IN ('sending','provider_accepted')`,
-      [req.companyId, batchId]
-    );
-    const existingBatch = await loadWeatherBatch(pool, req.companyId, batchId);
-    if (existingBatch?.notify_customers) await processWeatherBatchNotifications(req.companyId, req.userId, batchId);
-  }
-  const batch = await loadWeatherBatch(pool, req.companyId, batchId);
-  res.status(replayed ? 200 : 201).json({ batch, replayed });
-});
-
-let weatherScannerRunning = false;
-async function scanEnabledWeatherCompanies() {
-  if (weatherScannerRunning || !googleWeatherService.status().configured) return;
-  weatherScannerRunning = true;
-  try {
-    const companies = (await pool.query(
-      `SELECT id FROM companies
-        WHERE COALESCE((weather_settings ->> 'enabled')::boolean, false) = true
-        ORDER BY id ASC`
-    )).rows;
-    let cursor = 0;
-    async function worker() {
-      while (cursor < companies.length) {
-        const companyId = companies[cursor++].id;
-        try {
-          const report = await createWeatherRiskReport(companyId);
-          const fresh = await syncWeatherRiskObservations(companyId, report, { source: "weather.periodic_monitor" });
-          if (fresh.length) {
-            const owners = await employerUserIdsForCompany(companyId);
-            const highest = fresh.some((risk) => risk.severity === "critical") ? "Critical weather risk"
-              : fresh.some((risk) => risk.severity === "high") ? "High weather risk" : "Weather risk detected";
-            await sendPushToUsers(owners, "weather_risk", {
-              title: highest,
-              body: `${fresh.length} upcoming ${fresh.length === 1 ? "job may be" : "jobs may be"} affected. Review the Weather section in Schedule.`,
-              payload: { type: "weather_risk", schedule_mode: "weather" },
-              threadId: "weather-risk"
-            });
-          }
-        } catch (error) {
-          console.error("[weather] periodic company scan failed", { companyId, code: error?.code, message: error?.message });
-        }
-      }
-    }
-    await Promise.all(Array.from({ length: Math.min(2, companies.length) }, worker));
-  } finally {
-    weatherScannerRunning = false;
-  }
-}
-
-function startWeatherRiskWorkers() {
-  const configuredMinutes = Number(process.env.WEATHER_SCAN_INTERVAL_MINUTES || 180);
-  const intervalMinutes = Math.min(720, Math.max(30, Number.isFinite(configuredMinutes) ? configuredMinutes : 180));
-  setTimeout(() => scanEnabledWeatherCompanies().catch(() => {}), 15_000).unref?.();
-  setInterval(() => scanEnabledWeatherCompanies().catch(() => {}), intervalMinutes * 60_000).unref?.();
-}
-
-// ---------- INTELLIGENT WORKER ASSIGNMENT ----------
-function sendAssignmentRecommendationError(res, error) {
-  if (error instanceof AssignmentRecommendationError) {
-    return res.status(error.statusCode || 400).json({
-      error: error.code,
-      message: error.message,
-      ...(error.details ? { details: error.details } : {})
-    });
-  }
-  console.error("[assignment-recommendations] failed", { code: error?.code, message: error?.message });
-  return res.status(500).json({
-    error: "assignment_recommendations_failed",
-    message: "WolfCRM couldn't build worker recommendations."
-  });
-}
-
-async function loadAssignmentRecommendationContext(companyId, jobId, queryable = pool) {
-  const target = (await queryable.query(
-    `SELECT se.*, c.lat AS contact_latitude, c.lng AS contact_longitude
-       FROM schedule_events se
-       LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id
-      WHERE se.company_id = $1 AND se.id = $2
-      LIMIT 1`,
-    [companyId, jobId]
-  )).rows[0];
-  if (!target) {
-    throw new AssignmentRecommendationError("assignment_job_not_found", "The scheduled job was not found.", { statusCode: 404 });
-  }
-  const companyResult = await queryable.query(
-    `SELECT timezone, business_days, business_open_time, business_close_time
-       FROM companies WHERE id = $1`,
-    [companyId]
-  );
-  if (!companyResult.rowCount) {
-    throw new AssignmentRecommendationError("company_not_found", "Company is no longer available.", { statusCode: 404 });
-  }
-  const windowStart = new Date(new Date(target.start_at).getTime() - 36 * 3_600_000);
-  const windowEnd = new Date(new Date(target.end_at).getTime() + 36 * 3_600_000);
-  const [workersResult, availabilityResult, scheduleResult, originsResult] = await Promise.all([
-    queryable.query(
-      `SELECT u.id, u.email, u.display_name, u.role, p.*
-         FROM users u
-         LEFT JOIN employee_permissions p ON p.user_id = u.id
-        WHERE u.company_id = $1 AND u.deleted_at IS NULL
-        ORDER BY COALESCE(NULLIF(BTRIM(u.display_name), ''), u.email), u.id
-        LIMIT 51`,
-      [companyId]
-    ),
-    queryable.query(
-      `SELECT user_id, weekdays, start_time, end_time, timezone, enabled
-         FROM employee_schedule_availability WHERE company_id = $1`,
-      [companyId]
-    ),
-    queryable.query(
-      `SELECT se.id, se.title, se.start_at, se.end_at, se.worker_user_ids, se.started_at, se.finished_at,
-              c.lat AS contact_latitude, c.lng AS contact_longitude
-         FROM schedule_events se
-         LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id
-        WHERE se.company_id = $1 AND se.id <> $2
-          AND se.finished_at IS NULL
-          AND se.start_at < $4 AND se.end_at > $3
-        ORDER BY se.start_at, se.end_at, se.id
-        LIMIT 501`,
-      [companyId, jobId, windowStart, windowEnd]
-    ),
-    queryable.query(
-      `SELECT mes.employee_id, l.name, l.lat, l.lng
-         FROM mileage_employee_settings mes
-         JOIN mileage_company_locations l
-           ON l.company_id = mes.company_id AND l.id = mes.start_location_id AND l.active = true
-        WHERE mes.company_id = $1`,
-      [companyId]
-    )
-  ]);
-  if (workersResult.rows.length > 50) {
-    throw new AssignmentRecommendationError("assignment_workers_invalid", "Recommendations support up to 50 active employees.");
-  }
-  const workers = workersResult.rows.map((worker) => {
-    const access = resolveAccess({
-      role: worker.role,
-      preset: worker.permission_preset,
-      overrides: worker.permission_overrides,
-      legacy: worker
-    });
-    return {
-      id: worker.id,
-      email: worker.email,
-      display_name: worker.display_name,
-      permitted: access.capabilities["jobs.work"] === true
-    };
-  });
-  const company = companyResult.rows[0];
-  return {
-    target,
-    workers,
-    existingJobs: scheduleResult.rows,
-    availabilityByWorker: Object.fromEntries(availabilityResult.rows.map((row) => [row.user_id, row])),
-    companyAvailability: {
-      weekdays: Array.isArray(company.business_days) ? company.business_days.map(Number) : [1, 2, 3, 4, 5],
-      start_time: company.business_open_time || "09:00",
-      end_time: company.business_close_time || "17:00",
-      enabled: true
-    },
-    timeZone: company.timezone || "America/New_York",
-    originsByWorker: Object.fromEntries(originsResult.rows.map((row) => [row.employee_id, row]))
-  };
-}
-
-function assignmentRoutePoint(raw, id, fallbackLabel) {
-  if (raw?.contact_latitude == null && raw?.lat == null) return null;
-  if (raw?.contact_longitude == null && raw?.lng == null) return null;
-  const latitude = Number(raw.contact_latitude ?? raw.lat);
-  const longitude = Number(raw.contact_longitude ?? raw.lng);
-  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)
-      || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
-  return { id, label: String(raw.title || raw.name || fallbackLabel), latitude, longitude };
-}
-
-async function estimateAssignmentInsertionTravel({ context, recommendation, routingStatus }) {
-  if (!routingStatus.configured) {
-    return { coverage: "unavailable", warning: "Google routing is not configured." };
-  }
-  const targetPoint = assignmentRoutePoint(context.target, "assignment-target", "Target job");
-  if (!targetPoint) return { coverage: "unavailable", warning: "The target job has no saved coordinates." };
-  const jobsByID = new Map(context.existingJobs.map((job) => [String(job.id), job]));
-  const previous = recommendation.previous_job ? jobsByID.get(String(recommendation.previous_job.id)) : null;
-  const next = recommendation.next_job ? jobsByID.get(String(recommendation.next_job.id)) : null;
-  const previousPoint = previous ? assignmentRoutePoint(previous, "assignment-origin", "Previous job") : null;
-  const approvedOrigin = !previous
-    ? assignmentRoutePoint(context.originsByWorker[recommendation.worker_id], "assignment-origin", "Approved start location")
-    : null;
-  const origin = previousPoint || approvedOrigin;
-  const nextPoint = next ? assignmentRoutePoint(next, "assignment-next", "Next job") : null;
-  const departure = previous?.end_at || context.target.start_at;
-  const targetDurationSeconds = Math.max(0, Math.round(
-    (new Date(context.target.end_at).getTime() - new Date(context.target.start_at).getTime()) / 1000
-  ));
-
-  try {
-    if (!origin) {
-      if (!nextPoint) {
-        return {
-          coverage: "unavailable",
-          warning: previous
-            ? "The previous job and next leg do not have enough saved coordinates."
-            : "No preceding job or approved employee start location has saved coordinates."
-        };
-      }
-      const outgoingPlan = await googleRoutingService.plan({
-        start: targetPoint,
-        stops: [{ ...nextPoint, id: "assignment-next", service_duration_seconds: 0 }],
-        ending_behavior: "finish_at_final_stop",
-        optimize_order: false,
-        departure_time: context.target.end_at
-      });
-      return {
-        coverage: "partial",
-        source: "target_to_next_only",
-        incoming_seconds: null,
-        outgoing_seconds: outgoingPlan.legs[0]?.travel_time_seconds ?? outgoingPlan.travel_time_seconds,
-        baseline_seconds: null,
-        added_seconds: null,
-        distance_meters: outgoingPlan.distance_meters,
-        warning: previous
-          ? "The previous job is missing coordinates, so incoming and added travel are unknown."
-          : "No preceding job or approved start location is available, so incoming travel is unknown."
-      };
-    }
-
-    const withTarget = await googleRoutingService.plan({
-      start: origin,
-      stops: [{ ...targetPoint, id: "assignment-target", service_duration_seconds: targetDurationSeconds }],
-      ending_behavior: nextPoint ? "custom_address" : "finish_at_final_stop",
-      ...(nextPoint ? { end: { ...nextPoint, id: "assignment-end" } } : {}),
-      optimize_order: false,
-      departure_time: departure
-    });
-    let baselineSeconds = 0;
-    if (nextPoint) {
-      const baseline = await googleRoutingService.plan({
-        start: origin,
-        stops: [{ ...nextPoint, id: "assignment-next", service_duration_seconds: 0 }],
-        ending_behavior: "finish_at_final_stop",
-        optimize_order: false,
-        departure_time: departure
-      });
-      baselineSeconds = baseline.travel_time_seconds;
-    }
-    const incomingSeconds = withTarget.legs[0]?.travel_time_seconds ?? null;
-    const outgoingSeconds = next ? (nextPoint ? withTarget.legs[1]?.travel_time_seconds ?? null : null) : 0;
-    const complete = !next || Boolean(nextPoint);
-    return {
-      coverage: complete ? "complete" : "partial",
-      source: previousPoint ? "previous_job" : "approved_start_location",
-      incoming_seconds: incomingSeconds,
-      outgoing_seconds: outgoingSeconds,
-      baseline_seconds: complete ? baselineSeconds : null,
-      added_seconds: complete && incomingSeconds != null && outgoingSeconds != null
-        ? incomingSeconds + outgoingSeconds - baselineSeconds
-        : null,
-      distance_meters: withTarget.distance_meters,
-      warning: complete ? null : "The next job is missing coordinates, so outgoing and added travel are unknown."
-    };
-  } catch (error) {
-    return {
-      coverage: "unavailable",
-      source: previousPoint ? "previous_job" : approvedOrigin ? "approved_start_location" : null,
-      warning: error?.code === "invalid_route_request"
-        ? "This job is outside the routing provider's supported departure window."
-        : "Google could not calculate this employee's road insertion."
-    };
-  }
-}
-
-async function mapAssignmentWorkers(items, work, concurrency = 3) {
-  const output = Array(items.length);
-  let cursor = 0;
-  async function worker() {
-    while (cursor < items.length) {
-      const index = cursor++;
-      output[index] = await work(items[index], index);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, worker));
-  return output;
-}
-
-app.get("/api/jobs/:id/assignment-recommendations", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const context = await loadAssignmentRecommendationContext(req.companyId, req.params.id);
-    const routingStatus = googleRoutingService.status();
-    const initial = buildAssignmentRecommendations({
-      targetJob: context.target,
-      workers: context.workers,
-      existingJobs: context.existingJobs,
-      availabilityByWorker: context.availabilityByWorker,
-      companyAvailability: context.companyAvailability,
-      timeZone: context.timeZone,
-      routingStatus
-    });
-    const maximumRoadCandidates = 15;
-    const roadCandidateIDs = new Set(initial.recommendations.slice(0, maximumRoadCandidates).map((item) => item.worker_id));
-    const travelRows = await mapAssignmentWorkers(initial.recommendations, (recommendation) => (
-      roadCandidateIDs.has(recommendation.worker_id)
-        ? estimateAssignmentInsertionTravel({ context, recommendation, routingStatus })
-        : { coverage: "unavailable", warning: "Road estimate omitted by the bounded candidate limit." }
-    ));
-    const travelByWorker = Object.fromEntries(initial.recommendations.map((recommendation, index) => [
-      recommendation.worker_id,
-      travelRows[index]
-    ]));
-    const report = buildAssignmentRecommendations({
-      targetJob: context.target,
-      workers: context.workers,
-      existingJobs: context.existingJobs,
-      availabilityByWorker: context.availabilityByWorker,
-      companyAvailability: context.companyAvailability,
-      timeZone: context.timeZone,
-      travelByWorker,
-      routingStatus
-    });
-    if (initial.recommendations.length > maximumRoadCandidates) {
-      report.warnings.push(`Road estimates were limited to the leading ${maximumRoadCandidates} schedule candidates.`);
-    }
-    res.json(report);
-  } catch (error) {
-    sendAssignmentRecommendationError(res, error);
-  }
-});
-
-function assignmentApplicationPayload(row) {
-  if (!row) return null;
-  return {
-    id: row.id,
-    job_id: row.job_id,
-    actor_user_id: row.actor_user_id,
-    selected_worker_user_id: row.selected_worker_user_id,
-    assignment_mode: row.assignment_mode,
-    expected_job_updated_at: row.expected_job_updated_at,
-    applied_job_updated_at: row.applied_job_updated_at,
-    previous_worker_user_ids: safeArray(row.previous_worker_user_ids),
-    new_worker_user_ids: safeArray(row.new_worker_user_ids),
-    recommendation_snapshot: row.recommendation_snapshot || {},
-    created_at: row.created_at
-  };
-}
-
-async function loadAssignmentApplicationEvent(queryable, companyId, jobId) {
-  return (await queryable.query(
-    `SELECT se.*, se.start_at AS start, se.end_at AS "end"
-       FROM schedule_events se
-      WHERE se.company_id = $1 AND se.id = $2
-      LIMIT 1`,
-    [companyId, jobId]
-  )).rows[0] || null;
-}
-
-app.post(
-  "/api/jobs/:id/assignment-recommendations/apply",
-  authRequired,
-  requireAllCapabilities("schedule.manage_team", "schedule.edit"),
-  async (req, res) => {
-    if (!req.companyId) return res.status(403).json({ error: "company_required" });
-    const idempotencyKey = String(req.body?.idempotency_key || "").trim().toLowerCase();
-    const selectedWorkerID = String(req.body?.selected_worker_user_id || "").trim().toLowerCase();
-    const assignmentMode = String(req.body?.assignment_mode || "").trim().toLowerCase();
-    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-    if (!uuidPattern.test(idempotencyKey)) {
-      return res.status(400).json({ error: "assignment_idempotency_key_required", message: "Reload recommendations and try again." });
-    }
-    if (!uuidPattern.test(selectedWorkerID)) {
-      return res.status(400).json({ error: "assignment_worker_required", message: "Choose an active employee." });
-    }
-
-    let replayed = false;
-    let application = null;
-    let before = null;
-    let event = null;
-    const db = await pool.connect();
-    try {
-      await db.query("BEGIN");
-      await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`job-assignment:${req.companyId}:${idempotencyKey}`]);
-      const existing = (await db.query(
-        `SELECT * FROM job_assignment_recommendation_applications
-          WHERE company_id = $1 AND idempotency_key = $2
-          LIMIT 1`,
-        [req.companyId, idempotencyKey]
-      )).rows[0];
-      if (existing) {
-        if (String(existing.job_id) !== String(req.params.id)
-            || existing.assignment_mode !== assignmentMode
-            || (existing.selected_worker_user_id && String(existing.selected_worker_user_id) !== selectedWorkerID)) {
-          throw new AssignmentRecommendationError(
-            "assignment_idempotency_conflict",
-            "That apply token was already used for a different assignment. Refresh and try again.",
-            { statusCode: 409 }
-          );
-        }
-        replayed = true;
-        application = existing;
-        event = await loadAssignmentApplicationEvent(db, req.companyId, req.params.id);
-      } else {
-        before = (await db.query(
-          `SELECT * FROM schedule_events
-            WHERE company_id = $1 AND id = $2
-            FOR UPDATE`,
-          [req.companyId, req.params.id]
-        )).rows[0];
-        if (!before) {
-          throw new AssignmentRecommendationError("assignment_job_not_found", "The scheduled job was not found.", { statusCode: 404 });
-        }
-        const context = await loadAssignmentRecommendationContext(req.companyId, req.params.id, db);
-        const report = buildAssignmentRecommendations({
-          targetJob: context.target,
-          workers: context.workers,
-          existingJobs: context.existingJobs,
-          availabilityByWorker: context.availabilityByWorker,
-          companyAvailability: context.companyAvailability,
-          timeZone: context.timeZone,
-          routingStatus: { configured: false, provider: googleRoutingService.status().provider || "google" }
-        });
-        const change = planAssignmentApplication({
-          report,
-          selectedWorkerID,
-          assignmentMode,
-          expectedUpdatedAt: req.body?.expected_updated_at
-        });
-        event = (await db.query(
-          `UPDATE schedule_events
-              SET worker_user_ids = $3::jsonb, updated_at = now()
-            WHERE company_id = $1 AND id = $2
-            RETURNING *, start_at AS start, end_at AS "end"`,
-          [req.companyId, req.params.id, JSON.stringify(change.new_worker_user_ids)]
-        )).rows[0];
-        if (!event) {
-          throw new AssignmentRecommendationError(
-            "assignment_job_changed",
-            "This job changed while the assignment was being applied. Refresh and review it again.",
-            { statusCode: 409 }
-          );
-        }
-        application = (await db.query(
-          `INSERT INTO job_assignment_recommendation_applications(
-             id, company_id, job_id, actor_user_id, selected_worker_user_id,
-             assignment_mode, idempotency_key, expected_job_updated_at, applied_job_updated_at,
-             previous_worker_user_ids, new_worker_user_ids, recommendation_snapshot
-           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb)
-           RETURNING *`,
-          [
-            randomUUID(), req.companyId, req.params.id, req.userId, selectedWorkerID,
-            change.assignment_mode, idempotencyKey, req.body.expected_updated_at, event.updated_at,
-            JSON.stringify(change.previous_worker_user_ids), JSON.stringify(change.new_worker_user_ids),
-            JSON.stringify({
-              generated_at: report.generated_at,
-              target_job: report.target_job,
-              selected_recommendation: change.recommendation,
-              provider_status: googleRoutingService.status(),
-              validation: "schedule_availability_permission",
-              route_evidence_revalidated: false
-            })
-          ]
-        )).rows[0];
-      }
-      await db.query("COMMIT");
-    } catch (error) {
-      await db.query("ROLLBACK").catch(() => {});
-      return sendAssignmentRecommendationError(res, error);
-    } finally {
-      db.release();
-    }
-
-    if (!replayed && before && event) {
-      const oldWorkerIDs = safeArray(before.worker_user_ids).map(String);
-      const newWorkerIDs = safeArray(event.worker_user_ids).map(String);
-      const addedWorkers = newWorkerIDs.filter((id) => !oldWorkerIDs.includes(id));
-      await notifyMany(
-        addedWorkers,
-        req.companyId,
-        "job_assignment",
-        "New Job Assigned to You",
-        event.title,
-        { schedule_event_id: event.id },
-        req.userId
-      ).catch((error) => console.error("[assignment-recommendations] notification hook failed", error?.message || error));
-      await emitJobRouteEvents(req.companyId, req.userId, before, event, "assignment_recommendations.api")
-        .catch((error) => console.error("[assignment-recommendations] automation hook failed", error?.message || error));
-      await syncAutomationSchedulesForJob(req.companyId, event)
-        .catch((error) => console.error("[assignment-recommendations] schedule hook failed", error?.message || error));
-      await markGoogleSheetsContactDirty(pool, req.companyId, event.contact_id, "job.assignment_recommendation_applied")
-        .catch((error) => console.error("[assignment-recommendations] sheets hook failed", error?.message || error));
-    }
-    res.status(replayed ? 200 : 201).json({
-      application: assignmentApplicationPayload(application),
-      event,
-      replayed
-    });
-  }
-);
-
-// ---------- JOB ON MY WAY ----------
-function onMyWayEventPayload(row) {
-  if (!row) return null;
-  return {
-    id: row.id,
-    job_id: row.job_id,
-    contact_id: row.contact_id,
-    contact_name: row.contact_name,
-    recipient_phone: row.recipient_phone,
-    employee_id: row.employee_id,
-    employee_name: row.employee_name,
-    channel: row.channel,
-    message_body: row.message_body,
-    eta_seconds: row.eta_seconds == null ? null : Number(row.eta_seconds),
-    eta_source: row.eta_source,
-    status: row.live_status || row.status,
-    sms_conversation_id: row.sms_conversation_id,
-    sms_message_id: row.sms_message_id,
-    provider_message_sid: row.provider_message_sid,
-    error_code: row.error_code,
-    error_message: row.error_message,
-    explicit_resend: !!row.explicit_resend,
-    created_at: row.created_at,
-    updated_at: row.updated_at
-  };
-}
-
-async function fetchOnMyWayEvent(queryable, companyId, eventId) {
-  const { rows } = await queryable.query(
-    `SELECT e.*, COALESCE(sm.message_status, e.status) AS live_status
-       FROM job_on_my_way_events e
-       LEFT JOIN sms_messages sm ON sm.id = e.sms_message_id
-      WHERE e.company_id = $1 AND e.id = $2
-      LIMIT 1`,
-    [companyId, eventId]
-  );
-  return rows[0] || null;
-}
-
-async function loadOnMyWayContext(queryable, req, { forUpdate = false } = {}) {
-  const { rows } = await queryable.query(
-    `SELECT se.id AS job_id,
-            se.title AS job_title,
-            se.contact_id,
-            se.worker_user_ids,
-            se.finished_at,
-            c.name AS contact_name,
-            c.phone AS contact_phone,
-            c.lat AS contact_latitude,
-            c.lng AS contact_longitude,
-            co.name AS company_name,
-            co.on_my_way_message_template,
-            COALESCE(NULLIF(actor.display_name, ''), split_part(actor.email, '@', 1), 'A team member') AS employee_name
-       FROM schedule_events se
-       JOIN companies co ON co.id = se.company_id
-       JOIN users actor ON actor.id = $3 AND actor.company_id = se.company_id
-       LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id
-      WHERE se.id = $1 AND se.company_id = $2
-      LIMIT 1
-      ${forUpdate ? "FOR UPDATE OF se" : ""}`,
-    [req.params.id, req.companyId, req.userId]
-  );
-  const context = rows[0];
-  if (!context) throw new OnMyWayError("job_not_found", "This job is no longer available.", { statusCode: 404 });
-  if (context.finished_at) throw new OnMyWayError("job_already_finished", "Finished jobs cannot send an On My Way message.", { statusCode: 409 });
-  const workerIDs = Array.isArray(context.worker_user_ids) ? context.worker_user_ids.map(String) : [];
-  if (req.role !== "employer" && !hasCapability(req, "schedule.edit") && !workerIDs.includes(String(req.userId))) {
-    throw new OnMyWayError("job_not_assigned", "Only an assigned worker or scheduler can send this update.", { statusCode: 403 });
-  }
-  if (!context.contact_id || !context.contact_name) {
-    throw new OnMyWayError("job_contact_required", "Link a customer to this job before sending On My Way.", { statusCode: 422 });
-  }
-  const recipientPhone = normalizeE164Phone(context.contact_phone);
-  if (!isUsableE164(recipientPhone)) {
-    throw new OnMyWayError("customer_phone_required", "Add a valid customer mobile number before sending On My Way.", { statusCode: 422 });
-  }
-  return { ...context, recipient_phone: recipientPhone };
-}
-
-function sendOnMyWayError(res, error, fallbackCode = "on_my_way_failed") {
-  if (error instanceof OnMyWayError) {
-    return res.status(error.statusCode).json({
-      error: error.code,
-      message: error.message
-    });
-  }
-  console.error("[on-my-way] failed:", { code: error?.code, message: error?.message });
-  return res.status(500).json({ error: fallbackCode, message: "WolfCRM couldn't complete the On My Way workflow." });
-}
-
-async function calculateOnMyWayEta(req, origin, destination) {
-  if (!origin || !destination || !googleRoutingRateAllowed(req)) return null;
-  try {
-    const plan = await googleRoutingService.plan({
-      start: { id: "on-my-way-origin", label: "Current location", ...origin },
-      stops: [{ id: "on-my-way-destination", label: "Customer", ...destination, service_duration_seconds: 0, locked_order: null }],
-      ending_behavior: "finish_at_final_stop",
-      end: null,
-      optimize_order: false,
-      departure_time: new Date().toISOString()
-    });
-    const seconds = Math.round(Number(plan.travel_time_seconds));
-    return Number.isFinite(seconds) && seconds > 0 && seconds <= 86_400 ? seconds : null;
-  } catch (error) {
-    console.warn("[on-my-way/preview] ETA unavailable:", error?.code || error?.name || "routing_failed");
-    return null;
-  }
-}
-
-async function deliverCustomerWorkflowMessage({
-  channel,
-  companyId,
-  contactId,
-  recipientPhone,
-  body,
-  requireExplicitOptIn = false
-}) {
-  if (channel !== "sms") {
-    throw new OnMyWayError("on_my_way_channel_unavailable", "Only SMS is available for On My Way messages.", { statusCode: 422 });
-  }
-  const consent = await pool.query(
-    `SELECT status FROM phone_opt_outs
-      WHERE company_id = $1 AND normalized_phone = $2 AND channel = 'sms'
-      LIMIT 1`,
-    [companyId, recipientPhone]
-  );
-  if (consent.rows[0]?.status === "opted_out") {
-    throw new OnMyWayError("customer_sms_opted_out", "This customer has opted out of SMS messages.", { statusCode: 422 });
-  }
-  if (requireExplicitOptIn && consent.rows[0]?.status !== "opted_in") {
-    throw new OnMyWayError(
-      "customer_sms_marketing_consent_required",
-      "This customer does not have an explicit SMS marketing opt-in.",
-      { statusCode: 422 }
-    );
-  }
-  const lineResult = await pool.query(
-    `SELECT id, phone_number
-       FROM phone_lines
-      WHERE company_id = $1 AND active = true AND lower(status) = 'active'
-      ORDER BY created_at ASC
-      LIMIT 1`,
-    [companyId]
-  );
-  const line = lineResult.rows[0];
-  const fromNumber = normalizeE164Phone(line?.phone_number);
-  if (!line || !isUsableE164(fromNumber)) {
-    throw new OnMyWayError("phone_line_inactive", "No active company SMS line is available.", { statusCode: 503 });
-  }
-  const twilioClient = createTwilioClient();
-  if (!twilioClient) {
-    throw new OnMyWayError("twilio_not_configured", "Twilio SMS is not configured for this company.", { statusCode: 503 });
-  }
-  const conversation = (await pool.query(
-    `INSERT INTO sms_conversations(phone_line_id, external_phone_number, contact_id)
-     VALUES($1,$2,$3)
-     ON CONFLICT(phone_line_id, external_phone_number) DO UPDATE
-       SET contact_id = COALESCE(EXCLUDED.contact_id, sms_conversations.contact_id),
-           deleted_at = NULL,
-           updated_at = now()
-     RETURNING id`,
-    [line.id, recipientPhone, contactId]
-  )).rows[0];
-
-  try {
-    const sent = await twilioClient.messages.create({
-      from: fromNumber,
-      to: recipientPhone,
-      body,
-      statusCallback: twilioPublicUrl("/webhooks/twilio/message-status")
-    });
-    return {
-      conversationId: conversation.id,
-      fromNumber,
-      toNumber: recipientPhone,
-      providerMessageSid: sent.sid || null,
-      status: sent.status || "queued"
-    };
-  } catch (error) {
-    const optedOut = String(error?.code || "") === "21610";
-    throw new OnMyWayError(
-      optedOut ? "customer_sms_opted_out" : "twilio_send_failed",
-      optedOut ? "This customer has opted out of SMS messages." : "Twilio couldn't queue this message. No success was recorded.",
-      { statusCode: 502, details: error?.code ? { provider_code: String(error.code) } : null }
-    );
-  }
-}
-
-async function emitCustomerWorkflowSmsHooks({
-  companyId,
-  actorUserId,
-  contactId,
-  storedMessage,
-  recipientPhone,
-  fromNumber,
-  workflow = "customer.workflow",
-  dirtyReason = "sms.customer_workflow"
-}) {
-  try {
-    const stats = await pool.query(
-      `SELECT COUNT(*) FILTER (WHERE direction = 'outbound')::int AS outbound_count
-         FROM sms_messages
-        WHERE conversation_id = $1 AND deleted_at IS NULL`,
-      [storedMessage.conversation_id]
-    );
-    const payload = {
-      message_id: storedMessage.id,
-      conversation_id: storedMessage.conversation_id,
-      contact_id: contactId,
-      external_number: recipientPhone,
-      from_number: fromNumber,
-      to_number: recipientPhone,
-      body: storedMessage.body,
-      direction: "outbound",
-      status: storedMessage.message_status,
-      media_count: 0,
-      has_media: false,
-      outbound_count: stats.rows[0]?.outbound_count || 0,
-      workflow
-    };
-    await emitAutomationEvent({
-      companyId,
-      eventType: "sms.sent",
-      subjectType: "sms_message",
-      subjectId: storedMessage.id,
-      actorUserId,
-      source: workflow,
-      dedupeKey: `sms.sent:${storedMessage.id}`,
-      payload
-    });
-    if (Number(stats.rows[0]?.outbound_count || 0) === 1) {
-      await emitAutomationEvent({
-        companyId,
-        eventType: "sms.first_outbound",
-        subjectType: "sms_message",
-        subjectId: storedMessage.id,
-        actorUserId,
-        source: workflow,
-        dedupeKey: `sms.first_outbound:${storedMessage.conversation_id}`,
-        payload
-      });
-    }
-    await syncAutomationSchedulesForSmsOutbound(companyId, { ...storedMessage, contact_id: contactId, external_phone_number: recipientPhone });
-    await syncAutomationSchedulesForSmsConversationActivity(companyId, storedMessage.conversation_id, storedMessage);
-    await markGoogleSheetsContactDirty(pool, companyId, contactId, dirtyReason);
-  } catch (error) {
-    console.error("[on-my-way] SMS automation hook failed:", { messageId: storedMessage.id, code: error?.code, message: error?.message });
-  }
-}
-
-app.get("/api/jobs/:id/on-my-way", authRequired, requireCapability("jobs.view"), async (req, res) => {
-  try {
-    const exists = await pool.query(`SELECT id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
-    if (!exists.rowCount) return res.status(404).json({ error: "job_not_found" });
-    const { rows } = await pool.query(
-      `SELECT e.*, COALESCE(sm.message_status, e.status) AS live_status
-         FROM job_on_my_way_events e
-         LEFT JOIN sms_messages sm ON sm.id = e.sms_message_id
-        WHERE e.company_id = $1 AND e.job_id = $2
-        ORDER BY e.created_at DESC
-        LIMIT 20`,
-      [req.companyId, req.params.id]
-    );
-    res.json(rows.map(onMyWayEventPayload));
-  } catch (error) {
-    sendOnMyWayError(res, error, "on_my_way_history_failed");
-  }
-});
-
-app.post("/api/jobs/:id/on-my-way/preview", authRequired, requireAllCapabilities("jobs.work", "messaging.customer.send"), async (req, res) => {
-  try {
-    const context = await loadOnMyWayContext(pool, req);
-    const origin = parseOnMyWayCoordinate(req.body?.origin_latitude, req.body?.origin_longitude);
-    let destination = parseOnMyWayCoordinate(req.body?.destination_latitude, req.body?.destination_longitude);
-    if (!destination && context.contact_latitude != null && context.contact_longitude != null) {
-      destination = parseOnMyWayCoordinate(context.contact_latitude, context.contact_longitude);
-    }
-    const etaSeconds = await calculateOnMyWayEta(req, origin, destination);
-    const latest = (await pool.query(
-      `SELECT e.*, COALESCE(sm.message_status, e.status) AS live_status
-         FROM job_on_my_way_events e
-         LEFT JOIN sms_messages sm ON sm.id = e.sms_message_id
-        WHERE e.company_id = $1 AND e.job_id = $2
-        ORDER BY e.created_at DESC
-        LIMIT 1`,
-      [req.companyId, req.params.id]
-    )).rows[0];
-    const template = context.on_my_way_message_template || DEFAULT_ON_MY_WAY_TEMPLATE;
-    const message = renderOnMyWayTemplate(template, {
-      customerName: context.contact_name,
-      employeeName: context.employee_name,
-      companyName: context.company_name,
-      etaSeconds
-    });
-    res.json({
-      job_id: context.job_id,
-      contact_id: context.contact_id,
-      contact_name: context.contact_name,
-      recipient_phone: context.recipient_phone,
-      message_template: template,
-      message,
-      eta_seconds: etaSeconds,
-      eta_source: etaSeconds == null ? "unavailable" : "google_routes",
-      estimated_arrival_at: etaSeconds == null ? null : new Date(Date.now() + etaSeconds * 1000).toISOString(),
-      last_event: onMyWayEventPayload(latest)
-    });
-  } catch (error) {
-    sendOnMyWayError(res, error, "on_my_way_preview_failed");
-  }
-});
-
-app.post("/api/jobs/:id/on-my-way/send", authRequired, requireAllCapabilities("jobs.work", "messaging.customer.send"), async (req, res) => {
-  let context;
-  let eventId;
-  let message;
-  let channel;
-  let etaSeconds = null;
-  const idempotencyKey = (req.body?.idempotency_key || "").toString().trim().toLowerCase();
-  const allowDuplicate = req.body?.allow_duplicate === true;
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) {
-    return res.status(400).json({ error: "on_my_way_idempotency_key_required", message: "Reload the confirmation and try again." });
-  }
-
-  const db = await pool.connect();
-  try {
-    message = validateOnMyWayMessage(req.body?.message);
-    channel = normalizeOnMyWayChannel(req.body?.channel);
-    const rawEta = Number(req.body?.eta_seconds);
-    etaSeconds = Number.isFinite(rawEta) && rawEta > 0 && rawEta <= 86_400 ? Math.round(rawEta) : null;
-
-    await db.query("BEGIN");
-    context = await loadOnMyWayContext(db, req, { forUpdate: true });
-    const existing = (await db.query(
-      `SELECT * FROM job_on_my_way_events WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1`,
-      [req.companyId, idempotencyKey]
-    )).rows[0];
-    if (existing && existing.status !== "failed") {
-      await db.query("COMMIT");
-      const replayed = await fetchOnMyWayEvent(pool, req.companyId, existing.id);
-      return res.status(existing.status === "sending" || existing.status === "delivery_unknown" ? 202 : 200).json({
-        event: onMyWayEventPayload(replayed),
-        replayed: true
-      });
-    }
-
-    if (!allowDuplicate) {
-      const recent = (await db.query(
-        `SELECT e.*, COALESCE(sm.message_status, e.status) AS live_status
-           FROM job_on_my_way_events e
-           LEFT JOIN sms_messages sm ON sm.id = e.sms_message_id
-          WHERE e.company_id = $1 AND e.job_id = $2
-            AND COALESCE(sm.message_status, e.status) IN ('sending','queued','sent','delivered','delivery_unknown')
-            AND e.created_at >= now() - interval '30 minutes'
-          ORDER BY e.created_at DESC
-          LIMIT 1`,
-        [req.companyId, req.params.id]
-      )).rows[0];
-      if (recent) {
-        await db.query("ROLLBACK");
-        return res.status(409).json({
-          error: "on_my_way_recently_sent",
-          message: "An On My Way message was already sent recently. Confirm Send Again to resend.",
-          recent_event: onMyWayEventPayload(recent)
-        });
-      }
-    }
-
-    if (existing) {
-      eventId = existing.id;
-      await db.query(
-        `UPDATE job_on_my_way_events
-            SET recipient_phone = $3, employee_id = $4, employee_name = $5, channel = $6,
-                message_body = $7, eta_seconds = $8, eta_source = $9, status = 'sending',
-                explicit_resend = $10, error_code = NULL, error_message = NULL, updated_at = now()
-          WHERE company_id = $1 AND id = $2`,
-        [req.companyId, eventId, context.recipient_phone, req.userId, context.employee_name, channel,
-          message, etaSeconds, etaSeconds == null ? "unavailable" : "google_routes", allowDuplicate]
-      );
-    } else {
-      eventId = randomUUID();
-      await db.query(
-        `INSERT INTO job_on_my_way_events(
-           id, company_id, job_id, contact_id, contact_name, recipient_phone,
-           employee_id, employee_name, channel, message_body, eta_seconds, eta_source,
-           status, idempotency_key, explicit_resend
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'sending',$13,$14)`,
-        [eventId, req.companyId, req.params.id, context.contact_id, context.contact_name, context.recipient_phone,
-          req.userId, context.employee_name, channel, message, etaSeconds,
-          etaSeconds == null ? "unavailable" : "google_routes", idempotencyKey, allowDuplicate]
-      );
-    }
-    await db.query("COMMIT");
-  } catch (error) {
-    await db.query("ROLLBACK").catch(() => {});
-    return sendOnMyWayError(res, error, "on_my_way_reservation_failed");
-  } finally {
-    db.release();
-  }
-
-  let delivery;
-  try {
-    delivery = await deliverCustomerWorkflowMessage({
-      channel,
-      companyId: req.companyId,
-      contactId: context.contact_id,
-      recipientPhone: context.recipient_phone,
-      body: message
-    });
-  } catch (error) {
-    await pool.query(
-      `UPDATE job_on_my_way_events
-          SET status = 'failed', error_code = $3, error_message = $4, updated_at = now()
-        WHERE company_id = $1 AND id = $2`,
-      [req.companyId, eventId, error?.code || "customer_message_send_failed", error?.message || "Customer message failed."]
-    ).catch(() => {});
-    return sendOnMyWayError(res, error, "on_my_way_delivery_failed");
-  }
-
-  const persistence = await pool.connect();
-  let storedMessage;
-  try {
-    await persistence.query("BEGIN");
-    storedMessage = (await persistence.query(
-      `INSERT INTO sms_messages(
-         conversation_id, twilio_message_sid, direction, from_number, to_number,
-         body, message_status, media_count, media
-       ) VALUES($1,$2,'outbound',$3,$4,$5,$6,0,'[]'::jsonb)
-       RETURNING *`,
-      [delivery.conversationId, delivery.providerMessageSid, delivery.fromNumber, delivery.toNumber, message, delivery.status]
-    )).rows[0];
-    await persistence.query(
-      `UPDATE sms_conversations SET last_message_at = now(), updated_at = now() WHERE id = $1`,
-      [delivery.conversationId]
-    );
-    await persistence.query(
-      `UPDATE job_on_my_way_events
-          SET status = $3, sms_conversation_id = $4, sms_message_id = $5,
-              provider_message_sid = $6, updated_at = now()
-        WHERE company_id = $1 AND id = $2`,
-      [req.companyId, eventId, delivery.status, delivery.conversationId, storedMessage.id, delivery.providerMessageSid]
-    );
-    await persistence.query("COMMIT");
-  } catch (error) {
-    await persistence.query("ROLLBACK").catch(() => {});
-    await pool.query(
-      `UPDATE job_on_my_way_events
-          SET status = 'delivery_unknown', provider_message_sid = $3,
-              error_code = 'message_store_failed',
-              error_message = 'Provider accepted the message but local persistence did not finish.',
-              updated_at = now()
-        WHERE company_id = $1 AND id = $2`,
-      [req.companyId, eventId, delivery.providerMessageSid]
-    ).catch(() => {});
-    return res.status(502).json({
-      error: "on_my_way_delivery_unknown",
-      message: "Twilio accepted the message, but WolfCRM couldn't confirm its local record. Do not resend automatically."
-    });
-  } finally {
-    persistence.release();
-  }
-
-  await emitCustomerWorkflowSmsHooks({
-    companyId: req.companyId,
-    actorUserId: req.userId,
-    contactId: context.contact_id,
-    storedMessage,
-    recipientPhone: delivery.toNumber,
-    fromNumber: delivery.fromNumber,
-    workflow: "job.on_my_way",
-    dirtyReason: "sms.on_my_way"
-  });
-  const completed = await fetchOnMyWayEvent(pool, req.companyId, eventId);
-  res.status(201).json({ event: onMyWayEventPayload(completed), replayed: false });
 });
 
 // ---------- OPERATIONS: JOB WORKFLOWS ----------
@@ -12913,7 +8331,7 @@ function workflowRunPayload(row) {
   };
 }
 
-app.post("/api/jobs/:id/workflow/start", authRequired, requireCapability("jobs.work"), async (req, res) => {
+app.post("/api/jobs/:id/workflow/start", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const client = await pool.connect();
   try {
@@ -12944,7 +8362,7 @@ app.post("/api/jobs/:id/workflow/start", authRequired, requireCapability("jobs.w
   } finally { client.release(); }
 });
 
-app.get("/api/jobs/:id/workflow", authRequired, requireCapability("jobs.view"), async (req, res) => {
+app.get("/api/jobs/:id/workflow", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const row = (await pool.query(`SELECT * FROM job_workflow_runs WHERE company_id = $1 AND job_id = $2`, [req.companyId, req.params.id])).rows[0];
@@ -12953,7 +8371,7 @@ app.get("/api/jobs/:id/workflow", authRequired, requireCapability("jobs.view"), 
   } catch (e) { console.error(e); res.status(500).json({ error: "job_workflow_load_failed" }); }
 });
 
-app.put("/api/jobs/:id/workflow", authRequired, requireCapability("jobs.work"), async (req, res) => {
+app.put("/api/jobs/:id/workflow", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const snapshot = Array.isArray(req.body?.snapshot) ? req.body.snapshot : [];
   try {
@@ -12963,7 +8381,7 @@ app.put("/api/jobs/:id/workflow", authRequired, requireCapability("jobs.work"), 
   } catch (e) { console.error(e); res.status(500).json({ error: "job_workflow_update_failed" }); }
 });
 
-app.post("/api/jobs/:id/workflow/complete", authRequired, requireCapability("jobs.complete"), async (req, res) => {
+app.post("/api/jobs/:id/workflow/complete", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const snapshot = Array.isArray(req.body?.snapshot) ? req.body.snapshot : [];
   const overrideReason = (req.body?.override_reason || "").toString().trim() || null;
@@ -12990,8 +8408,7 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, requireCapability("job
        WHERE id = $1 AND company_id = $2
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
                  contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
-                 company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
-                 weather_exposure`,
+                 company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by`,
       [req.params.id, req.companyId, now, req.userId]
     )).rows[0];
     await emitAutomationEvent({ companyId: req.companyId, eventType: "job.completed", subjectType: "job", subjectId: req.params.id, actorUserId: req.userId, source: "job.workflow", dedupeKey: `job.completed:${req.params.id}:${updated.finished_at}`, payload: { job_id: req.params.id, finished_at: updated.finished_at, override: !!overrideReason } });
@@ -13006,14 +8423,14 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, requireCapability("job
   } finally { client.release(); }
 });
 
-app.get("/api/job-workflow-templates", authRequired, requireCapability("jobs.manage_templates"), async (req, res) => {
+app.get("/api/job-workflow-templates", authRequired, requireEmployer, async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT id, name, scope, service_type, enabled, archived_at, sections FROM job_workflow_templates WHERE company_id = $1 AND archived_at IS NULL ORDER BY updated_at DESC`, [req.companyId]);
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "workflow_templates_failed" }); }
 });
 
-app.put("/api/job-workflow-templates/:id", authRequired, requireCapability("jobs.manage_templates"), async (req, res) => {
+app.put("/api/job-workflow-templates/:id", authRequired, requireEmployer, async (req, res) => {
   const { name, scope, service_type, enabled, sections } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
   try {
@@ -13029,14 +8446,14 @@ app.put("/api/job-workflow-templates/:id", authRequired, requireCapability("jobs
   } catch (e) { console.error(e); res.status(500).json({ error: "workflow_template_save_failed" }); }
 });
 
-app.delete("/api/job-workflow-templates/:id", authRequired, requireCapability("jobs.manage_templates"), async (req, res) => {
+app.delete("/api/job-workflow-templates/:id", authRequired, requireEmployer, async (req, res) => {
   try {
     await pool.query(`UPDATE job_workflow_templates SET archived_at = now(), updated_at = now() WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
     res.status(204).end();
   } catch (e) { console.error(e); res.status(500).json({ error: "workflow_template_archive_failed" }); }
 });
 
-app.get("/api/jobs/:id/photos", authRequired, requireCapability("jobs.view"), async (req, res) => {
+app.get("/api/jobs/:id/photos", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const allowed = (await pool.query(`SELECT contact_id FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0];
@@ -13046,7 +8463,7 @@ app.get("/api/jobs/:id/photos", authRequired, requireCapability("jobs.view"), as
   } catch (e) { console.error(e); res.status(500).json({ error: "job_photos_failed" }); }
 });
 
-app.post("/api/jobs/:id/photos", authRequired, requireCapability("jobs.work"), async (req, res) => {
+app.post("/api/jobs/:id/photos", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const { category, caption, object_key, thumbnail_key, workflow_item_id } = req.body || {};
   if (!object_key) return res.status(400).json({ error: "object_key_required" });
@@ -13065,7 +8482,7 @@ app.post("/api/jobs/:id/photos", authRequired, requireCapability("jobs.work"), a
 });
 
 // ---------- OPERATIONS: EQUIPMENT & MATERIALS ----------
-app.get("/api/operations/inventory/locations", authRequired, requireCapability("operations.view"), async (req, res) => {
+app.get("/api/operations/inventory/locations", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     await pool.query(`INSERT INTO inventory_locations(id, company_id, name, kind) VALUES($1, $2, 'Shop', 'shop') ON CONFLICT(id) DO NOTHING`, [`${req.companyId}:shop`, req.companyId]);
@@ -13074,7 +8491,7 @@ app.get("/api/operations/inventory/locations", authRequired, requireCapability("
   } catch (e) { console.error(e); res.status(500).json({ error: "inventory_locations_failed" }); }
 });
 
-app.get("/api/operations/inventory/items", authRequired, requireCapability("operations.view"), async (req, res) => {
+app.get("/api/operations/inventory/items", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const { rows } = await pool.query(`SELECT id, name, item_type, tracking_mode, category, unit, quantity_on_hand::float8 AS quantity_on_hand, reorder_point::float8 AS reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes FROM inventory_items WHERE company_id = $1 ORDER BY updated_at DESC`, [req.companyId]);
@@ -13082,7 +8499,7 @@ app.get("/api/operations/inventory/items", authRequired, requireCapability("oper
   } catch (e) { console.error(e); res.status(500).json({ error: "inventory_items_failed" }); }
 });
 
-app.put("/api/operations/inventory/items/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.put("/api/operations/inventory/items/:id", authRequired, requireEmployer, async (req, res) => {
   const { name, item_type, tracking_mode, category, unit, reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
   try {
@@ -13098,7 +8515,7 @@ app.put("/api/operations/inventory/items/:id", authRequired, requireCapability("
   } catch (e) { console.error(e); res.status(500).json({ error: "inventory_item_save_failed" }); }
 });
 
-app.post("/api/operations/inventory/transactions", authRequired, requireCapability("operations.request"), async (req, res) => {
+app.post("/api/operations/inventory/transactions", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const { item_id, transaction_type, quantity, from_location_id, to_location_id, job_id, note, idempotency_key, reverses_transaction_id } = req.body || {};
   const qty = Number(quantity);
@@ -13137,7 +8554,7 @@ app.post("/api/operations/inventory/transactions", authRequired, requireCapabili
   } finally { client.release(); }
 });
 
-app.get("/api/operations/requests", authRequired, requireCapability("operations.view"), async (req, res) => {
+app.get("/api/operations/requests", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const { rows } = await pool.query(`SELECT id, request_type, item_id, item_name, quantity::float8 AS quantity, urgency, explanation, status, requester_id, owner_response, created_at FROM equipment_requests WHERE company_id = $1 AND ($2 = true OR requester_id = $3) ORDER BY CASE urgency WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, created_at ASC`, [req.companyId, req.role === "employer", req.userId]);
@@ -13145,7 +8562,7 @@ app.get("/api/operations/requests", authRequired, requireCapability("operations.
   } catch (e) { console.error(e); res.status(500).json({ error: "equipment_requests_failed" }); }
 });
 
-app.post("/api/operations/requests", authRequired, requireCapability("operations.request"), async (req, res) => {
+app.post("/api/operations/requests", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const { request_type, item_id, item_name, quantity, urgency, explanation } = req.body || {};
   if (!request_type || !explanation) return res.status(400).json({ error: "invalid_request" });
@@ -13155,7 +8572,7 @@ app.post("/api/operations/requests", authRequired, requireCapability("operations
   } catch (e) { console.error(e); res.status(500).json({ error: "equipment_request_failed" }); }
 });
 
-app.patch("/api/operations/requests/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.patch("/api/operations/requests/:id", authRequired, requireEmployer, async (req, res) => {
   const { status, owner_response } = req.body || {};
   try {
     const { rows } = await pool.query(`UPDATE equipment_requests SET status = COALESCE($3, status), owner_response = COALESCE($4, owner_response), updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING id, request_type, item_id, item_name, quantity::float8 AS quantity, urgency, explanation, status, requester_id, owner_response, created_at`, [req.params.id, req.companyId, status || null, owner_response || null]);
@@ -13165,7 +8582,7 @@ app.patch("/api/operations/requests/:id", authRequired, requireCapability("opera
 });
 
 // ---------- OPERATIONS: MILEAGE ----------
-app.get("/api/operations/mileage", authRequired, requireCapability("operations.view"), async (req, res) => {
+app.get("/api/operations/mileage", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     await pool.query(`INSERT INTO mileage_company_settings(company_id) VALUES($1) ON CONFLICT(company_id) DO NOTHING`, [req.companyId]);
@@ -13200,7 +8617,7 @@ app.get("/api/operations/mileage", authRequired, requireCapability("operations.v
   } catch (e) { console.error(e); res.status(500).json({ error: "mileage_load_failed" }); }
 });
 
-app.put("/api/operations/mileage/settings", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.put("/api/operations/mileage/settings", authRequired, requireEmployer, async (req, res) => {
   const { enabled, default_rate_cents_per_mile } = req.body || {};
   try {
     const { rows } = await pool.query(`INSERT INTO mileage_company_settings(company_id, enabled, default_rate_cents_per_mile) VALUES($1,$2,$3) ON CONFLICT(company_id) DO UPDATE SET enabled = EXCLUDED.enabled, default_rate_cents_per_mile = EXCLUDED.default_rate_cents_per_mile, updated_at = now() RETURNING enabled, default_rate_cents_per_mile`, [req.companyId, toBool(enabled), Number(default_rate_cents_per_mile) || 0]);
@@ -13208,7 +8625,7 @@ app.put("/api/operations/mileage/settings", authRequired, requireCapability("ope
   } catch (e) { console.error(e); res.status(500).json({ error: "mileage_settings_failed" }); }
 });
 
-app.put("/api/operations/mileage/employees/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.put("/api/operations/mileage/employees/:id", authRequired, requireEmployer, async (req, res) => {
   const { enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date } = req.body || {};
   try {
     const { rows } = await pool.query(`INSERT INTO mileage_employee_settings(company_id, employee_id, enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(company_id, employee_id) DO UPDATE SET enabled = EXCLUDED.enabled, rate_cents_per_mile = EXCLUDED.rate_cents_per_mile, start_rule = EXCLUDED.start_rule, end_rule = EXCLUDED.end_rule, start_location_id = EXCLUDED.start_location_id, end_location_id = EXCLUDED.end_location_id, vehicle_type = EXCLUDED.vehicle_type, effective_date = EXCLUDED.effective_date, updated_at = now() RETURNING employee_id, enabled, rate_cents_per_mile, start_rule, end_rule, start_location_id, end_location_id, vehicle_type, effective_date::text`, [req.companyId, req.params.id, toBool(enabled), rate_cents_per_mile ?? null, start_rule || "company_location", end_rule || "last_completed_job", start_location_id || null, end_location_id || null, vehicle_type || "not_specified", effective_date || null]);
@@ -13216,7 +8633,7 @@ app.put("/api/operations/mileage/employees/:id", authRequired, requireCapability
   } catch (e) { console.error(e); res.status(500).json({ error: "mileage_employee_settings_failed" }); }
 });
 
-app.post("/api/operations/mileage/employees/:id/calculate", authRequired, requireCapability("operations.request"), async (req, res) => {
+app.post("/api/operations/mileage/employees/:id/calculate", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const employeeId = req.role === "employer" ? req.params.id : req.userId;
   const day = (req.body?.day || new Date().toISOString().slice(0, 10)).toString().slice(0, 10);
@@ -13289,7 +8706,7 @@ app.post("/api/operations/mileage/employees/:id/calculate", authRequired, requir
   } finally { client.release(); }
 });
 
-app.post("/api/operations/mileage/address-proposals", authRequired, requireCapability("operations.request"), async (req, res) => {
+app.post("/api/operations/mileage/address-proposals", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const { kind, label, address, lat, lng, explanation } = req.body || {};
   if (!address || !Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) return res.status(400).json({ error: "valid_address_required" });
@@ -13304,7 +8721,7 @@ app.post("/api/operations/mileage/address-proposals", authRequired, requireCapab
   } catch (e) { console.error("[operations] mileage address proposal failed:", e); res.status(500).json({ error: "mileage_address_proposal_failed" }); }
 });
 
-app.post("/api/operations/mileage/address-proposals/:id/review", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.post("/api/operations/mileage/address-proposals/:id/review", authRequired, requireEmployer, async (req, res) => {
   const action = req.body?.action === "approve" ? "approved" : req.body?.action === "reject" ? "rejected" : null;
   if (!action) return res.status(400).json({ error: "invalid_action" });
   const client = await pool.connect();
@@ -13329,7 +8746,7 @@ app.post("/api/operations/mileage/address-proposals/:id/review", authRequired, r
   } finally { client.release(); }
 });
 
-app.post("/api/operations/mileage/manual-trips", authRequired, requireCapability("operations.request"), async (req, res) => {
+app.post("/api/operations/mileage/manual-trips", authRequired, async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const employeeId = req.role === "employer" && req.body?.employee_id ? req.body.employee_id : req.userId;
   const day = (req.body?.service_date || new Date().toISOString().slice(0, 10)).toString().slice(0, 10);
@@ -13352,7 +8769,7 @@ app.post("/api/operations/mileage/manual-trips", authRequired, requireCapability
   } catch (e) { console.error("[operations] manual trip failed:", e); res.status(500).json({ error: "mileage_manual_trip_failed" }); }
 });
 
-app.post("/api/operations/mileage/manual-trips/:id/review", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.post("/api/operations/mileage/manual-trips/:id/review", authRequired, requireEmployer, async (req, res) => {
   const status = req.body?.action === "approve" ? "approved" : req.body?.action === "reject" ? "rejected" : null;
   if (!status) return res.status(400).json({ error: "invalid_action" });
   try {
@@ -13369,7 +8786,7 @@ app.post("/api/operations/mileage/manual-trips/:id/review", authRequired, requir
   } catch (e) { console.error("[operations] manual trip review failed:", e); res.status(500).json({ error: "mileage_manual_trip_review_failed" }); }
 });
 
-app.post("/api/operations/mileage/logs/:id/review", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.post("/api/operations/mileage/logs/:id/review", authRequired, requireEmployer, async (req, res) => {
   const action = cleanString(req.body?.action, 40);
   const nextStatus = action === "approve" ? "approved" : action === "reject" ? "rejected" : action === "request_correction" ? "ready_for_review" : action === "mark_paid" ? "paid" : null;
   if (!nextStatus) return res.status(400).json({ error: "invalid_action" });
@@ -13392,14 +8809,13 @@ app.post("/api/operations/mileage/logs/:id/review", authRequired, requireCapabil
   } catch (e) { console.error("[operations] mileage log review failed:", e); res.status(500).json({ error: "mileage_log_review_failed" }); }
 });
 
-app.get("/api/reports/weekly-sales", authRequired, requireAnyCapability("sales.view_self", "sales.view_all"), async (req, res) => {
+app.get("/api/reports/weekly-sales", authRequired, async (req, res) => {
   try {
     const range = statsRange("week", req.query.date);
     if (!range) return res.status(400).json({ error: "invalid_range" });
     const requestedUser = (req.query.user_id || "").toString();
-    const canViewAllSales = hasCapability(req, "sales.view_all");
-    const userID = canViewAllSales && requestedUser ? requestedUser : req.userId;
-    if (canViewAllSales) {
+    const userID = req.role === "employer" && requestedUser ? requestedUser : req.userId;
+    if (req.role === "employer") {
       const allowed = await pool.query(`SELECT id FROM users WHERE id = $1 AND company_id = $2`, [userID, req.companyId]);
       if (!allowed.rowCount) return res.status(404).json({ error: "employee_not_found" });
     }
@@ -13431,832 +8847,6 @@ app.get("/api/reports/weekly-sales", authRequired, requireAnyCapability("sales.v
       jobs
     });
   } catch (e) { console.error(e); res.status(500).json({ error: "weekly_sales_report_failed" }); }
-});
-
-// ---------- SALES ANALYTICS ----------
-async function salesAnalyticsSource(source, fn) {
-  try {
-    return { source, value: await fn(), failed: false };
-  } catch (error) {
-    console.warn("[sales-analytics] source failed", {
-      source,
-      code: error?.code || error?.name || null,
-      message: error?.message || String(error)
-    });
-    return { source, value: null, failed: true };
-  }
-}
-
-async function loadSalesAnalyticsSummary(companyId, employeeId, start, end, prefix) {
-  const parameters = [companyId, start.toISOString(), end.toISOString(), employeeId];
-  const employeeContact = `($4::uuid IS NULL OR c.user_id = $4)`;
-  const quoteCompany = `(q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
-    SELECT 1 FROM users quote_owner WHERE quote_owner.id = q.user_id AND quote_owner.company_id = $1
-  )))`;
-  const acceptedQuoteValue = `COALESCE((
-    SELECT CASE WHEN accepted.payload->>'total_cents' ~ '^[0-9]+$' THEN (accepted.payload->>'total_cents')::bigint END
-      FROM automation_events accepted
-     WHERE accepted.company_id = $1 AND accepted.event_type = 'quote.accepted'
-       AND accepted.subject_id = q.id::text
-     ORDER BY accepted.occurred_at ASC, accepted.id ASC LIMIT 1
-  ), q.total_cents, 0)`;
-  const sources = await Promise.all([
-    salesAnalyticsSource(`${prefix}.contacts`, async () => (await pool.query(
-      `SELECT
-         COUNT(*) FILTER (WHERE c.created_at >= $2 AND c.created_at < $3)::bigint AS new_contacts,
-         COUNT(*) FILTER (WHERE c.lead_submitted_at >= $2 AND c.lead_submitted_at < $3)::bigint AS external_leads,
-         COUNT(*) FILTER (
-           WHERE c.lead_submitted_at >= $2 AND c.lead_submitted_at < $3
-             AND EXISTS (
-               SELECT 1 FROM opportunities o
-                WHERE o.company_id = $1 AND o.contact_id = c.id::text AND o.state = 'won'
-             )
-         )::bigint AS converted_leads
-       FROM contacts c
-      WHERE c.company_id = $1 AND c.deleted_at IS NULL AND ${employeeContact}`,
-      parameters
-    )).rows[0]),
-    salesAnalyticsSource(`${prefix}.communications`, async () => (await pool.query(
-      `WITH activity AS (
-         SELECT sc.contact_id, sm.created_at AS occurred_at
-           FROM sms_messages sm
-           JOIN sms_conversations sc ON sc.id = sm.conversation_id
-           JOIN phone_lines pl ON pl.id = sc.phone_line_id
-          WHERE pl.company_id = $1 AND sm.direction = 'outbound'
-            AND sm.deleted_at IS NULL AND sc.deleted_at IS NULL AND sm.created_at < $3
-         UNION ALL
-         SELECT ic.contact_id, COALESCE(im.provider_created_at, im.created_at) AS occurred_at
-           FROM imessage_messages im
-           JOIN imessage_conversations ic ON ic.id = im.conversation_id
-          WHERE ic.company_id = $1 AND im.direction = 'outbound'
-            AND im.deleted_at IS NULL AND ic.deleted_at IS NULL
-            AND COALESCE(im.provider_created_at, im.created_at) < $3
-         UNION ALL
-         SELECT pc.contact_id, pc.started_at AS occurred_at
-           FROM phone_calls pc
-          WHERE pc.company_id = $1 AND pc.direction = 'outbound' AND pc.started_at < $3
-       ), scoped_activity AS (
-         SELECT a.contact_id, a.occurred_at
-           FROM activity a
-           JOIN contacts c ON c.id = a.contact_id
-          WHERE c.company_id = $1 AND c.deleted_at IS NULL AND ${employeeContact}
-       ), lead_response AS (
-         SELECT c.id, c.lead_submitted_at, MIN(a.occurred_at) AS first_attempt_at
-           FROM contacts c
-           LEFT JOIN scoped_activity a ON a.contact_id = c.id AND a.occurred_at >= c.lead_submitted_at
-          WHERE c.company_id = $1 AND c.deleted_at IS NULL AND ${employeeContact}
-            AND c.lead_submitted_at >= $2 AND c.lead_submitted_at < $3
-          GROUP BY c.id, c.lead_submitted_at
-       ), response_seconds AS (
-         SELECT ROUND(EXTRACT(EPOCH FROM (first_attempt_at - lead_submitted_at)))::bigint AS seconds
-           FROM lead_response WHERE first_attempt_at IS NOT NULL
-       )
-       SELECT
-         (SELECT COUNT(DISTINCT contact_id)::bigint FROM scoped_activity WHERE occurred_at >= $2 AND occurred_at < $3) AS contacts_attempted,
-         (SELECT COUNT(*)::bigint FROM lead_response WHERE first_attempt_at IS NOT NULL) AS leads_contacted,
-         (SELECT COUNT(*)::bigint FROM response_seconds) AS speed_matched_count,
-         (SELECT COALESCE(SUM(seconds), 0)::bigint FROM response_seconds) AS speed_total_seconds,
-         (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY seconds)::bigint FROM response_seconds) AS speed_median_seconds`,
-      parameters
-    )).rows[0]),
-    salesAnalyticsSource(`${prefix}.quotes`, async () => (await pool.query(
-      `SELECT
-         COUNT(*) FILTER (WHERE q.created_at >= $2 AND q.created_at < $3)::bigint AS quotes_created,
-         COUNT(*) FILTER (WHERE q.sent_at >= $2 AND q.sent_at < $3)::bigint AS quotes_sent,
-         COUNT(*) FILTER (WHERE q.accepted_at >= $2 AND q.accepted_at < $3)::bigint AS quotes_accepted,
-         COUNT(*) FILTER (WHERE q.declined_at >= $2 AND q.declined_at < $3)::bigint AS quotes_declined,
-         COALESCE(SUM(${acceptedQuoteValue}) FILTER (WHERE q.accepted_at >= $2 AND q.accepted_at < $3), 0)::bigint AS revenue_sold_cents
-       FROM quotes q
-      WHERE ${quoteCompany} AND ($4::uuid IS NULL OR q.user_id = $4)`,
-      parameters
-    )).rows[0]),
-    salesAnalyticsSource(`${prefix}.outcomes`, async () => (await pool.query(
-      `SELECT
-         COUNT(*) FILTER (WHERE ae.event_type = 'pipeline.won')::bigint AS won_opportunities,
-         COUNT(*) FILTER (WHERE ae.event_type = 'pipeline.lost')::bigint AS lost_opportunities
-       FROM automation_events ae
-      WHERE ae.company_id = $1 AND ae.occurred_at >= $2 AND ae.occurred_at < $3
-        AND ae.event_type IN ('pipeline.won', 'pipeline.lost')
-        AND ($4::uuid IS NULL OR EXISTS (
-          SELECT 1 FROM contacts c
-           WHERE c.company_id = $1 AND c.deleted_at IS NULL AND c.user_id = $4
-             AND c.id::text = ae.payload->>'contact_id'
-        ))`,
-      parameters
-    )).rows[0]),
-    employeeId
-      ? Promise.resolve({ source: `${prefix}.appointments`, value: null, failed: false })
-      : salesAnalyticsSource(`${prefix}.appointments`, async () => (await pool.query(
-      `SELECT COUNT(DISTINCT ae.subject_id)::bigint AS appointments_booked
-         FROM automation_events ae
-        WHERE ae.company_id = $1 AND ae.event_type = 'job.created'
-          AND ae.occurred_at >= $2 AND ae.occurred_at < $3`,
-      parameters
-    )).rows[0]),
-    salesAnalyticsSource(`${prefix}.jobs`, async () => (await pool.query(
-      `SELECT
-         COUNT(*)::bigint AS completed_jobs,
-         COALESCE(SUM(CASE
-           WHEN $4::uuid IS NULL THEN COALESCE(se.price_cents, 0)
-           WHEN jsonb_array_length(se.sales_user_ids) > 0
-             THEN ROUND(COALESCE(se.price_cents, 0)::numeric / jsonb_array_length(se.sales_user_ids))
-           ELSE COALESCE(se.price_cents, 0)
-         END), 0)::bigint AS realized_revenue_cents
-       FROM schedule_events se
-      WHERE se.company_id = $1 AND se.finished_at >= $2 AND se.finished_at < $3
-        AND ($4::uuid IS NULL OR se.sales_user_ids ? $4::text
-          OR (jsonb_array_length(se.sales_user_ids) = 0 AND se.created_by = $4))`,
-      parameters
-    )).rows[0]),
-    salesAnalyticsSource(`${prefix}.sales_cycle`, async () => (await pool.query(
-      `WITH cohort AS (
-         SELECT c.id, c.lead_submitted_at,
-                (SELECT MIN(ae.occurred_at)
-                   FROM automation_events ae
-                  WHERE ae.company_id = $1 AND ae.event_type = 'pipeline.won'
-                    AND ae.payload->>'contact_id' = c.id::text
-                    AND ae.occurred_at >= c.lead_submitted_at AND ae.occurred_at < $3) AS won_at
-           FROM contacts c
-          WHERE c.company_id = $1 AND c.deleted_at IS NULL AND ${employeeContact}
-            AND c.lead_submitted_at >= $2 AND c.lead_submitted_at < $3
-       ), cycle_seconds AS (
-         SELECT ROUND(EXTRACT(EPOCH FROM (won_at - lead_submitted_at)))::bigint AS seconds
-           FROM cohort WHERE won_at IS NOT NULL
-       )
-       SELECT COUNT(*)::bigint AS sales_cycle_matched_count,
-              COALESCE(SUM(seconds), 0)::bigint AS sales_cycle_total_seconds
-         FROM cycle_seconds`,
-      parameters
-    )).rows[0])
-  ]);
-  const facts = Object.fromEntries(sources.map(({ source, value }) => [source.split(".").at(-1), value]));
-  return {
-    summary: buildSalesSummary({
-      contacts: facts.contacts,
-      communications: facts.communications,
-      quotes: facts.quotes,
-      outcomes: facts.outcomes,
-      appointments: facts.appointments,
-      jobs: facts.jobs,
-      salesCycle: facts.sales_cycle
-    }),
-    failedSources: sources.filter((item) => item.failed).map((item) => item.source)
-  };
-}
-
-async function loadSalesAnalyticsTrend(companyId, employeeId, start, end, bucket, timezone) {
-  const { rows } = await pool.query(
-    `WITH facts AS (
-       SELECT c.created_at AS occurred_at, 1::bigint AS new_contacts, 0::bigint AS external_leads,
-              0::bigint AS quotes_created, 0::bigint AS quotes_accepted, 0::bigint AS won_opportunities,
-              0::bigint AS lost_opportunities, 0::bigint AS completed_jobs,
-              0::bigint AS revenue_sold_cents, 0::bigint AS realized_revenue_cents
-         FROM contacts c WHERE c.company_id = $1 AND c.deleted_at IS NULL
-          AND c.created_at >= $2 AND c.created_at < $3 AND ($4::uuid IS NULL OR c.user_id = $4)
-       UNION ALL
-       SELECT c.lead_submitted_at, 0, 1, 0, 0, 0, 0, 0, 0, 0
-         FROM contacts c WHERE c.company_id = $1 AND c.deleted_at IS NULL
-          AND c.lead_submitted_at >= $2 AND c.lead_submitted_at < $3 AND ($4::uuid IS NULL OR c.user_id = $4)
-       UNION ALL
-       SELECT q.created_at, 0, 0, 1, 0, 0, 0, 0, 0, 0
-         FROM quotes q WHERE (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
-           SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
-         ))) AND q.created_at >= $2 AND q.created_at < $3 AND ($4::uuid IS NULL OR q.user_id = $4)
-       UNION ALL
-       SELECT q.accepted_at, 0, 0, 0, 1, 0, 0, 0,
-              COALESCE((SELECT CASE WHEN accepted.payload->>'total_cents' ~ '^[0-9]+$'
-                THEN (accepted.payload->>'total_cents')::bigint END
-                FROM automation_events accepted
-                WHERE accepted.company_id = $1 AND accepted.event_type = 'quote.accepted'
-                  AND accepted.subject_id = q.id::text
-                ORDER BY accepted.occurred_at ASC, accepted.id ASC LIMIT 1), q.total_cents, 0), 0
-         FROM quotes q WHERE (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
-           SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
-         ))) AND q.accepted_at >= $2 AND q.accepted_at < $3 AND ($4::uuid IS NULL OR q.user_id = $4)
-       UNION ALL
-       SELECT ae.occurred_at, 0, 0, 0, 0,
-              CASE WHEN ae.event_type = 'pipeline.won' THEN 1 ELSE 0 END,
-              CASE WHEN ae.event_type = 'pipeline.lost' THEN 1 ELSE 0 END, 0, 0, 0
-         FROM automation_events ae WHERE ae.company_id = $1
-          AND ae.event_type IN ('pipeline.won', 'pipeline.lost')
-          AND ae.occurred_at >= $2 AND ae.occurred_at < $3
-          AND ($4::uuid IS NULL OR EXISTS (
-            SELECT 1 FROM contacts c WHERE c.company_id = $1 AND c.deleted_at IS NULL
-              AND c.user_id = $4 AND c.id::text = ae.payload->>'contact_id'
-          ))
-       UNION ALL
-       SELECT se.finished_at, 0, 0, 0, 0, 0, 0, 1, 0,
-              CASE WHEN $4::uuid IS NULL THEN COALESCE(se.price_cents, 0)
-                   WHEN jsonb_array_length(se.sales_user_ids) > 0
-                     THEN ROUND(COALESCE(se.price_cents, 0)::numeric / jsonb_array_length(se.sales_user_ids))
-                   ELSE COALESCE(se.price_cents, 0) END
-         FROM schedule_events se WHERE se.company_id = $1
-          AND se.finished_at >= $2 AND se.finished_at < $3
-          AND ($4::uuid IS NULL OR se.sales_user_ids ? $4::text
-            OR (jsonb_array_length(se.sales_user_ids) = 0 AND se.created_by = $4))
-     )
-     SELECT date_trunc($5, occurred_at AT TIME ZONE $6) AT TIME ZONE $6 AS bucket_start,
-            SUM(new_contacts)::bigint AS new_contacts, SUM(external_leads)::bigint AS external_leads,
-            SUM(quotes_created)::bigint AS quotes_created, SUM(quotes_accepted)::bigint AS quotes_accepted,
-            SUM(won_opportunities)::bigint AS won_opportunities, SUM(lost_opportunities)::bigint AS lost_opportunities,
-            SUM(completed_jobs)::bigint AS completed_jobs, SUM(revenue_sold_cents)::bigint AS revenue_sold_cents,
-            SUM(realized_revenue_cents)::bigint AS realized_revenue_cents
-       FROM facts GROUP BY bucket_start ORDER BY bucket_start ASC`,
-    [companyId, start.toISOString(), end.toISOString(), employeeId, bucket, timezone]
-  );
-  return normalizeSalesTrend(rows);
-}
-
-async function loadSalesSourceBreakdown(companyId, employeeId, start, end) {
-  const { rows } = await pool.query(
-    `WITH scoped_contacts AS (
-       SELECT c.id, c.user_id,
-              COALESCE(NULLIF(lower(trim(c.source)), ''), 'unknown') AS source_key,
-              COALESCE(NULLIF(trim(c.source), ''), 'Unknown') AS source_label,
-              c.created_at, c.lead_submitted_at
-         FROM contacts c
-        WHERE c.company_id = $1 AND c.deleted_at IS NULL AND ($4::uuid IS NULL OR c.user_id = $4)
-     ), contact_facts AS (
-       SELECT source_key, MIN(source_label) AS source_label,
-              COUNT(*) FILTER (WHERE created_at >= $2 AND created_at < $3)::bigint AS new_contacts,
-              COUNT(*) FILTER (WHERE lead_submitted_at >= $2 AND lead_submitted_at < $3)::bigint AS external_leads,
-              COUNT(*) FILTER (WHERE lead_submitted_at >= $2 AND lead_submitted_at < $3 AND EXISTS (
-                SELECT 1 FROM opportunities o WHERE o.company_id = $1 AND o.contact_id = scoped_contacts.id::text AND o.state = 'won'
-              ))::bigint AS converted_leads
-         FROM scoped_contacts GROUP BY source_key
-     ), quote_facts AS (
-       SELECT sc.source_key,
-              COUNT(*) FILTER (WHERE q.created_at >= $2 AND q.created_at < $3)::bigint AS quotes_created,
-              COUNT(*) FILTER (WHERE q.accepted_at >= $2 AND q.accepted_at < $3)::bigint AS quotes_accepted,
-              COALESCE(SUM(COALESCE((SELECT CASE WHEN accepted.payload->>'total_cents' ~ '^[0-9]+$'
-                THEN (accepted.payload->>'total_cents')::bigint END
-                FROM automation_events accepted
-                WHERE accepted.company_id = $1 AND accepted.event_type = 'quote.accepted'
-                  AND accepted.subject_id = q.id::text
-                ORDER BY accepted.occurred_at ASC, accepted.id ASC LIMIT 1), q.total_cents, 0))
-                FILTER (WHERE q.accepted_at >= $2 AND q.accepted_at < $3), 0)::bigint AS revenue_sold_cents
-         FROM scoped_contacts sc JOIN quotes q ON q.contact_id = sc.id::text
-        WHERE (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
-          SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
-        ))) AND ($4::uuid IS NULL OR q.user_id = $4)
-          AND ((q.created_at >= $2 AND q.created_at < $3) OR (q.accepted_at >= $2 AND q.accepted_at < $3))
-        GROUP BY sc.source_key
-     ), outcome_facts AS (
-       SELECT sc.source_key,
-              COUNT(*) FILTER (WHERE ae.event_type = 'pipeline.won')::bigint AS won_opportunities,
-              COUNT(*) FILTER (WHERE ae.event_type = 'pipeline.lost')::bigint AS lost_opportunities
-         FROM scoped_contacts sc JOIN automation_events ae ON ae.payload->>'contact_id' = sc.id::text
-        WHERE ae.company_id = $1 AND ae.occurred_at >= $2 AND ae.occurred_at < $3
-          AND ae.event_type IN ('pipeline.won', 'pipeline.lost') GROUP BY sc.source_key
-     ), job_facts AS (
-       SELECT sc.source_key, COUNT(*)::bigint AS completed_jobs,
-              COALESCE(SUM(CASE WHEN $4::uuid IS NULL THEN COALESCE(se.price_cents, 0)
-                WHEN jsonb_array_length(se.sales_user_ids) > 0
-                  THEN ROUND(COALESCE(se.price_cents, 0)::numeric / jsonb_array_length(se.sales_user_ids))
-                ELSE COALESCE(se.price_cents, 0) END), 0)::bigint AS realized_revenue_cents
-         FROM scoped_contacts sc JOIN schedule_events se ON se.contact_id = sc.id::text
-        WHERE se.company_id = $1 AND se.finished_at >= $2 AND se.finished_at < $3
-          AND ($4::uuid IS NULL OR se.sales_user_ids ? $4::text
-            OR (jsonb_array_length(se.sales_user_ids) = 0 AND se.created_by = $4))
-        GROUP BY sc.source_key
-     )
-     SELECT cf.source_key, cf.source_label, cf.new_contacts, cf.external_leads, cf.converted_leads,
-            COALESCE(qf.quotes_created, 0)::bigint AS quotes_created,
-            COALESCE(qf.quotes_accepted, 0)::bigint AS quotes_accepted,
-            COALESCE(of.won_opportunities, 0)::bigint AS won_opportunities,
-            COALESCE(of.lost_opportunities, 0)::bigint AS lost_opportunities,
-            COALESCE(jf.completed_jobs, 0)::bigint AS completed_jobs,
-            COALESCE(qf.revenue_sold_cents, 0)::bigint AS revenue_sold_cents,
-            COALESCE(jf.realized_revenue_cents, 0)::bigint AS realized_revenue_cents
-       FROM contact_facts cf
-       LEFT JOIN quote_facts qf USING(source_key)
-       LEFT JOIN outcome_facts of USING(source_key)
-       LEFT JOIN job_facts jf USING(source_key)
-      ORDER BY (cf.external_leads + cf.new_contacts + COALESCE(qf.quotes_accepted, 0)
-        + COALESCE(of.won_opportunities, 0) + COALESCE(of.lost_opportunities, 0)
-        + COALESCE(jf.completed_jobs, 0)) DESC, cf.source_key ASC
-      LIMIT $5`,
-    [companyId, start.toISOString(), end.toISOString(), employeeId, SALES_ANALYTICS_LIMITS.maximumBreakdownRows]
-  );
-  return normalizeSalesBreakdown(rows, { identityKey: "source_key", labelKey: "source_label" });
-}
-
-async function loadSalesTeamBreakdown(companyId, start, end) {
-  const { rows } = await pool.query(
-    `WITH team AS (
-       SELECT id, COALESCE(NULLIF(display_name, ''), email) AS display_name
-         FROM users WHERE company_id = $1 AND deleted_at IS NULL
-     ), contact_facts AS (
-       SELECT c.user_id,
-              COUNT(*) FILTER (WHERE c.created_at >= $2 AND c.created_at < $3)::bigint AS new_contacts,
-              COUNT(*) FILTER (WHERE c.lead_submitted_at >= $2 AND c.lead_submitted_at < $3)::bigint AS external_leads,
-              COUNT(*) FILTER (WHERE c.lead_submitted_at >= $2 AND c.lead_submitted_at < $3 AND EXISTS (
-                SELECT 1 FROM opportunities o WHERE o.company_id = $1 AND o.contact_id = c.id::text AND o.state = 'won'
-              ))::bigint AS converted_leads
-         FROM contacts c WHERE c.company_id = $1 AND c.deleted_at IS NULL GROUP BY c.user_id
-     ), quote_facts AS (
-       SELECT q.user_id,
-              COUNT(*) FILTER (WHERE q.created_at >= $2 AND q.created_at < $3)::bigint AS quotes_created,
-              COUNT(*) FILTER (WHERE q.accepted_at >= $2 AND q.accepted_at < $3)::bigint AS quotes_accepted,
-              COALESCE(SUM(COALESCE((SELECT CASE WHEN accepted.payload->>'total_cents' ~ '^[0-9]+$'
-                THEN (accepted.payload->>'total_cents')::bigint END
-                FROM automation_events accepted
-                WHERE accepted.company_id = $1 AND accepted.event_type = 'quote.accepted'
-                  AND accepted.subject_id = q.id::text
-                ORDER BY accepted.occurred_at ASC, accepted.id ASC LIMIT 1), q.total_cents, 0))
-                FILTER (WHERE q.accepted_at >= $2 AND q.accepted_at < $3), 0)::bigint AS revenue_sold_cents
-         FROM quotes q WHERE (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
-           SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
-         ))) AND ((q.created_at >= $2 AND q.created_at < $3) OR (q.accepted_at >= $2 AND q.accepted_at < $3))
-         GROUP BY q.user_id
-     ), outcome_facts AS (
-       SELECT c.user_id,
-              COUNT(*) FILTER (WHERE ae.event_type = 'pipeline.won')::bigint AS won_opportunities,
-              COUNT(*) FILTER (WHERE ae.event_type = 'pipeline.lost')::bigint AS lost_opportunities
-         FROM automation_events ae JOIN contacts c
-           ON c.company_id = $1 AND c.deleted_at IS NULL AND c.id::text = ae.payload->>'contact_id'
-        WHERE ae.company_id = $1 AND ae.occurred_at >= $2 AND ae.occurred_at < $3
-          AND ae.event_type IN ('pipeline.won', 'pipeline.lost') GROUP BY c.user_id
-     ), job_credits AS (
-       SELECT credit.user_id, COUNT(*)::bigint AS completed_jobs,
-              COALESCE(SUM(ROUND(COALESCE(se.price_cents, 0)::numeric / credit.credit_count)), 0)::bigint AS realized_revenue_cents
-         FROM schedule_events se
-         CROSS JOIN LATERAL (
-           SELECT value AS user_id, jsonb_array_length(se.sales_user_ids) AS credit_count
-             FROM jsonb_array_elements_text(se.sales_user_ids)
-           UNION ALL
-           SELECT se.created_by::text, 1 WHERE jsonb_array_length(se.sales_user_ids) = 0 AND se.created_by IS NOT NULL
-         ) credit
-        WHERE se.company_id = $1 AND se.finished_at >= $2 AND se.finished_at < $3
-        GROUP BY credit.user_id
-     )
-     SELECT t.id::text AS user_id, t.display_name,
-            COALESCE(cf.new_contacts, 0)::bigint AS new_contacts,
-            COALESCE(cf.external_leads, 0)::bigint AS external_leads,
-            COALESCE(cf.converted_leads, 0)::bigint AS converted_leads,
-            COALESCE(qf.quotes_created, 0)::bigint AS quotes_created,
-            COALESCE(qf.quotes_accepted, 0)::bigint AS quotes_accepted,
-            COALESCE(of.won_opportunities, 0)::bigint AS won_opportunities,
-            COALESCE(of.lost_opportunities, 0)::bigint AS lost_opportunities,
-            COALESCE(jc.completed_jobs, 0)::bigint AS completed_jobs,
-            COALESCE(qf.revenue_sold_cents, 0)::bigint AS revenue_sold_cents,
-            COALESCE(jc.realized_revenue_cents, 0)::bigint AS realized_revenue_cents
-       FROM team t LEFT JOIN contact_facts cf ON cf.user_id = t.id
-       LEFT JOIN quote_facts qf ON qf.user_id = t.id
-       LEFT JOIN outcome_facts of ON of.user_id = t.id
-       LEFT JOIN job_credits jc ON jc.user_id = t.id::text
-      ORDER BY realized_revenue_cents DESC, won_opportunities DESC, t.display_name ASC
-      LIMIT $4`,
-    [companyId, start.toISOString(), end.toISOString(), SALES_ANALYTICS_LIMITS.maximumBreakdownRows]
-  );
-  return normalizeSalesBreakdown(rows, { identityKey: "user_id", labelKey: "display_name" });
-}
-
-app.get("/api/sales/analytics", authRequired, requireAnyCapability("sales.view_self", "sales.view_all"), async (req, res) => {
-  try {
-    const range = validateSalesAnalyticsQuery(req.query);
-    const canViewAll = hasCapability(req, "sales.view_all");
-    let employeeId = range.employee_id;
-    let employeeName = null;
-    if (!canViewAll) {
-      if (employeeId && employeeId !== req.userId) {
-        return res.status(403).json({ error: "sales_employee_forbidden" });
-      }
-      employeeId = req.userId;
-    }
-    if (employeeId) {
-      const employee = await pool.query(
-        `SELECT id, COALESCE(NULLIF(display_name, ''), email) AS display_name
-           FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
-        [employeeId, req.companyId]
-      );
-      if (!employee.rowCount) return res.status(404).json({ error: "employee_not_found" });
-      employeeName = employee.rows[0].display_name;
-    }
-    const company = await pool.query(`SELECT timezone FROM companies WHERE id = $1`, [req.companyId]);
-    const timezone = company.rows[0]?.timezone || "America/New_York";
-    const [current, previous, trendResult, sourceResult, teamResult, coverageResult] = await Promise.all([
-      loadSalesAnalyticsSummary(req.companyId, employeeId, range.start, range.end, "current"),
-      loadSalesAnalyticsSummary(req.companyId, employeeId, range.previous_start, range.previous_end, "previous"),
-      salesAnalyticsSource("trend", () => loadSalesAnalyticsTrend(req.companyId, employeeId, range.start, range.end, range.bucket, timezone)),
-      salesAnalyticsSource("sources", () => loadSalesSourceBreakdown(req.companyId, employeeId, range.start, range.end)),
-      canViewAll && !employeeId
-        ? salesAnalyticsSource("team", () => loadSalesTeamBreakdown(req.companyId, range.start, range.end))
-        : Promise.resolve({ source: "team", value: [], failed: false }),
-      salesAnalyticsSource("coverage", async () => (await pool.query(
-        `SELECT
-           MIN(occurred_at) FILTER (WHERE event_type IN ('pipeline.won','pipeline.lost')) AS outcome_history_started_at,
-           MIN(occurred_at) FILTER (WHERE event_type = 'job.created') AS booking_history_started_at,
-           MIN(occurred_at) FILTER (WHERE event_type = 'quote.accepted') AS quote_journal_started_at,
-           (SELECT MIN(q.accepted_at) FROM quotes q
-             WHERE q.accepted_at IS NOT NULL AND (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
-               SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
-             )))) AS quote_acceptance_started_at
-         FROM automation_events WHERE company_id = $1`,
-        [req.companyId]
-      )).rows[0])
-    ]);
-    const failedSources = [...new Set([
-      ...current.failedSources,
-      ...previous.failedSources,
-      ...[trendResult, sourceResult, teamResult, coverageResult].filter((item) => item.failed).map((item) => item.source)
-    ])];
-    const coverageWarnings = [];
-    const outcomeStart = coverageResult.value?.outcome_history_started_at || null;
-    const bookingStart = coverageResult.value?.booking_history_started_at || null;
-    if (coverageResult.failed) {
-      coverageWarnings.push("Historical coverage could not be checked during this refresh.");
-    } else {
-      if (outcomeStart && range.start < new Date(outcomeStart)) {
-        coverageWarnings.push("Win/loss and sales-cycle history begins after the selected range starts.");
-      }
-      if (bookingStart && range.start < new Date(bookingStart)) {
-        coverageWarnings.push("Appointment-booking history begins after the selected range starts.");
-      }
-      if (!outcomeStart) coverageWarnings.push("No durable pipeline win/loss history has been recorded yet.");
-      if (!bookingStart) coverageWarnings.push("No durable appointment-booking history has been recorded yet.");
-      const quoteAcceptanceStart = coverageResult.value?.quote_acceptance_started_at || null;
-      const quoteJournalStart = coverageResult.value?.quote_journal_started_at || null;
-      if (quoteAcceptanceStart && (!quoteJournalStart || new Date(quoteAcceptanceStart) < new Date(quoteJournalStart))) {
-        coverageWarnings.push("Older accepted quotes without an acceptance snapshot use their current saved total.");
-      }
-    }
-    if (employeeId) {
-      coverageWarnings.push("Employee lead, outcome, and communication metrics use contact ownership; quote metrics use quote creator; completed revenue uses job sales credit.");
-      coverageWarnings.push("Appointment-booker attribution is not available for individual employee reports yet.");
-    }
-    res.json({
-      generated_at: new Date().toISOString(),
-      range: {
-        start: range.start.toISOString(),
-        end: range.end.toISOString(),
-        previous_start: range.previous_start.toISOString(),
-        previous_end: range.previous_end.toISOString(),
-        timezone,
-        bucket: range.bucket,
-        audience: employeeId ? "employee" : "company",
-        employee_id: employeeId,
-        employee_name: employeeName
-      },
-      partial: failedSources.length > 0,
-      failed_sources: failedSources,
-      coverage: {
-        outcome_history_started_at: outcomeStart,
-        booking_history_started_at: bookingStart,
-        warnings: coverageWarnings
-      },
-      summary: current.summary,
-      previous_summary: previous.summary,
-      trend: trendResult.value || [],
-      sources: sourceResult.value || [],
-      team: teamResult.value || []
-    });
-  } catch (error) {
-    if (error instanceof SalesAnalyticsError) {
-      return res.status(error.statusCode).json({ error: error.code, message: error.message });
-    }
-    console.error("[sales-analytics] report failed", { code: error?.code, message: error?.message });
-    res.status(500).json({ error: "sales_analytics_failed" });
-  }
-});
-
-// ---------- BUSINESS EXCEPTION CENTER ----------
-async function businessExceptionSource(source, fn, fallback) {
-  try {
-    return { value: await fn(), failed: false, source };
-  } catch (error) {
-    console.warn("[business-exceptions] source failed", {
-      source,
-      code: error?.code || error?.name || null,
-      message: error?.message || String(error)
-    });
-    return { value: fallback, failed: true, source };
-  }
-}
-
-function mapBusinessException(row) {
-  const jsonValue = (value, fallback) => {
-    if (value && typeof value === "object") return value;
-    if (typeof value === "string") {
-      try { return JSON.parse(value); } catch (_) {}
-    }
-    return fallback;
-  };
-  return {
-    id: String(row.id),
-    type: row.type,
-    severity: row.severity,
-    source_type: row.source_type,
-    source_id: row.source_id,
-    fingerprint: row.fingerprint,
-    title: row.title,
-    explanation: row.explanation,
-    recommended_action: row.recommended_action,
-    destination: jsonValue(row.destination, null),
-    metadata: jsonValue(row.metadata, {}),
-    due_at: row.due_at || null,
-    status: row.status,
-    snoozed_until: row.snoozed_until || null,
-    detected_at: row.detected_at,
-    last_detected_at: row.last_detected_at,
-    status_updated_at: row.status_updated_at,
-    resolved_at: row.resolved_at || null,
-    resolution_source: row.resolution_source || null
-  };
-}
-
-async function loadBusinessExceptionCandidates(companyId, currentAt) {
-  const [scheduleSource, tasksSource, automationSource, messagesSource, uncertainSource] = await Promise.all([
-    businessExceptionSource("schedule", async () => {
-    const [jobs, workers] = await Promise.all([
-      pool.query(
-        `SELECT se.id, se.title, se.start_at, se.end_at, se.started_at, se.finished_at,
-                se.worker_user_ids, se.updated_at, c.name AS contact_name
-           FROM schedule_events se
-           LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id
-          WHERE se.company_id = $1 AND se.finished_at IS NULL
-            AND se.start_at >= $2::timestamptz - interval '30 days'
-            AND se.start_at < $2::timestamptz + interval '8 days'
-          ORDER BY se.start_at, se.id
-          LIMIT $3`,
-        [companyId, currentAt.toISOString(), BUSINESS_EXCEPTION_LIMITS.maximumJobs]
-      ),
-      pool.query(
-        `SELECT id, display_name, email, deleted_at
-           FROM users
-          WHERE company_id = $1 AND deleted_at IS NULL
-          ORDER BY id
-          LIMIT $2`,
-        [companyId, BUSINESS_EXCEPTION_LIMITS.maximumJobs]
-      )
-    ]);
-    return { jobs: jobs.rows, workers: workers.rows };
-    }, { jobs: [], workers: [] }),
-    businessExceptionSource("tasks", () => pool.query(
-    `SELECT task.id, task.title, task.due_date, task.priority, task.assignee_ids,
-            task.completed, task.updated_at
-       FROM todo_tasks task
-       JOIN users owner ON owner.id = task.user_id AND owner.company_id = $1
-      WHERE task.completed = false AND task.due_date IS NOT NULL AND task.due_date < $2
-      ORDER BY task.due_date, task.id
-      LIMIT $3`,
-    [companyId, currentAt.toISOString(), BUSINESS_EXCEPTION_LIMITS.maximumTasks]
-    ), { rows: [] }),
-    businessExceptionSource("automations", () => pool.query(
-    `SELECT id, automation_id, run_id, attempts, error_code, error_message, status, failed_at
-       FROM automation_dead_letters
-      WHERE company_id = $1 AND status = 'open'
-      ORDER BY failed_at, id
-      LIMIT $2`,
-    [companyId, BUSINESS_EXCEPTION_LIMITS.maximumAutomationIssues]
-    ), { rows: [] }),
-    businessExceptionSource("messages", () => pool.query(
-    `SELECT sm.id, sm.conversation_id, sm.direction, sm.to_number, sm.message_status,
-            sm.twilio_error_code, sm.created_at, sm.updated_at, c.name AS contact_name
-       FROM sms_messages sm
-       JOIN sms_conversations sc ON sc.id = sm.conversation_id
-       JOIN phone_lines line ON line.id = sc.phone_line_id AND line.company_id = $1
-       LEFT JOIN contacts c ON c.id = sc.contact_id AND c.company_id = line.company_id
-      WHERE sm.direction = 'outbound' AND sm.message_status IN ('failed','undelivered')
-        AND sm.updated_at >= $2::timestamptz - interval '30 days'
-      ORDER BY sm.updated_at, sm.id
-      LIMIT $3`,
-    [companyId, currentAt.toISOString(), BUSINESS_EXCEPTION_LIMITS.maximumMessageFailures]
-    ), { rows: [] }),
-    businessExceptionSource("message_delivery_unknown", () => pool.query(
-    `SELECT item.batch_id, item.contact_id, item.outcome, item.provider_message_sid,
-            item.sms_conversation_id, item.error_code, item.created_at, item.updated_at
-       FROM smart_contact_action_items item
-       JOIN smart_contact_action_batches batch ON batch.id = item.batch_id
-        AND batch.company_id = item.company_id AND batch.action_type = 'sms_campaign'
-      WHERE item.company_id = $1 AND item.outcome = 'delivery_unknown'
-        AND item.updated_at >= $2::timestamptz - interval '30 days'
-      ORDER BY item.updated_at, item.batch_id, item.contact_id
-      LIMIT $3`,
-    [companyId, currentAt.toISOString(), BUSINESS_EXCEPTION_LIMITS.maximumMessageFailures]
-    ), { rows: [] })
-  ]);
-
-  const evaluation = buildBusinessExceptionEvaluation({
-    jobs: scheduleSource.value.jobs,
-    workers: scheduleSource.value.workers,
-    tasks: tasksSource.value.rows,
-    automationIssues: automationSource.value.rows,
-    messageFailures: messagesSource.value.rows,
-    deliveryUnknownItems: uncertainSource.value.rows,
-    now: currentAt
-  });
-  const candidates = evaluation.candidates;
-  const evaluatedTypes = [];
-  if (!scheduleSource.failed) {
-    evaluatedTypes.push("job_not_started", "job_duration_overrun");
-    if (!evaluation.truncatedTypes.includes("schedule_conflict")) evaluatedTypes.push("schedule_conflict");
-  }
-  if (!tasksSource.failed) evaluatedTypes.push("overdue_task");
-  if (!automationSource.failed) evaluatedTypes.push("automation_failure");
-  if (!messagesSource.failed && !uncertainSource.failed) evaluatedTypes.push("customer_message_failure");
-  const knownTypes = new Set(BUSINESS_EXCEPTION_TYPES);
-  if (candidates.some((item) => !knownTypes.has(item.type)) || evaluatedTypes.some((type) => !knownTypes.has(type))) {
-    throw new BusinessExceptionError("business_exception_type_invalid", "Exception evaluation produced an unsupported type.", 500);
-  }
-  const failedSources = [scheduleSource, tasksSource, automationSource, messagesSource, uncertainSource]
-    .filter((source) => source.failed)
-    .map((source) => source.source);
-  if (evaluation.truncatedTypes.includes("schedule_conflict")) failedSources.push("schedule_conflicts_truncated");
-  return { candidates, evaluatedTypes, failedSources };
-}
-
-async function synchronizeBusinessExceptions(companyId, candidates, evaluatedTypes) {
-  const db = await pool.connect();
-  try {
-    await db.query("BEGIN");
-    await db.query(
-      `UPDATE business_exceptions
-          SET status = 'open', snoozed_until = NULL, status_updated_at = now(),
-              status_updated_by = NULL, updated_at = now()
-        WHERE company_id = $1 AND status = 'snoozed' AND snoozed_until <= now()`,
-      [companyId]
-    );
-    if (candidates.length) {
-      await db.query(
-        `INSERT INTO business_exceptions(
-           company_id, type, severity, source_type, source_id, fingerprint, title,
-           explanation, recommended_action, destination, metadata, due_at
-         )
-         SELECT $1::uuid, item.type, item.severity, item.source_type, item.source_id,
-                item.fingerprint, item.title, item.explanation, item.recommended_action,
-                item.destination, COALESCE(item.metadata, '{}'::jsonb), item.due_at
-           FROM jsonb_to_recordset($2::jsonb) AS item(
-             type text, severity text, source_type text, source_id text, fingerprint text,
-             title text, explanation text, recommended_action text, destination jsonb,
-             metadata jsonb, due_at timestamptz
-           )
-         ON CONFLICT(company_id, type, source_type, source_id) DO UPDATE SET
-           severity = EXCLUDED.severity,
-           fingerprint = EXCLUDED.fingerprint,
-           title = EXCLUDED.title,
-           explanation = EXCLUDED.explanation,
-           recommended_action = EXCLUDED.recommended_action,
-           destination = EXCLUDED.destination,
-           metadata = EXCLUDED.metadata,
-           due_at = EXCLUDED.due_at,
-           detected_at = CASE
-             WHEN business_exceptions.fingerprint <> EXCLUDED.fingerprint
-               OR (business_exceptions.status = 'resolved' AND business_exceptions.resolution_source = 'automatic')
-             THEN now() ELSE business_exceptions.detected_at END,
-           last_detected_at = now(),
-           status = CASE
-             WHEN business_exceptions.fingerprint <> EXCLUDED.fingerprint
-               OR (business_exceptions.status = 'resolved' AND business_exceptions.resolution_source = 'automatic')
-               OR (business_exceptions.status = 'snoozed' AND business_exceptions.snoozed_until <= now())
-             THEN 'open' ELSE business_exceptions.status END,
-           snoozed_until = CASE
-             WHEN business_exceptions.fingerprint <> EXCLUDED.fingerprint
-               OR (business_exceptions.status = 'resolved' AND business_exceptions.resolution_source = 'automatic')
-               OR (business_exceptions.status = 'snoozed' AND business_exceptions.snoozed_until <= now())
-             THEN NULL ELSE business_exceptions.snoozed_until END,
-           resolved_at = CASE
-             WHEN business_exceptions.fingerprint <> EXCLUDED.fingerprint
-               OR (business_exceptions.status = 'resolved' AND business_exceptions.resolution_source = 'automatic')
-             THEN NULL ELSE business_exceptions.resolved_at END,
-           resolution_source = CASE
-             WHEN business_exceptions.fingerprint <> EXCLUDED.fingerprint
-               OR (business_exceptions.status = 'resolved' AND business_exceptions.resolution_source = 'automatic')
-             THEN NULL ELSE business_exceptions.resolution_source END,
-           status_updated_at = CASE
-             WHEN business_exceptions.fingerprint <> EXCLUDED.fingerprint
-               OR (business_exceptions.status = 'resolved' AND business_exceptions.resolution_source = 'automatic')
-               OR (business_exceptions.status = 'snoozed' AND business_exceptions.snoozed_until <= now())
-             THEN now() ELSE business_exceptions.status_updated_at END,
-           status_updated_by = CASE
-             WHEN business_exceptions.fingerprint <> EXCLUDED.fingerprint
-               OR (business_exceptions.status = 'resolved' AND business_exceptions.resolution_source = 'automatic')
-               OR (business_exceptions.status = 'snoozed' AND business_exceptions.snoozed_until <= now())
-             THEN NULL ELSE business_exceptions.status_updated_by END,
-           updated_at = now()`,
-        [companyId, JSON.stringify(candidates)]
-      );
-    }
-    if (evaluatedTypes.length) {
-      const currentRows = (await db.query(
-        `SELECT id, type, source_type, source_id
-           FROM business_exceptions
-          WHERE company_id = $1 AND type = ANY($2::text[]) AND status <> 'resolved'
-          FOR UPDATE`,
-        [companyId, evaluatedTypes]
-      )).rows;
-      const candidateKeys = new Set(candidates.map((item) => `${item.type}:${item.source_type}:${item.source_id}`));
-      const resolvedIDs = currentRows
-        .filter((row) => !candidateKeys.has(`${row.type}:${row.source_type}:${row.source_id}`))
-        .map((row) => row.id);
-      if (resolvedIDs.length) {
-        await db.query(
-          `UPDATE business_exceptions
-              SET status = 'resolved', snoozed_until = NULL, resolved_at = now(),
-                  resolution_source = 'automatic', status_updated_at = now(),
-                  status_updated_by = NULL, updated_at = now()
-            WHERE company_id = $1 AND id = ANY($2::uuid[])`,
-          [companyId, resolvedIDs]
-        );
-      }
-    }
-    await db.query("COMMIT");
-  } catch (error) {
-    await db.query("ROLLBACK").catch(() => {});
-    throw error;
-  } finally {
-    db.release();
-  }
-}
-
-async function businessExceptionResponse(companyId, failedSources) {
-  const [itemsResult, countsResult] = await Promise.all([
-    pool.query(
-      `SELECT * FROM business_exceptions
-        WHERE company_id = $1 AND status IN ('open','snoozed')
-        ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
-                 detected_at, type, source_id
-        LIMIT $2`,
-      [companyId, BUSINESS_EXCEPTION_LIMITS.maximumReturned]
-    ),
-    pool.query(
-      `SELECT COUNT(*) FILTER (WHERE status = 'open')::int AS active_count,
-              COUNT(*) FILTER (WHERE status = 'open' AND severity = 'critical')::int AS critical_count,
-              COUNT(*) FILTER (WHERE status = 'open' AND severity = 'high')::int AS high_count,
-              COUNT(*) FILTER (WHERE status = 'open' AND severity = 'medium')::int AS medium_count,
-              COUNT(*) FILTER (WHERE status = 'open' AND severity = 'low')::int AS low_count,
-              COUNT(*) FILTER (WHERE status = 'snoozed')::int AS snoozed_count
-         FROM business_exceptions
-        WHERE company_id = $1`,
-      [companyId]
-    )
-  ]);
-  const counts = countsResult.rows[0] || {};
-  const items = itemsResult.rows.map(mapBusinessException).sort(compareBusinessExceptions);
-  return {
-    generated_at: new Date().toISOString(),
-    partial: failedSources.length > 0,
-    failed_sources: failedSources,
-    summary: {
-      active_count: Number(counts.active_count || 0),
-      critical_count: Number(counts.critical_count || 0),
-      high_count: Number(counts.high_count || 0),
-      medium_count: Number(counts.medium_count || 0),
-      low_count: Number(counts.low_count || 0),
-      snoozed_count: Number(counts.snoozed_count || 0)
-    },
-    items
-  };
-}
-
-app.get("/api/business-exceptions", authRequired, requireCapability("dashboard.exceptions.view"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  try {
-    const currentAt = new Date();
-    const loaded = await loadBusinessExceptionCandidates(req.companyId, currentAt);
-    await synchronizeBusinessExceptions(req.companyId, loaded.candidates, loaded.evaluatedTypes);
-    res.json(await businessExceptionResponse(req.companyId, loaded.failedSources));
-  } catch (error) {
-    console.error("[business-exceptions] evaluation failed", { code: error?.code, message: error?.message });
-    const status = error instanceof BusinessExceptionError ? error.statusCode : 500;
-    res.status(status).json({
-      error: error instanceof BusinessExceptionError ? error.code : "business_exceptions_failed",
-      message: error instanceof BusinessExceptionError ? error.message : "WolfCRM couldn't evaluate business exceptions."
-    });
-  }
-});
-
-app.patch("/api/business-exceptions/:id", authRequired, requireCapability("dashboard.exceptions.manage"), async (req, res) => {
-  if (!req.companyId) return res.status(403).json({ error: "company_required" });
-  const exceptionId = String(req.params.id || "").trim();
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(exceptionId)) {
-    return res.status(400).json({ error: "business_exception_id_invalid", message: "The exception ID is invalid." });
-  }
-  let mutation;
-  try {
-    mutation = validateBusinessExceptionMutation(req.body);
-  } catch (error) {
-    const status = error instanceof BusinessExceptionError ? error.statusCode : 400;
-    return res.status(status).json({ error: error?.code || "business_exception_mutation_invalid", message: error?.message });
-  }
-  try {
-    const row = (await pool.query(
-      `UPDATE business_exceptions
-          SET status = $3,
-              snoozed_until = $4,
-              resolved_at = CASE WHEN $3 = 'resolved' THEN now() ELSE NULL END,
-              resolution_source = CASE WHEN $3 = 'resolved' THEN 'manual' ELSE NULL END,
-              status_updated_at = now(), status_updated_by = $5, updated_at = now()
-        WHERE id = $1 AND company_id = $2
-        RETURNING *`,
-      [exceptionId, req.companyId, mutation.status, mutation.snoozed_until, req.userId]
-    )).rows[0];
-    if (!row) return res.status(404).json({ error: "business_exception_not_found" });
-    res.json(mapBusinessException(row));
-  } catch (error) {
-    console.error("[business-exceptions] mutation failed", { id: exceptionId, code: error?.code, message: error?.message });
-    res.status(500).json({ error: "business_exception_update_failed", message: "WolfCRM couldn't update that exception." });
-  }
 });
 
 // ---------- DASHBOARD COMMAND CENTER ----------
@@ -14431,7 +9021,7 @@ function filterDashboardDismissed(items, dismissals) {
   return items.filter((item) => !hidden.has(dashboardItemKey(item)));
 }
 
-app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.view"), async (req, res) => {
+app.get("/api/dashboard/summary", authRequired, async (req, res) => {
   try {
     const requestId = dashboardRequestId(req);
     const now = new Date();
@@ -14803,7 +9393,7 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
   }
 });
 
-app.post("/api/dashboard/items/dismiss", authRequired, requireCapability("dashboard.view"), async (req, res) => {
+app.post("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
   const { type, source_id, fingerprint } = req.body || {};
   if (!DASHBOARD_DISMISS_TYPES.has(type) || !source_id) return res.status(400).json({ error: "invalid_dashboard_item" });
   try {
@@ -14821,7 +9411,7 @@ app.post("/api/dashboard/items/dismiss", authRequired, requireCapability("dashbo
   }
 });
 
-app.delete("/api/dashboard/items/dismiss", authRequired, requireCapability("dashboard.view"), async (req, res) => {
+app.delete("/api/dashboard/items/dismiss", authRequired, async (req, res) => {
   const { type, source_id, fingerprint } = req.query?.type ? req.query : (req.body || {});
   if (!DASHBOARD_DISMISS_TYPES.has(type) || !source_id) return res.status(400).json({ error: "invalid_dashboard_item" });
   try {
@@ -14841,7 +9431,7 @@ app.delete("/api/dashboard/items/dismiss", authRequired, requireCapability("dash
 });
 
 // ---------- MAP PINS ----------
-app.get("/api/map-pins", authRequired, requireCapability("operations.view"), async (req, res) => {
+app.get("/api/map-pins", authRequired, async (req, res) => {
   try {
     const companyScope = req.query.scope === "company" && req.companyId;
     const where = companyScope
@@ -14861,7 +9451,7 @@ app.get("/api/map-pins", authRequired, requireCapability("operations.view"), asy
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_pins" }); }
 });
 
-app.put("/api/map-pins/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.put("/api/map-pins/:id", authRequired, async (req, res) => {
   const { latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at } = req.body || {};
   if (typeof latitude !== "number" || typeof longitude !== "number") {
     return res.status(400).json({ error: "missing_coords" });
@@ -14940,7 +9530,7 @@ app.put("/api/map-pins/:id", authRequired, requireCapability("operations.manage"
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_pin" }); }
 });
 
-app.delete("/api/map-pins/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.delete("/api/map-pins/:id", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `DELETE FROM map_pins p
@@ -14980,7 +9570,7 @@ function statsRange(kind, dateValue) {
   return { start, end };
 }
 
-app.get("/api/map-stats", authRequired, requireCapability("operations.view"), async (req, res) => {
+app.get("/api/map-stats", authRequired, async (req, res) => {
   try {
     const period = ["day", "week", "month", "all"].includes(req.query.period) ? req.query.period : "day";
     const range = statsRange(period, req.query.date);
@@ -15031,7 +9621,7 @@ app.get("/api/map-stats", authRequired, requireCapability("operations.view"), as
 });
 
 // ---------- MEASUREMENTS ----------
-app.get("/api/measurements", authRequired, requireCapability("operations.view"), async (req, res) => {
+app.get("/api/measurements", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, name, points, created_at, linked_contact_ids, units
@@ -15044,7 +9634,7 @@ app.get("/api/measurements", authRequired, requireCapability("operations.view"),
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_measurements" }); }
 });
 
-app.put("/api/measurements/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.put("/api/measurements/:id", authRequired, async (req, res) => {
   const { name, points, created_at, linked_contact_ids, units } = req.body || {};
   if (!Array.isArray(points)) {
     return res.status(400).json({ error: "missing_points" });
@@ -15097,7 +9687,7 @@ app.put("/api/measurements/:id", authRequired, requireCapability("operations.man
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_measurement" }); }
 });
 
-app.delete("/api/measurements/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+app.delete("/api/measurements/:id", authRequired, async (req, res) => {
   try {
     await pool.query(`DELETE FROM measurements WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.userId]);
@@ -15111,7 +9701,7 @@ app.delete("/api/measurements/:id", authRequired, requireCapability("operations.
 });
 
 // ---------- TO-DO: TASKS ----------
-app.get("/api/todo/tasks", authRequired, requireCapability("tasks.view"), async (req, res) => {
+app.get("/api/todo/tasks", authRequired, async (req, res) => {
   try {
     const companyUsers = req.companyId
       ? (await pool.query(`SELECT id FROM users WHERE company_id = $1`, [req.companyId])).rows.map((r) => r.id)
@@ -15131,7 +9721,7 @@ app.get("/api/todo/tasks", authRequired, requireCapability("tasks.view"), async 
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_tasks" }); }
 });
 
-app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.put("/api/todo/tasks/:id", authRequired, async (req, res) => {
   const {
     title, detail, creator_id, assignee_ids, due_date, priority, status,
     linked_contact_id, linked_job_id, linked_equipment_id,
@@ -15209,7 +9799,7 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_task" }); }
 });
 
-app.delete("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.delete("/api/todo/tasks/:id", authRequired, async (req, res) => {
   try {
     const before = (await pool.query(`DELETE FROM todo_tasks WHERE id = $1 AND user_id = $2 RETURNING *`,
       [req.params.id, req.userId])).rows[0];
@@ -15222,7 +9812,7 @@ app.delete("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"
 });
 
 // ---------- TO-DO: ROUTINES ----------
-app.get("/api/todo/routines", authRequired, requireCapability("tasks.view"), async (req, res) => {
+app.get("/api/todo/routines", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, title, time, weekdays, reminders, enabled, color_hex
@@ -15233,7 +9823,7 @@ app.get("/api/todo/routines", authRequired, requireCapability("tasks.view"), asy
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_routines" }); }
 });
 
-app.put("/api/todo/routines/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.put("/api/todo/routines/:id", authRequired, async (req, res) => {
   const { title, time, weekdays, reminders, enabled, color_hex } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
   try {
@@ -15270,7 +9860,7 @@ app.put("/api/todo/routines/:id", authRequired, requireCapability("tasks.manage"
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_routine" }); }
 });
 
-app.delete("/api/todo/routines/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.delete("/api/todo/routines/:id", authRequired, async (req, res) => {
   try {
     const before = (await pool.query(`DELETE FROM todo_routines WHERE id = $1 AND user_id = $2 RETURNING *`,
       [req.params.id, req.userId])).rows[0];
@@ -15285,7 +9875,7 @@ app.delete("/api/todo/routines/:id", authRequired, requireCapability("tasks.mana
 });
 
 // ---------- TO-DO: PER-DAY ROUTINE COMPLETIONS ----------
-app.get("/api/todo/routine-done", authRequired, requireCapability("tasks.view"), async (req, res) => {
+app.get("/api/todo/routine-done", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT routine_id, day_key FROM todo_routine_done WHERE user_id = $1`,
@@ -15295,7 +9885,7 @@ app.get("/api/todo/routine-done", authRequired, requireCapability("tasks.view"),
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_routine_done" }); }
 });
 
-app.put("/api/todo/routine-done", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.put("/api/todo/routine-done", authRequired, async (req, res) => {
   const { routine_id, day_key } = req.body || {};
   if (!routine_id || !day_key) return res.status(400).json({ error: "missing_params" });
   try {
@@ -15312,7 +9902,7 @@ app.put("/api/todo/routine-done", authRequired, requireCapability("tasks.manage"
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_mark_routine_done" }); }
 });
 
-app.delete("/api/todo/routine-done", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.delete("/api/todo/routine-done", authRequired, async (req, res) => {
   const { routine_id, day_key } = req.query || {};
   if (!routine_id || !day_key) return res.status(400).json({ error: "missing_params" });
   try {
@@ -15326,7 +9916,7 @@ app.delete("/api/todo/routine-done", authRequired, requireCapability("tasks.mana
 });
 
 // ---------- TO-DO: CUSTOMER REMINDERS ----------
-app.get("/api/todo/customer-reminders", authRequired, requireCapability("tasks.view"), async (req, res) => {
+app.get("/api/todo/customer-reminders", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, title, contact_id, contact_name, phone, due_date, completed, color_hex
@@ -15337,7 +9927,7 @@ app.get("/api/todo/customer-reminders", authRequired, requireCapability("tasks.v
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_customer_reminders" }); }
 });
 
-app.put("/api/todo/customer-reminders/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.put("/api/todo/customer-reminders/:id", authRequired, async (req, res) => {
   const { title, contact_id, contact_name, phone, due_date, completed, color_hex } = req.body || {};
   if (!contact_name) return res.status(400).json({ error: "contact_name_required" });
   try {
@@ -15376,7 +9966,7 @@ app.put("/api/todo/customer-reminders/:id", authRequired, requireCapability("tas
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_customer_reminder" }); }
 });
 
-app.delete("/api/todo/customer-reminders/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.delete("/api/todo/customer-reminders/:id", authRequired, async (req, res) => {
   try {
     const before = (await pool.query(
       `DELETE FROM todo_customer_reminders WHERE id = $1 AND user_id = $2 RETURNING *`,
@@ -15391,7 +9981,7 @@ app.delete("/api/todo/customer-reminders/:id", authRequired, requireCapability("
 });
 
 // ---------- TO-DO: ACTIVITY LOGS ----------
-app.get("/api/todo/logs", authRequired, requireCapability("tasks.view"), async (req, res) => {
+app.get("/api/todo/logs", authRequired, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, kind, ts AS timestamp, task_id, routine_id, contact_id, note
@@ -15402,7 +9992,7 @@ app.get("/api/todo/logs", authRequired, requireCapability("tasks.view"), async (
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_logs" }); }
 });
 
-app.put("/api/todo/logs/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.put("/api/todo/logs/:id", authRequired, async (req, res) => {
   const { kind, timestamp, task_id, routine_id, contact_id, note } = req.body || {};
   if (!kind) return res.status(400).json({ error: "kind_required" });
   try {
@@ -15420,7 +10010,7 @@ app.put("/api/todo/logs/:id", authRequired, requireCapability("tasks.manage"), a
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_log" }); }
 });
 
-app.delete("/api/todo/logs/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
+app.delete("/api/todo/logs/:id", authRequired, async (req, res) => {
   try {
     await pool.query(`DELETE FROM todo_logs WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.userId]);
@@ -15434,7 +10024,7 @@ app.delete("/api/todo/logs/:id", authRequired, requireCapability("tasks.manage")
 // All of these are employer-only. Employees never touch Stripe onboarding
 // or account settings.
 
-app.get("/api/payments/connect/status", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.get("/api/payments/connect/status", authRequired, requireEmployer, async (req, res) => {
   try {
     const settings = await ensureBusinessSettings(req.userId, req.companyId);
     const stripe = getStripe();
@@ -15475,7 +10065,7 @@ app.get("/api/payments/connect/status", authRequired, requireCapability("payment
   }
 });
 
-app.post("/api/payments/connect/create-account", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.post("/api/payments/connect/create-account", authRequired, requireEmployer, async (req, res) => {
   const stripe = requireStripe(res); if (!stripe) return;
   try {
     const settings = await ensureBusinessSettings(req.userId, req.companyId);
@@ -15503,7 +10093,7 @@ app.post("/api/payments/connect/create-account", authRequired, requireCapability
   }
 });
 
-app.post("/api/payments/connect/create-account-link", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.post("/api/payments/connect/create-account-link", authRequired, requireEmployer, async (req, res) => {
   const stripe = requireStripe(res); if (!stripe) return;
   try {
     let settings = await ensureBusinessSettings(req.userId, req.companyId);
@@ -15541,7 +10131,7 @@ app.post("/api/payments/connect/create-account-link", authRequired, requireCapab
   }
 });
 
-app.post("/api/payments/connect/refresh-status", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.post("/api/payments/connect/refresh-status", authRequired, requireEmployer, async (req, res) => {
   const stripe = requireStripe(res); if (!stripe) return;
   try {
     const settings = await ensureBusinessSettings(req.userId, req.companyId);
@@ -15594,7 +10184,7 @@ app.get("/stripe/connect/refresh", (_req, res) => {
 //                          SERVICE PLAN ROUTES
 // ==========================================================================
 
-app.get("/api/service-plans", authRequired, requireCapability("payments.view"), async (req, res) => {
+app.get("/api/service-plans", authRequired, requireEmployer, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -15616,7 +10206,7 @@ app.get("/api/service-plans", authRequired, requireCapability("payments.view"), 
   }
 });
 
-app.get("/api/service-plans/dashboard", authRequired, requireCapability("payments.view"), async (req, res) => {
+app.get("/api/service-plans/dashboard", authRequired, requireEmployer, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -15699,7 +10289,7 @@ app.get("/api/service-plans/dashboard", authRequired, requireCapability("payment
   }
 });
 
-app.get("/api/service-plans/:id", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
+app.get("/api/service-plans/:id", authRequired, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -15722,7 +10312,7 @@ app.get("/api/service-plans/:id", authRequired, requireAnyCapability("payments.c
   }
 });
 
-app.get("/api/contacts/:contactId/service-plans", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
+app.get("/api/contacts/:contactId/service-plans", authRequired, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     // verify contact belongs to this employer scope
@@ -15759,7 +10349,7 @@ app.get("/api/contacts/:contactId/service-plans", authRequired, requireAnyCapabi
   }
 });
 
-app.post("/api/service-plans", authRequired, requireCapability("payments.collect"), async (req, res) => {
+app.post("/api/service-plans", authRequired, async (req, res) => {
   if (!canCreateServicePlan(req)) return res.status(403).json({ error: "forbidden" });
   try {
     const {
@@ -15857,7 +10447,7 @@ app.post("/api/service-plans", authRequired, requireCapability("payments.collect
   }
 });
 
-app.put("/api/service-plans/:id", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.put("/api/service-plans/:id", authRequired, requireEmployer, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const b = req.body || {};
@@ -15920,7 +10510,7 @@ app.put("/api/service-plans/:id", authRequired, requireCapability("payments.mana
 // Start the connected-account subscription. Both employer and employee can
 // call this because the whole point is to collect the customer's first
 // payment at signup time.
-app.post("/api/service-plans/:id/start-connected-subscription", authRequired, requireCapability("payments.collect"), async (req, res) => {
+app.post("/api/service-plans/:id/start-connected-subscription", authRequired, async (req, res) => {
   if (!canCollectServicePlanPayment(req)) return res.status(403).json({ error: "forbidden" });
   const stripe = requireStripe(res); if (!stripe) return;
   try {
@@ -16123,7 +10713,7 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, re
   }
 });
 
-app.post("/api/service-plans/:id/mark-serviced", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.post("/api/service-plans/:id/mark-serviced", authRequired, requireEmployer, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -16172,7 +10762,7 @@ app.post("/api/service-plans/:id/mark-serviced", authRequired, requireCapability
   }
 });
 
-app.post("/api/service-plans/:id/pause", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.post("/api/service-plans/:id/pause", authRequired, requireEmployer, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -16212,7 +10802,7 @@ app.post("/api/service-plans/:id/pause", authRequired, requireCapability("paymen
   }
 });
 
-app.post("/api/service-plans/:id/cancel", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.post("/api/service-plans/:id/cancel", authRequired, requireEmployer, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -16267,7 +10857,7 @@ app.post("/api/service-plans/:id/cancel", authRequired, requireCapability("payme
 //                       CONTACT PAYMENT ROUTES
 // ==========================================================================
 
-app.post("/api/contacts/:contactId/payments/start", authRequired, requireCapability("payments.collect"), async (req, res) => {
+app.post("/api/contacts/:contactId/payments/start", authRequired, async (req, res) => {
   if (!canTakeContactPayment(req)) return res.status(403).json({ error: "forbidden" });
   const stripe = requireStripe(res); if (!stripe) return;
   try {
@@ -16374,7 +10964,7 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, requireCapabil
   }
 });
 
-app.get("/api/contacts/:contactId/payments", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
+app.get("/api/contacts/:contactId/payments", authRequired, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const c = await pool.query(`SELECT id FROM contacts WHERE id = $1 AND user_id = $2`,
@@ -16402,7 +10992,7 @@ app.get("/api/contacts/:contactId/payments", authRequired, requireAnyCapability(
   }
 });
 
-app.get("/api/payments", authRequired, requireCapability("payments.view"), async (req, res) => {
+app.get("/api/payments", authRequired, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 200);
@@ -16430,7 +11020,7 @@ app.get("/api/payments", authRequired, requireCapability("payments.view"), async
   }
 });
 
-app.get("/api/payments/:id", authRequired, requireCapability("payments.view"), async (req, res) => {
+app.get("/api/payments/:id", authRequired, async (req, res) => {
   try {
     const employerId = await resolveEmployerUserId(req);
     const { rows } = await pool.query(
@@ -16446,92 +11036,6 @@ app.get("/api/payments/:id", authRequired, requireCapability("payments.view"), a
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "get_payment_failed" });
-  }
-});
-
-app.post("/api/payments/:id/client-result", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
-  const status = String(req.body?.status || "").trim().toLowerCase();
-  if (!["canceled", "failed"].includes(status)) {
-    return res.status(400).json({ error: "payment_client_result_invalid", message: "The app can only record a canceled or failed presentation result." });
-  }
-  try {
-    const employerId = await resolveEmployerUserId(req);
-    const existing = await pool.query(`SELECT * FROM payment_records WHERE id::text = $1 AND user_id = $2`, [req.params.id, employerId]);
-    const payment = existing.rows[0];
-    if (!payment) return res.status(404).json({ error: "payment_not_found" });
-    if (req.role !== "employer" && payment.created_by_user_id !== req.userId) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-    const { rows } = await pool.query(
-      `UPDATE payment_records
-          SET client_result_status = $3,
-              client_result_note = $4,
-              client_result_at = now(),
-              status = CASE
-                WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status
-                WHEN status = 'pending' THEN $3
-                ELSE status
-              END,
-              updated_at = now()
-        WHERE id::text = $1 AND user_id = $2
-        RETURNING *`,
-      [req.params.id, employerId, status, String(req.body?.note || "").trim().slice(0, 500) || null]
-    );
-    res.json(sanitizePaymentRecord(rows[0], { employeeSafe: req.role !== "employer" }));
-  } catch (error) {
-    console.error("[payments] client result failed", { code: error?.code, message: error?.message });
-    res.status(500).json({ error: "payment_client_result_failed" });
-  }
-});
-
-app.post("/api/payments/:id/reconcile", authRequired, requireAnyCapability("payments.collect", "payments.view"), async (req, res) => {
-  const stripe = requireStripe(res); if (!stripe) return;
-  try {
-    const employerId = await resolveEmployerUserId(req);
-    const existing = await pool.query(`SELECT * FROM payment_records WHERE id::text = $1 AND user_id = $2`, [req.params.id, employerId]);
-    const payment = existing.rows[0];
-    if (!payment) return res.status(404).json({ error: "payment_not_found" });
-    if (req.role !== "employer" && payment.created_by_user_id !== req.userId) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-    if (!payment.stripe_payment_intent_id || !payment.stripe_connected_account_id) {
-      return res.status(409).json({ error: "payment_not_reconcilable", message: "This payment has no Stripe PaymentIntent to reconcile." });
-    }
-    const intent = await stripe.paymentIntents.retrieve(
-      payment.stripe_payment_intent_id,
-      { expand: ["latest_charge"] },
-      { stripeAccount: payment.stripe_connected_account_id }
-    );
-    const mapped = mapStripePaymentIntentStatus(intent);
-    const latestCharge = intent.latest_charge && typeof intent.latest_charge === "object" ? intent.latest_charge : null;
-    const refundState = latestCharge
-      ? normalizeStripeRefundState({
-        paymentAmountCents: Number(payment.amount_cents || 0),
-        providerRefundedCents: Number(latestCharge.amount_refunded || 0),
-        providerFullyRefunded: Boolean(latestCharge.refunded)
-      })
-      : null;
-    const paidAt = latestCharge?.created ? new Date(Number(latestCharge.created) * 1000) : null;
-    const nextStatus = refundState?.refunded_amount_cents > 0 ? refundState.status : mapped;
-    const { rows } = await pool.query(
-      `UPDATE payment_records
-          SET status = CASE
-                WHEN status IN ('partially_refunded','refunded') AND $3 NOT IN ('partially_refunded','refunded') THEN status
-                ELSE $3
-              END,
-              paid_at = CASE WHEN $3 IN ('succeeded','partially_refunded','refunded') THEN COALESCE(paid_at, $4) ELSE paid_at END,
-              refunded_amount_cents = COALESCE($5, refunded_amount_cents),
-              refund_amount_known = CASE WHEN $5::bigint IS NULL THEN refund_amount_known ELSE true END,
-              stripe_charge_id = COALESCE($6, stripe_charge_id),
-              updated_at = now()
-        WHERE id::text = $1 AND user_id = $2
-        RETURNING *`,
-      [req.params.id, employerId, nextStatus, paidAt, refundState?.refunded_amount_cents ?? null, latestCharge?.id || null]
-    );
-    res.json(sanitizePaymentRecord(rows[0], { employeeSafe: req.role !== "employer" }));
-  } catch (error) {
-    console.error("[payments] reconcile failed", { code: error?.code, message: error?.message });
-    res.status(502).json({ error: "payment_reconcile_failed", message: "WolfCRM could not confirm the payment with Stripe." });
   }
 });
 
@@ -16559,21 +11063,15 @@ app.post("/stripe/webhook", async (req, res) => {
   }
 
   const connectedAccountId = event.account || null;
-  let claim;
-  try {
-    claim = await claimStripeWebhookEvent(pool, event);
-  } catch (error) {
-    console.error("stripe webhook claim failed:", error?.message || error);
-    return res.status(500).json({ error: "webhook_claim_failed" });
-  }
-  if (!claim.claimed) {
-    return res.json({ received: true, duplicate: claim.duplicate, processing: claim.in_progress });
-  }
-  const eventOccurredAt = Number.isFinite(Number(event.created)) && Number(event.created) > 0
-    ? new Date(Number(event.created) * 1000)
-    : null;
 
   try {
+    // Duplicate protection: check if we've already recorded this stripe_event_id.
+    const dupe = await pool.query(
+      `SELECT id FROM service_plan_events WHERE stripe_event_id = $1 LIMIT 1`,
+      [event.id]
+    );
+    if (dupe.rows.length) return res.json({ received: true, duplicate: true });
+
     async function markServicePlanEvent(planId, contactId, employerId, companyId, type, notes = null) {
       if (!planId) return;
       await pool.query(
@@ -16582,72 +11080,6 @@ app.post("/stripe/webhook", async (req, res) => {
          ON CONFLICT DO NOTHING`,
         [employerId, companyId || null, planId, contactId || null, type, notes, event.id]
       );
-    }
-
-    async function applyChargeRefund(charge) {
-      const paymentIntentId = typeof charge?.payment_intent === "string"
-        ? charge.payment_intent
-        : charge?.payment_intent?.id || null;
-      if (!paymentIntentId) return [];
-      const providerRefunded = Number(charge.amount_refunded || 0);
-      if (!Number.isSafeInteger(providerRefunded) || providerRefunded < 0) return [];
-      const refunded = await pool.query(
-        `WITH candidate AS (
-           SELECT id, refunded_amount_cents AS previous_refunded_amount_cents
-             FROM payment_records
-            WHERE stripe_payment_intent_id = $1
-              AND stripe_connected_account_id IS NOT DISTINCT FROM $6
-            FOR UPDATE
-         ), updated AS (
-           UPDATE payment_records payment
-            SET refunded_amount_cents = GREATEST(payment.refunded_amount_cents, LEAST(payment.amount_cents, $2::bigint)),
-                refund_amount_known = true,
-                status = CASE
-                  WHEN $3::boolean OR GREATEST(payment.refunded_amount_cents, LEAST(payment.amount_cents, $2::bigint)) >= payment.amount_cents THEN 'refunded'
-                  WHEN GREATEST(payment.refunded_amount_cents, LEAST(payment.amount_cents, $2::bigint)) > 0 THEN 'partially_refunded'
-                  ELSE payment.status
-                END,
-                refunded_at = CASE
-                  WHEN LEAST(payment.amount_cents, $2::bigint) >= payment.refunded_amount_cents
-                    THEN GREATEST(COALESCE(payment.refunded_at, $4), $4)
-                  ELSE payment.refunded_at
-                END,
-                stripe_charge_id = COALESCE($5, payment.stripe_charge_id),
-                updated_at = now()
-           FROM candidate
-          WHERE payment.id = candidate.id
-            AND (
-              payment.refund_amount_known = false
-              OR LEAST(payment.amount_cents, $2::bigint) > payment.refunded_amount_cents
-              OR ($3::boolean AND payment.status <> 'refunded')
-              OR (payment.refunded_at IS NULL AND $4::timestamptz IS NOT NULL AND LEAST(payment.amount_cents, $2::bigint) >= payment.refunded_amount_cents)
-            )
-          RETURNING payment.id, payment.company_id, payment.contact_id, payment.service_plan_id,
-                    payment.amount_cents, payment.currency, payment.status, payment.refunded_amount_cents,
-                    payment.job_id, candidate.previous_refunded_amount_cents
-         )
-         SELECT *, refunded_amount_cents > previous_refunded_amount_cents AS cumulative_transition_observed
-           FROM updated`,
-        [paymentIntentId, providerRefunded, Boolean(charge.refunded), eventOccurredAt, charge.id || null, connectedAccountId]
-      );
-      for (const rec of refunded.rows) {
-        const automationType = rec.status === "refunded" ? "payment.refunded" : "payment.partially_refunded";
-        await emitAutomationEvent({
-          companyId: rec.company_id,
-          eventType: automationType,
-          subjectType: "payment",
-          subjectId: rec.id,
-          source: "stripe.webhook",
-          dedupeKey: `${automationType}:${event.id}:${rec.id}`,
-          payload: {
-            payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id,
-            job_id: rec.job_id || null, amount_cents: rec.amount_cents,
-            refunded_amount_cents: Number(rec.refunded_amount_cents || 0), currency: rec.currency,
-            stripe_event_id: event.id, stripe_payment_intent_id: paymentIntentId, stripe_charge_id: charge.id || null
-          }
-        });
-      }
-      return refunded.rows;
     }
 
     switch (event.type) {
@@ -16684,7 +11116,7 @@ app.post("/stripe/webhook", async (req, res) => {
                   status = COALESCE($3, status),
                   updated_at = now()
             WHERE stripe_subscription_id = $1
-              AND stripe_connected_account_id IS NOT DISTINCT FROM $4
+              AND (stripe_connected_account_id = $4 OR $4 IS NULL)
             RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
           [sub.id, sub.status, localStatus, connectedAccountId]
         );
@@ -16717,16 +11149,13 @@ app.post("/stripe/webhook", async (req, res) => {
         // Update payment record.
         const paidRecords = await pool.query(
           `UPDATE payment_records
-              SET status = CASE WHEN status IN ('partially_refunded','refunded') THEN status ELSE 'succeeded' END,
-                  paid_at = COALESCE(paid_at, $3),
-                  updated_at = now()
-            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
-              AND stripe_connected_account_id IS NOT DISTINCT FROM $4
-            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency, job_id, status`,
-          [invoice.id, invoice.subscription || null, eventOccurredAt, connectedAccountId]
+              SET status = 'succeeded', updated_at = now()
+            WHERE stripe_invoice_id = $1
+               OR stripe_subscription_id = $2
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
+          [invoice.id, invoice.subscription || null]
         );
         for (const rec of paidRecords.rows) {
-          if (rec.status !== "succeeded" && rec.status !== "paid") continue;
           await emitAutomationEvent({
             companyId: rec.company_id,
             eventType: "payment.succeeded",
@@ -16734,7 +11163,7 @@ app.post("/stripe/webhook", async (req, res) => {
             subjectId: rec.id,
             source: "stripe.webhook",
             dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
-            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, job_id: rec.job_id || null, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_invoice_id: invoice.id }
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_invoice_id: invoice.id }
           });
         }
         // If this is the initial invoice, mark plan active.
@@ -16745,7 +11174,7 @@ app.post("/stripe/webhook", async (req, res) => {
                     stripe_subscription_status = 'active',
                     updated_at = now()
               WHERE stripe_subscription_id = $1
-                AND stripe_connected_account_id IS NOT DISTINCT FROM $2
+                AND (stripe_connected_account_id = $2 OR $2 IS NULL)
               RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
             [invoice.subscription, connectedAccountId]
           );
@@ -16771,13 +11200,11 @@ app.post("/stripe/webhook", async (req, res) => {
         const invoice = event.data.object;
         const failedRecords = await pool.query(
           `UPDATE payment_records
-              SET status = CASE WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status ELSE 'failed' END,
-                  updated_at = now()
-            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
-              AND stripe_connected_account_id IS NOT DISTINCT FROM $3
-              AND status NOT IN ('succeeded','paid','partially_refunded','refunded')
+              SET status = 'failed', updated_at = now()
+            WHERE stripe_invoice_id = $1
+               OR stripe_subscription_id = $2
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [invoice.id, invoice.subscription || null, connectedAccountId]
+          [invoice.id, invoice.subscription || null]
         );
         for (const rec of failedRecords.rows) {
           await emitAutomationEvent({
@@ -16795,9 +11222,8 @@ app.post("/stripe/webhook", async (req, res) => {
             `UPDATE service_plans
                 SET status = 'past_due', updated_at = now()
               WHERE stripe_subscription_id = $1
-                AND stripe_connected_account_id IS NOT DISTINCT FROM $2
               RETURNING id, user_id, company_id, contact_id, status, stripe_subscription_status, next_service_date, price_cents`,
-            [invoice.subscription, connectedAccountId]
+            [invoice.subscription]
           );
           if (rows.length) {
             await markServicePlanEvent(rows[0].id, rows[0].contact_id, rows[0].user_id, rows[0].company_id,
@@ -16818,20 +11244,14 @@ app.post("/stripe/webhook", async (req, res) => {
 
       case "payment_intent.succeeded": {
         const pi = event.data.object;
-        const latestChargeId = typeof pi.latest_charge === "string" ? pi.latest_charge : pi.latest_charge?.id || null;
         const paidRecords = await pool.query(
           `UPDATE payment_records
-              SET status = CASE WHEN status IN ('partially_refunded','refunded') THEN status ELSE 'succeeded' END,
-                  paid_at = COALESCE(paid_at, $2),
-                  stripe_charge_id = COALESCE($3, stripe_charge_id),
-                  updated_at = now()
+              SET status = 'succeeded', updated_at = now()
             WHERE stripe_payment_intent_id = $1
-              AND stripe_connected_account_id IS NOT DISTINCT FROM $4
-            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency, job_id, status`,
-          [pi.id, eventOccurredAt, latestChargeId, connectedAccountId]
+            RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
+          [pi.id]
         );
         for (const rec of paidRecords.rows) {
-          if (rec.status !== "succeeded" && rec.status !== "paid") continue;
           await emitAutomationEvent({
             companyId: rec.company_id,
             eventType: "payment.succeeded",
@@ -16839,7 +11259,7 @@ app.post("/stripe/webhook", async (req, res) => {
             subjectId: rec.id,
             source: "stripe.webhook",
             dedupeKey: `payment.succeeded:${event.id}:${rec.id}`,
-            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, job_id: rec.job_id || null, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
+            payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: pi.id }
           });
         }
         break;
@@ -16849,13 +11269,10 @@ app.post("/stripe/webhook", async (req, res) => {
         const pi = event.data.object;
         const failedRecords = await pool.query(
           `UPDATE payment_records
-              SET status = CASE WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status ELSE 'failed' END,
-                  updated_at = now()
+              SET status = 'failed', updated_at = now()
             WHERE stripe_payment_intent_id = $1
-              AND stripe_connected_account_id IS NOT DISTINCT FROM $2
-              AND status NOT IN ('succeeded','paid','partially_refunded','refunded')
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [pi.id, connectedAccountId]
+          [pi.id]
         );
         for (const rec of failedRecords.rows) {
           await emitAutomationEvent({
@@ -16873,25 +11290,23 @@ app.post("/stripe/webhook", async (req, res) => {
 
       case "charge.refunded": {
         const charge = event.data.object;
-        await applyChargeRefund(charge);
-        break;
-      }
-
-      case "refund.created":
-      case "refund.updated": {
-        const refund = event.data.object;
-        const chargeId = typeof refund.charge === "string" ? refund.charge : refund.charge?.id || null;
-        if (chargeId) {
-          const charge = await stripe.charges.retrieve(chargeId, {}, { stripeAccount: connectedAccountId || undefined });
-          const appliedRefunds = await applyChargeRefund(charge);
-          if (connectedAccountId) {
-            await captureStripeRefundEvidence(pool, {
-              connectedAccountID: connectedAccountId,
-              refund,
-              charge,
-              stripeEventID: event.id,
-              observedAt: eventOccurredAt,
-              observedCumulativeTransition: appliedRefunds.length === 1 && appliedRefunds[0].cumulative_transition_observed === true
+        if (charge.payment_intent) {
+          const refunded = await pool.query(
+            `UPDATE payment_records
+                SET status = 'refunded', updated_at = now()
+              WHERE stripe_payment_intent_id = $1
+              RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
+            [charge.payment_intent]
+          );
+          for (const rec of refunded.rows) {
+            await emitAutomationEvent({
+              companyId: rec.company_id,
+              eventType: charge.amount_refunded && charge.amount_refunded < charge.amount ? "payment.partially_refunded" : "payment.refunded",
+              subjectType: "payment",
+              subjectId: rec.id,
+              source: "stripe.webhook",
+              dedupeKey: `payment.refunded:${event.id}:${rec.id}`,
+              payload: { payment_id: rec.id, contact_id: rec.contact_id, service_plan_id: rec.service_plan_id, amount_cents: rec.amount_cents, currency: rec.currency, stripe_event_id: event.id, stripe_payment_intent_id: charge.payment_intent }
             });
           }
         }
@@ -16905,14 +11320,10 @@ app.post("/stripe/webhook", async (req, res) => {
         const statusMap = { "payment_intent.canceled": "canceled", "payment_intent.requires_action": "action_required", "payment_intent.requires_payment_method": "payment_method_required" };
         const eventMap = { "payment_intent.canceled": "payment.canceled", "payment_intent.requires_action": "payment.action_required", "payment_intent.requires_payment_method": "payment.payment_method_required" };
         const records = await pool.query(
-          `UPDATE payment_records
-              SET status = CASE WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status ELSE $2 END,
-                  updated_at = now()
+          `UPDATE payment_records SET status = $2, updated_at = now()
             WHERE stripe_payment_intent_id = $1
-              AND stripe_connected_account_id IS NOT DISTINCT FROM $3
-              AND status NOT IN ('succeeded','paid','partially_refunded','refunded')
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
-          [pi.id, statusMap[event.type], connectedAccountId]
+          [pi.id, statusMap[event.type]]
         );
         for (const rec of records.rows) {
           await emitAutomationEvent({
@@ -16936,9 +11347,8 @@ app.post("/stripe/webhook", async (req, res) => {
         const records = await pool.query(
           `SELECT id, company_id, contact_id, service_plan_id, amount_cents, currency
              FROM payment_records
-            WHERE (stripe_payment_intent_id = $1 OR stripe_invoice_id = $2)
-              AND stripe_connected_account_id IS NOT DISTINCT FROM $3`,
-          [dispute.payment_intent || null, dispute.invoice || null, connectedAccountId]
+            WHERE stripe_payment_intent_id = $1 OR stripe_invoice_id = $2`,
+          [dispute.payment_intent || null, dispute.invoice || null]
         );
         for (const rec of records.rows) {
           await emitAutomationEvent({
@@ -16959,10 +11369,8 @@ app.post("/stripe/webhook", async (req, res) => {
         break;
     }
 
-    await completeStripeWebhookEvent(pool, event.id);
     res.json({ received: true });
   } catch (e) {
-    await failStripeWebhookEvent(pool, event.id, e).catch(() => {});
     console.error("webhook handling error:", e);
     res.status(500).json({ error: "webhook_handler_failed" });
   }
@@ -16982,7 +11390,7 @@ async function startServer() {
     app,
     pool,
     authRequired,
-    requireEmployer: requireAutomationAccess,
+    requireEmployer,
     sendPushToUsers,
     createTwilioClient,
     twilioPublicUrl,
@@ -16993,34 +11401,22 @@ async function startServer() {
     app,
     pool,
     authRequired,
-    requireMessagingView: requireCapability("messaging.customer.view"),
-    requireMessagingSend: requireCapability("messaging.customer.send"),
-    requireIntegrationManage: requireCapability("integrations.manage"),
     sendCompanyPhonePush
-  });
-  await installPayStructureSystem({
-    app,
-    pool,
-    authRequired,
-    requirePayManage: requireCapability("pay.manage")
   });
   await installFinanceSystem({
     app,
     pool,
     authRequired,
-    requireEmployer: requireFinanceAccess,
-    getStripe
+    requireEmployer
   });
   await installGoogleSheetsSchema(pool);
   installGoogleSheetsSystem({
     app,
     pool,
     authRequired,
-    requireEmployer: requireCapability("integrations.manage"),
-    requireIntegrationView: requireCapability("integrations.view")
+    requireEmployer
   });
   startGoogleSheetsWorkers(pool);
-  startWeatherRiskWorkers();
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }
 
