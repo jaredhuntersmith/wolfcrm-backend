@@ -234,7 +234,7 @@ export async function applyReceiptLifecycleTransitionInClient(client, {
     const transaction = await client.query(
       `SELECT id FROM finance_transactions
         WHERE id=$1 AND company_id=$2 AND removed_at IS NULL
-        FOR KEY SHARE`,
+        FOR UPDATE`,
       [request.transaction_id, companyID]
     );
     if (!transaction.rows.length) {

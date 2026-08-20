@@ -7,6 +7,7 @@ import {
   scoreReceiptCandidate
 } from "../finance-receipt-matching.js";
 import {
+  createReceiptCapture,
   createReceiptCashPurchase,
   installReceiptRoutes,
   installReceiptSchema,
@@ -25,6 +26,7 @@ import {
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
 const RECEIPT_ID = "223e4567-e89b-42d3-a456-426614174000";
+const CONTENT_SHA256 = "a".repeat(64);
 
 function tx(overrides = {}) {
   return {
@@ -186,6 +188,131 @@ test("receipt restore status preserves valid archived state and fails conservati
   });
 });
 
+test("initial direct capture and selected match commit atomically", async () => {
+  const companyID = "323e4567-e89b-42d3-a456-426614174000";
+  const userID = "423e4567-e89b-42d3-a456-426614174000";
+  const transactionID = "523e4567-e89b-42d3-a456-426614174000";
+  const calls = [];
+  const created = {
+    id: RECEIPT_ID,
+    company_id: companyID,
+    transaction_id: transactionID,
+    status: "matched",
+    source: "ios",
+    match_method: "user_direct",
+    content_sha256: CONTENT_SHA256,
+    details_version: 1,
+    lifecycle_version: 1
+  };
+  const client = {
+    async query(sql) {
+      const compact = sql.replace(/\s+/g, " ").trim();
+      calls.push(compact);
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(compact) || compact.includes("pg_advisory_xact_lock")) return { rows: [] };
+      if (compact.startsWith("SELECT id FROM finance_transactions")) return { rows: [{ id: transactionID }] };
+      if (compact.startsWith("SELECT * FROM finance_receipts")) return { rows: [] };
+      if (compact.startsWith("INSERT INTO finance_receipts")) return { rows: [created] };
+      if (compact.startsWith("INSERT INTO finance_receipt_matches")) return { rows: [] };
+      throw new Error(`Unexpected query: ${compact}`);
+    },
+    release() {}
+  };
+  const result = await createReceiptCapture({
+    pool: { async connect() { return client; } },
+    companyID,
+    actorUserID: userID,
+    body: {
+      transaction_id: transactionID,
+      merchant_name: "Supply Store",
+      amount_cents: 1200,
+      currency: "usd",
+      content_sha256: CONTENT_SHA256.toUpperCase()
+    }
+  });
+  assert.equal(result.recovered, false);
+  assert.equal(result.receipt.transaction_id, transactionID);
+  assert.ok(calls.indexOf("BEGIN") < calls.findIndex((sql) => sql.startsWith("INSERT INTO finance_receipts")));
+  assert.ok(calls.findIndex((sql) => sql.startsWith("INSERT INTO finance_receipt_matches")) < calls.indexOf("COMMIT"));
+  assert.match(calls.find((sql) => sql.startsWith("SELECT id FROM finance_transactions")), /removed_at IS NULL.*FOR UPDATE/);
+});
+
+test("failed content-identical capture recovers the same authority while completed duplicates fail", async () => {
+  const companyID = "323e4567-e89b-42d3-a456-426614174000";
+  const failed = {
+    id: RECEIPT_ID,
+    company_id: companyID,
+    transaction_id: null,
+    status: "processing_failed",
+    source: "ios",
+    object_key: null,
+    details_version: 1,
+    content_sha256: CONTENT_SHA256
+  };
+
+  async function invoke(existing) {
+    const calls = [];
+    const client = {
+      async query(sql) {
+        const compact = sql.replace(/\s+/g, " ").trim();
+        calls.push(compact);
+        if (["BEGIN", "COMMIT", "ROLLBACK"].includes(compact) || compact.includes("pg_advisory_xact_lock")) return { rows: [] };
+        if (compact.startsWith("SELECT * FROM finance_receipts")) return { rows: [existing] };
+        throw new Error(`Unexpected query: ${compact}`);
+      },
+      release() {}
+    };
+    try {
+      const result = await createReceiptCapture({
+        pool: { async connect() { return client; } },
+        companyID,
+        actorUserID: null,
+        body: { amount_cents: 1200, currency: "usd", content_sha256: CONTENT_SHA256 }
+      });
+      return { result, calls };
+    } catch (error) {
+      return { error, calls };
+    }
+  }
+
+  const recovered = await invoke(failed);
+  assert.equal(recovered.result.recovered, true);
+  assert.equal(recovered.result.receipt.id, RECEIPT_ID);
+  assert.equal(recovered.calls.some((sql) => sql.startsWith("INSERT INTO finance_receipts")), false);
+  assert.equal(recovered.calls.filter((sql) => sql === "COMMIT").length, 1);
+
+  const duplicate = await invoke({ ...failed, status: "unmatched", object_key: "companies/c/finance-receipts/r/image.jpg" });
+  assert.equal(duplicate.error.code, "duplicate_receipt");
+  assert.equal(duplicate.error.existing_receipt_id, RECEIPT_ID);
+  assert.equal(duplicate.calls.filter((sql) => sql === "ROLLBACK").length, 1);
+});
+
+test("capture creation rolls back when selected-match evidence cannot be retained", async () => {
+  const companyID = "323e4567-e89b-42d3-a456-426614174000";
+  const transactionID = "523e4567-e89b-42d3-a456-426614174000";
+  const calls = [];
+  const client = {
+    async query(sql) {
+      const compact = sql.replace(/\s+/g, " ").trim();
+      calls.push(compact);
+      if (["BEGIN", "ROLLBACK"].includes(compact) || compact.includes("pg_advisory_xact_lock")) return { rows: [] };
+      if (compact.startsWith("SELECT id FROM finance_transactions")) return { rows: [{ id: transactionID }] };
+      if (compact.startsWith("SELECT * FROM finance_receipts")) return { rows: [] };
+      if (compact.startsWith("INSERT INTO finance_receipts")) return { rows: [{ id: RECEIPT_ID }] };
+      if (compact.startsWith("INSERT INTO finance_receipt_matches")) throw new Error("match insert failed");
+      throw new Error(`Unexpected query: ${compact}`);
+    },
+    release() {}
+  };
+  await assert.rejects(() => createReceiptCapture({
+    pool: { async connect() { return client; } },
+    companyID,
+    actorUserID: null,
+    body: { transaction_id: transactionID, content_sha256: CONTENT_SHA256 }
+  }), /match insert failed/);
+  assert.equal(calls.includes("COMMIT"), false);
+  assert.equal(calls.filter((sql) => sql === "ROLLBACK").length, 1);
+});
+
 test("receipt lifecycle match commits once and exact retry replays without another write", async () => {
   const companyID = "423e4567-e89b-42d3-a456-426614174000";
   const userID = "523e4567-e89b-42d3-a456-426614174000";
@@ -255,6 +382,152 @@ test("receipt lifecycle match commits once and exact retry replays without anoth
   assert.equal(queries.filter((sql) => sql.startsWith("INSERT INTO finance_receipt_matches")).length, 1);
   assert.equal(queries.filter((sql) => sql.startsWith("INSERT INTO finance_receipt_lifecycle_audit")).length, 1);
   assert.equal(queries.filter((sql) => sql === "COMMIT").length, 2);
+});
+
+test("receipt re-match, unmatch, archive, and restore advance one audited lifecycle", async () => {
+  const companyID = "423e4567-e89b-42d3-a456-426614174000";
+  const userID = "523e4567-e89b-42d3-a456-426614174000";
+  const firstTransactionID = "623e4567-e89b-42d3-a456-426614174000";
+  const secondTransactionID = "723e4567-e89b-42d3-a456-426614174000";
+  let receiptRow = {
+    id: RECEIPT_ID,
+    company_id: companyID,
+    status: "manually_matched",
+    transaction_id: firstTransactionID,
+    match_method: "manual",
+    object_key: `companies/${companyID}/finance-receipts/${RECEIPT_ID}/image.jpg`,
+    lifecycle_version: 3,
+    archived_at: null,
+    archived_from_status: null
+  };
+  const audits = [];
+  const client = {
+    async query(sql, params = []) {
+      const compact = sql.replace(/\s+/g, " ").trim();
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(compact) || compact.includes("pg_advisory_xact_lock")) return { rows: [] };
+      if (compact.includes("FROM finance_receipt_lifecycle_audit") && compact.includes("client_request_id")) return { rows: [] };
+      if (compact.startsWith("SELECT id FROM finance_transactions")) return { rows: [{ id: secondTransactionID }] };
+      if (compact.startsWith("SELECT * FROM finance_receipts")) return { rows: [receiptRow] };
+      if (compact.startsWith("UPDATE finance_receipts")) {
+        const nextVersion = Number(receiptRow.lifecycle_version) + 1;
+        if (compact.includes("SET transaction_id=$3")) {
+          receiptRow = { ...receiptRow, transaction_id: secondTransactionID, status: "manually_matched", match_method: "manual", lifecycle_version: nextVersion };
+        } else if (compact.includes("SET transaction_id=NULL")) {
+          receiptRow = { ...receiptRow, transaction_id: null, status: "unmatched", match_method: null, match_confidence: null, matched_at: null, lifecycle_version: nextVersion };
+        } else if (compact.includes("SET archived_from_status=status")) {
+          receiptRow = { ...receiptRow, archived_from_status: receiptRow.status, status: "archived", archived_at: "2026-08-20T00:00:00Z", lifecycle_version: nextVersion };
+        } else if (compact.includes("archived_at=NULL")) {
+          receiptRow = { ...receiptRow, status: params[2], archived_at: null, archived_from_status: null, lifecycle_version: nextVersion };
+        }
+        return { rows: [receiptRow] };
+      }
+      if (compact.startsWith("INSERT INTO finance_receipt_matches")) return { rows: [] };
+      if (compact.startsWith("INSERT INTO finance_receipt_lifecycle_audit")) {
+        const row = {
+          id: `audit_${audits.length + 1}`,
+          receipt_id: RECEIPT_ID,
+          version: params[2],
+          action: params[4],
+          reason: params[5],
+          request_fingerprint: params[7],
+          before_state: JSON.parse(params[8]),
+          after_state: JSON.parse(params[9])
+        };
+        audits.push(row);
+        return { rows: [row] };
+      }
+      throw new Error(`Unexpected query: ${compact}`);
+    },
+    release() {}
+  };
+  const pool = { async connect() { return client; } };
+  const commands = [
+    normalizeReceiptLifecycleRequest({
+      receiptID: RECEIPT_ID,
+      body: {
+        client_request_id: "823e4567-e89b-42d3-a456-426614174000",
+        expected_lifecycle_version: 3,
+        action: "match",
+        transaction_id: secondTransactionID,
+        method: "manual",
+        reason: "Corrected the selected transaction"
+      }
+    }),
+    normalizeReceiptLifecycleRequest({
+      receiptID: RECEIPT_ID,
+      body: {
+        client_request_id: "923e4567-e89b-42d3-a456-426614174000",
+        expected_lifecycle_version: 4,
+        action: "unmatch",
+        reason: "Removed the reviewed match"
+      }
+    }),
+    normalizeReceiptLifecycleRequest({
+      receiptID: RECEIPT_ID,
+      body: {
+        client_request_id: "a23e4567-e89b-42d3-a456-426614174000",
+        expected_lifecycle_version: 5,
+        action: "archive",
+        reason: "Archived duplicate evidence"
+      }
+    }),
+    normalizeReceiptLifecycleRequest({
+      receiptID: RECEIPT_ID,
+      body: {
+        client_request_id: "b23e4567-e89b-42d3-a456-426614174000",
+        expected_lifecycle_version: 6,
+        action: "restore",
+        reason: "Restored retained evidence"
+      }
+    })
+  ];
+  for (const request of commands) {
+    await executeReceiptLifecycleTransition(pool, { companyID, actorUserID: userID, request });
+  }
+  assert.deepEqual(audits.map((audit) => audit.action), ["rematched", "unmatched", "archived", "restored"]);
+  assert.deepEqual(audits.map((audit) => audit.version), [4, 5, 6, 7]);
+  assert.equal(receiptRow.status, "unmatched");
+  assert.equal(receiptRow.transaction_id, null);
+  assert.equal(receiptRow.lifecycle_version, 7);
+});
+
+test("cash-purchase receipt cannot be detached", async () => {
+  const companyID = "423e4567-e89b-42d3-a456-426614174000";
+  const request = normalizeReceiptLifecycleRequest({
+    receiptID: RECEIPT_ID,
+    body: {
+      client_request_id: REQUEST_ID,
+      expected_lifecycle_version: 2,
+      action: "unmatch",
+      reason: "Attempted detach"
+    }
+  });
+  const calls = [];
+  const client = {
+    async query(sql) {
+      const compact = sql.replace(/\s+/g, " ").trim();
+      calls.push(compact);
+      if (["BEGIN", "ROLLBACK"].includes(compact) || compact.includes("pg_advisory_xact_lock")) return { rows: [] };
+      if (compact.includes("FROM finance_receipt_lifecycle_audit")) return { rows: [] };
+      if (compact.startsWith("SELECT * FROM finance_receipts")) return { rows: [{
+        id: RECEIPT_ID,
+        company_id: companyID,
+        status: "cash_purchase",
+        transaction_id: "623e4567-e89b-42d3-a456-426614174000",
+        match_method: "cash_purchase",
+        object_key: "receipt.jpg",
+        lifecycle_version: 2
+      }] };
+      throw new Error(`Unexpected query: ${compact}`);
+    },
+    release() {}
+  };
+  await assert.rejects(
+    () => executeReceiptLifecycleTransition({ async connect() { return client; } }, { companyID, actorUserID: null, request }),
+    (error) => error.code === "receipt_cash_purchase_locked"
+  );
+  assert.equal(calls.some((sql) => sql.startsWith("UPDATE finance_receipts")), false);
+  assert.equal(calls.filter((sql) => sql === "ROLLBACK").length, 1);
 });
 
 test("cash receipt purchase creates one transaction and exact retry is balance safe", async () => {
@@ -601,6 +874,9 @@ test("receipt detail schema is additive tenant scoped versioned and append only"
   assert.match(sql, /finance_receipts_lifecycle_version_positive CHECK\(lifecycle_version > 0\)/);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS archived_from_status/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_receipt_lifecycle_audit/);
+  assert.match(sql, /finance_receipt_matches_company_receipt_fk/);
+  assert.match(sql, /finance_receipt_matches_company_transaction_fk/);
+  assert.match(sql, /REFERENCES finance_transactions\(company_id, id\)/);
   assert.match(sql, /provider_history_unmatched/);
   assert.match(sql, /cash_purchase_created/);
   assert.match(sql, /UNIQUE\(company_id, receipt_id, version\)/);
@@ -631,6 +907,11 @@ test("receipt routes expose bounded detail audit and stale safe replacement", ()
   assert.match(source, /receipt_details_audited_route_required/);
   assert.match(source, /current\.status === "processing_failed" \|\| !current\.object_key/);
   assert.match(source, /status IN \('processing','processing_failed'\) OR \(object_key IS NULL AND details_version=1\)/);
+  assert.match(source, /SELECT id, status, details_version, object_key, thumbnail_object_key/);
+  assert.match(source, /captureIncomplete/);
+  assert.match(source, /receipt_capture_complete/);
+  assert.match(source, /\$\{kind\}\.jpg/);
+  assert.doesNotMatch(source, /kind-\$\{randomUUID/);
   assert.match(source, /createReceiptCashPurchase/);
   assert.match(source, /receipt_cash_purchase_amount_mismatch/);
   assert.match(source, /receipt_cash_purchase_category_mismatch/);
@@ -645,6 +926,8 @@ test("receipt routes expose bounded detail audit and stale safe replacement", ()
   const matchingSource = fs.readFileSync(new URL("../finance-receipt-matching.js", import.meta.url), "utf8");
   assert.match(matchingSource, /executeReceiptLifecycleTransition/);
   assert.match(matchingSource, /auditAction: "auto_matched"/);
+  const lifecycleSource = fs.readFileSync(new URL("../finance-receipt-lifecycle.js", import.meta.url), "utf8");
+  assert.match(lifecycleSource, /removed_at IS NULL[\s\S]*FOR UPDATE/);
 });
 
 let passed = 0;

@@ -1,6 +1,6 @@
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { randomUUID, createHash } from "node:crypto";
+import { createHash } from "node:crypto";
 import { chooseReceiptMatch, findReceiptCandidates, normalizeMerchantName } from "./finance-receipt-matching.js";
 import {
   appendReceiptLifecycleAudit,
@@ -52,6 +52,15 @@ function parseDateOnly(value, fieldName = "date", { nullable = false } = {}) {
 function parseTime(value) {
   const raw = cleanString(value, 10);
   return /^\d{2}:\d{2}(:\d{2})?$/.test(raw) ? raw : null;
+}
+
+function parseContentSHA256(value) {
+  const raw = cleanString(value, 128);
+  if (!raw) return null;
+  if (!/^[0-9a-f]{64}$/i.test(raw)) {
+    throw receiptRequestError("content_sha256_invalid", "Receipt content hash is invalid.");
+  }
+  return raw.toLowerCase();
 }
 
 function receiptRequestError(code, message, statusCode = 400, details = {}) {
@@ -211,7 +220,13 @@ function requireCompany(req, res) {
 }
 
 function handleReceiptError(res, error, fallback) {
-  if (error?.statusCode) return res.status(error.statusCode).json({ error: error.code || fallback, message: error.message || "Receipt request failed." });
+  if (error?.statusCode) {
+    const payload = { error: error.code || fallback, message: error.message || "Receipt request failed." };
+    for (const key of ["current_version", "current_balance_cents", "existing_receipt_id"]) {
+      if (error[key] !== undefined) payload[key] = error[key];
+    }
+    return res.status(error.statusCode).json(payload);
+  }
   console.error("[finance-receipts]", fallback, { message: error?.message });
   res.status(500).json({ error: fallback, message: "Receipt request failed." });
 }
@@ -352,6 +367,107 @@ function transactionPayload(row) {
     institution_name: row.institution_name,
     score: row.score
   };
+}
+
+function isRecoverableReceiptCapture(row, transactionID) {
+  if (!row || row.source !== "ios" || row.object_key || Number(row.details_version || 1) !== 1) return false;
+  if (String(row.transaction_id || "") !== String(transactionID || "")) return false;
+  if (["processing", "processing_failed"].includes(row.status)) return true;
+  return row.status === "matched" && row.match_method === "user_direct" && Boolean(transactionID);
+}
+
+export async function createReceiptCapture({ pool, companyID, actorUserID, body = {} }) {
+  if (body.object_key || body.thumbnail_object_key) {
+    throw receiptRequestError(
+      "receipt_object_key_not_allowed",
+      "Receipt image keys must be issued by the server after the receipt is created."
+    );
+  }
+  const payload = receiptUpdatePayload(body);
+  const transactionID = cleanString(body.transaction_id, 80) || null;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    if (payload.content_sha256) {
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext($1::text))`,
+        [`${companyID}|receipt-content|${payload.content_sha256}`]
+      );
+    }
+    if (transactionID) {
+      const transaction = await client.query(
+        `SELECT id FROM finance_transactions
+          WHERE id=$1 AND company_id=$2 AND removed_at IS NULL
+          FOR UPDATE`,
+        [transactionID, companyID]
+      );
+      if (!transaction.rows.length) {
+        throw receiptRequestError("finance_transaction_not_found", "Transaction was not found.", 404);
+      }
+    }
+    if (payload.content_sha256) {
+      const duplicate = await client.query(
+        `SELECT * FROM finance_receipts
+          WHERE company_id=$1 AND content_sha256=$2 AND archived_at IS NULL
+          ORDER BY created_at, id
+          LIMIT 1
+          FOR UPDATE`,
+        [companyID, payload.content_sha256]
+      );
+      if (duplicate.rows.length) {
+        const existing = duplicate.rows[0];
+        if (isRecoverableReceiptCapture(existing, transactionID)) {
+          await client.query("COMMIT");
+          return { receipt: existing, recovered: true };
+        }
+        throw receiptRequestError(
+          "duplicate_receipt",
+          "This receipt image already exists.",
+          409,
+          { existing_receipt_id: existing.id }
+        );
+      }
+    }
+    const status = transactionID ? "matched" : "processing";
+    const method = transactionID ? "user_direct" : null;
+    const { rows } = await client.query(
+      `INSERT INTO finance_receipts (
+         company_id, transaction_id, status, source, merchant_name, normalized_merchant_name,
+         purchase_date, purchase_time, amount_cents, subtotal_cents, tax_cents, tip_cents,
+         currency, address, city, state, postal_code, country, payment_method_text,
+         card_last_four, finance_category, business_use, note, ocr_text, ocr_confidence,
+         object_key, thumbnail_object_key, mime_type, pixel_width, pixel_height, file_size_bytes,
+         content_sha256, match_method, match_confidence, matched_at, created_by
+       ) VALUES ($1,$2,$3,'ios',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)
+       RETURNING *`,
+      [
+        companyID, transactionID, status, payload.merchant_name, payload.normalized_merchant_name,
+        payload.purchase_date, payload.purchase_time, payload.amount_cents, payload.subtotal_cents,
+        payload.tax_cents, payload.tip_cents, payload.currency, payload.address, payload.city,
+        payload.state, payload.postal_code, payload.country, payload.payment_method_text,
+        payload.card_last_four, payload.finance_category, payload.business_use, payload.note,
+        payload.ocr_text, payload.ocr_confidence, null,
+        null, payload.mime_type, payload.pixel_width,
+        payload.pixel_height, payload.file_size_bytes, payload.content_sha256, method,
+        transactionID ? 100 : null, transactionID ? new Date() : null, actorUserID
+      ]
+    );
+    if (transactionID) {
+      await client.query(
+        `INSERT INTO finance_receipt_matches(
+           company_id, receipt_id, transaction_id, method, confidence_score, was_selected, created_by
+         ) VALUES($1,$2,$3,'user_direct',100,true,$4)`,
+        [companyID, rows[0].id, transactionID, actorUserID]
+      );
+    }
+    await client.query("COMMIT");
+    return { receipt: rows[0], recovered: false };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function createReceiptCashPurchase({ pool, companyID, actorUserID, request }) {
@@ -634,7 +750,7 @@ function receiptUpdatePayload(body) {
     pixel_width: Number.isInteger(body.pixel_width) ? body.pixel_width : null,
     pixel_height: Number.isInteger(body.pixel_height) ? body.pixel_height : null,
     file_size_bytes: Number.isInteger(body.file_size_bytes) ? body.file_size_bytes : null,
-    content_sha256: cleanString(body.content_sha256, 128) || null
+    content_sha256: parseContentSHA256(body.content_sha256)
   };
 }
 
@@ -686,6 +802,7 @@ export async function installReceiptSchema(pool) {
     CREATE INDEX IF NOT EXISTS finance_receipts_company_date_idx ON finance_receipts(company_id, purchase_date DESC);
     CREATE INDEX IF NOT EXISTS finance_receipts_transaction_idx ON finance_receipts(company_id, transaction_id);
     CREATE INDEX IF NOT EXISTS finance_receipts_hash_idx ON finance_receipts(company_id, content_sha256) WHERE content_sha256 IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS finance_transactions_company_id_idx ON finance_transactions(company_id, id);
 
     ALTER TABLE finance_receipts
       ADD COLUMN IF NOT EXISTS details_version INTEGER NOT NULL DEFAULT 1;
@@ -724,14 +841,34 @@ export async function installReceiptSchema(pool) {
     CREATE TABLE IF NOT EXISTS finance_receipt_matches (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      receipt_id UUID NOT NULL REFERENCES finance_receipts(id) ON DELETE RESTRICT,
-      transaction_id UUID NOT NULL REFERENCES finance_transactions(id) ON DELETE RESTRICT,
+      receipt_id UUID NOT NULL,
+      transaction_id UUID NOT NULL,
       method TEXT NOT NULL CHECK (method IN ('auto','manual','user_direct','cash_purchase')),
       confidence_score INTEGER CHECK (confidence_score IS NULL OR (confidence_score >= 0 AND confidence_score <= 100)),
       was_selected BOOLEAN NOT NULL DEFAULT false,
       created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CONSTRAINT finance_receipt_matches_company_receipt_fk
+        FOREIGN KEY (company_id, receipt_id) REFERENCES finance_receipts(company_id, id) ON DELETE RESTRICT,
+      CONSTRAINT finance_receipt_matches_company_transaction_fk
+        FOREIGN KEY (company_id, transaction_id) REFERENCES finance_transactions(company_id, id) ON DELETE RESTRICT
     );
+    DO $$
+    BEGIN
+      ALTER TABLE finance_receipt_matches
+        ADD CONSTRAINT finance_receipt_matches_company_receipt_fk
+        FOREIGN KEY (company_id, receipt_id)
+        REFERENCES finance_receipts(company_id, id) ON DELETE RESTRICT NOT VALID;
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+    DO $$
+    BEGIN
+      ALTER TABLE finance_receipt_matches
+        ADD CONSTRAINT finance_receipt_matches_company_transaction_fk
+        FOREIGN KEY (company_id, transaction_id)
+        REFERENCES finance_transactions(company_id, id) ON DELETE RESTRICT NOT VALID;
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
     CREATE INDEX IF NOT EXISTS finance_receipt_matches_receipt_idx ON finance_receipt_matches(company_id, receipt_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS finance_receipt_matches_transaction_idx ON finance_receipt_matches(company_id, transaction_id, created_at DESC);
 
@@ -847,51 +984,13 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
   app.post("/api/finance/receipts", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
-      if (req.body?.object_key || req.body?.thumbnail_object_key) {
-        return res.status(400).json({ error: "receipt_object_key_not_allowed", message: "Receipt image keys must be issued by the server after the receipt is created." });
-      }
-      const payload = receiptUpdatePayload(req.body || {});
-      const transactionId = cleanString(req.body?.transaction_id, 80) || null;
-      if (transactionId) {
-        const tx = await pool.query(`SELECT id FROM finance_transactions WHERE id = $1 AND company_id = $2`, [transactionId, req.companyId]);
-        if (!tx.rows.length) return res.status(404).json({ error: "finance_transaction_not_found", message: "Transaction was not found." });
-      }
-      if (payload.content_sha256) {
-        const dup = await pool.query(`SELECT id FROM finance_receipts WHERE company_id = $1 AND content_sha256 = $2 AND archived_at IS NULL LIMIT 1`, [req.companyId, payload.content_sha256]);
-        if (dup.rows.length) return res.status(409).json({ error: "duplicate_receipt", message: "This receipt image already exists.", existing_receipt_id: dup.rows[0].id });
-      }
-      const status = transactionId ? "matched" : "processing";
-      const method = transactionId ? "user_direct" : null;
-      const { rows } = await pool.query(
-        `INSERT INTO finance_receipts (
-           company_id, transaction_id, status, source, merchant_name, normalized_merchant_name,
-           purchase_date, purchase_time, amount_cents, subtotal_cents, tax_cents, tip_cents,
-           currency, address, city, state, postal_code, country, payment_method_text,
-           card_last_four, finance_category, business_use, note, ocr_text, ocr_confidence,
-           object_key, thumbnail_object_key, mime_type, pixel_width, pixel_height, file_size_bytes,
-           content_sha256, match_method, match_confidence, matched_at, created_by
-         ) VALUES ($1,$2,$3,'ios',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)
-         RETURNING *`,
-        [
-          req.companyId, transactionId, status, payload.merchant_name, payload.normalized_merchant_name,
-          payload.purchase_date, payload.purchase_time, payload.amount_cents, payload.subtotal_cents,
-          payload.tax_cents, payload.tip_cents, payload.currency, payload.address, payload.city,
-          payload.state, payload.postal_code, payload.country, payload.payment_method_text,
-          payload.card_last_four, payload.finance_category, payload.business_use, payload.note,
-          payload.ocr_text, payload.ocr_confidence, null,
-          null, payload.mime_type, payload.pixel_width,
-          payload.pixel_height, payload.file_size_bytes, payload.content_sha256, method,
-          transactionId ? 100 : null, transactionId ? new Date() : null, req.userId
-        ]
-      );
-      if (transactionId) {
-        await pool.query(
-          `INSERT INTO finance_receipt_matches(company_id, receipt_id, transaction_id, method, confidence_score, was_selected, created_by)
-           VALUES($1,$2,$3,'user_direct',100,true,$4)`,
-          [req.companyId, rows[0].id, transactionId, req.userId]
-        );
-      }
-      res.status(201).json(receiptPayload(rows[0]));
+      const result = await createReceiptCapture({
+        pool,
+        companyID: req.companyId,
+        actorUserID: req.userId,
+        body: req.body || {}
+      });
+      res.status(result.recovered ? 200 : 201).json(receiptPayload(result.receipt));
     } catch (error) {
       handleReceiptError(res, error, "finance_receipt_create_failed");
     }
@@ -903,13 +1002,27 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
       const cfg = mediaBucketConfig();
       const s3 = getMediaS3Client();
       if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured", message: "Receipt storage is not configured." });
-      const { rows } = await pool.query(`SELECT id FROM finance_receipts WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+      const { rows } = await pool.query(
+        `SELECT id, status, details_version, object_key, thumbnail_object_key
+           FROM finance_receipts
+          WHERE id=$1 AND company_id=$2`,
+        [req.params.id, req.companyId]
+      );
       if (!rows.length) return res.status(404).json({ error: "finance_receipt_not_found", message: "Receipt was not found." });
+      const receipt = rows[0];
+      const captureIncomplete = ["processing", "processing_failed"].includes(receipt.status)
+        || (!receipt.object_key && Number(receipt.details_version || 1) === 1);
+      if (!captureIncomplete || receipt.object_key || receipt.thumbnail_object_key) {
+        return res.status(409).json({
+          error: "receipt_capture_complete",
+          message: "Completed receipt media cannot be replaced through the capture upload route."
+        });
+      }
       const kind = req.body?.kind === "thumbnail" ? "thumbnail" : "image";
       const mimeType = cleanString(req.body?.mime_type || "image/jpeg", 80);
       const byteSize = Number(req.body?.byte_size || 0);
       if (!Number.isFinite(byteSize) || byteSize <= 0 || byteSize > 25 * 1024 * 1024) return res.status(400).json({ error: "invalid_receipt_file_size", message: "Receipt image size is invalid." });
-      const objectKey = `${receiptObjectPrefix(req.companyId, req.params.id)}${kind}-${randomUUID()}.jpg`;
+      const objectKey = `${receiptObjectPrefix(req.companyId, req.params.id)}${kind}.jpg`;
       const uploadUrl = await getSignedUrl(s3, new PutObjectCommand({ Bucket: cfg.bucket, Key: objectKey, ContentType: mimeType }), { expiresIn: 900 });
       res.json({ object_key: objectKey, upload_url: uploadUrl, mime_type: mimeType, byte_size: byteSize, kind });
     } catch (error) {
