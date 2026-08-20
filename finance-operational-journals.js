@@ -668,6 +668,11 @@ async function loadDetail(poolOrClient, companyID, operationalSourceID, requeste
   };
 }
 
+export async function loadOperationalReceivableCloseEvaluation(poolOrClient, companyID, operationalSourceID) {
+  const detail = await loadDetail(poolOrClient, companyID, operationalSourceID);
+  return detail.source;
+}
+
 async function loadLockedBundle(client, companyID, operationalSourceID, revenueAccountID = null) {
   const sourceResult = await client.query(
     `SELECT src.*,

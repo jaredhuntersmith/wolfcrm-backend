@@ -170,6 +170,7 @@ function testAdministrativeRouteClassification() {
   assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/general-ledger/entries/123/reverse"), "accounting.manage");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/statement-readiness"), "accounting.view");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/statement-readiness/profile"), "accounting.manage");
+  assert.equal(requiredFinanceCapability("POST", "/api/finance/accounting/statement-readiness/period-close"), "accounting.manage");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/bank-sources"), "accounting.view");
   assert.equal(requiredFinanceCapability("GET", "/api/finance/accounting/bank-sources/accounts/123/mapping"), "accounting.view");
   assert.equal(requiredFinanceCapability("PUT", "/api/finance/accounting/bank-sources/accounts/123/mapping"), "accounting.manage");

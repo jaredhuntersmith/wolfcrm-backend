@@ -8,6 +8,7 @@ import {
   snapshotInput
 } from "./finance-general-ledger.js";
 import { syncOperationalAccountingSources } from "./finance-operational-accounting.js";
+import { loadOperationalApplicationCloseEvaluation } from "./finance-operational-applications.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const STRIPE_ID_PATTERN = /^[A-Za-z]+_[A-Za-z0-9_]+$/;
@@ -776,7 +777,7 @@ export function evaluateStripeSettlement({ payout, normalizedMembers, members, b
   };
   const sourceFingerprint = fingerprint(sourceSnapshot);
   const eligible = unique.length === 0;
-  const sourceCurrent = posting?.status === "posted" && posting.source_fingerprint === sourceFingerprint;
+  const sourceCurrent = eligible && posting?.status === "posted" && posting.source_fingerprint === sourceFingerprint;
   let reviewState = "blocked";
   if (sourceCurrent) reviewState = "posted";
   else if (posting?.status === "posted") reviewState = "stale";
@@ -911,6 +912,73 @@ async function detailPayload(poolOrClient, companyID, connectedAccountID, payout
       "This journal moves reviewed Payment Clearing to bank cash and exact provider fees; it does not recognize revenue or change Phase 1 cash Profit & Loss."
     ]
   };
+}
+
+export async function loadStripeSettlementLocalCloseEvaluation(poolOrClient, companyID, settlementID) {
+  const postingResult = await poolOrClient.query(
+    `SELECT * FROM finance_stripe_settlements WHERE company_id=$1 AND id=$2`,
+    [companyID, settlementID]
+  );
+  const posting = postingResult.rows[0];
+  if (!posting) throw new FinanceStripeSettlementError("stripe_settlement_not_found", "Stripe settlement was not found.", 404);
+  const retained = objectValue(posting.source_snapshot);
+  const payout = { ...objectValue(retained.payout), blockers: [] };
+  const totals = objectValue(retained.totals);
+  const retainedMembers = Array.isArray(retained.members) ? retained.members : [];
+  const memberResult = await poolOrClient.query(
+    `SELECT * FROM finance_stripe_settlement_members
+      WHERE company_id=$1 AND settlement_id=$2 AND settlement_version=$3 AND active=true
+      ORDER BY stripe_balance_transaction_id`,
+    [companyID, settlementID, posting.version]
+  );
+  const retainedByBalance = new Map(retainedMembers.map((member) => [String(member.stripe_balance_transaction_id), member]));
+  const members = [];
+  for (const row of memberResult.rows) {
+    const retainedMember = retainedByBalance.get(String(row.stripe_balance_transaction_id)) || {};
+    const applicationEvaluation = await loadOperationalApplicationCloseEvaluation(poolOrClient, companyID, row.operational_application_id);
+    const memberBlockers = [];
+    if (!retainedByBalance.has(String(row.stripe_balance_transaction_id))) {
+      memberBlockers.push(blocker("stripe_settlement_member_not_retained", "A current local settlement member is absent from retained provider evidence."));
+    }
+    if (applicationEvaluation.source_current !== true
+        || String(applicationEvaluation.authority_id || "") !== String(row.operational_application_id)
+        || Number(applicationEvaluation.authority_version) !== Number(row.application_version)
+        || Number(row.application_version) !== Number(retainedMember.application_version)
+        || String(row.operational_application_id) !== String(retainedMember.operational_application_id || "")) {
+      memberBlockers.push(blocker("stripe_settlement_application_stale", "A retained settlement member no longer matches its current reviewed application."));
+    }
+    members.push({
+      stripe_balance_transaction_id: String(row.stripe_balance_transaction_id),
+      type: row.member_type,
+      stripe_source_id: row.stripe_source_id,
+      amount_cents: storedInteger(row.amount_cents, "member_amount_cents"),
+      fee_cents: storedInteger(row.fee_cents, "member_fee_cents"),
+      net_cents: storedInteger(row.net_cents, "member_net_cents"),
+      currency: row.currency,
+      status: retainedMember.status || "available",
+      payment_record_id: retainedMember.payment_record_id || null,
+      refund_revision_id: retainedMember.refund_revision_id || null,
+      application_id: String(row.operational_application_id),
+      application_kind: retainedMember.application_kind || null,
+      application_version: Number(row.application_version),
+      blockers: memberBlockers
+    });
+  }
+  const activeBalanceIDs = new Set(members.map((member) => member.stripe_balance_transaction_id));
+  const missingRetainedCount = retainedMembers.filter((member) => !activeBalanceIDs.has(String(member.stripe_balance_transaction_id))).length;
+  const normalizedMembers = {
+    gross_cents: storedInteger(totals.gross_cents ?? 0, "gross_cents"),
+    fee_cents: storedInteger(totals.fee_cents ?? 0, "fee_cents"),
+    net_cents: storedInteger(totals.net_cents ?? 0, "net_cents"),
+    blockers: missingRetainedCount > 0
+      ? [blocker("stripe_settlement_member_missing", `${missingRetainedCount} retained settlement member${missingRetainedCount === 1 ? " is" : "s are"} no longer active.`)]
+      : []
+  };
+  const [accounts, bankEvidence] = await Promise.all([
+    loadSystemAccounts(poolOrClient, companyID),
+    loadBankEvidence(poolOrClient, companyID, posting.bank_transaction_id, posting.id, false)
+  ]);
+  return evaluateStripeSettlement({ payout, normalizedMembers, members, bankEvidence, accounts, posting });
 }
 
 function storedDetailPayload(posting, journal, audit) {

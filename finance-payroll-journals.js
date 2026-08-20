@@ -486,6 +486,11 @@ async function loadDetail(poolOrClient, companyID, periodID) {
   };
 }
 
+export async function loadPayrollJournalCloseEvaluation(poolOrClient, companyID, periodID) {
+  const detail = await loadDetail(poolOrClient, companyID, periodID);
+  return detail.source;
+}
+
 async function loadReport(poolOrClient, companyID, range, limit) {
   const [countResult, rowResult] = await Promise.all([
     poolOrClient.query(

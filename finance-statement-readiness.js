@@ -1,10 +1,17 @@
 import { createHash } from "node:crypto";
+import { loadBankSourceCloseEvaluation } from "./finance-bank-sources.js";
+import { loadBankTransferCloseEvaluation } from "./finance-bank-transfers.js";
 import { syncOperationalAccountingSources } from "./finance-operational-accounting.js";
+import { loadOperationalApplicationCloseEvaluation } from "./finance-operational-applications.js";
+import { loadOperationalReceivableCloseEvaluation } from "./finance-operational-journals.js";
+import { loadPayrollJournalCloseEvaluation } from "./finance-payroll-journals.js";
+import { loadStripeSettlementLocalCloseEvaluation } from "./finance-stripe-settlements.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const OPENING_METHODS = new Set(["company_inception_zero", "reviewed_journal"]);
 const MAX_OPENING_CANDIDATES = 100;
 const MAX_AUDIT_ROWS = 50;
+const MAX_CLOSE_AUTHORITIES = 1000;
 
 export class FinanceStatementReadinessError extends Error {
   constructor(code, message, statusCode = 400, details = {}) {
@@ -114,6 +121,30 @@ export function normalizeStatementCoverageProfileRequest({ body = {}, companyTod
   return { ...input, request_fingerprint: statementReadinessFingerprint(input) };
 }
 
+export function normalizeStatementPeriodCloseRequest({ body = {}, companyToday }) {
+  const today = dateOnly(companyToday, "company_today");
+  const asOfDate = dateOnly(body.as_of_date, "as_of_date");
+  if (asOfDate > today) {
+    throw new FinanceStatementReadinessError("statement_as_of_future", "Statement readiness cannot be closed after the company's current local day.");
+  }
+  const sourceInventoryFingerprint = cleanString(body.source_inventory_fingerprint, 64).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(sourceInventoryFingerprint)) {
+    throw new FinanceStatementReadinessError("source_inventory_fingerprint_invalid", "Source inventory fingerprint is invalid.");
+  }
+  const reason = (body.reason ?? "").toString().trim();
+  if (!reason) throw new FinanceStatementReadinessError("statement_period_close_reason_required", "An audit reason is required.");
+  if (reason.length > 500) throw new FinanceStatementReadinessError("statement_period_close_reason_too_long", "Audit reason must be 500 characters or fewer.");
+  const input = {
+    client_request_id: uuid(body.client_request_id, "client_request_id"),
+    expected_profile_version: exactInteger(body.expected_profile_version ?? 0, "expected_profile_version"),
+    expected_close_version: exactInteger(body.expected_close_version ?? 0, "expected_close_version"),
+    as_of_date: asOfDate,
+    source_inventory_fingerprint: sourceInventoryFingerprint,
+    reason
+  };
+  return { ...input, request_fingerprint: statementReadinessFingerprint(input) };
+}
+
 function storedCount(value, field) {
   const parsed = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
   if (!Number.isSafeInteger(parsed) || parsed < 0) {
@@ -145,6 +176,60 @@ export function normalizeStatementCoverageArea({ key, label, row = {}, blockerCo
     evidence_hash: cleanString(row.evidence_hash, 64) || statementReadinessFingerprint({ key, totalCount, coveredCount, blockingCount, metrics }),
     blockers: blockingCount > 0 ? [blocker(blockerCode, blockerMessage, key)] : [],
     warnings
+  };
+}
+
+export function normalizeStatementWorkflowEvidence(records = [], { truncated = false } = {}) {
+  const normalized = records.map((record) => ({
+    workflow: cleanString(record.workflow, 80),
+    authority_id: cleanString(record.authority_id, 80),
+    authority_version: exactInteger(record.authority_version ?? 0, "authority_version"),
+    stored_fingerprint: cleanString(record.stored_fingerprint, 64) || null,
+    live_fingerprint: cleanString(record.live_fingerprint, 64) || null,
+    source_current: record.source_current === true,
+    blocker_codes: [...new Set((record.blocker_codes || []).map((code) => cleanString(code, 100)).filter(Boolean))].sort()
+  })).sort((left, right) => `${left.workflow}|${left.authority_id}`.localeCompare(`${right.workflow}|${right.authority_id}`));
+  const seen = new Set();
+  let duplicate = false;
+  for (const record of normalized) {
+    const key = `${record.workflow}|${record.authority_id}`;
+    if (!record.workflow || !record.authority_id || seen.has(key)) duplicate = true;
+    seen.add(key);
+  }
+  const blockers = [];
+  if (truncated) blockers.push(blocker(
+    "statement_close_evidence_too_large",
+    `The local workflow set exceeds the exact ${MAX_CLOSE_AUTHORITIES}-authority close bound. Shorten the coverage period before closing.`,
+    "source_period_close"
+  ));
+  if (duplicate) blockers.push(blocker(
+    "statement_close_evidence_duplicate",
+    "The local workflow evidence contains a missing or duplicate authority identity.",
+    "source_period_close"
+  ));
+  const staleCount = normalized.filter((record) => !record.source_current).length;
+  if (staleCount > 0) blockers.push(blocker(
+    "statement_close_workflow_stale",
+    `${staleCount} local workflow authorit${staleCount === 1 ? "y no longer matches" : "ies no longer match"} live reviewed evidence.`,
+    "source_period_close"
+  ));
+  const byWorkflow = {};
+  for (const record of normalized) {
+    const summary = byWorkflow[record.workflow] || { total_count: 0, current_count: 0, blocking_count: 0 };
+    summary.total_count += 1;
+    if (record.source_current) summary.current_count += 1;
+    else summary.blocking_count += 1;
+    byWorkflow[record.workflow] = summary;
+  }
+  return {
+    total_count: normalized.length,
+    current_count: normalized.length - staleCount,
+    blocking_count: staleCount,
+    truncated: Boolean(truncated),
+    by_workflow: byWorkflow,
+    evidence_fingerprint: statementReadinessFingerprint(normalized),
+    records: normalized,
+    blockers: uniqueBlockers(blockers)
   };
 }
 
@@ -235,15 +320,93 @@ export function evaluateOpeningCoverage({ profile = null, permanentAccounts = []
   };
 }
 
-export function buildStatementReadiness({ profile = null, opening, areas = [], stripeConnected = false, asOfDate }) {
-  const common = [...(opening?.blockers || []), ...areas.flatMap((area) => area.blockers || [])];
-  if (areas.some((area) => (area.total_count || 0) > 0)) {
-    common.push(blocker(
-      "source_period_close_not_reviewed",
-      "Source inventory exists, but Phase 4E1 does not yet retain a period-close attestation that revalidates every owning workflow's live fingerprint at the requested boundary.",
+export function evaluateStatementPeriodClose({
+  close = null,
+  latestCloseVersion = 0,
+  profile = null,
+  opening,
+  areas = [],
+  workflows,
+  sourceInventoryFingerprint,
+  asOfDate
+}) {
+  const eligibilityBlockers = uniqueBlockers([
+    ...(opening?.blockers || []),
+    ...areas.flatMap((area) => area.blockers || []),
+    ...(workflows?.blockers || [])
+  ]);
+  const eligible = Boolean(profile) && opening?.source_current === true && eligibilityBlockers.length === 0;
+  const matches = Boolean(close)
+    && dateValue(close.coverage_start_date) === profile?.coverage_start_date
+    && dateValue(close.as_of_date) === asOfDate
+    && Number(close.coverage_profile_version) === Number(profile?.version || 0)
+    && close.opening_evidence_fingerprint === opening?.live_fingerprint
+    && close.source_inventory_fingerprint === sourceInventoryFingerprint
+    && close.workflow_evidence_fingerprint === workflows?.evidence_fingerprint;
+  const sourceCurrent = eligible && matches;
+  const localEvidenceExists = areas.some((area) => (area.total_count || 0) > 0) || (workflows?.total_count || 0) > 0;
+  const blockers = [...eligibilityBlockers];
+  if (localEvidenceExists && !sourceCurrent) {
+    blockers.push(blocker(
+      close ? "source_period_close_stale" : "source_period_close_not_reviewed",
+      close
+        ? "The latest retained local period close no longer matches the complete live source-workflow evidence at this boundary."
+        : "Source inventory exists and needs one audited local period close that revalidates every owning workflow's live fingerprint at this boundary.",
       "source_period_close"
     ));
   }
+  return {
+    id: close?.id ? String(close.id) : null,
+    status: sourceCurrent ? "current" : close ? "stale" : "not_reviewed",
+    source_current: sourceCurrent,
+    eligible,
+    version: close ? Number(close.version) : null,
+    latest_version: Number(latestCloseVersion || 0),
+    coverage_start_date: close ? dateValue(close.coverage_start_date) : profile?.coverage_start_date || null,
+    as_of_date: close ? dateValue(close.as_of_date) : asOfDate,
+    source_inventory_fingerprint: close?.source_inventory_fingerprint || null,
+    workflow_evidence_fingerprint: close?.workflow_evidence_fingerprint || null,
+    reason: close?.reason || null,
+    reviewed_by: close?.reviewed_by || null,
+    reviewed_at: close?.created_at || null,
+    blockers: uniqueBlockers(blockers)
+  };
+}
+
+export function buildStatementReadiness({
+  profile = null,
+  opening,
+  areas = [],
+  workflows = normalizeStatementWorkflowEvidence([]),
+  periodCloseRow = null,
+  latestCloseVersion = 0,
+  stripeConnected = false,
+  asOfDate
+}) {
+  const sourceInventoryFingerprint = statementReadinessFingerprint({
+    coverage_start_date: profile?.coverage_start_date || null,
+    as_of_date: asOfDate,
+    opening_fingerprint: opening?.live_fingerprint || null,
+    areas: areas.map((area) => ({ key: area.key, evidence_hash: area.evidence_hash, metrics: area.metrics })),
+    workflow_evidence_fingerprint: workflows.evidence_fingerprint,
+    stripe_connected: Boolean(stripeConnected)
+  });
+  const periodClose = evaluateStatementPeriodClose({
+    close: periodCloseRow,
+    latestCloseVersion,
+    profile,
+    opening,
+    areas,
+    workflows,
+    sourceInventoryFingerprint,
+    asOfDate
+  });
+  const common = uniqueBlockers([
+    ...(opening?.blockers || []),
+    ...areas.flatMap((area) => area.blockers || []),
+    ...(workflows?.blockers || []),
+    ...periodClose.blockers.filter((item) => item.code.startsWith("source_period_close_"))
+  ]);
   const payrollArea = areas.find((area) => area.key === "payroll_accruals");
   if ((payrollArea?.total_count || 0) > 0 || (payrollArea?.metrics?.payroll_time_entry_count || 0) > 0) {
     common.push(blocker(
@@ -268,13 +431,6 @@ export function buildStatementReadiness({ profile = null, opening, areas = [], s
       "cash_flow_classification"
     )
   ]);
-  const sourceInventoryFingerprint = statementReadinessFingerprint({
-    coverage_start_date: profile?.coverage_start_date || null,
-    as_of_date: asOfDate,
-    opening_fingerprint: opening?.live_fingerprint || null,
-    areas: areas.map((area) => ({ key: area.key, evidence_hash: area.evidence_hash, metrics: area.metrics })),
-    stripe_connected: Boolean(stripeConnected)
-  });
   const statementGate = (statement, blockers) => ({
     statement,
     status: blockers.length === 0 ? "coverage_ready" : "blocked",
@@ -286,6 +442,8 @@ export function buildStatementReadiness({ profile = null, opening, areas = [], s
   return {
     source_inventory_fingerprint: sourceInventoryFingerprint,
     areas,
+    workflows,
+    period_close: periodClose,
     statements: {
       balance_sheet: statementGate("balance_sheet", balanceSheetBlockers),
       cash_flow: statementGate("cash_flow", cashFlowBlockers)
@@ -334,6 +492,53 @@ export async function installFinanceStatementReadinessSchema(pool) {
     );
     CREATE INDEX IF NOT EXISTS finance_statement_coverage_audit_company_created_idx
       ON finance_statement_coverage_audit(company_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS finance_statement_period_closes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL CHECK (version > 0),
+      coverage_profile_version INTEGER NOT NULL CHECK (coverage_profile_version > 0),
+      coverage_start_date DATE NOT NULL,
+      as_of_date DATE NOT NULL CHECK (as_of_date >= coverage_start_date),
+      opening_evidence_fingerprint TEXT NOT NULL CHECK (char_length(opening_evidence_fingerprint)=64),
+      source_inventory_fingerprint TEXT NOT NULL CHECK (char_length(source_inventory_fingerprint)=64),
+      workflow_evidence_fingerprint TEXT NOT NULL CHECK (char_length(workflow_evidence_fingerprint)=64),
+      evidence_snapshot JSONB NOT NULL,
+      supersedes_close_id UUID,
+      client_request_id UUID NOT NULL,
+      request_fingerprint TEXT NOT NULL CHECK (char_length(request_fingerprint)=64),
+      reason TEXT NOT NULL,
+      reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, id),
+      UNIQUE(company_id, version),
+      UNIQUE(company_id, client_request_id),
+      FOREIGN KEY (company_id, supersedes_close_id)
+        REFERENCES finance_statement_period_closes(company_id, id) ON DELETE RESTRICT
+    );
+    CREATE INDEX IF NOT EXISTS finance_statement_period_closes_company_boundary_idx
+      ON finance_statement_period_closes(company_id, coverage_start_date, as_of_date, version DESC);
+
+    CREATE TABLE IF NOT EXISTS finance_statement_period_close_audit (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      close_id UUID NOT NULL,
+      version INTEGER NOT NULL CHECK (version > 0),
+      coverage_start_date DATE NOT NULL,
+      as_of_date DATE NOT NULL,
+      source_inventory_fingerprint TEXT NOT NULL CHECK (char_length(source_inventory_fingerprint)=64),
+      workflow_evidence_fingerprint TEXT NOT NULL CHECK (char_length(workflow_evidence_fingerprint)=64),
+      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL CHECK (action='local_period_closed'),
+      reason TEXT NOT NULL,
+      evidence_snapshot JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(company_id, close_id),
+      FOREIGN KEY (company_id, close_id)
+        REFERENCES finance_statement_period_closes(company_id, id) ON DELETE RESTRICT
+    );
+    CREATE INDEX IF NOT EXISTS finance_statement_period_close_audit_company_created_idx
+      ON finance_statement_period_close_audit(company_id, created_at DESC);
   `);
 }
 
@@ -618,8 +823,20 @@ async function loadInventoryAreas(poolOrClient, companyID, startDate, asOfDate, 
            ON application.company_id=revision.company_id AND application.kind='refund' AND application.refund_revision_id=revision.id
          LEFT JOIN finance_journal_entries journal
            ON journal.company_id=application.company_id AND journal.id=application.journal_entry_id
-        WHERE revision.company_id=$1
+       WHERE revision.company_id=$1
           AND (revision.occurred_at IS NULL OR (revision.occurred_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date)
+       UNION ALL
+       SELECT 'customer_credit', application.id, application.version, application.entry_date::timestamp,
+              application.id, application.version,
+              CASE WHEN application.status='posted' AND journal.id IS NOT NULL
+                         AND journal.source_type='finance_operational_application'
+                         AND journal.source_id=application.id AND journal.source_version=application.version
+                   THEN true ELSE false END
+         FROM finance_operational_applications application
+         LEFT JOIN finance_journal_entries journal
+           ON journal.company_id=application.company_id AND journal.id=application.journal_entry_id
+        WHERE application.company_id=$1 AND application.kind='customer_credit' AND application.status='posted'
+          AND application.entry_date BETWEEN $2::date AND $3::date
      )
      SELECT COUNT(*)::int AS total_count,
             COUNT(*) FILTER (WHERE covered)::int AS covered_count,
@@ -715,9 +932,9 @@ async function loadInventoryAreas(poolOrClient, companyID, startDate, asOfDate, 
       blockerMessage: "Every current completed-job receivable in the coverage period needs exact dated source evidence and a current source-owned journal."
     }),
     normalizeStatementCoverageArea({
-      key: "operational_applications", label: "Payment and refund applications",
+      key: "operational_applications", label: "Payment, refund, and customer-credit applications",
       row: applicationResult.rows[0], blockerCode: "operational_application_coverage_incomplete",
-      blockerMessage: "Every collected payment and retained refund revision in the coverage period needs exact dated application authority and a current source-owned journal."
+      blockerMessage: "Every collected payment, retained refund revision, and posted customer-credit application in the coverage period needs exact dated application authority and a current source-owned journal."
     }),
     normalizeStatementCoverageArea({
       key: "payroll_accruals", label: "Supported payroll accruals",
@@ -730,6 +947,157 @@ async function loadInventoryAreas(poolOrClient, companyID, startDate, asOfDate, 
       blockerMessage: "Every posted payment/refund application in the period must be bound to an exact current settlement before Payment Clearing can be treated as settled."
     })
   ];
+}
+
+async function loadWorkflowEvidence(poolOrClient, companyID, startDate, asOfDate, timezone) {
+  const { rows } = await poolOrClient.query(
+    `WITH authorities AS (
+       SELECT 'bank_transaction'::text AS workflow, posting.finance_transaction_id AS authority_id,
+              posting.version AS authority_version, posting.source_fingerprint AS stored_source_fingerprint,
+              posting.journal_entry_id, 'finance_transaction'::text AS expected_source_type,
+              posting.finance_transaction_id AS expected_source_id
+         FROM finance_bank_transaction_postings posting
+         JOIN finance_transactions tx ON tx.company_id=posting.company_id AND tx.id=posting.finance_transaction_id
+        WHERE posting.company_id=$1 AND posting.status='posted'
+          AND tx.transaction_date BETWEEN $2::date AND $3::date
+       UNION ALL
+       SELECT 'bank_transfer', pair.id, pair.version, pair.source_fingerprint, pair.journal_entry_id,
+              'finance_transfer_pair', pair.id
+         FROM finance_transfer_pairs pair
+         JOIN finance_journal_entries entry ON entry.company_id=pair.company_id AND entry.id=pair.journal_entry_id
+        WHERE pair.company_id=$1 AND pair.status='posted' AND entry.entry_date BETWEEN $2::date AND $3::date
+       UNION ALL
+       SELECT 'job_receivable', posting.operational_source_id, posting.version, posting.source_fingerprint,
+              posting.journal_entry_id, 'finance_operational_source', posting.operational_source_id
+         FROM finance_operational_receivable_postings posting
+         JOIN finance_operational_sources source
+           ON source.company_id=posting.company_id AND source.id=posting.operational_source_id
+        WHERE posting.company_id=$1 AND posting.status='posted'
+          AND source.occurred_at IS NOT NULL
+          AND (source.occurred_at AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
+       UNION ALL
+       SELECT 'operational_application', application.id, application.version, application.source_fingerprint,
+              application.journal_entry_id, 'finance_operational_application', application.id
+         FROM finance_operational_applications application
+        WHERE application.company_id=$1 AND application.status='posted'
+          AND application.entry_date BETWEEN $2::date AND $3::date
+       UNION ALL
+       SELECT 'payroll_accrual', posting.evaluation_period_id, posting.version, posting.source_fingerprint,
+              posting.journal_entry_id, 'finance_payroll_evaluation', posting.evaluation_period_id
+         FROM finance_payroll_journal_postings posting
+         JOIN finance_payroll_evaluation_periods evaluation
+           ON evaluation.company_id=posting.company_id AND evaluation.id=posting.evaluation_period_id
+        WHERE posting.company_id=$1 AND posting.status='posted'
+          AND evaluation.end_date BETWEEN $2::date AND $3::date
+       UNION ALL
+       SELECT 'stripe_settlement', settlement.id, settlement.version, settlement.source_fingerprint,
+              settlement.journal_entry_id, 'finance_stripe_settlement', settlement.id
+         FROM finance_stripe_settlements settlement
+         JOIN finance_journal_entries entry
+           ON entry.company_id=settlement.company_id AND entry.id=settlement.journal_entry_id
+        WHERE settlement.company_id=$1 AND settlement.status='posted'
+          AND entry.entry_date BETWEEN $2::date AND $3::date
+     )
+     SELECT authority.*, journal.source_type AS journal_source_type,
+            journal.source_id AS journal_source_id, journal.source_version AS journal_source_version,
+            reversed.id AS journal_reversed_by_entry_id
+       FROM authorities authority
+       LEFT JOIN finance_journal_entries journal
+         ON journal.company_id=$1 AND journal.id=authority.journal_entry_id
+       LEFT JOIN finance_journal_entries reversed
+         ON reversed.company_id=journal.company_id AND reversed.reversal_of_entry_id=journal.id
+      ORDER BY authority.workflow, authority.authority_id
+      LIMIT $5`,
+    [companyID, startDate, asOfDate, timezone, MAX_CLOSE_AUTHORITIES + 1]
+  );
+  const truncated = rows.length > MAX_CLOSE_AUTHORITIES;
+  const records = [];
+  for (const row of rows.slice(0, MAX_CLOSE_AUTHORITIES)) {
+    let evaluation;
+    try {
+      switch (row.workflow) {
+      case "bank_transaction":
+        evaluation = await loadBankSourceCloseEvaluation(poolOrClient, companyID, row.authority_id);
+        break;
+      case "bank_transfer":
+        evaluation = await loadBankTransferCloseEvaluation(poolOrClient, companyID, row.authority_id);
+        break;
+      case "job_receivable":
+        evaluation = await loadOperationalReceivableCloseEvaluation(poolOrClient, companyID, row.authority_id);
+        break;
+      case "operational_application":
+        evaluation = await loadOperationalApplicationCloseEvaluation(poolOrClient, companyID, row.authority_id);
+        break;
+      case "payroll_accrual":
+        evaluation = await loadPayrollJournalCloseEvaluation(poolOrClient, companyID, row.authority_id);
+        break;
+      case "stripe_settlement":
+        evaluation = await loadStripeSettlementLocalCloseEvaluation(poolOrClient, companyID, row.authority_id);
+        break;
+      default:
+        throw new FinanceStatementReadinessError("statement_close_workflow_invalid", "Stored close workflow kind is invalid.", 409);
+      }
+    } catch (error) {
+      if (!error?.statusCode) throw error;
+      evaluation = {
+        source_current: false,
+        source_fingerprint: null,
+        blockers: [{ code: error.code || "workflow_evaluation_failed" }]
+      };
+    }
+    const journalCurrent = Boolean(row.journal_entry_id)
+      && row.journal_source_type === row.expected_source_type
+      && String(row.journal_source_id || "") === String(row.expected_source_id)
+      && Number(row.journal_source_version) === Number(row.authority_version)
+      && !row.journal_reversed_by_entry_id;
+    const blockerCodes = (evaluation.blockers || []).map((item) => item.code).filter(Boolean);
+    if (!journalCurrent) blockerCodes.push("workflow_journal_authority_invalid");
+    records.push({
+      workflow: row.workflow,
+      authority_id: String(row.authority_id),
+      authority_version: Number(row.authority_version),
+      stored_fingerprint: row.stored_source_fingerprint,
+      live_fingerprint: evaluation.source_fingerprint || null,
+      source_current: evaluation.source_current === true && journalCurrent,
+      blocker_codes: blockerCodes
+    });
+  }
+  return normalizeStatementWorkflowEvidence(records, { truncated });
+}
+
+async function loadPeriodCloseState(poolOrClient, companyID, coverageStartDate, asOfDate, auditLimit = MAX_AUDIT_ROWS) {
+  const [closeResult, versionResult, auditResult] = await Promise.all([
+    poolOrClient.query(
+      `SELECT * FROM finance_statement_period_closes
+        WHERE company_id=$1 AND coverage_start_date=$2::date AND as_of_date=$3::date
+        ORDER BY version DESC LIMIT 1`,
+      [companyID, coverageStartDate, asOfDate]
+    ),
+    poolOrClient.query(
+      `SELECT COALESCE(MAX(version),0)::int AS latest_version
+         FROM finance_statement_period_closes WHERE company_id=$1`,
+      [companyID]
+    ),
+    poolOrClient.query(
+      `SELECT id, close_id, version, coverage_start_date, as_of_date, action, reason,
+              source_inventory_fingerprint, workflow_evidence_fingerprint, actor_user_id, created_at
+         FROM finance_statement_period_close_audit
+        WHERE company_id=$1 ORDER BY created_at DESC LIMIT $2`,
+      [companyID, Math.min(Math.max(Number(auditLimit) || MAX_AUDIT_ROWS, 1), 100)]
+    )
+  ]);
+  return {
+    close: closeResult.rows[0] || null,
+    latest_version: Number(versionResult.rows[0]?.latest_version || 0),
+    audit: auditResult.rows.map((row) => ({
+      id: String(row.id), close_id: String(row.close_id), version: Number(row.version),
+      coverage_start_date: dateValue(row.coverage_start_date), as_of_date: dateValue(row.as_of_date),
+      action: row.action, reason: row.reason,
+      source_inventory_fingerprint: row.source_inventory_fingerprint,
+      workflow_evidence_fingerprint: row.workflow_evidence_fingerprint,
+      actor_user_id: row.actor_user_id || null, created_at: timestampValue(row.created_at)
+    }))
+  };
 }
 
 async function loadStatementReadiness(pool, companyID, asOfValue, auditLimit, ensureChartAccounts) {
@@ -754,10 +1122,19 @@ async function loadStatementReadiness(pool, companyID, asOfValue, auditLimit, en
     const areas = profile
       ? await loadInventoryAreas(client, companyID, profile.coverage_start_date, asOfDate, context.timezone)
       : [];
+    const workflows = profile
+      ? await loadWorkflowEvidence(client, companyID, profile.coverage_start_date, asOfDate, context.timezone)
+      : normalizeStatementWorkflowEvidence([]);
+    const closeState = profile
+      ? await loadPeriodCloseState(client, companyID, profile.coverage_start_date, asOfDate, auditLimit)
+      : { close: null, latest_version: 0, audit: [] };
     const readiness = buildStatementReadiness({
       profile,
       opening,
       areas,
+      workflows,
+      periodCloseRow: closeState.close,
+      latestCloseVersion: closeState.latest_version,
       stripeConnected: context.stripe_connected,
       asOfDate
     });
@@ -778,6 +1155,7 @@ async function loadStatementReadiness(pool, companyID, asOfValue, auditLimit, en
       opening_journal_candidates: openingCandidates.candidates,
       opening_journal_candidates_truncated: openingCandidates.truncated,
       audit,
+      period_close_audit: closeState.audit,
       ...readiness,
       warnings: [
         "This screen inventories formal-statement coverage; it is not a Balance Sheet or Cash Flow report.",
@@ -893,6 +1271,122 @@ export function installFinanceStatementReadinessRoutes({ app, pool, authRequired
       sendError(res, error, "statement_coverage_update_failed");
     } finally {
       client.release();
+    }
+  });
+
+  app.post("/api/finance/accounting/statement-readiness/period-close", authRequired, requireFinanceAccess, async (req, res) => {
+    if (!req.companyId) return res.status(400).json({ error: "company_required", message: "Statement readiness requires a company workspace." });
+    let client = null;
+    try {
+      await ensureChartAccounts(pool, req.companyId, req.userId);
+      client = await pool.connect();
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, [`${req.companyId}|accounting`]);
+      await syncOperationalAccountingSources(client, req.companyId);
+      const context = await loadCompanyContext(client, req.companyId);
+      const request = normalizeStatementPeriodCloseRequest({ body: req.body, companyToday: context.company_today });
+      const replay = await client.query(
+        `SELECT request_fingerprint FROM finance_statement_period_closes
+          WHERE company_id=$1 AND client_request_id=$2::uuid FOR UPDATE`,
+        [req.companyId, request.client_request_id]
+      );
+      if (replay.rows.length) {
+        if (replay.rows[0].request_fingerprint !== request.request_fingerprint) {
+          throw new FinanceStatementReadinessError("statement_period_close_request_conflict", "That request ID was already used with different content.", 409);
+        }
+        await client.query("COMMIT");
+        return res.json({ replayed: true, ...(await loadStatementReadiness(pool, req.companyId, request.as_of_date, req.query.audit_limit, ensureChartAccounts)) });
+      }
+      const profileRow = await loadProfile(client, req.companyId, { lock: true });
+      if (!profileRow) {
+        throw new FinanceStatementReadinessError("statement_coverage_profile_missing", "Review opening coverage before closing a local period.", 409);
+      }
+      const profile = { ...profilePayload(profileRow), timezone: context.timezone };
+      if (request.as_of_date < profile.coverage_start_date) {
+        throw new FinanceStatementReadinessError("statement_as_of_before_coverage", "As-of date must be on or after the reviewed coverage start.");
+      }
+      if (request.expected_profile_version !== profile.version) {
+        throw new FinanceStatementReadinessError("statement_period_close_profile_stale", "Opening coverage changed after this close was loaded.", 409, { current_version: profile.version });
+      }
+      const [opening, areas, workflows, closeState] = await Promise.all([
+        loadOpeningEvidence(client, req.companyId, { ...profileRow, timezone: context.timezone }),
+        loadInventoryAreas(client, req.companyId, profile.coverage_start_date, request.as_of_date, context.timezone),
+        loadWorkflowEvidence(client, req.companyId, profile.coverage_start_date, request.as_of_date, context.timezone),
+        loadPeriodCloseState(client, req.companyId, profile.coverage_start_date, request.as_of_date, req.query.audit_limit)
+      ]);
+      if (request.expected_close_version !== closeState.latest_version) {
+        throw new FinanceStatementReadinessError("statement_period_close_stale", "Local period-close authority changed after it was loaded.", 409, { current_version: closeState.latest_version });
+      }
+      const readiness = buildStatementReadiness({
+        profile,
+        opening,
+        areas,
+        workflows,
+        periodCloseRow: closeState.close,
+        latestCloseVersion: closeState.latest_version,
+        stripeConnected: context.stripe_connected,
+        asOfDate: request.as_of_date
+      });
+      if (request.source_inventory_fingerprint !== readiness.source_inventory_fingerprint) {
+        throw new FinanceStatementReadinessError("statement_period_close_inventory_stale", "Source inventory changed after this close was loaded.", 409);
+      }
+      if (!readiness.period_close.eligible) {
+        throw new FinanceStatementReadinessError(
+          "statement_period_close_blocked",
+          "Resolve every local opening, source-area, and workflow blocker before closing the period.",
+          409,
+          { blockers: readiness.period_close.blockers }
+        );
+      }
+      const nextVersion = closeState.latest_version + 1;
+      const evidenceSnapshot = {
+        coverage_profile_version: profile.version,
+        coverage_start_date: profile.coverage_start_date,
+        as_of_date: request.as_of_date,
+        opening_evidence_fingerprint: opening.live_fingerprint,
+        source_inventory_fingerprint: readiness.source_inventory_fingerprint,
+        workflow_evidence_fingerprint: workflows.evidence_fingerprint,
+        areas: areas.map((area) => ({
+          key: area.key,
+          total_count: area.total_count,
+          covered_count: area.covered_count,
+          blocking_count: area.blocking_count,
+          metrics: area.metrics,
+          evidence_hash: area.evidence_hash
+        })),
+        workflows: workflows.records
+      };
+      const insertResult = await client.query(
+        `INSERT INTO finance_statement_period_closes (
+           company_id, version, coverage_profile_version, coverage_start_date, as_of_date,
+           opening_evidence_fingerprint, source_inventory_fingerprint, workflow_evidence_fingerprint,
+           evidence_snapshot, supersedes_close_id, client_request_id, request_fingerprint,
+           reason, reviewed_by
+         ) VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9,$10::uuid,$11::uuid,$12,$13,$14)
+         RETURNING *`,
+        [req.companyId, nextVersion, profile.version, profile.coverage_start_date, request.as_of_date,
+          opening.live_fingerprint, readiness.source_inventory_fingerprint, workflows.evidence_fingerprint,
+          JSON.stringify(evidenceSnapshot), closeState.close?.id || null, request.client_request_id,
+          request.request_fingerprint, request.reason, req.userId]
+      );
+      const saved = insertResult.rows[0];
+      await client.query(
+        `INSERT INTO finance_statement_period_close_audit (
+           company_id, close_id, version, coverage_start_date, as_of_date,
+           source_inventory_fingerprint, workflow_evidence_fingerprint,
+           actor_user_id, action, reason, evidence_snapshot
+         ) VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,'local_period_closed',$9,$10)`,
+        [req.companyId, saved.id, nextVersion, profile.coverage_start_date, request.as_of_date,
+          readiness.source_inventory_fingerprint, workflows.evidence_fingerprint,
+          req.userId, request.reason, JSON.stringify(evidenceSnapshot)]
+      );
+      await client.query("COMMIT");
+      res.json({ replayed: false, ...(await loadStatementReadiness(pool, req.companyId, request.as_of_date, req.query.audit_limit, ensureChartAccounts)) });
+    } catch (error) {
+      await client?.query("ROLLBACK").catch(() => {});
+      sendError(res, error, "statement_period_close_failed");
+    } finally {
+      client?.release();
     }
   });
 }

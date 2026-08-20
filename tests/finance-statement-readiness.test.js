@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
   buildStatementReadiness,
+  evaluateStatementPeriodClose,
   evaluateOpeningCoverage,
   installFinanceStatementReadinessRoutes,
   installFinanceStatementReadinessSchema,
   normalizeStatementCoverageArea,
   normalizeStatementCoverageProfileRequest,
+  normalizeStatementPeriodCloseRequest,
+  normalizeStatementWorkflowEvidence,
   statementReadinessFingerprint
 } from "../finance-statement-readiness.js";
 
@@ -78,6 +81,32 @@ test("coverage profile requests require exact date, method, journal identity, ve
   assert.throws(() => normalizeStatementCoverageProfileRequest({
     body: request({ reason: "x".repeat(501) }), companyToday: "2026-08-19"
   }), (error) => error.code === "statement_coverage_reason_too_long");
+});
+
+test("period close requests require loaded versions, exact inventory identity, date, UUID, and reason", () => {
+  const input = normalizeStatementPeriodCloseRequest({
+    companyToday: "2026-08-19",
+    body: {
+      client_request_id: REQUEST_ID,
+      expected_profile_version: 3,
+      expected_close_version: 7,
+      as_of_date: "2026-08-19",
+      source_inventory_fingerprint: "a".repeat(64),
+      reason: "Reviewed every current local source workflow"
+    }
+  });
+  assert.equal(input.expected_profile_version, 3);
+  assert.equal(input.expected_close_version, 7);
+  assert.match(input.request_fingerprint, /^[0-9a-f]{64}$/);
+  assert.throws(() => normalizeStatementPeriodCloseRequest({
+    companyToday: "2026-08-19", body: { ...input, as_of_date: "2026-08-20" }
+  }), (error) => error.code === "statement_as_of_future");
+  assert.throws(() => normalizeStatementPeriodCloseRequest({
+    companyToday: "2026-08-19", body: { ...input, source_inventory_fingerprint: "bad" }
+  }), (error) => error.code === "source_inventory_fingerprint_invalid");
+  assert.throws(() => normalizeStatementPeriodCloseRequest({
+    companyToday: "2026-08-19", body: { ...input, reason: "" }
+  }), (error) => error.code === "statement_period_close_reason_required");
 });
 
 test("company inception zero fails closed when retained activity predates the start", () => {
@@ -233,6 +262,67 @@ test("statement gates keep close, provider, payroll, and cash-flow limitations e
   assert.match(blocked.source_inventory_fingerprint, /^[0-9a-f]{64}$/);
 });
 
+test("workflow evidence is canonical, exact, and blocks stale or duplicate authority", () => {
+  const current = normalizeStatementWorkflowEvidence([
+    { workflow: "job_receivable", authority_id: "b", authority_version: 2, stored_fingerprint: "b".repeat(64), live_fingerprint: "b".repeat(64), source_current: true },
+    { workflow: "bank_transaction", authority_id: "a", authority_version: 1, stored_fingerprint: "a".repeat(64), live_fingerprint: "a".repeat(64), source_current: true }
+  ]);
+  const reordered = normalizeStatementWorkflowEvidence([...current.records].reverse());
+  assert.equal(current.evidence_fingerprint, reordered.evidence_fingerprint);
+  assert.equal(current.current_count, 2);
+  assert.equal(current.by_workflow.bank_transaction.current_count, 1);
+
+  const stale = normalizeStatementWorkflowEvidence([
+    { ...current.records[0], source_current: false, blocker_codes: ["source_changed"] }
+  ]);
+  assert.equal(stale.blocking_count, 1);
+  assert.ok(stale.blockers.some((item) => item.code === "statement_close_workflow_stale"));
+
+  const duplicate = normalizeStatementWorkflowEvidence([current.records[0], current.records[0]]);
+  assert.ok(duplicate.blockers.some((item) => item.code === "statement_close_evidence_duplicate"));
+  const oversized = normalizeStatementWorkflowEvidence([], { truncated: true });
+  assert.ok(oversized.blockers.some((item) => item.code === "statement_close_evidence_too_large"));
+});
+
+test("a matching local close clears only the local-close blocker and becomes stale on evidence change", () => {
+  const profile = { coverage_start_date: "2026-01-01", version: 2 };
+  const opening = { status: "current", source_current: true, live_fingerprint: "o".repeat(64), blockers: [] };
+  const area = normalizeStatementCoverageArea({
+    key: "bank_transactions", label: "Bank transactions",
+    row: { total_count: 1, covered_count: 1, blocking_count: 0, evidence_hash: "bank" },
+    blockerCode: "bank_incomplete", blockerMessage: "Incomplete"
+  });
+  const workflows = normalizeStatementWorkflowEvidence([
+    { workflow: "bank_transaction", authority_id: "source", authority_version: 1,
+      stored_fingerprint: "a".repeat(64), live_fingerprint: "a".repeat(64), source_current: true }
+  ]);
+  const unclosed = buildStatementReadiness({ profile, opening, areas: [area], workflows, stripeConnected: false, asOfDate: "2026-08-19" });
+  assert.ok(unclosed.statements.balance_sheet.blockers.some((item) => item.code === "source_period_close_not_reviewed"));
+  const row = {
+    id: "close", version: 4, coverage_profile_version: 2,
+    coverage_start_date: "2026-01-01", as_of_date: "2026-08-19",
+    opening_evidence_fingerprint: opening.live_fingerprint,
+    source_inventory_fingerprint: unclosed.source_inventory_fingerprint,
+    workflow_evidence_fingerprint: workflows.evidence_fingerprint,
+    reason: "Reviewed", reviewed_by: "owner", created_at: null
+  };
+  const closed = buildStatementReadiness({
+    profile, opening, areas: [area], workflows, periodCloseRow: row, latestCloseVersion: 4,
+    stripeConnected: false, asOfDate: "2026-08-19"
+  });
+  assert.equal(closed.period_close.status, "current");
+  assert.equal(closed.period_close.source_current, true);
+  assert.ok(!closed.statements.balance_sheet.blockers.some((item) => item.code.startsWith("source_period_close_")));
+  assert.ok(closed.statements.cash_flow.blockers.some((item) => item.code === "cash_flow_classification_unavailable"));
+
+  const stale = evaluateStatementPeriodClose({
+    close: row, latestCloseVersion: 4, profile, opening, areas: [area], workflows,
+    sourceInventoryFingerprint: "c".repeat(64), asOfDate: "2026-08-19"
+  });
+  assert.equal(stale.status, "stale");
+  assert.ok(stale.blockers.some((item) => item.code === "source_period_close_stale"));
+});
+
 test("fingerprints are canonical and content sensitive", () => {
   assert.equal(statementReadinessFingerprint({ b: 2, a: 1 }), statementReadinessFingerprint({ a: 1, b: 2 }));
   assert.notEqual(statementReadinessFingerprint({ a: 1 }), statementReadinessFingerprint({ a: 2 }));
@@ -244,19 +334,24 @@ test("schema is additive, tenant-scoped, audited, and creates no statements", as
   const sql = calls.join("\n");
   assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_statement_coverage_profiles/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_statement_coverage_audit/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_statement_period_closes/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS finance_statement_period_close_audit/);
   assert.match(sql, /FOREIGN KEY \(company_id, opening_journal_entry_id\)/);
   assert.match(sql, /UNIQUE\(company_id, client_request_id\)/);
   assert.match(sql, /company_inception_zero/);
   assert.match(sql, /reviewed_journal/);
+  assert.match(sql, /UNIQUE\(company_id, version\)/);
+  assert.match(sql, /FOREIGN KEY \(company_id, supersedes_close_id\)/);
   assert.doesNotMatch(sql, /DROP TABLE|TRUNCATE/);
   assert.doesNotMatch(sql, /finance_balance_sheet|finance_cash_flow/);
 });
 
-test("routes expose readiness/profile only and source retains repeatable-read inventory gates", () => {
+test("routes expose readiness, opening review, and append-only close while retaining live workflow gates", () => {
   const routes = [];
   const app = {
     get(path) { routes.push(["GET", path]); },
-    put(path) { routes.push(["PUT", path]); }
+    put(path) { routes.push(["PUT", path]); },
+    post(path) { routes.push(["POST", path]); }
   };
   installFinanceStatementReadinessRoutes({
     app,
@@ -267,7 +362,8 @@ test("routes expose readiness/profile only and source retains repeatable-read in
   });
   assert.deepEqual(routes, [
     ["GET", "/api/finance/accounting/statement-readiness"],
-    ["PUT", "/api/finance/accounting/statement-readiness/profile"]
+    ["PUT", "/api/finance/accounting/statement-readiness/profile"],
+    ["POST", "/api/finance/accounting/statement-readiness/period-close"]
   ]);
   const source = fs.readFileSync(new URL("../finance-statement-readiness.js", import.meta.url), "utf8");
   assert.match(source, /BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY/);
@@ -275,6 +371,10 @@ test("routes expose readiness/profile only and source retains repeatable-read in
   assert.match(source, /cash_flow_classification_unavailable/);
   assert.match(source, /stripe_provider_period_inventory_unavailable/);
   assert.match(source, /payroll_cash_settlement_unsupported/);
+  assert.match(source, /loadBankSourceCloseEvaluation/);
+  assert.match(source, /loadOperationalApplicationCloseEvaluation/);
+  assert.match(source, /application\.kind='customer_credit'/);
+  assert.match(source, /BEGIN ISOLATION LEVEL REPEATABLE READ/);
   assert.doesNotMatch(source, /\/balance-sheet|\/cash-flow/);
 });
 

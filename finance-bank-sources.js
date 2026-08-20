@@ -878,6 +878,11 @@ async function loadTransactionDetail(poolOrClient, companyID, transactionID) {
   };
 }
 
+export async function loadBankSourceCloseEvaluation(poolOrClient, companyID, transactionID) {
+  const detail = await loadTransactionDetail(poolOrClient, companyID, transactionID);
+  return detail.transaction;
+}
+
 async function insertLedgerAudit(client, companyID, userID, entry, relatedEntry, action, reason, input) {
   await client.query(
     `INSERT INTO finance_journal_audit (company_id, entry_id, related_entry_id, actor_user_id, action, reason, entry_snapshot)

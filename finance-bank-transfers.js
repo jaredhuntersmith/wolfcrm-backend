@@ -724,6 +724,11 @@ async function loadPairDetail(poolOrClient, companyID, pairID) {
   };
 }
 
+export async function loadBankTransferCloseEvaluation(poolOrClient, companyID, pairID) {
+  const detail = await loadPairDetail(poolOrClient, companyID, pairID);
+  return detail.pair;
+}
+
 async function loadTransferReport(poolOrClient, companyID, range, limit) {
   const candidateResult = await poolOrClient.query(
     `${SOURCE_SELECT}

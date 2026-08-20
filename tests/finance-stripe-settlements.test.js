@@ -189,6 +189,27 @@ test("an explicit reconciled clearing deposit produces exact bank fee and cleari
   assert.equal(result.source_snapshot.members[1].operational_application_id, IDs.refundApp);
 });
 
+test("a matching retained fingerprint is not current while live settlement evidence is blocked", () => {
+  const payout = normalizeStripePayout(providerPayout());
+  const normalized = normalizeStripeBalanceMembers(rawMembers(), "usd");
+  const members = resolvedMembers(normalized);
+  const baseline = evaluateStripeSettlement({ payout, normalizedMembers: normalized, members, bankEvidence: bankEvidence(), accounts: accounts() });
+  const blocked = evaluateStripeSettlement({
+    payout,
+    normalizedMembers: normalized,
+    members: members.map((member, index) => index === 0
+      ? { ...member, blockers: [{ code: "stripe_settlement_application_stale", message: "Application changed." }] }
+      : member),
+    bankEvidence: bankEvidence(),
+    accounts: accounts(),
+    posting: { status: "posted", source_fingerprint: baseline.source_fingerprint }
+  });
+  assert.equal(blocked.source_fingerprint, baseline.source_fingerprint);
+  assert.equal(blocked.eligible, false);
+  assert.equal(blocked.source_current, false);
+  assert.equal(blocked.review_state, "stale");
+});
+
 test("zero-fee payouts omit the fee line", () => {
   const payout = normalizeStripePayout(providerPayout({ amount: 10_000 }));
   const normalized = normalizeStripeBalanceMembers([{
@@ -277,6 +298,8 @@ test("schema and routes are additive, tenant-scoped, bounded, audited, and never
   assert.match(source, /finance_stripe_settlement_members_active_application_idx/);
   assert.match(source, /stripe\.balanceTransactions\.list/);
   assert.match(source, /stripeAccount: connectedAccountID/);
+  assert.match(source, /applicationEvaluation\.authority_version/);
+  assert.match(applicationsSource, /authority_version: Number\(bundle\.application\.version\)/);
   assert.match(source, /source_snapshot->'payout'->>'arrival_date'/);
   assert.match(source, /SELECT id FROM companies WHERE id=\$1 FOR UPDATE/);
   assert.doesNotMatch(source, /UPDATE finance_transactions\s+SET/);

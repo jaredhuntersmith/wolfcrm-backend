@@ -917,6 +917,37 @@ async function loadCreditBundle(poolOrClient, companyID, { applicationID = null,
   return { application, origin, targetJob, accounts, authority, availableCredit, evaluation };
 }
 
+export async function loadOperationalApplicationCloseEvaluation(poolOrClient, companyID, applicationID) {
+  const result = await poolOrClient.query(
+    `SELECT id, kind, operational_source_id, refund_revision_id
+       FROM finance_operational_applications WHERE company_id=$1 AND id=$2`,
+    [companyID, applicationID]
+  );
+  const application = result.rows[0];
+  if (!application) {
+    throw new FinanceOperationalApplicationError("operational_application_not_found", "Operational application was not found.", 404);
+  }
+  let bundle;
+  if (application.kind === "payment") {
+    bundle = await loadPaymentBundle(poolOrClient, companyID, application.operational_source_id);
+  } else if (application.kind === "refund") {
+    bundle = await loadRefundBundle(poolOrClient, companyID, application.refund_revision_id);
+  } else if (application.kind === "customer_credit") {
+    bundle = await loadCreditBundle(poolOrClient, companyID, { applicationID });
+  } else {
+    throw new FinanceOperationalApplicationError("operational_application_kind_invalid", "Operational application kind is invalid.", 409);
+  }
+  if (String(bundle.application?.id || "") !== String(applicationID)) {
+    throw new FinanceOperationalApplicationError("operational_application_authority_mismatch", "Operational application authority is inconsistent.", 409);
+  }
+  return {
+    ...bundle.evaluation,
+    authority_id: String(bundle.application.id),
+    authority_version: Number(bundle.application.version),
+    authority_kind: bundle.application.kind
+  };
+}
+
 function applicationPayload(kind, bundle) {
   const evaluation = bundle.evaluation;
   const snapshot = evaluation.source_snapshot;
