@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync } from "node:crypto";
 import {
   GOOGLE_ROUTING_LIMITS,
   GoogleRoutingError,
@@ -128,6 +129,7 @@ async function testFixedOrderChunking() {
 async function testRouteOptimizationResponse() {
   const fetchImpl = async (url, init) => {
     assert.match(url, /routeoptimization\.googleapis\.com/);
+    assert.equal(init.headers.Authorization, "Bearer test-oauth-token");
     const body = JSON.parse(init.body);
     assert.equal(body.model.shipments.length, 3);
     return response({
@@ -153,6 +155,7 @@ async function testRouteOptimizationResponse() {
     apiKey: "test-key",
     projectId: "test-project",
     routeOptimizationEnabled: true,
+    routeOptimizationAccessTokenProvider: async () => "test-oauth-token",
     fetchImpl,
     now: () => FIXED_NOW
   });
@@ -215,6 +218,7 @@ async function testRouteOptimizationFallsBackToGoogleMatrix() {
     apiKey: "test-key",
     projectId: "test-project",
     routeOptimizationEnabled: true,
+    routeOptimizationAccessTokenProvider: async () => "test-oauth-token",
     maximumAttempts: 1,
     fetchImpl: async (url, init) => {
       if (url.includes("routeoptimization.googleapis.com")) {
@@ -232,6 +236,47 @@ async function testRouteOptimizationFallsBackToGoogleMatrix() {
   assert.equal(calls.routes.length, 1);
   assert.equal(result.strategy, "route_matrix");
   assert.ok(result.warnings.some((warning) => warning.includes("Route Optimization was unavailable")));
+}
+
+async function testRouteOptimizationServiceAccountOAuth() {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  let tokenRequests = 0;
+  let optimizationRequests = 0;
+  const service = createGoogleRoutingService({
+    apiKey: "test-key",
+    projectId: "test-project",
+    routeOptimizationEnabled: true,
+    routeOptimizationServiceAccountJSON: JSON.stringify({
+      client_email: "wolfcrm-route-optimization@test-project.iam.gserviceaccount.com",
+      private_key: privateKey.export({ type: "pkcs8", format: "pem" }).toString()
+    }),
+    fetchImpl: async (url, init) => {
+      if (url === "https://oauth2.googleapis.com/token") {
+        tokenRequests += 1;
+        assert.match(init.body, /grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer/);
+        assert.ok(!init.body.includes("test-key"));
+        return response({ access_token: "minted-oauth-token", expires_in: 3600 });
+      }
+      assert.match(url, /routeoptimization\.googleapis\.com/);
+      optimizationRequests += 1;
+      assert.equal(init.headers.Authorization, "Bearer minted-oauth-token");
+      assert.equal(init.headers["X-Goog-Api-Key"], undefined);
+      return response({
+        routes: [{
+          vehicleStartTime: "2026-08-19T12:00:00Z",
+          vehicleEndTime: "2026-08-19T12:05:00Z",
+          visits: [{ shipmentLabel: "stop-1", startTime: "2026-08-19T12:05:00Z" }],
+          transitions: [{ travelDuration: "300s", travelDistanceMeters: 2000 }]
+        }]
+      });
+    },
+    now: () => FIXED_NOW
+  });
+  const result = await service.plan(planBody(1));
+  assert.equal(result.strategy, "route_optimization");
+  assert.equal(tokenRequests, 1);
+  assert.equal(optimizationRequests, 1);
+  assert.equal(service.status().route_optimization_configured, true);
 }
 
 async function testValidationAndConfigurationFailures() {
@@ -254,6 +299,7 @@ const tests = [
   ["37-stop matrix batching", testThirtySevenStopMatrixBatching],
   ["fixed-order Compute Routes chunking", testFixedOrderChunking],
   ["Route Optimization response parsing", testRouteOptimizationResponse],
+  ["Route Optimization service-account OAuth", testRouteOptimizationServiceAccountOAuth],
   ["rate-limit retry", testRetryAfterRateLimit],
   ["missing matrix element fails closed", testMissingRoadMatrixElementFailsClosed],
   ["Route Optimization Google-matrix fallback", testRouteOptimizationFallsBackToGoogleMatrix],

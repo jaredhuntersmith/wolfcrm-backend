@@ -1,5 +1,9 @@
+import { createSign } from "node:crypto";
+
 const ROUTES_BASE_URL = "https://routes.googleapis.com";
 const ROUTE_OPTIMIZATION_BASE_URL = "https://routeoptimization.googleapis.com";
+const GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GOOGLE_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 
 export const GOOGLE_ROUTING_LIMITS = Object.freeze({
   maximumStops: 100,
@@ -111,6 +115,7 @@ export function googleRoutingConfigFromEnv(env = process.env) {
   return {
     apiKey,
     projectId,
+    routeOptimizationServiceAccountJSON: firstNonEmpty(env.GOOGLE_ROUTE_OPTIMIZATION_SERVICE_ACCOUNT_JSON),
     routeOptimizationEnabled: parseBoolean(env.GOOGLE_ROUTE_OPTIMIZATION_ENABLED, Boolean(projectId)),
     maximumConcurrency: clampInteger(env.GOOGLE_ROUTING_MAX_CONCURRENCY, 2, 1, 5),
     requestTimeoutMs: clampInteger(env.GOOGLE_ROUTING_TIMEOUT_MS, 12_000, 2_000, 30_000),
@@ -129,6 +134,8 @@ export class GoogleRoutingService {
   constructor({
     apiKey = null,
     projectId = null,
+    routeOptimizationServiceAccountJSON = null,
+    routeOptimizationAccessTokenProvider = null,
     routeOptimizationEnabled = Boolean(projectId),
     maximumConcurrency = 2,
     requestTimeoutMs = 12_000,
@@ -141,6 +148,11 @@ export class GoogleRoutingService {
   } = {}) {
     this.apiKey = firstNonEmpty(apiKey);
     this.projectId = firstNonEmpty(projectId);
+    this.routeOptimizationServiceAccount = parseRouteOptimizationServiceAccount(routeOptimizationServiceAccountJSON);
+    this.routeOptimizationAccessTokenProvider = typeof routeOptimizationAccessTokenProvider === "function"
+      ? routeOptimizationAccessTokenProvider
+      : this.routeOptimizationServiceAccount ? (signal) => this.createRouteOptimizationAccessToken(signal) : null;
+    this.routeOptimizationAccessToken = null;
     this.routeOptimizationEnabled = Boolean(routeOptimizationEnabled);
     this.requestTimeoutMs = requestTimeoutMs;
     this.overallTimeoutMs = overallTimeoutMs;
@@ -156,7 +168,7 @@ export class GoogleRoutingService {
     return {
       configured: Boolean(this.apiKey),
       routes_api_configured: Boolean(this.apiKey),
-      route_optimization_configured: Boolean(this.apiKey && this.projectId && this.routeOptimizationEnabled),
+      route_optimization_configured: Boolean(this.projectId && this.routeOptimizationEnabled && this.routeOptimizationAccessTokenProvider),
       provider: "google",
       maximum_stops: GOOGLE_ROUTING_LIMITS.maximumStops,
       matrix_maximum_elements: GOOGLE_ROUTING_LIMITS.matrixMaximumElements,
@@ -176,7 +188,7 @@ export class GoogleRoutingService {
     const deadline = linkedTimeoutSignal(signal, this.overallTimeoutMs);
     const warnings = [];
     try {
-      if (request.optimizeOrder && request.lockedOrders.size === 0 && this.routeOptimizationEnabled && this.projectId) {
+      if (request.optimizeOrder && request.lockedOrders.size === 0 && this.routeOptimizationEnabled && this.projectId && this.routeOptimizationAccessTokenProvider) {
         try {
           return await this.optimizeTours(request, deadline.signal);
         } catch (error) {
@@ -238,7 +250,7 @@ export class GoogleRoutingService {
     };
 
     const endpoint = `${ROUTE_OPTIMIZATION_BASE_URL}/v1/projects/${encodeURIComponent(this.projectId)}:optimizeTours`;
-    const response = await this.googleRequest(endpoint, body, { signal, cacheable: false });
+    const response = await this.googleRequest(endpoint, body, { signal, cacheable: false, authentication: "routeOptimizationOAuth" });
     if (Array.isArray(response.skippedShipments) && response.skippedShipments.length) {
       throw new GoogleRoutingError("google_optimization_skipped_stops", "Google could not include every stop in this route.", { statusCode: 502 });
     }
@@ -428,7 +440,7 @@ export class GoogleRoutingService {
     };
   }
 
-  async googleRequest(url, body, { signal, fieldMask = null, cacheable = false }) {
+  async googleRequest(url, body, { signal, fieldMask = null, cacheable = false, authentication = "apiKey" }) {
     const cacheKey = cacheable ? JSON.stringify([url, fieldMask, body]) : null;
     if (cacheKey) {
       const cached = this.cache.get(cacheKey);
@@ -442,10 +454,12 @@ export class GoogleRoutingService {
         const value = await this.gate.run(async () => {
           const attemptSignal = linkedTimeoutSignal(signal, this.requestTimeoutMs);
           try {
-            const headers = {
-              "Content-Type": "application/json",
-              "X-Goog-Api-Key": this.apiKey
-            };
+            const headers = { "Content-Type": "application/json" };
+            if (authentication === "routeOptimizationOAuth") {
+              headers.Authorization = `Bearer ${await this.routeOptimizationAccessTokenProvider(attemptSignal.signal)}`;
+            } else {
+              headers["X-Goog-Api-Key"] = this.apiKey;
+            }
             if (fieldMask) headers["X-Goog-FieldMask"] = fieldMask;
             const response = await this.fetchImpl(url, {
               method: "POST",
@@ -490,6 +504,44 @@ export class GoogleRoutingService {
       }
     }
     throw lastError || new GoogleRoutingError("google_routing_failed", "Google routing failed.", { statusCode: 502 });
+  }
+
+  async createRouteOptimizationAccessToken(signal) {
+    const nowMilliseconds = this.now().getTime();
+    if (this.routeOptimizationAccessToken && this.routeOptimizationAccessToken.expiresAt > nowMilliseconds + 60_000) {
+      return this.routeOptimizationAccessToken.value;
+    }
+    const account = this.routeOptimizationServiceAccount;
+    if (!account) {
+      throw new GoogleRoutingError("google_route_optimization_not_configured", "Google Route Optimization OAuth is not configured.", { statusCode: 503 });
+    }
+    const nowSeconds = Math.floor(nowMilliseconds / 1000);
+    const assertion = signedGoogleServiceAccountAssertion(account, nowSeconds);
+    let response;
+    try {
+      response = await this.fetchImpl(GOOGLE_OAUTH_TOKEN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+          assertion
+        }).toString(),
+        signal
+      });
+    } catch (error) {
+      throw new GoogleRoutingError("google_route_optimization_auth_unavailable", "Google Route Optimization authentication is temporarily unavailable.", { statusCode: 502, retryable: true, cause: error });
+    }
+    const body = await safeResponseJson(response);
+    if (!response.ok || typeof body?.access_token !== "string" || !body.access_token) {
+      throw new GoogleRoutingError("google_route_optimization_auth_failed", "Google Route Optimization authentication failed.", {
+        statusCode: 502,
+        retryable: RETRYABLE_STATUS_CODES.has(response.status),
+        details: { upstream_status: response.status }
+      });
+    }
+    const expiresIn = clampInteger(body.expires_in, 3600, 60, 3600);
+    this.routeOptimizationAccessToken = { value: body.access_token, expiresAt: nowMilliseconds + expiresIn * 1000 };
+    return body.access_token;
   }
 }
 
@@ -835,6 +887,43 @@ function firstNonEmpty(...values) {
 function parseBoolean(value, fallback) {
   if (value == null || value === "") return fallback;
   return !["0", "false", "no", "off"].includes(String(value).trim().toLowerCase());
+}
+
+function parseRouteOptimizationServiceAccount(raw) {
+  if (!raw) return null;
+  let value = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (!value || typeof value !== "object") return null;
+  const clientEmail = firstNonEmpty(value.client_email);
+  const privateKey = firstNonEmpty(value.private_key);
+  if (!clientEmail || !privateKey || !privateKey.includes("BEGIN PRIVATE KEY")) return null;
+  return { clientEmail, privateKey };
+}
+
+function signedGoogleServiceAccountAssertion(account, nowSeconds) {
+  const header = base64urlJSON({ alg: "RS256", typ: "JWT" });
+  const payload = base64urlJSON({
+    iss: account.clientEmail,
+    scope: GOOGLE_CLOUD_PLATFORM_SCOPE,
+    aud: GOOGLE_OAUTH_TOKEN_URL,
+    iat: nowSeconds,
+    exp: nowSeconds + 3600
+  });
+  const unsigned = `${header}.${payload}`;
+  const signer = createSign("RSA-SHA256");
+  signer.update(unsigned);
+  signer.end();
+  return `${unsigned}.${signer.sign(account.privateKey, "base64url")}`;
+}
+
+function base64urlJSON(value) {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
 }
 
 function clampInteger(value, fallback, minimum, maximum) {
