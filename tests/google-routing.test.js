@@ -132,6 +132,8 @@ async function testRouteOptimizationResponse() {
     assert.equal(init.headers.Authorization, "Bearer test-oauth-token");
     const body = JSON.parse(init.body);
     assert.equal(body.model.shipments.length, 3);
+    assert.doesNotMatch(body.model.globalStartTime, /\.\d{3}Z$/);
+    assert.doesNotMatch(body.model.globalEndTime, /\.\d{3}Z$/);
     return response({
       routes: [{
         vehicleStartTime: "2026-08-19T12:00:00Z",

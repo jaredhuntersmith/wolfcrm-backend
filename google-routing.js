@@ -220,8 +220,8 @@ export class GoogleRoutingService {
       label: "wolfcrm-route",
       startWaypoint: googleWaypoint(request.start),
       startTimeWindows: [{
-        startTime: startTime.toISOString(),
-        endTime: new Date(startTime.getTime() + 60_000).toISOString()
+        startTime: googleTimestamp(startTime),
+        endTime: googleTimestamp(new Date(startTime.getTime() + 60_000))
       }],
       costPerTraveledHour: 1
     };
@@ -233,8 +233,10 @@ export class GoogleRoutingService {
       populatePolylines: true,
       populateTransitionPolylines: true,
       model: {
-        globalStartTime: startTime.toISOString(),
-        globalEndTime: endTime.toISOString(),
+        // Route Optimization uses protobuf Timestamp JSON. It rejects an explicit
+        // zero `nanos` value, which JavaScript's ISO serializer emits as `.000Z`.
+        globalStartTime: googleTimestamp(startTime),
+        globalEndTime: googleTimestamp(endTime),
         globalDurationCostPerHour: 1,
         shipments: request.stops.map((stop) => ({
           label: stop.id,
@@ -739,6 +741,12 @@ function parseDurationSeconds(value) {
     throw new GoogleRoutingError("google_duration_invalid", "Google returned an invalid route duration.", { statusCode: 502 });
   }
   return Number(value.slice(0, -1));
+}
+
+function googleTimestamp(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) throw new GoogleRoutingError("invalid_route_request", "Route timestamps must be valid.");
+  return date.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 function secondsDuration(value) {
