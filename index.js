@@ -137,6 +137,7 @@ import {
 } from "./sales-analytics.js";
 import { contactRequestChangedFields } from "./contact-update-events.js";
 import { buildDesktopContactSearchPredicate } from "./contact-search.js";
+import { buildContactExportCSV, defaultContactExportFilename } from "./contact-export.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -7495,6 +7496,57 @@ app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "failed_list" });
+  }
+});
+
+app.get("/api/contacts/export.csv", authRequired, requireCapability("contacts.export"), async (req, res) => {
+  try {
+    const contactScope = companyOrUserContactWhere(req, "c");
+    const contacts = (await pool.query(
+      `SELECT c.* FROM contacts c
+        WHERE ${contactScope.sql}
+        ORDER BY LOWER(c.name) ASC, c.id ASC`,
+      contactScope.values
+    )).rows;
+    const contactIDs = contacts.map((contact) => String(contact.id));
+
+    let quotes = [];
+    if (contactIDs.length && hasCapability(req, "quotes.view")) {
+      const quoteScope = quoteScopeSQL(req, "q");
+      quotes = (await pool.query(
+        `SELECT q.id, q.contact_id, q.title, q.line_items, q.total_cents, q.notes,
+                q.status, q.created_at, q.updated_at
+           FROM quotes q
+          WHERE ${quoteScope.sql}
+            AND q.contact_id = ANY($${quoteScope.values.length + 1}::text[])
+          ORDER BY q.created_at ASC, q.id ASC`,
+        [...quoteScope.values, contactIDs]
+      )).rows;
+    }
+
+    let completedJobs = [];
+    if (contactIDs.length && (hasCapability(req, "schedule.view") || hasCapability(req, "jobs.view"))) {
+      const tenantColumn = req.companyId ? "company_id" : "user_id";
+      const tenantValue = req.companyId || req.userId;
+      completedJobs = (await pool.query(
+        `SELECT id, contact_id, title, start_at, finished_at, price_cents, services, service_items, notes
+           FROM schedule_events
+          WHERE ${tenantColumn} = $1
+            AND finished_at IS NOT NULL
+            AND contact_id = ANY($2::text[])
+          ORDER BY start_at ASC, id ASC`,
+        [tenantValue, contactIDs]
+      )).rows;
+    }
+
+    res.set("Content-Type", "text/csv; charset=utf-8");
+    res.set("Content-Disposition", `attachment; filename="${defaultContactExportFilename()}"`);
+    res.set("Cache-Control", "private, no-store");
+    res.set("X-Content-Type-Options", "nosniff");
+    res.send(buildContactExportCSV({ contacts, quotes, completedJobs }));
+  } catch (error) {
+    console.error("[contacts] export failed:", error && error.message ? error.message : error);
+    res.status(500).json({ error: "failed_export_contacts", message: "Contacts could not be exported." });
   }
 });
 
