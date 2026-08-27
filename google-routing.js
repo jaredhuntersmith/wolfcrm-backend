@@ -229,7 +229,9 @@ export class GoogleRoutingService {
 
     const body = {
       timeout: "20s",
-      searchMode: "CONSUME_ALL_AVAILABLE_TIME",
+      // Interactive route planning should return promptly. The long-running solver
+      // mode can hold an iPhone request until the full search timeout expires.
+      searchMode: "RETURN_FAST",
       populatePolylines: true,
       populateTransitionPolylines: true,
       model: {
