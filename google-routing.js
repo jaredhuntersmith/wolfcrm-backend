@@ -474,9 +474,10 @@ export class GoogleRoutingService {
             if (!response.ok) {
               const retryAfterMs = retryAfterMilliseconds(response.headers?.get?.("retry-after"));
               const upstream = await safeResponseJson(response);
+              const rateLimited = response.status === 429;
               throw new GoogleRoutingError(
-                "google_routing_upstream_error",
-                upstream?.error?.message || `Google routing returned HTTP ${response.status}.`,
+                rateLimited ? "google_routing_rate_limited" : "google_routing_upstream_error",
+                rateLimited ? "Google routing is busy. Wait a minute and try again." : (upstream?.error?.message || `Google routing returned HTTP ${response.status}.`),
                 {
                   statusCode: 502,
                   retryable: RETRYABLE_STATUS_CODES.has(response.status),
