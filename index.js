@@ -135,6 +135,7 @@ import {
   normalizeSalesTrend,
   validateSalesAnalyticsQuery
 } from "./sales-analytics.js";
+import { contactRequestChangedFields } from "./contact-update-events.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -7293,12 +7294,6 @@ function contactTagsForDatabase(value, fallback = "lead") {
   return `{${escaped.join(",")}}`;
 }
 
-function contactChangedFields(before, after, fields) {
-  return fields
-    .map((field) => ({ field, old_value: before?.[field] ?? null, new_value: after?.[field] ?? null }))
-    .filter((item) => JSON.stringify(item.old_value) !== JSON.stringify(item.new_value));
-}
-
 function contactFieldEventType(field) {
   if (["name", "phone", "email", "address", "job_type", "source"].includes(field)) return `contact.${field}_changed`;
   if (field === "value_cents") return "contact.value_changed";
@@ -7934,8 +7929,7 @@ app.put("/api/contacts/:id", authRequired, requireCapability("contacts.edit"), a
     );
     if (!r.rowCount) return res.status(404).json({ error: "not_found" });
     if (req.companyId) {
-      const fields = ["name", "phone", "email", "address", "value_cents", "lat", "lng", "job_type", "u1", "u2", "u3", "u4", "u5", "source"].filter((key) => has(key));
-      const changed = contactChangedFields(before, r.rows[0], fields);
+      const changed = contactRequestChangedFields(before, r.rows[0], body);
       await emitContactUpdateEvents({ companyId: req.companyId, contactId: r.rows[0].id, actorUserId: req.userId, source: "contacts.api", changedFields: changed });
       if (Object.prototype.hasOwnProperty.call(req.body || {}, "tags")) {
         await emitContactTagEvents({ companyId: req.companyId, contactId: r.rows[0].id, actorUserId: req.userId, source: "contacts.api", previousTags: contactTagsArray(before?.tags), nextTags: contactTagsArray(r.rows[0].tags) });
