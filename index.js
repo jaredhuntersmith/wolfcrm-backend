@@ -7397,7 +7397,78 @@ async function emitJobServiceRouteEvents(companyId, actorUserId, jobId, before, 
 // ---------- contacts (AUTH REQUIRED + COMPANY-SCOPED) ----------
 app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async (req, res) => {
   const q = (req.query.q || "").toString().trim();
+  const desktopView = req.query.view === "desktop";
   try {
+    if (desktopView) {
+      const scope = companyOrUserContactWhere(req, "c");
+      const includePipeline = hasCapability(req, "pipeline.view");
+      const requestedLimit = Number.parseInt(String(req.query.limit || "50"), 10);
+      const requestedOffset = Number.parseInt(String(req.query.offset || "0"), 10);
+      const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 10), 100) : 50;
+      const offset = Number.isFinite(requestedOffset) ? Math.max(requestedOffset, 0) : 0;
+      const direction = String(req.query.direction || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+      const sortColumns = {
+        name: "c.name",
+        created_at: "c.created_at",
+        updated_at: "c.updated_at",
+        value_cents: "c.value_cents",
+        source: "c.source",
+        stage: "COALESCE(lp.stage_name, '')"
+      };
+      const requestedSort = String(req.query.sort || "updated_at");
+      const sort = requestedSort === "stage" && !includePipeline
+        ? sortColumns.updated_at
+        : (sortColumns[requestedSort] || sortColumns.updated_at);
+      const values = [...scope.values];
+      const where = [scope.sql];
+      const bind = (value) => {
+        values.push(value);
+        return `$${values.length}`;
+      };
+      if (q) {
+        const term = bind(`%${q}%`);
+        where.push(`(c.name ILIKE ${term} OR COALESCE(c.phone,'') ILIKE ${term} OR COALESCE(c.email,'') ILIKE ${term} OR COALESCE(c.address,'') ILIKE ${term} OR COALESCE(c.job_type,'') ILIKE ${term} OR COALESCE(c.source,'') ILIKE ${term} OR COALESCE(c.u1,'') ILIKE ${term} OR COALESCE(c.u2,'') ILIKE ${term} OR COALESCE(c.u3,'') ILIKE ${term} OR COALESCE(c.u4,'') ILIKE ${term} OR COALESCE(c.u5,'') ILIKE ${term})`);
+      }
+      const tag = String(req.query.tag || "").trim();
+      if (tag) where.push(`COALESCE(c.tags, '') ILIKE ${bind(`%${tag}%`)}`);
+      const source = String(req.query.source || "").trim();
+      if (source) where.push(`COALESCE(c.source, '') = ${bind(source)}`);
+      const stage = String(req.query.stage || "").trim();
+      if (stage && includePipeline) {
+        if (stage === "none") where.push("lp.contact_id IS NULL");
+        else if (["lost", "won"].includes(stage)) where.push(`lp.state = ${bind(stage)}`);
+        else where.push(`lp.stage_id = ${bind(stage)}`);
+      }
+      const pipelineCTE = includePipeline
+        ? `WITH latest_pipeline AS (
+             SELECT DISTINCT ON (o.contact_id) o.contact_id, o.state, o.stage_id, o.updated_at, s.name AS stage_name
+               FROM opportunities o
+               LEFT JOIN stages s ON s.id = o.stage_id
+              WHERE ${req.companyId ? "o.company_id = $1" : "o.user_id = $1"}
+              ORDER BY o.contact_id, o.updated_at DESC, o.id DESC
+           )`
+        : "";
+      const pipelineJoin = includePipeline ? "LEFT JOIN latest_pipeline lp ON lp.contact_id = c.id::text" : "";
+      const pipelineColumns = includePipeline
+        ? "lp.stage_id, lp.stage_name, lp.state AS stage_state"
+        : "NULL::text AS stage_id, NULL::text AS stage_name, NULL::text AS stage_state";
+      const whereSQL = where.join(" AND ");
+      const countQuery = `${pipelineCTE} SELECT COUNT(*)::int AS total FROM contacts c ${pipelineJoin} WHERE ${whereSQL}`;
+      const countResult = await pool.query(countQuery, values);
+      const listValues = [...values, limit, offset];
+      const rows = (await pool.query(
+        `${pipelineCTE}
+         SELECT c.*, ${pipelineColumns}, c.updated_at AS last_activity_at
+           FROM contacts c
+           ${pipelineJoin}
+          WHERE ${whereSQL}
+          ORDER BY ${sort} ${direction} NULLS LAST, c.id ASC
+          LIMIT $${listValues.length - 1} OFFSET $${listValues.length}`,
+        listValues
+      )).rows;
+      const total = Number(countResult.rows[0]?.total || 0);
+      return res.json({ items: rows, total, limit, offset, has_more: offset + rows.length < total });
+    }
     const scope = companyOrUserContactWhere(req);
     let rows;
     if (q) {
@@ -7443,6 +7514,127 @@ app.get("/api/contacts/:id", authRequired, requireCapability("contacts.view"), a
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "failed_get" });
+  }
+});
+
+// Bounded desktop inspector payload. The original contact endpoints remain
+// unchanged for iOS; this combines only records the current user may already
+// read, avoiding whole-company schedule/task/message downloads on selection.
+app.get("/api/contacts/:id/workspace", authRequired, requireCapability("contacts.view"), async (req, res) => {
+  try {
+    const scope = companyOrUserContactWhere(req, "c");
+    const { rows: contactRows } = await pool.query(
+      `SELECT c.* FROM contacts c WHERE c.id = $1 AND ${scope.sql.replace("$1", "$2")}`,
+      [req.params.id, ...scope.values]
+    );
+    if (!contactRows.length) return res.status(404).json({ error: "not_found" });
+
+    const access = {
+      pipeline: hasCapability(req, "pipeline.view"),
+      jobs: hasCapability(req, "schedule.view") || hasCapability(req, "jobs.view"),
+      tasks: hasCapability(req, "tasks.view"),
+      quotes: hasCapability(req, "quotes.view"),
+      messages: hasCapability(req, "messaging.customer.view"),
+      payments: hasCapability(req, "payments.view") || hasCapability(req, "payments.collect")
+    };
+    const tenantColumn = req.companyId ? "company_id" : "user_id";
+    const tenantValue = req.companyId || req.userId;
+    const employerId = access.payments ? await resolveEmployerUserId(req) : null;
+    const quoteScope = access.quotes ? quoteScopeSQL(req) : null;
+
+    const [pipelineResult, jobsResult, tasksResult, quotesResult, conversationsResult, servicePlansResult, paymentsResult] = await Promise.all([
+      access.pipeline
+        ? pool.query(
+            `SELECT o.id, o.state, o.stage_id, o.created_at, o.stage_entered_at, s.name AS stage_name
+               FROM opportunities o
+               LEFT JOIN stages s ON s.id = o.stage_id
+              WHERE o.${tenantColumn} = $1 AND o.contact_id = $2
+              ORDER BY o.updated_at DESC, o.id DESC LIMIT 1`,
+            [tenantValue, req.params.id]
+          )
+        : Promise.resolve({ rows: [] }),
+      access.jobs
+        ? pool.query(
+            `SELECT id, title, start_at AS start, end_at AS "end", color, notes, contact_id, quote_id,
+                    services, service_items, price_cents, material_cost_cents, started_at, finished_at, weather_exposure, updated_at
+               FROM schedule_events
+              WHERE ${tenantColumn} = $1 AND contact_id = $2
+              ORDER BY start_at DESC LIMIT 50`,
+            [tenantValue, req.params.id]
+          )
+        : Promise.resolve({ rows: [] }),
+      access.tasks
+        ? pool.query(
+            `SELECT id, title, detail, assignee_ids, due_date, priority, status, linked_contact_id,
+                    linked_job_id, completed, completed_at, completion_note, updated_at
+               FROM todo_tasks
+              WHERE linked_contact_id = $1
+                AND (user_id = $2 OR ($3::uuid IS NOT NULL AND user_id IN (SELECT id FROM users WHERE company_id = $3)) OR assignee_ids ? $2::text)
+              ORDER BY completed ASC, due_date NULLS LAST, updated_at DESC
+              LIMIT 50`,
+            [req.params.id, req.userId, req.companyId || null]
+          )
+        : Promise.resolve({ rows: [] }),
+      quoteScope
+        ? pool.query(
+            `SELECT id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
+               FROM quotes q
+              WHERE ${quoteScope.sql} AND q.contact_id = $${quoteScope.values.length + 1}
+              ORDER BY q.updated_at DESC LIMIT 50`,
+            [...quoteScope.values, req.params.id]
+          )
+        : Promise.resolve({ rows: [] }),
+      access.messages && req.companyId
+        ? pool.query(
+            `SELECT sc.id, sc.external_phone_number, sc.last_message_at,
+                    lm.body AS last_message_body, lm.direction AS last_message_direction, lm.message_status AS last_message_status
+               FROM sms_conversations sc
+               JOIN phone_lines pl ON pl.id = sc.phone_line_id AND pl.company_id = $1
+               LEFT JOIN LATERAL (
+                 SELECT body, direction, message_status
+                   FROM sms_messages
+                  WHERE conversation_id = sc.id AND deleted_at IS NULL
+                  ORDER BY created_at DESC LIMIT 1
+               ) lm ON true
+              WHERE sc.contact_id::text = $2 AND sc.deleted_at IS NULL
+              ORDER BY sc.last_message_at DESC NULLS LAST LIMIT 20`,
+            [req.companyId, req.params.id]
+          )
+        : Promise.resolve({ rows: [] }),
+      access.payments && employerId
+        ? pool.query(
+            `SELECT sp.* FROM service_plans sp
+              WHERE sp.user_id = $1 AND sp.contact_id::text = $2
+                ${req.role === "employer" ? "" : "AND sp.created_by_user_id = $3"}
+              ORDER BY sp.created_at DESC LIMIT 50`,
+            req.role === "employer" ? [employerId, req.params.id] : [employerId, req.params.id, req.userId]
+          )
+        : Promise.resolve({ rows: [] }),
+      access.payments && employerId
+        ? pool.query(
+            `SELECT * FROM payment_records
+              WHERE user_id = $1 AND contact_id::text = $2
+                ${req.role === "employer" ? "" : "AND created_by_user_id = $3"}
+              ORDER BY created_at DESC LIMIT 50`,
+            req.role === "employer" ? [employerId, req.params.id] : [employerId, req.params.id, req.userId]
+          )
+        : Promise.resolve({ rows: [] })
+    ]);
+
+    res.json({
+      contact: contactRows[0],
+      access,
+      pipeline: pipelineResult.rows[0] || null,
+      jobs: jobsResult.rows,
+      tasks: tasksResult.rows,
+      quotes: quotesResult.rows,
+      conversations: conversationsResult.rows,
+      service_plans: servicePlansResult.rows.map((row) => sanitizeServicePlan(row, { employeeSafe: req.role !== "employer" })),
+      payments: paymentsResult.rows.map((row) => sanitizePaymentRecord(row, { employeeSafe: req.role !== "employer" }))
+    });
+  } catch (error) {
+    console.error("[contacts/workspace] failed", { contactId: req.params.id, code: error?.code, message: error?.message });
+    res.status(500).json({ error: "contact_workspace_failed", message: "WolfCRM couldn't load this contact workspace." });
   }
 });
 
