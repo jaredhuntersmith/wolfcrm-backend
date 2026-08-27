@@ -136,6 +136,7 @@ import {
   validateSalesAnalyticsQuery
 } from "./sales-analytics.js";
 import { contactRequestChangedFields } from "./contact-update-events.js";
+import { buildDesktopContactSearchPredicate } from "./contact-search.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -7422,7 +7423,7 @@ app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async
       };
       if (q) {
         const term = bind(`%${q}%`);
-        where.push(`(c.name ILIKE ${term} OR COALESCE(c.phone,'') ILIKE ${term} OR COALESCE(c.email,'') ILIKE ${term} OR COALESCE(c.address,'') ILIKE ${term} OR COALESCE(c.job_type,'') ILIKE ${term} OR COALESCE(c.source,'') ILIKE ${term} OR COALESCE(c.u1,'') ILIKE ${term} OR COALESCE(c.u2,'') ILIKE ${term} OR COALESCE(c.u3,'') ILIKE ${term} OR COALESCE(c.u4,'') ILIKE ${term} OR COALESCE(c.u5,'') ILIKE ${term})`);
+        where.push(buildDesktopContactSearchPredicate(term, "c"));
       }
       const tag = String(req.query.tag || "").trim();
       if (tag) where.push(`COALESCE(c.tags, '') ILIKE ${bind(`%${tag}%`)}`);
