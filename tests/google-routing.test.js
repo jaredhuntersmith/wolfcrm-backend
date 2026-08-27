@@ -296,6 +296,9 @@ async function testValidationAndConfigurationFailures() {
     () => normalizePlanRequest(duplicateLocks, FIXED_NOW),
     (error) => error.code === "invalid_route_request" && error.statusCode === 400
   );
+
+  const staleDeparture = normalizePlanRequest({ ...planBody(1), departure_time: "2026-08-19T11:59:59.000Z" }, FIXED_NOW);
+  assert.equal(staleDeparture.departureTime.toISOString(), "2026-08-19T12:01:00.000Z");
 }
 
 const tests = [

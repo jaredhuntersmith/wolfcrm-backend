@@ -591,7 +591,11 @@ export function normalizePlanRequest(raw, now = new Date()) {
   }
 
   let departureTime = parseDate(raw.departure_time) || now;
-  if (departureTime.getTime() < now.getTime() - 300_000) departureTime = now;
+  // Route Optimization requires a strictly future protobuf Timestamp. Requests
+  // from a device that was rendered moments earlier can otherwise arrive as
+  // "now" (or a few minutes stale) and be rejected by Google.
+  const earliestDepartureTime = new Date(now.getTime() + 60_000);
+  if (departureTime.getTime() < earliestDepartureTime.getTime()) departureTime = earliestDepartureTime;
   if (departureTime.getTime() > now.getTime() + 31 * 86_400_000) {
     throw invalidRequest("Departure time must be within 31 days.", { field: "departure_time" });
   }
