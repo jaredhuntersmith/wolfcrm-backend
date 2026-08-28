@@ -5,7 +5,7 @@ import express from "express";
 import cors from "cors";
 import { createHash, randomUUID, randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import pkg from "pg";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Stripe from "stripe";
 import apn from "@parse/node-apn";
@@ -65,6 +65,11 @@ import {
   validateAccessUpdate
 } from "./permissions.js";
 import {
+  TodoOperationalLinkError,
+  normalizeTaskOperationalLinks,
+  validateTaskOperationalLinks,
+} from "./todo-operational-links.js";
+import {
   TAB_ROLE_PRESETS,
   isKnownTabRolePreset,
   resolveTabNavigation,
@@ -85,6 +90,14 @@ import {
   validateAssignments,
   validateAvailability
 } from "./schedule-team.js";
+import {
+  InventoryCountInputError,
+  countAdjustment,
+  normalizeCountGeneration,
+  normalizeCountReview,
+  normalizeCountSchedule,
+  normalizeCountSubmission
+} from "./operations-inventory-counts.js";
 import {
   DEFAULT_ON_MY_WAY_TEMPLATE,
   OnMyWayError,
@@ -159,6 +172,12 @@ import {
   normalizeMeasurementID,
   normalizeMeasurementInput
 } from "./measurement-contract.js";
+import {
+  OperationsRepairInputError,
+  normalizeRepairCreate,
+  normalizeRepairUpdate,
+  repairLifecycleTimestamps,
+} from "./operations-repairs.js";
 import { installWebsiteBuilderSystem } from "./website-builder.js";
 
 const { Pool } = pkg;
@@ -1870,6 +1889,100 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS equipment_requests_company_idx ON equipment_requests(company_id, status, created_at);
 
+    CREATE TABLE IF NOT EXISTS equipment_repairs (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+      request_id TEXT REFERENCES equipment_requests(id) ON DELETE SET NULL,
+      reported_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      assigned_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      vendor TEXT,
+      problem TEXT NOT NULL,
+      diagnosis TEXT,
+      status TEXT NOT NULL DEFAULT 'reported',
+      priority TEXT NOT NULL DEFAULT 'normal',
+      estimated_cost_cents INTEGER,
+      actual_cost_cents INTEGER,
+      opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      scheduled_at TIMESTAMPTZ,
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      resolution_notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS equipment_repairs_company_idx ON equipment_repairs(company_id, status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS equipment_repairs_item_idx ON equipment_repairs(company_id, item_id, created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS equipment_repairs_request_idx ON equipment_repairs(company_id, request_id) WHERE request_id IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS equipment_asset_history (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      summary TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS equipment_asset_history_item_idx ON equipment_asset_history(company_id, item_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS inventory_count_schedules (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      location_id TEXT NOT NULL,
+      assigned_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      frequency TEXT NOT NULL,
+      due_date DATE,
+      due_time TIME,
+      reminder_minutes INTEGER,
+      variance_threshold NUMERIC NOT NULL DEFAULT 0,
+      approval_required BOOLEAN NOT NULL DEFAULT true,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS inventory_count_schedules_company_idx ON inventory_count_schedules(company_id, enabled, due_date);
+
+    CREATE TABLE IF NOT EXISTS inventory_count_submissions (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      schedule_id TEXT REFERENCES inventory_count_schedules(id) ON DELETE SET NULL,
+      location_id TEXT NOT NULL,
+      assigned_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      due_date DATE,
+      approval_required BOOLEAN NOT NULL DEFAULT true,
+      variance_threshold NUMERIC NOT NULL DEFAULT 0,
+      submitted_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      submitted_at TIMESTAMPTZ,
+      reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      reviewed_at TIMESTAMPTZ,
+      review_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS inventory_count_submissions_company_idx ON inventory_count_submissions(company_id, status, due_date, created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS inventory_count_submissions_schedule_due_idx ON inventory_count_submissions(company_id, schedule_id, due_date) WHERE schedule_id IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS inventory_count_submission_items (
+      id TEXT PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      submission_id TEXT NOT NULL REFERENCES inventory_count_submissions(id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL REFERENCES inventory_items(id) ON DELETE RESTRICT,
+      item_name TEXT NOT NULL,
+      expected_quantity NUMERIC NOT NULL,
+      counted_quantity NUMERIC,
+      variance NUMERIC,
+      note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(submission_id, item_id)
+    );
+    CREATE INDEX IF NOT EXISTS inventory_count_submission_items_idx ON inventory_count_submission_items(company_id, submission_id);
+
     CREATE TABLE IF NOT EXISTS mileage_company_settings (
       company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
       enabled BOOLEAN NOT NULL DEFAULT false,
@@ -2259,6 +2372,8 @@ async function bootstrap() {
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_contact_id TEXT;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_job_id TEXT;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_equipment_id TEXT;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_equipment_request_id TEXT;
+    ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS linked_inventory_count_id TEXT;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS completed_by UUID;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS completion_note TEXT;
     ALTER TABLE todo_tasks ADD COLUMN IF NOT EXISTS completion_note_required BOOLEAN NOT NULL DEFAULT false;
@@ -10327,6 +10442,10 @@ function toBool(v, fallback = false) {
   return !!v;
 }
 
+function cleanString(value, maxLength = 1000) {
+  return value == null ? "" : String(value).trim().slice(0, maxLength);
+}
+
 // ---------- INTEGRATIONS: Zapier / Meta Lead webhook ----------
 
 // Shape returned by all integration endpoints. Never includes internals.
@@ -13986,8 +14105,10 @@ app.get("/api/operations/inventory/items", authRequired, requireCapability("oper
 app.put("/api/operations/inventory/items/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const { name, item_type, tracking_mode, category, unit, reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query(
+    await client.query("BEGIN");
+    const { rows } = await client.query(
       `INSERT INTO inventory_items(id, company_id, name, item_type, tracking_mode, category, unit, reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, item_type = EXCLUDED.item_type, tracking_mode = EXCLUDED.tracking_mode, category = EXCLUDED.category, unit = EXCLUDED.unit, reorder_point = EXCLUDED.reorder_point, cost_per_unit_cents = EXCLUDED.cost_per_unit_cents, status = EXCLUDED.status, location_id = EXCLUDED.location_id, assigned_user_id = EXCLUDED.assigned_user_id, notes = EXCLUDED.notes, updated_at = now()
@@ -13995,8 +14116,54 @@ app.put("/api/operations/inventory/items/:id", authRequired, requireCapability("
        RETURNING id, name, item_type, tracking_mode, category, unit, quantity_on_hand::float8 AS quantity_on_hand, reorder_point::float8 AS reorder_point, cost_per_unit_cents, status, location_id, assigned_user_id, notes`,
       [req.params.id, req.companyId, name, item_type || "material", tracking_mode || "quantity", category || null, unit || "each", reorder_point ?? null, cost_per_unit_cents ?? null, status || "available", location_id || null, assigned_user_id || null, notes || null]
     );
+    if (!rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "inventory_item_not_found" });
+    }
+    await client.query(
+      `INSERT INTO equipment_asset_history(id, company_id, item_id, event_type, actor_user_id, summary)
+       VALUES($1,$2,$3,'item_saved',$4,$5)`,
+      [randomUUID(), req.companyId, req.params.id, req.userId, `${rows[0].name} details saved`]
+    );
+    await client.query("COMMIT");
     res.json(rows[0]);
-  } catch (e) { console.error(e); res.status(500).json({ error: "inventory_item_save_failed" }); }
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error(e);
+    res.status(500).json({ error: "inventory_item_save_failed" });
+  } finally { client.release(); }
+});
+
+app.get("/api/operations/inventory/items/:id/history", authRequired, requireCapability("operations.view"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const item = (await pool.query(
+      `SELECT id, unit FROM inventory_items WHERE id = $1 AND company_id = $2`,
+      [req.params.id, req.companyId]
+    )).rows[0];
+    if (!item) return res.status(404).json({ error: "inventory_item_not_found" });
+    const { rows } = await pool.query(
+      `SELECT id, item_id, event_type, actor_user_id, summary, created_at
+         FROM (
+           SELECT h.id, h.item_id, h.event_type, h.actor_user_id, h.summary, h.created_at
+             FROM equipment_asset_history h
+            WHERE h.company_id = $1 AND h.item_id = $2
+           UNION ALL
+           SELECT t.id, t.item_id, 'inventory_' || t.transaction_type, t.employee_id,
+                  initcap(replace(t.transaction_type, '_', ' ')) || ' · ' || trim(to_char(t.quantity, 'FM999999990.##')) || ' ' || $3,
+                  t.created_at
+             FROM inventory_transactions t
+            WHERE t.company_id = $1 AND t.item_id = $2
+         ) events
+        ORDER BY created_at DESC, id DESC
+        LIMIT 200`,
+      [req.companyId, req.params.id, item.unit || "each"]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[operations] inventory history failed:", e);
+    res.status(500).json({ error: "inventory_history_failed" });
+  }
 });
 
 app.post("/api/operations/inventory/transactions", authRequired, requireCapability("operations.request"), async (req, res) => {
@@ -14065,7 +14232,515 @@ app.patch("/api/operations/requests/:id", authRequired, requireCapability("opera
   } catch (e) { console.error(e); res.status(500).json({ error: "equipment_request_update_failed" }); }
 });
 
+const equipmentRepairSelect = `
+  SELECT r.id, r.item_id, i.name AS item_name, r.request_id, r.reported_by, r.created_by,
+         r.assigned_user_id, r.vendor, r.problem, r.diagnosis, r.status, r.priority,
+         r.estimated_cost_cents, r.actual_cost_cents, r.opened_at, r.scheduled_at,
+         r.started_at, r.completed_at, r.resolution_notes, r.created_at, r.updated_at
+    FROM equipment_repairs r
+    JOIN inventory_items i ON i.id = r.item_id AND i.company_id = r.company_id`;
+
+function sendOperationsRepairError(res, error, fallbackCode) {
+  if (error instanceof OperationsRepairInputError) {
+    return res.status(error.statusCode).json({ error: error.code, message: error.message });
+  }
+  if (error?.code === "23505") {
+    return res.status(409).json({ error: "repair_already_exists_for_request" });
+  }
+  console.error(`[operations] ${fallbackCode}:`, error);
+  return res.status(500).json({ error: fallbackCode });
+}
+
+app.get("/api/operations/repairs", authRequired, requireCapability("operations.view"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const { rows } = await pool.query(
+      `${equipmentRepairSelect}
+        WHERE r.company_id = $1
+        ORDER BY CASE WHEN r.status IN ('completed','not_repairable','cancelled') THEN 1 ELSE 0 END,
+                 CASE r.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
+                 r.updated_at DESC
+        LIMIT 300`,
+      [req.companyId]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("[operations] equipment repairs failed:", e);
+    res.status(500).json({ error: "equipment_repairs_failed" });
+  }
+});
+
+app.post("/api/operations/repairs", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const client = await pool.connect();
+  try {
+    const input = normalizeRepairCreate(req.body);
+    await client.query("BEGIN");
+    const item = (await client.query(
+      `SELECT id, name, status FROM inventory_items WHERE id = $1 AND company_id = $2 FOR UPDATE`,
+      [input.item_id, req.companyId]
+    )).rows[0];
+    if (!item) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "inventory_item_not_found" });
+    }
+    let reportedBy = req.userId;
+    if (input.request_id) {
+      const request = (await client.query(
+        `SELECT requester_id, item_id FROM equipment_requests WHERE id = $1 AND company_id = $2 FOR UPDATE`,
+        [input.request_id, req.companyId]
+      )).rows[0];
+      if (!request) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "equipment_request_not_found" });
+      }
+      if (request.item_id && request.item_id !== input.item_id) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "repair_request_item_mismatch" });
+      }
+      reportedBy = request.requester_id || req.userId;
+    }
+    if (input.assigned_user_id) {
+      const assigned = await client.query(
+        `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+        [input.assigned_user_id, req.companyId]
+      );
+      if (!assigned.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "assigned_user_not_found" });
+      }
+    }
+    const now = new Date();
+    const lifecycle = repairLifecycleTimestamps({ nextStatus: input.status, now });
+    const repairId = randomUUID();
+    await client.query(
+      `INSERT INTO equipment_repairs(
+         id, company_id, item_id, request_id, reported_by, created_by, assigned_user_id,
+         vendor, problem, diagnosis, status, priority, estimated_cost_cents, actual_cost_cents,
+         scheduled_at, started_at, completed_at, resolution_notes
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+      [repairId, req.companyId, input.item_id, input.request_id, reportedBy, req.userId,
+       input.assigned_user_id, input.vendor, input.problem, input.diagnosis, input.status, input.priority,
+       input.estimated_cost_cents, input.actual_cost_cents, input.scheduled_at, lifecycle.started_at,
+       lifecycle.completed_at, input.resolution_notes]
+    );
+    if (!["lost", "retired"].includes(item.status) && !["completed", "cancelled"].includes(input.status)) {
+      await client.query(
+        `UPDATE inventory_items SET status = 'under_repair', updated_at = now() WHERE id = $1 AND company_id = $2`,
+        [input.item_id, req.companyId]
+      );
+    }
+    if (input.request_id) {
+      await client.query(
+        `UPDATE equipment_requests
+            SET status = 'under_review', owner_response = 'Repair created', updated_at = now()
+          WHERE id = $1 AND company_id = $2`,
+        [input.request_id, req.companyId]
+      );
+    }
+    await client.query(
+      `INSERT INTO equipment_asset_history(id, company_id, item_id, event_type, actor_user_id, summary)
+       VALUES($1,$2,$3,'repair_created',$4,$5)`,
+      [randomUUID(), req.companyId, input.item_id, req.userId, `Repair opened · ${input.problem}`]
+    );
+    const saved = (await client.query(
+      `${equipmentRepairSelect} WHERE r.company_id = $1 AND r.id = $2`,
+      [req.companyId, repairId]
+    )).rows[0];
+    await client.query("COMMIT");
+    res.status(201).json(saved);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    sendOperationsRepairError(res, e, "equipment_repair_create_failed");
+  } finally { client.release(); }
+});
+
+app.patch("/api/operations/repairs/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const client = await pool.connect();
+  try {
+    const changes = normalizeRepairUpdate(req.body);
+    await client.query("BEGIN");
+    const existing = (await client.query(
+      `SELECT r.*, i.name AS item_name, i.status AS item_status
+         FROM equipment_repairs r
+         JOIN inventory_items i ON i.id = r.item_id AND i.company_id = r.company_id
+        WHERE r.id = $1 AND r.company_id = $2
+        FOR UPDATE OF r, i`,
+      [req.params.id, req.companyId]
+    )).rows[0];
+    if (!existing) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "equipment_repair_not_found" });
+    }
+    const next = { ...existing, ...changes };
+    if (next.assigned_user_id) {
+      const assigned = await client.query(
+        `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+        [next.assigned_user_id, req.companyId]
+      );
+      if (!assigned.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "assigned_user_not_found" });
+      }
+    }
+    const lifecycle = repairLifecycleTimestamps({
+      previousStatus: existing.status,
+      nextStatus: next.status,
+      startedAt: existing.started_at,
+      completedAt: existing.completed_at,
+      now: new Date(),
+    });
+    await client.query(
+      `UPDATE equipment_repairs
+          SET assigned_user_id = $3, vendor = $4, problem = $5, diagnosis = $6, status = $7,
+              priority = $8, estimated_cost_cents = $9, actual_cost_cents = $10,
+              scheduled_at = $11, started_at = $12, completed_at = $13,
+              resolution_notes = $14, updated_at = now()
+        WHERE id = $1 AND company_id = $2`,
+      [req.params.id, req.companyId, next.assigned_user_id, next.vendor, next.problem, next.diagnosis,
+       next.status, next.priority, next.estimated_cost_cents, next.actual_cost_cents,
+       next.scheduled_at, lifecycle.started_at, lifecycle.completed_at, next.resolution_notes]
+    );
+    if (next.status === "completed" && ["under_repair", "broken", "needs_inspection"].includes(existing.item_status)) {
+      await client.query(
+        `UPDATE inventory_items SET status = 'available', updated_at = now() WHERE id = $1 AND company_id = $2`,
+        [existing.item_id, req.companyId]
+      );
+    } else if (next.status === "not_repairable" && existing.item_status !== "retired") {
+      await client.query(
+        `UPDATE inventory_items SET status = 'broken', updated_at = now() WHERE id = $1 AND company_id = $2`,
+        [existing.item_id, req.companyId]
+      );
+    } else if (next.status === "cancelled" && existing.item_status === "under_repair") {
+      await client.query(
+        `UPDATE inventory_items SET status = 'needs_inspection', updated_at = now() WHERE id = $1 AND company_id = $2`,
+        [existing.item_id, req.companyId]
+      );
+    } else if (!["completed", "cancelled"].includes(next.status) && !["lost", "retired"].includes(existing.item_status)) {
+      await client.query(
+        `UPDATE inventory_items SET status = 'under_repair', updated_at = now() WHERE id = $1 AND company_id = $2`,
+        [existing.item_id, req.companyId]
+      );
+    }
+    const summary = existing.status === next.status
+      ? `Repair details updated · ${next.problem}`
+      : `Repair moved from ${existing.status.replaceAll("_", " ")} to ${next.status.replaceAll("_", " ")}`;
+    await client.query(
+      `INSERT INTO equipment_asset_history(id, company_id, item_id, event_type, actor_user_id, summary)
+       VALUES($1,$2,$3,'repair_updated',$4,$5)`,
+      [randomUUID(), req.companyId, existing.item_id, req.userId, summary]
+    );
+    const saved = (await client.query(
+      `${equipmentRepairSelect} WHERE r.company_id = $1 AND r.id = $2`,
+      [req.companyId, req.params.id]
+    )).rows[0];
+    await client.query("COMMIT");
+    res.json(saved);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    sendOperationsRepairError(res, e, "equipment_repair_update_failed");
+  } finally { client.release(); }
+});
+
 // ---------- OPERATIONS: MILEAGE ----------
+const inventoryCountSubmissionSelect = `
+  SELECT s.id, s.schedule_id, s.location_id, l.name AS location_name, s.assigned_user_id,
+         s.status, s.due_date::text AS due_date, s.submitted_by, s.submitted_at,
+         s.reviewed_by, s.reviewed_at, s.review_note,
+         COALESCE((
+           SELECT json_agg(json_build_object(
+             'id', si.id, 'item_id', si.item_id, 'item_name', si.item_name,
+             'expected_quantity', si.expected_quantity::float8,
+             'counted_quantity', COALESCE(si.counted_quantity, si.expected_quantity)::float8,
+             'variance', COALESCE(si.variance, 0)::float8, 'note', si.note
+           ) ORDER BY si.item_name, si.id)
+             FROM inventory_count_submission_items si
+            WHERE si.company_id = s.company_id AND si.submission_id = s.id
+         ), '[]'::json) AS items
+    FROM inventory_count_submissions s
+    JOIN inventory_locations l ON l.id = s.location_id AND l.company_id = s.company_id`;
+
+async function loadInventoryCountSubmission(queryable, id, companyId) {
+  return (await queryable.query(`${inventoryCountSubmissionSelect} WHERE s.id = $1 AND s.company_id = $2`, [id, companyId])).rows[0] || null;
+}
+
+async function reconcileInventoryCount(client, submission, reviewerId, reviewNote) {
+  const countedItems = (await client.query(
+    `SELECT si.item_id, si.item_name, si.counted_quantity::float8 AS counted_quantity,
+            i.quantity_on_hand::float8 AS current_quantity, i.cost_per_unit_cents
+       FROM inventory_count_submission_items si
+       JOIN inventory_items i ON i.id = si.item_id AND i.company_id = si.company_id
+      WHERE si.submission_id = $1 AND si.company_id = $2 AND si.counted_quantity IS NOT NULL
+      ORDER BY si.item_id
+      FOR UPDATE OF i`,
+    [submission.id, submission.company_id]
+  )).rows;
+  for (const item of countedItems) {
+    const adjustment = countAdjustment(item.current_quantity, item.counted_quantity);
+    if (adjustment !== 0) {
+      await client.query(
+        `INSERT INTO inventory_transactions(
+           id, company_id, item_id, transaction_type, quantity, employee_id, note,
+           cost_snapshot_cents, idempotency_key
+         ) VALUES($1,$2,$3,'inventory_count_adjustment',$4,$5,$6,$7,$8)
+         ON CONFLICT(company_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+        [randomUUID(), submission.company_id, item.item_id, adjustment, reviewerId,
+         `Inventory count ${submission.id}${reviewNote ? ` · ${reviewNote}` : ""}`,
+         item.cost_per_unit_cents || null, `inventory-count:${submission.id}:${item.item_id}`]
+      );
+      await client.query(
+        `UPDATE inventory_items SET quantity_on_hand = $3, updated_at = now()
+          WHERE id = $1 AND company_id = $2`,
+        [item.item_id, submission.company_id, item.counted_quantity]
+      );
+    }
+  }
+}
+
+app.get("/api/operations/inventory-counts/schedules", authRequired, requireCapability("operations.view"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, location_id, assigned_user_id, frequency, due_date::text AS due_date,
+              to_char(due_time, 'HH24:MI') AS due_time, reminder_minutes,
+              variance_threshold::float8 AS variance_threshold, approval_required, enabled, created_by
+         FROM inventory_count_schedules
+        WHERE company_id = $1
+        ORDER BY enabled DESC, due_date NULLS LAST, name, id`,
+      [req.companyId]
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("[operations] count schedules failed:", error);
+    res.status(500).json({ error: "inventory_count_schedules_failed" });
+  }
+});
+
+app.get("/api/operations/inventory-counts/assignees", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, email, display_name
+         FROM users
+        WHERE company_id = $1 AND deleted_at IS NULL
+        ORDER BY COALESCE(NULLIF(display_name, ''), email), id`,
+      [req.companyId]
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("[operations] count assignees failed:", error);
+    res.status(500).json({ error: "inventory_count_assignees_failed" });
+  }
+});
+
+app.put("/api/operations/inventory-counts/schedules/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const input = normalizeCountSchedule(req.body);
+    const location = await pool.query(`SELECT id FROM inventory_locations WHERE id = $1 AND company_id = $2 AND active = true`, [input.location_id, req.companyId]);
+    if (!location.rowCount) return res.status(404).json({ error: "inventory_location_not_found" });
+    if (input.assigned_user_id) {
+      const user = await pool.query(`SELECT id FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`, [input.assigned_user_id, req.companyId]);
+      if (!user.rowCount) return res.status(404).json({ error: "assigned_user_not_found" });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO inventory_count_schedules(
+         id, company_id, name, location_id, assigned_user_id, frequency, due_date, due_time,
+         reminder_minutes, variance_threshold, approval_required, enabled, created_by
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ON CONFLICT(id) DO UPDATE SET
+         name = EXCLUDED.name, location_id = EXCLUDED.location_id,
+         assigned_user_id = EXCLUDED.assigned_user_id, frequency = EXCLUDED.frequency,
+         due_date = EXCLUDED.due_date, due_time = EXCLUDED.due_time,
+         reminder_minutes = EXCLUDED.reminder_minutes,
+         variance_threshold = EXCLUDED.variance_threshold,
+         approval_required = EXCLUDED.approval_required, enabled = EXCLUDED.enabled,
+         updated_at = now()
+       WHERE inventory_count_schedules.company_id = EXCLUDED.company_id
+       RETURNING id, name, location_id, assigned_user_id, frequency, due_date::text AS due_date,
+                 to_char(due_time, 'HH24:MI') AS due_time, reminder_minutes,
+                 variance_threshold::float8 AS variance_threshold, approval_required, enabled, created_by`,
+      [req.params.id, req.companyId, input.name, input.location_id, input.assigned_user_id,
+       input.frequency, input.due_date, input.due_time, input.reminder_minutes,
+       input.variance_threshold, input.approval_required, input.enabled, req.userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "inventory_count_schedule_not_found" });
+    res.json(rows[0]);
+  } catch (error) {
+    if (error instanceof InventoryCountInputError) return res.status(error.statusCode).json({ error: error.code, message: error.message });
+    console.error("[operations] count schedule save failed:", error);
+    res.status(500).json({ error: "inventory_count_schedule_save_failed" });
+  }
+});
+
+app.post("/api/operations/inventory-counts/schedules/:id/generate", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const client = await pool.connect();
+  try {
+    const input = normalizeCountGeneration(req.body);
+    await client.query("BEGIN");
+    const schedule = (await client.query(
+      `SELECT * FROM inventory_count_schedules WHERE id = $1 AND company_id = $2 FOR UPDATE`,
+      [req.params.id, req.companyId]
+    )).rows[0];
+    if (!schedule) { await client.query("ROLLBACK"); return res.status(404).json({ error: "inventory_count_schedule_not_found" }); }
+    if (!schedule.enabled) { await client.query("ROLLBACK"); return res.status(409).json({ error: "inventory_count_schedule_disabled" }); }
+    const dueDate = input.due_date || (schedule.due_date ? new Date(schedule.due_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
+    const existing = (await client.query(
+      `SELECT id FROM inventory_count_submissions WHERE company_id = $1 AND schedule_id = $2 AND due_date = $3`,
+      [req.companyId, schedule.id, dueDate]
+    )).rows[0];
+    if (existing) {
+      await client.query("COMMIT");
+      return res.json(await loadInventoryCountSubmission(pool, existing.id, req.companyId));
+    }
+    const inventory = (await client.query(
+      `SELECT id, name, quantity_on_hand::float8 AS quantity_on_hand
+         FROM inventory_items
+        WHERE company_id = $1 AND location_id = $2 AND tracking_mode = 'quantity' AND status <> 'retired'
+        ORDER BY name, id
+        FOR SHARE`,
+      [req.companyId, schedule.location_id]
+    )).rows;
+    if (!inventory.length) { await client.query("ROLLBACK"); return res.status(409).json({ error: "inventory_count_has_no_items" }); }
+    const submissionID = randomUUID();
+    await client.query(
+      `INSERT INTO inventory_count_submissions(
+         id, company_id, schedule_id, location_id, assigned_user_id, due_date,
+         approval_required, variance_threshold
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [submissionID, req.companyId, schedule.id, schedule.location_id, schedule.assigned_user_id,
+       dueDate, schedule.approval_required, schedule.variance_threshold]
+    );
+    for (const item of inventory) {
+      await client.query(
+        `INSERT INTO inventory_count_submission_items(
+           id, company_id, submission_id, item_id, item_name, expected_quantity
+         ) VALUES($1,$2,$3,$4,$5,$6)`,
+        [randomUUID(), req.companyId, submissionID, item.id, item.name, item.quantity_on_hand]
+      );
+    }
+    await client.query("COMMIT");
+    res.status(201).json(await loadInventoryCountSubmission(pool, submissionID, req.companyId));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error instanceof InventoryCountInputError) return res.status(error.statusCode).json({ error: error.code, message: error.message });
+    console.error("[operations] count generation failed:", error);
+    res.status(500).json({ error: "inventory_count_generation_failed" });
+  } finally { client.release(); }
+});
+
+app.get("/api/operations/inventory-counts/submissions", authRequired, requireCapability("operations.view"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const mayManage = hasCapability(req, "operations.manage");
+    const { rows } = await pool.query(
+      `${inventoryCountSubmissionSelect}
+        WHERE s.company_id = $1
+          AND ($2 = true OR s.assigned_user_id IS NULL OR s.assigned_user_id = $3 OR s.submitted_by = $3)
+        ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'submitted' THEN 1 WHEN 'rejected' THEN 2 ELSE 3 END,
+                 s.due_date NULLS LAST, s.created_at DESC
+        LIMIT 200`,
+      [req.companyId, mayManage, req.userId]
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("[operations] count submissions failed:", error);
+    res.status(500).json({ error: "inventory_count_submissions_failed" });
+  }
+});
+
+app.post("/api/operations/inventory-counts/submissions/:id/submit", authRequired, requireCapability("operations.request"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const client = await pool.connect();
+  try {
+    const input = normalizeCountSubmission(req.body);
+    await client.query("BEGIN");
+    const submission = (await client.query(
+      `SELECT * FROM inventory_count_submissions s WHERE s.id = $1 AND s.company_id = $2 FOR UPDATE`,
+      [req.params.id, req.companyId]
+    )).rows[0];
+    if (!submission) { await client.query("ROLLBACK"); return res.status(404).json({ error: "inventory_count_not_found" }); }
+    if (!hasCapability(req, "operations.manage") && submission.assigned_user_id && submission.assigned_user_id !== req.userId) {
+      await client.query("ROLLBACK"); return res.status(403).json({ error: "inventory_count_not_assigned" });
+    }
+    if (!['pending', 'rejected'].includes(submission.status)) {
+      await client.query("ROLLBACK"); return res.status(409).json({ error: "inventory_count_already_submitted" });
+    }
+    const snapshot = (await client.query(
+      `SELECT item_id FROM inventory_count_submission_items WHERE submission_id = $1 AND company_id = $2 ORDER BY item_id FOR UPDATE`,
+      [submission.id, req.companyId]
+    )).rows.map((row) => row.item_id);
+    const submittedIDs = input.items.map((item) => item.item_id).sort();
+    if (snapshot.length !== submittedIDs.length || snapshot.some((id, index) => id !== submittedIDs[index])) {
+      await client.query("ROLLBACK"); return res.status(409).json({ error: "inventory_count_items_must_be_complete" });
+    }
+    for (const item of input.items) {
+      await client.query(
+        `UPDATE inventory_count_submission_items
+            SET counted_quantity = $4, variance = $4 - expected_quantity, note = $5, updated_at = now()
+          WHERE submission_id = $1 AND company_id = $2 AND item_id = $3`,
+        [submission.id, req.companyId, item.item_id, item.counted_quantity, item.note]
+      );
+    }
+    const autoApprove = submission.approval_required === false;
+    if (autoApprove) await reconcileInventoryCount(client, submission, req.userId, "Auto-approved by schedule");
+    await client.query(
+      `UPDATE inventory_count_submissions
+          SET status = $3, submitted_by = $4, submitted_at = now(),
+              reviewed_by = CASE WHEN $5 THEN $4::uuid ELSE NULL END,
+              reviewed_at = CASE WHEN $5 THEN now() ELSE NULL END,
+              review_note = CASE WHEN $5 THEN 'Auto-approved by schedule' ELSE NULL END,
+              updated_at = now()
+        WHERE id = $1 AND company_id = $2`,
+      [submission.id, req.companyId, autoApprove ? "approved" : "submitted", req.userId, autoApprove]
+    );
+    await client.query("COMMIT");
+    res.json(await loadInventoryCountSubmission(pool, submission.id, req.companyId));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error instanceof InventoryCountInputError) return res.status(error.statusCode).json({ error: error.code, message: error.message });
+    console.error("[operations] count submit failed:", error);
+    res.status(500).json({ error: "inventory_count_submit_failed" });
+  } finally { client.release(); }
+});
+
+app.post("/api/operations/inventory-counts/submissions/:id/review", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const client = await pool.connect();
+  try {
+    const input = normalizeCountReview(req.body);
+    await client.query("BEGIN");
+    const submission = (await client.query(
+      `SELECT * FROM inventory_count_submissions s WHERE s.id = $1 AND s.company_id = $2 FOR UPDATE`,
+      [req.params.id, req.companyId]
+    )).rows[0];
+    if (!submission) { await client.query("ROLLBACK"); return res.status(404).json({ error: "inventory_count_not_found" }); }
+    if (submission.status === "approved" && input.action === "approve") {
+      await client.query("COMMIT");
+      return res.json(await loadInventoryCountSubmission(pool, submission.id, req.companyId));
+    }
+    if (submission.status !== "submitted") {
+      await client.query("ROLLBACK"); return res.status(409).json({ error: "inventory_count_not_reviewable" });
+    }
+    if (input.action === "approve") await reconcileInventoryCount(client, submission, req.userId, input.note);
+    await client.query(
+      `UPDATE inventory_count_submissions
+          SET status = $3, reviewed_by = $4, reviewed_at = now(), review_note = $5, updated_at = now()
+        WHERE id = $1 AND company_id = $2`,
+      [submission.id, req.companyId, input.action === "approve" ? "approved" : "rejected", req.userId, input.note]
+    );
+    await client.query("COMMIT");
+    res.json(await loadInventoryCountSubmission(pool, submission.id, req.companyId));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error instanceof InventoryCountInputError) return res.status(error.statusCode).json({ error: error.code, message: error.message });
+    console.error("[operations] count review failed:", error);
+    res.status(500).json({ error: "inventory_count_review_failed" });
+  } finally { client.release(); }
+});
+
 app.get("/api/operations/mileage", authRequired, requireCapability("operations.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
@@ -15348,6 +16023,11 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
     const jobsUpcomingEnd = parseDashboardDate(req.query.jobs_upcoming_end, new Date(currentAt.getTime() + 30 * 86400000));
     const employer = req.role === "employer";
     const failedSources = [];
+    const companyTimezoneSource = await dashboardSource(requestId, "company_timezone", () => req.companyId
+      ? pool.query(`SELECT timezone FROM companies WHERE id = $1`, [req.companyId])
+      : Promise.resolve({ rows: [] }), { rows: [] });
+    if (companyTimezoneSource.failed) failedSources.push(companyTimezoneSource.source);
+    const companyTimezone = companyTimezoneSource.value.rows[0]?.timezone || "America/New_York";
     const jobScope = employer
       ? { sql: "se.company_id = $1", values: [req.companyId] }
       : {
@@ -15680,6 +16360,7 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
     const tasksTodayCompleted = Number(taskStats.completed_today || 0) + Number(customerStats.completed_today || 0) + routineCompletedToday;
     res.json({
       generated_at: new Date().toISOString(),
+      company_timezone: companyTimezone,
       metrics: {
         jobs_today: jobsToday.length,
         jobs_today_completed: completedJobsToday,
@@ -15762,6 +16443,111 @@ app.get("/api/map-pins", authRequired, requireCapability("operations.view"), asy
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_pins" }); }
 });
 
+app.post("/api/map-pins/canvass", authRequired, requireAllCapabilities("operations.manage", "contacts.view"), async (req, res) => {
+  const rawContactIDs = req.body?.contact_ids;
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (!Array.isArray(rawContactIDs) || !rawContactIDs.length || rawContactIDs.length > 100) {
+    return res.status(400).json({ error: "canvass_contacts_invalid", message: "Choose between 1 and 100 Contacts." });
+  }
+  const contactIDs = [...new Set(rawContactIDs.map((value) => String(value || "").trim()))];
+  if (contactIDs.length !== rawContactIDs.length || contactIDs.some((id) => !uuidPattern.test(id))) {
+    return res.status(400).json({ error: "canvass_contacts_invalid", message: "The selected Contact list is invalid." });
+  }
+
+  const client = await pool.connect();
+  const createdPins = [];
+  try {
+    await client.query("BEGIN");
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`map-canvass:${req.userId}`]);
+    const contactScope = companyOrUserContactWhere(req);
+    const contacts = (await client.query(
+      `SELECT id::text AS id, name, address, phone, email, lat, lng
+         FROM contacts
+        WHERE ${contactScope.sql} AND deleted_at IS NULL AND id = ANY($2::uuid[])`,
+      [...contactScope.values, contactIDs]
+    )).rows;
+    const contactsByID = new Map(contacts.map((contact) => [String(contact.id), contact]));
+    const existing = (await client.query(
+      `SELECT p.id, p.user_id, p.latitude, p.longitude, p.name, p.address, p.notes,
+              p.status, p.phone, p.email, p.contact_id, p.created_at,
+              COALESCE(NULLIF(u.display_name, ''), u.email) AS owner_name
+         FROM map_pins p
+         JOIN users u ON u.id = p.user_id
+        WHERE p.user_id = $1 AND p.contact_id = ANY($2::text[])
+        ORDER BY p.created_at, p.id`,
+      [req.userId, contactIDs]
+    )).rows;
+    const pinsByContactID = new Map();
+    for (const pin of existing) {
+      const contactID = String(pin.contact_id || "");
+      if (contactID && !pinsByContactID.has(contactID)) pinsByContactID.set(contactID, pin);
+    }
+
+    const items = [];
+    for (const contactID of contactIDs) {
+      const contact = contactsByID.get(contactID);
+      if (!contact) {
+        items.push({ contact_id: contactID, outcome: "omitted", reason: "contact_unavailable" });
+        continue;
+      }
+      const existingPin = pinsByContactID.get(contactID);
+      if (existingPin) {
+        items.push({ contact_id: contactID, outcome: "reused", pin: existingPin });
+        continue;
+      }
+      const latitude = Number(contact.lat);
+      const longitude = Number(contact.lng);
+      if (!Number.isFinite(latitude) || Math.abs(latitude) > 90 || !Number.isFinite(longitude) || Math.abs(longitude) > 180) {
+        items.push({ contact_id: contactID, outcome: "omitted", reason: "missing_coordinates" });
+        continue;
+      }
+      const pin = (await client.query(
+        `INSERT INTO map_pins(id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, source)
+         VALUES($1,$2,$3,$4,$5,$6,'','lead',$7,$8,$9,'web')
+         RETURNING id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at`,
+        [randomUUID(), req.userId, latitude, longitude, contact.name || "Unnamed contact", contact.address || "", contact.phone || null, contact.email || null, contactID]
+      )).rows[0];
+      createdPins.push(pin);
+      items.push({ contact_id: contactID, outcome: "created", pin });
+    }
+    await client.query("COMMIT");
+
+    for (const pin of createdPins) {
+      const payload = {
+        pin_id: pin.id,
+        status: pin.status,
+        contact_id: pin.contact_id,
+        list_id: null,
+        address: pin.address || "",
+        latitude: pin.latitude,
+        longitude: pin.longitude,
+        source: "web",
+        old_status: null,
+        new_status: pin.status
+      };
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_created", subjectType: "map_pin", subjectId: pin.id, actorUserId: req.userId, source: "web", dedupeKey: `map.pin_created:${pin.id}`, payload }).catch(() => {});
+      await syncAutomationSchedulesForMapPin(req.companyId, pin, "status_changed").catch(() => {});
+    }
+
+    const createdCount = items.filter((item) => item.outcome === "created").length;
+    const reusedCount = items.filter((item) => item.outcome === "reused").length;
+    const omittedCount = items.filter((item) => item.outcome === "omitted").length;
+    res.json({
+      requested_count: contactIDs.length,
+      created_count: createdCount,
+      reused_count: reusedCount,
+      omitted_count: omittedCount,
+      items
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[map-pins] canvass handoff failed", { code: error?.code, message: error?.message });
+    res.status(500).json({ error: "canvass_handoff_failed", message: "The canvassing list could not be prepared." });
+  } finally {
+    client.release();
+  }
+});
+
 app.put("/api/map-pins/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   const { latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at } = req.body || {};
   if (typeof latitude !== "number" || typeof longitude !== "number") {
@@ -15839,6 +16625,171 @@ app.put("/api/map-pins/:id", authRequired, requireCapability("operations.manage"
     }
     res.json(r.rows[0]);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_pin" }); }
+});
+
+app.post("/api/map-pins/:id/contact", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  const intent = req.body?.intent === "schedule" ? "schedule" : "convert";
+  const client = await pool.connect();
+  let pin;
+  let contact;
+  let created = false;
+  let previousPin;
+  let previousTags = [];
+  let tagsChanged = false;
+  try {
+    await client.query("BEGIN");
+    previousPin = (await client.query(
+      `SELECT p.*, u.company_id
+         FROM map_pins p
+         JOIN users u ON u.id = p.user_id
+        WHERE p.id = $1
+          AND (p.user_id = $2 OR ($3 = 'employer' AND u.company_id = $4))
+        FOR UPDATE OF p`,
+      [req.params.id, req.userId, req.role, req.companyId]
+    )).rows[0];
+    if (!previousPin) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "map_pin_not_found" });
+    }
+    if (intent === "schedule" && (!String(previousPin.name || "").trim() || !String(previousPin.address || "").trim())) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "map_pin_schedule_fields_required",
+        message: "Add a name and address before scheduling this location."
+      });
+    }
+
+    if (previousPin.contact_id) {
+      if (!hasCapability(req, "contacts.view")) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ error: "missing_capability", capability: "contacts.view" });
+      }
+      const contactScope = companyOrUserContactWhere(req, "c");
+      contact = (await client.query(
+        `SELECT c.* FROM contacts c
+          WHERE c.id::text = $1 AND ${contactScope.sql.replace("$1", "$2")}
+          FOR UPDATE`,
+        [previousPin.contact_id, ...contactScope.values]
+      )).rows[0];
+      if (!contact) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "linked_contact_unavailable" });
+      }
+      if (intent === "schedule") {
+        if (!hasCapability(req, "contacts.edit")) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({ error: "missing_capability", capability: "contacts.edit" });
+        }
+        previousTags = contactTagsArray(contact.tags);
+        if (!previousTags.some((tag) => tag.toLowerCase() === "won")) {
+          contact = (await client.query(
+            `UPDATE contacts SET tags = $2, updated_at = now() WHERE id = $1 RETURNING *`,
+            [contact.id, contactTagsForDatabase([...previousTags, "won"])]
+          )).rows[0];
+          tagsChanged = true;
+        }
+      }
+    } else {
+      if (!hasCapability(req, "contacts.create")) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ error: "missing_capability", capability: "contacts.create" });
+      }
+      const contactBody = {
+        name: String(previousPin.name || "").trim() || "New Contact",
+        phone: previousPin.phone || null,
+        email: previousPin.email || null,
+        address: previousPin.address || null,
+        lat: Number(previousPin.latitude),
+        lng: Number(previousPin.longitude),
+        tags: [intent === "schedule" ? "won" : previousPin.status || "lead"],
+        source: "map"
+      };
+      const statements = contactInsertStatements(req, contactBody);
+      const contactID = randomUUID();
+      statements[0].values[0] = contactID;
+      statements[1].values[0] = contactID;
+      try {
+        contact = (await client.query(statements[0].sql, statements[0].values)).rows[0];
+      } catch (insertError) {
+        if (insertError.code !== "42703") throw insertError;
+        contact = (await client.query(statements[1].sql, statements[1].values)).rows[0];
+      }
+      created = true;
+    }
+
+    pin = (await client.query(
+      `UPDATE map_pins
+          SET contact_id = $2,
+              status = CASE WHEN $3 = 'schedule' THEN 'won' ELSE status END,
+              updated_at = now()
+        WHERE id = $1
+        RETURNING id, user_id, latitude, longitude, name, address, notes, status,
+                  phone, email, contact_id, created_at, updated_at, list_id, source,
+                  last_visit_at, last_knock_at, visit_count, knock_count`,
+      [previousPin.id, contact.id, intent]
+    )).rows[0];
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    const classified = classifyContactCreateError(error);
+    console.error("map_pin_contact_conversion_failed", {
+      companyId: req.companyId,
+      userId: req.userId,
+      pinId: req.params.id,
+      code: classified.code
+    });
+    return res.status(500).json({
+      error: "map_pin_contact_conversion_failed",
+      message: classified.message
+    });
+  } finally {
+    client.release();
+  }
+
+  if (created) await emitContactCreatedEffects(req, contact, "map");
+  if (tagsChanged && req.companyId) {
+    await emitContactUpdateEvents({
+      companyId: req.companyId,
+      contactId: contact.id,
+      actorUserId: req.userId,
+      source: "map.schedule",
+      changedFields: [{ field: "tags", old_value: previousTags, new_value: contactTagsArray(contact.tags) }]
+    }).catch(() => {});
+    await emitContactTagEvents({
+      companyId: req.companyId,
+      contactId: contact.id,
+      actorUserId: req.userId,
+      source: "map.schedule",
+      previousTags,
+      nextTags: contactTagsArray(contact.tags)
+    }).catch(() => {});
+    await markGoogleSheetsContactDirty(pool, req.companyId, contact.id, "contact.updated").catch(() => {});
+  }
+  if (req.companyId && (created || previousPin.status !== pin.status || previousPin.contact_id !== pin.contact_id)) {
+    const payload = {
+      pin_id: pin.id,
+      contact_id: contact.id,
+      status: pin.status,
+      old_status: previousPin.status,
+      new_status: pin.status,
+      address: pin.address || "",
+      latitude: pin.latitude,
+      longitude: pin.longitude,
+      source: "web",
+      intent
+    };
+    await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_updated", subjectType: "map_pin", subjectId: pin.id, actorUserId: req.userId, source: "web", payload }).catch(() => {});
+    if (previousPin.contact_id !== pin.contact_id) {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_converted_to_contact", subjectType: "map_pin", subjectId: pin.id, actorUserId: req.userId, source: "web", dedupeKey: `map.pin_converted_to_contact:${pin.id}:${contact.id}`, payload }).catch(() => {});
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_contact_linked", subjectType: "map_pin", subjectId: pin.id, actorUserId: req.userId, source: "web", payload }).catch(() => {});
+    }
+    if (previousPin.status !== pin.status) {
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_status_changed", subjectType: "map_pin", subjectId: pin.id, actorUserId: req.userId, source: "web", payload }).catch(() => {});
+      await emitAutomationEvent({ companyId: req.companyId, eventType: "map.pin_marked_won", subjectType: "map_pin", subjectId: pin.id, actorUserId: req.userId, source: "web", payload }).catch(() => {});
+      await syncAutomationSchedulesForMapPin(req.companyId, pin, "status_changed").catch(() => {});
+    }
+  }
+  res.status(created ? 201 : 200).json({ contact, pin, created, intent });
 });
 
 app.delete("/api/map-pins/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
@@ -16084,7 +17035,7 @@ app.get("/api/todo/tasks", authRequired, requireCapability("tasks.view"), async 
       : [req.userId];
     const { rows } = await pool.query(
       `SELECT id, title, detail, creator_id, assignee_ids, due_date, priority, status,
-              linked_contact_id, linked_job_id, linked_equipment_id,
+              linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
               reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex
        FROM todo_tasks
        WHERE user_id = $1
@@ -16100,7 +17051,7 @@ app.get("/api/todo/tasks", authRequired, requireCapability("tasks.view"), async 
 app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   const {
     title, detail, creator_id, assignee_ids, due_date, priority, status,
-    linked_contact_id, linked_job_id, linked_equipment_id,
+    linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
     reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex
   } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
@@ -16111,12 +17062,17 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
       [req.params.id, req.userId, req.companyId]
     );
     const ownerUserId = previous.rows[0]?.user_id || creator_id || req.userId;
+    const operationalLinks = normalizeTaskOperationalLinks(
+      req.body || {},
+      previous.rows[0] || null
+    );
+    await validateTaskOperationalLinks(pool, req.companyId, operationalLinks);
     const r = await pool.query(
       `INSERT INTO todo_tasks
         (id, user_id, title, detail, creator_id, assignee_ids, due_date, priority, status,
-         linked_contact_id, linked_job_id, linked_equipment_id, reminders, subtasks,
+         linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id, reminders, subtasks,
          completed, completed_at, completed_by, completion_note, completion_note_required, color_hex)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, $16, $17, $18, $19, $20)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, $17, $18, $19, $20, $21, $22)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              detail = EXCLUDED.detail,
@@ -16128,6 +17084,8 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
              linked_contact_id = EXCLUDED.linked_contact_id,
              linked_job_id = EXCLUDED.linked_job_id,
              linked_equipment_id = EXCLUDED.linked_equipment_id,
+             linked_equipment_request_id = EXCLUDED.linked_equipment_request_id,
+             linked_inventory_count_id = EXCLUDED.linked_inventory_count_id,
              reminders = EXCLUDED.reminders,
              subtasks = EXCLUDED.subtasks,
              completed = EXCLUDED.completed,
@@ -16138,15 +17096,16 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
              color_hex = EXCLUDED.color_hex,
              updated_at = now()
        WHERE todo_tasks.user_id = $2
-          OR ($21::uuid IS NOT NULL AND todo_tasks.user_id IN (SELECT id FROM users WHERE company_id = $21))
-          OR todo_tasks.assignee_ids ? $22::text
+          OR ($23::uuid IS NOT NULL AND todo_tasks.user_id IN (SELECT id FROM users WHERE company_id = $23))
+          OR todo_tasks.assignee_ids ? $24::text
        RETURNING id, title, detail, creator_id, assignee_ids, due_date, priority, status,
-                 linked_contact_id, linked_job_id, linked_equipment_id,
+                 linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
                  reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex`,
       [
         req.params.id, ownerUserId, title, detail || null, creator_id || req.userId, JSON.stringify(assignees), due_date || null,
         priority || "normal", completed ? "completed" : (status || "open"),
-        linked_contact_id || null, linked_job_id || null, linked_equipment_id || null,
+        linked_contact_id || null, linked_job_id || null, operationalLinks.linked_equipment_id,
+        operationalLinks.linked_equipment_request_id, operationalLinks.linked_inventory_count_id,
         JSON.stringify(reminders || []), JSON.stringify(subtasks || []),
         toBool(completed), completed_at || (completed ? new Date() : null),
         completed_by || (completed ? req.userId : null), completion_note || null, toBool(completion_note_required), color_hex || null,
@@ -16159,7 +17118,7 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
       if (!before) {
         await emitAutomationEvent({ companyId: req.companyId, eventType: "task.created", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", dedupeKey: `task.created:${after.id}`, payload: { task_id: after.id, title: after.title, due_date: after.due_date } });
       } else {
-        const changed = rowChanges(before, after, ["title", "due_date", "completed", "subtasks"]);
+        const changed = rowChanges(before, after, ["title", "due_date", "completed", "subtasks", "linked_equipment_id", "linked_equipment_request_id", "linked_inventory_count_id"]);
         if (changed.length) await emitAutomationEvent({ companyId: req.companyId, eventType: "task.updated", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { task_id: after.id, title: after.title, changed_fields: changed } });
         if (changed.some((c) => c.field === "title")) await emitAutomationEvent({ companyId: req.companyId, eventType: "task.title_changed", subjectType: "task", subjectId: after.id, actorUserId: req.userId, source: "todo.api", payload: { task_id: after.id } });
         if (changed.some((c) => c.field === "due_date")) {
@@ -16172,7 +17131,13 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
       await syncAutomationSchedulesForTask(req.companyId, after);
     }
     res.json(r.rows[0]);
-  } catch (e) { console.error(e); res.status(500).json({ error: "failed_upsert_task" }); }
+  } catch (e) {
+    if (e instanceof TodoOperationalLinkError) {
+      return res.status(e.statusCode).json({ error: e.code, message: e.message });
+    }
+    console.error(e);
+    res.status(500).json({ error: "failed_upsert_task" });
+  }
 });
 
 app.delete("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
@@ -18203,7 +19168,33 @@ async function startServer() {
     pool,
     authRequired,
     requireView: requireCapability("website.view"),
-    requireManage: requireCapability("website.manage")
+    requireManage: requireCapability("website.manage"),
+    requirePublish: requireCapability("website.publish"),
+    emitAutomationEvent,
+    markContactDirty: (companyId, contactId, reason) => markGoogleSheetsContactDirty(pool, companyId, contactId, reason),
+    sendPushToUsers,
+    syncTaskSchedules: syncAutomationSchedulesForTask,
+    mediaStorage: {
+      uploadUrl: async (objectKey, mimeType, byteSize) => {
+        const cfg = mediaBucketConfig();
+        const s3 = getMediaS3Client();
+        if (!cfg || !s3) return null;
+        return getSignedUrl(s3, new PutObjectCommand({ Bucket: cfg.bucket, Key: objectKey, ContentType: mimeType, ContentLength: byteSize }), { expiresIn: 900 });
+      },
+      downloadUrl: async (objectKey) => {
+        const cfg = mediaBucketConfig();
+        const s3 = getMediaS3Client();
+        if (!cfg || !s3) throw Object.assign(new Error("Website media storage is not configured."), { statusCode: 503, code: "media_bucket_not_configured" });
+        return getSignedUrl(s3, new GetObjectCommand({ Bucket: cfg.bucket, Key: objectKey }), { expiresIn: 900 });
+      },
+      inspect: async (objectKey) => {
+        const cfg = mediaBucketConfig();
+        const s3 = getMediaS3Client();
+        if (!cfg || !s3) throw Object.assign(new Error("Website media storage is not configured."), { statusCode: 503, code: "media_bucket_not_configured" });
+        const object = await s3.send(new HeadObjectCommand({ Bucket: cfg.bucket, Key: objectKey }));
+        return { byte_size: Number(object.ContentLength || 0), mime_type: object.ContentType || "" };
+      }
+    }
   });
   await installFinanceSystem({
     app,

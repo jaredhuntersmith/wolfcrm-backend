@@ -23,6 +23,7 @@
     "test:contact-import": "node --test tests/contact-import.test.js",
     "test:measurements": "node --test tests/measurement-*.test.js",
     "test:website-builder": "node --test tests/website-builder.test.js",
+    "test:operations": "node --test tests/operations-*.test.js",
     "test:navigation-tabs": "node --test tests/navigation-tabs.test.js",
     "test:dashboard-layout": "node --test tests/dashboard-layout.test.js",
     "test:schedule-team": "node --test tests/schedule-team.test.js",
