@@ -124,6 +124,7 @@ const WEBSITE_BLOCK_DESIGN_CUSTOM_COLOR_FIELDS = new Set([
 ]);
 const WEBSITE_BLOCK_DESIGN_CUSTOM_NUMBER_FIELDS = Object.freeze({
   custom_width_percent: [10, 220],
+  custom_height_px: [0, 2400],
   custom_min_height_px: [0, 2400],
   custom_padding_px: [0, 320],
   custom_offset_x_px: [-800, 800],
