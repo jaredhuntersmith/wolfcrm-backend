@@ -236,6 +236,31 @@ test("initial direct capture and selected match commit atomically", async () => 
   assert.match(calls.find((sql) => sql.startsWith("SELECT id FROM finance_transactions")), /removed_at IS NULL.*FOR UPDATE/);
 });
 
+test("browser capture records upload provenance while preserving the native default", async () => {
+  const companyID = "323e4567-e89b-42d3-a456-426614174000";
+  const insertedSources = [];
+  const pool = {
+    async connect() {
+      return {
+        async query(sql, values = []) {
+          const compact = sql.replace(/\s+/g, " ").trim();
+          if (["BEGIN", "COMMIT", "ROLLBACK"].includes(compact) || compact.includes("pg_advisory_xact_lock")) return { rows: [] };
+          if (compact.startsWith("SELECT * FROM finance_receipts")) return { rows: [] };
+          if (compact.startsWith("INSERT INTO finance_receipts")) {
+            insertedSources.push(values[3]);
+            return { rows: [{ id: RECEIPT_ID, source: values[3], status: "processing" }] };
+          }
+          throw new Error(`Unexpected query: ${compact}`);
+        },
+        release() {}
+      };
+    }
+  };
+  await createReceiptCapture({ pool, companyID, actorUserID: null, source: "upload", body: { content_sha256: CONTENT_SHA256 } });
+  await createReceiptCapture({ pool, companyID, actorUserID: null, body: {} });
+  assert.deepEqual(insertedSources, ["upload", "ios"]);
+});
+
 test("failed content-identical capture recovers the same authority while completed duplicates fail", async () => {
   const companyID = "323e4567-e89b-42d3-a456-426614174000";
   const failed = {

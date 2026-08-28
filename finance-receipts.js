@@ -370,13 +370,13 @@ function transactionPayload(row) {
 }
 
 function isRecoverableReceiptCapture(row, transactionID) {
-  if (!row || row.source !== "ios" || row.object_key || Number(row.details_version || 1) !== 1) return false;
+  if (!row || !["ios", "upload"].includes(row.source) || row.object_key || Number(row.details_version || 1) !== 1) return false;
   if (String(row.transaction_id || "") !== String(transactionID || "")) return false;
   if (["processing", "processing_failed"].includes(row.status)) return true;
   return row.status === "matched" && row.match_method === "user_direct" && Boolean(transactionID);
 }
 
-export async function createReceiptCapture({ pool, companyID, actorUserID, body = {} }) {
+export async function createReceiptCapture({ pool, companyID, actorUserID, source = "ios", body = {} }) {
   if (body.object_key || body.thumbnail_object_key) {
     throw receiptRequestError(
       "receipt_object_key_not_allowed",
@@ -384,6 +384,7 @@ export async function createReceiptCapture({ pool, companyID, actorUserID, body 
     );
   }
   const payload = receiptUpdatePayload(body);
+  const captureSource = source === "upload" ? "upload" : "ios";
   const transactionID = cleanString(body.transaction_id, 80) || null;
   const client = await pool.connect();
   try {
@@ -438,10 +439,10 @@ export async function createReceiptCapture({ pool, companyID, actorUserID, body 
          card_last_four, finance_category, business_use, note, ocr_text, ocr_confidence,
          object_key, thumbnail_object_key, mime_type, pixel_width, pixel_height, file_size_bytes,
          content_sha256, match_method, match_confidence, matched_at, created_by
-       ) VALUES ($1,$2,$3,'ios',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
        RETURNING *`,
       [
-        companyID, transactionID, status, payload.merchant_name, payload.normalized_merchant_name,
+        companyID, transactionID, status, captureSource, payload.merchant_name, payload.normalized_merchant_name,
         payload.purchase_date, payload.purchase_time, payload.amount_cents, payload.subtotal_cents,
         payload.tax_cents, payload.tip_cents, payload.currency, payload.address, payload.city,
         payload.state, payload.postal_code, payload.country, payload.payment_method_text,
@@ -1067,6 +1068,7 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
         pool,
         companyID: req.companyId,
         actorUserID: req.userId,
+        source: req.get("x-wolfcrm-client") === "web" ? "upload" : "ios",
         body: req.body || {}
       });
       res.status(result.recovered ? 200 : 201).json(receiptPayload(result.receipt));
