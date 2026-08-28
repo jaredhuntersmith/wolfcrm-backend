@@ -95,6 +95,10 @@ import {
   validateOnMyWayTemplate
 } from "./on-my-way.js";
 import {
+  CustomerMessageComposeError,
+  validateCustomerMessageCompose
+} from "./customer-message-compose.js";
+import {
   WeatherSchedulingError,
   buildWeatherRiskReport,
   createGoogleWeatherService,
@@ -4997,6 +5001,134 @@ app.get("/api/phone/messages/:id/media/:index", authRequired, requireCapability(
     console.error("[phone/message/media] failed:", { code: e?.code, status: e?.status, message: e?.message });
     res.status(e?.status || 500).json({ error: "media_fetch_failed" });
   }
+});
+
+app.post("/api/phone/messages", authRequired, requireCapability("messaging.customer.send"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+
+  let request;
+  try {
+    request = validateCustomerMessageCompose(req.body);
+  } catch (error) {
+    if (error instanceof CustomerMessageComposeError) {
+      return res.status(error.statusCode).json({
+        error: error.code,
+        message: error.message,
+        ...(error.details ? { details: error.details } : {})
+      });
+    }
+    return res.status(400).json({ error: "invalid_message_request" });
+  }
+
+  let contact;
+  try {
+    contact = (await pool.query(
+      `SELECT c.id, c.name, c.phone
+         FROM contacts c
+        WHERE c.id = $1 AND c.company_id = $2
+        LIMIT 1`,
+      [request.contactId, req.companyId]
+    )).rows[0];
+  } catch (error) {
+    console.error("[phone/messages/new] contact lookup failed:", { code: error?.code, message: error?.message });
+    return res.status(500).json({ error: "contact_lookup_failed", message: "WolfCRM couldn't load that customer." });
+  }
+  if (!contact) return res.status(404).json({ error: "contact_not_found", message: "That customer is no longer available." });
+
+  const recipientPhone = normalizeE164Phone(contact.phone);
+  if (!isUsableE164(recipientPhone)) {
+    return res.status(422).json({ error: "customer_phone_required", message: "Add a valid customer mobile number before sending a message." });
+  }
+
+  let delivery;
+  try {
+    delivery = await deliverCustomerWorkflowMessage({
+      channel: "sms",
+      companyId: req.companyId,
+      contactId: contact.id,
+      recipientPhone,
+      body: request.body
+    });
+  } catch (error) {
+    if (error?.code === "customer_sms_opted_out") {
+      await recordPhoneSmsConsent(req.companyId, recipientPhone, "opted_out", "customer.compose").catch(() => {});
+    }
+    if (error instanceof OnMyWayError) {
+      return res.status(error.statusCode).json({
+        error: error.code,
+        message: error.message,
+        ...(error.details ? { details: error.details } : {})
+      });
+    }
+    console.error("[phone/messages/new] delivery failed:", { code: error?.code, message: error?.message });
+    return res.status(500).json({ error: "phone_message_send_failed", message: "WolfCRM couldn't send that message." });
+  }
+
+  let persistence;
+  try {
+    persistence = await pool.connect();
+  } catch (error) {
+    console.error("[phone/messages/new] provider accepted but persistence connection failed:", {
+      providerMessageSid: delivery.providerMessageSid,
+      code: error?.code,
+      message: error?.message
+    });
+    return res.status(502).json({
+      error: "message_delivery_unknown",
+      message: "The provider accepted this message, but WolfCRM couldn't confirm its local record. Check Messages before trying again."
+    });
+  }
+  let storedMessage;
+  try {
+    await persistence.query("BEGIN");
+    storedMessage = (await persistence.query(
+      `INSERT INTO sms_messages(
+         conversation_id, twilio_message_sid, direction, from_number, to_number,
+         body, message_status, media_count, media
+       ) VALUES($1,$2,'outbound',$3,$4,$5,$6,0,'[]'::jsonb)
+       RETURNING id, conversation_id, twilio_message_sid, direction, from_number,
+                 to_number, body, message_status, media_count, media,
+                 twilio_error_code, twilio_error_message, created_at, updated_at`,
+      [
+        delivery.conversationId,
+        delivery.providerMessageSid,
+        delivery.fromNumber,
+        delivery.toNumber,
+        request.body,
+        delivery.status
+      ]
+    )).rows[0];
+    await persistence.query(
+      `UPDATE sms_conversations SET last_message_at = now(), updated_at = now() WHERE id = $1`,
+      [delivery.conversationId]
+    );
+    await persistence.query("COMMIT");
+  } catch (error) {
+    await persistence.query("ROLLBACK").catch(() => {});
+    console.error("[phone/messages/new] provider accepted but persistence failed:", {
+      providerMessageSid: delivery.providerMessageSid,
+      code: error?.code,
+      message: error?.message
+    });
+    return res.status(502).json({
+      error: "message_delivery_unknown",
+      message: "The provider accepted this message, but WolfCRM couldn't confirm its local record. Check Messages before trying again."
+    });
+  } finally {
+    persistence.release();
+  }
+
+  await emitCustomerWorkflowSmsHooks({
+    companyId: req.companyId,
+    actorUserId: req.userId,
+    contactId: contact.id,
+    storedMessage,
+    recipientPhone: delivery.toNumber,
+    fromNumber: delivery.fromNumber,
+    workflow: "customer.compose",
+    dirtyReason: "sms.customer_compose"
+  });
+  res.status(201).json({ conversation_id: delivery.conversationId, message: storedMessage });
 });
 
 app.post("/api/phone/conversations/:id/messages", authRequired, requireCapability("messaging.customer.send"), async (req, res) => {
