@@ -17,6 +17,8 @@ const MAX_BLOCKS_PER_PAGE = 100;
 const MAX_PAGE_CONTENT_BYTES = 262144;
 const SEO_TITLE_LIMIT = 70;
 const SEO_DESCRIPTION_LIMIT = 200;
+const MAX_NAVIGATION_ITEMS = 30;
+const NAVIGATION_LABEL_LIMIT = 80;
 const WEBSITE_THEME_DEFAULTS = Object.freeze({
   primary_color: "#0f766e",
   accent_color: "#f59e0b",
@@ -38,6 +40,13 @@ const WEBSITE_THEME_COLOR_FIELDS = Object.freeze([
 ]);
 const WEBSITE_THEME_FONT_CHOICES = new Set(["system", "modern", "classic"]);
 const WEBSITE_THEME_CORNER_CHOICES = new Set(["square", "soft", "rounded"]);
+const WEBSITE_NAVIGATION_DEFAULTS = Object.freeze({
+  mode: "automatic",
+  show_brand: true,
+  cta_label: "",
+  cta_href: "",
+  items: [],
+});
 const WEBSITE_BLOCK_TYPES = new Set(["hero", "text", "callout", "features", "spacer"]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -98,6 +107,10 @@ function themeError(message) {
   return new WebsiteBuilderError("website_project_theme_invalid", message);
 }
 
+function navigationError(message) {
+  return new WebsiteBuilderError("website_project_navigation_invalid", message);
+}
+
 function assertOnlyKeys(value, allowed, label) {
   const unknown = Object.keys(value).find((key) => !allowed.has(key));
   if (unknown) throw contentError(`${label} contains an unsupported ${unknown} field.`);
@@ -130,6 +143,14 @@ function blockLink(value) {
     /^tel:\+?[0-9(). -]{7,30}$/i.test(link)
   ) return link;
   throw contentError("Button links must use a local path, HTTP(S), mailto, or tel address.");
+}
+
+function navigationLink(value) {
+  try {
+    return blockLink(value);
+  } catch {
+    throw navigationError("Navigation calls to action must use a local path, HTTP(S), mailto, or tel address.");
+  }
 }
 
 function normalizeWebsiteBlock(value, index) {
@@ -310,6 +331,67 @@ function websiteProjectThemePayload(value) {
   }
 }
 
+export function normalizeWebsiteProjectNavigation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw navigationError("Navigation settings must be an object.");
+  }
+  const allowed = new Set(["mode", "show_brand", "cta_label", "cta_href", "items"]);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown) throw navigationError(`Navigation settings contain an unsupported ${unknown} field.`);
+  const mode = value.mode ?? "automatic";
+  if (mode !== "automatic" && mode !== "custom") {
+    throw navigationError("Navigation mode must be automatic or custom.");
+  }
+  if (value.show_brand !== undefined && typeof value.show_brand !== "boolean") {
+    throw navigationError("Brand visibility must be true or false.");
+  }
+  const ctaLabel = cleanString(value.cta_label, NAVIGATION_LABEL_LIMIT);
+  const ctaHref = navigationLink(value.cta_href);
+  if ((ctaLabel && !ctaHref) || (!ctaLabel && ctaHref)) {
+    throw navigationError("Navigation call-to-action label and link must be provided together.");
+  }
+  const rawItems = value.items ?? [];
+  if (!Array.isArray(rawItems) || rawItems.length > MAX_NAVIGATION_ITEMS) {
+    throw navigationError(`Custom navigation may contain up to ${MAX_NAVIGATION_ITEMS} items.`);
+  }
+  const items = rawItems.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw navigationError(`Navigation item ${index + 1} must be an object.`);
+    }
+    const itemUnknown = Object.keys(item).find((key) => key !== "page_id" && key !== "label");
+    if (itemUnknown) throw navigationError(`Navigation item ${index + 1} contains an unsupported ${itemUnknown} field.`);
+    if (typeof item.page_id !== "string" || !UUID_PATTERN.test(item.page_id)) {
+      throw navigationError(`Navigation item ${index + 1} has an invalid page identifier.`);
+    }
+    return {
+      page_id: item.page_id,
+      label: requiredName(item.label, `Navigation item ${index + 1} label`, NAVIGATION_LABEL_LIMIT),
+    };
+  });
+  if (new Set(items.map((item) => item.page_id)).size !== items.length) {
+    throw navigationError("A page may appear only once in custom navigation.");
+  }
+  return {
+    mode,
+    show_brand: value.show_brand !== false,
+    cta_label: ctaLabel,
+    cta_href: ctaHref,
+    items: mode === "custom" ? items : [],
+  };
+}
+
+function websiteProjectNavigationPayload(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const compatible = Object.fromEntries(
+    Object.entries(source).filter(([key]) => Object.hasOwn(WEBSITE_NAVIGATION_DEFAULTS, key)),
+  );
+  try {
+    return normalizeWebsiteProjectNavigation({ ...WEBSITE_NAVIGATION_DEFAULTS, ...compatible });
+  } catch {
+    return { ...WEBSITE_NAVIGATION_DEFAULTS, items: [] };
+  }
+}
+
 function lifecycleStatus(value) {
   if (!WEBSITE_LIFECYCLE_STATUSES.includes(value)) {
     throw new WebsiteBuilderError(
@@ -390,11 +472,15 @@ export function normalizeWebsiteProjectUpdate(body = {}) {
     theme: body.theme === undefined
       ? undefined
       : normalizeWebsiteProjectTheme(body.theme),
+    navigation: body.navigation === undefined
+      ? undefined
+      : normalizeWebsiteProjectNavigation(body.navigation),
   };
   if (
     update.name === undefined &&
     update.lifecycle_status === undefined &&
-    update.theme === undefined
+    update.theme === undefined &&
+    update.navigation === undefined
   ) {
     throw new WebsiteBuilderError(
       "website_project_update_empty",
@@ -524,6 +610,7 @@ function projectPayload(row) {
     kind: row.kind,
     lifecycle_status: row.lifecycle_status,
     theme: websiteProjectThemePayload(row.theme),
+    navigation: websiteProjectNavigationPayload(row.navigation),
     version: exactNumber(row.version),
     active_page_count: exactNumber(row.active_page_count),
     archived_page_count: exactNumber(row.archived_page_count),
@@ -559,6 +646,7 @@ function projectAuditSnapshot(row) {
     kind: row.kind,
     lifecycle_status: row.lifecycle_status,
     theme: websiteProjectThemePayload(row.theme),
+    navigation: websiteProjectNavigationPayload(row.navigation),
     version: exactNumber(row.version),
   } : null;
 }
@@ -685,6 +773,7 @@ export async function installWebsiteBuilderSchema(pool) {
       kind TEXT NOT NULL CHECK (kind IN ('website', 'landing_page', 'funnel')),
       lifecycle_status TEXT NOT NULL DEFAULT 'draft' CHECK (lifecycle_status IN ('draft', 'archived')),
       theme JSONB NOT NULL DEFAULT '{}'::jsonb,
+      navigation JSONB NOT NULL DEFAULT '{}'::jsonb,
       version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
       created_by UUID REFERENCES users(id) ON DELETE SET NULL,
       updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -694,10 +783,14 @@ export async function installWebsiteBuilderSchema(pool) {
       UNIQUE(id, company_id),
       CHECK (char_length(name) BETWEEN 1 AND ${PROJECT_NAME_LIMIT}),
       CHECK (jsonb_typeof(theme) = 'object'),
-      CHECK (octet_length(theme::text) <= 8192)
+      CHECK (octet_length(theme::text) <= 8192),
+      CHECK (jsonb_typeof(navigation) = 'object'),
+      CHECK (octet_length(navigation::text) <= 32768)
     );
     ALTER TABLE website_projects
       ADD COLUMN IF NOT EXISTS theme JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE website_projects
+      ADD COLUMN IF NOT EXISTS navigation JSONB NOT NULL DEFAULT '{}'::jsonb;
     CREATE INDEX IF NOT EXISTS website_projects_company_status_updated_idx
       ON website_projects(company_id, lifecycle_status, updated_at DESC);
 
@@ -889,7 +982,7 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       assertVersion(current, input.expected_version, "project");
       if (
         current.lifecycle_status === "archived" &&
-        (input.name !== undefined || input.theme !== undefined) &&
+        (input.name !== undefined || input.theme !== undefined || input.navigation !== undefined) &&
         input.lifecycle_status !== "draft"
       ) {
         throw new WebsiteBuilderError(
@@ -901,8 +994,28 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       const nextName = input.name ?? current.name;
       const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
       const nextTheme = input.theme ?? websiteProjectThemePayload(current.theme);
+      const nextNavigation = input.navigation ?? websiteProjectNavigationPayload(current.navigation);
+      if (input.navigation?.mode === "custom") {
+        const pageIds = input.navigation.items.map((item) => item.page_id);
+        if (pageIds.length) {
+          const { rows } = await client.query(
+            `SELECT id::text AS id FROM website_pages
+              WHERE company_id = $1 AND project_id = $2 AND archived_at IS NULL
+                AND id = ANY($3::uuid[])`,
+            [req.companyId, current.id, pageIds],
+          );
+          if (rows.length !== pageIds.length) {
+            throw new WebsiteBuilderError(
+              "website_project_navigation_page_invalid",
+              "Custom navigation may include only active pages from this project.",
+              409,
+            );
+          }
+        }
+      }
       const themeUnchanged = JSON.stringify(nextTheme) === JSON.stringify(websiteProjectThemePayload(current.theme));
-      if (nextName === current.name && nextStatus === current.lifecycle_status && themeUnchanged) {
+      const navigationUnchanged = JSON.stringify(nextNavigation) === JSON.stringify(websiteProjectNavigationPayload(current.navigation));
+      if (nextName === current.name && nextStatus === current.lifecycle_status && themeUnchanged && navigationUnchanged) {
         await client.query("COMMIT");
         return res.json({ project: projectPayload(current) });
       }
@@ -911,13 +1024,14 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
             SET name = $3,
                 lifecycle_status = $4,
                 theme = $5::jsonb,
+                navigation = $6::jsonb,
                 archived_at = CASE WHEN $4 = 'archived' THEN COALESCE(archived_at, now()) ELSE NULL END,
-                updated_by = $6,
+                updated_by = $7,
                 updated_at = now(),
                 version = version + 1
           WHERE id = $1 AND company_id = $2
           RETURNING *`,
-        [current.id, req.companyId, nextName, nextStatus, JSON.stringify(nextTheme), req.userId],
+        [current.id, req.companyId, nextName, nextStatus, JSON.stringify(nextTheme), JSON.stringify(nextNavigation), req.userId],
       )).rows[0];
       await appendAudit(client, {
         companyId: req.companyId,
@@ -925,9 +1039,11 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
         actorUserId: req.userId,
         action: nextStatus !== current.lifecycle_status
           ? `project.${nextStatus}`
-          : input.theme !== undefined && input.name === undefined
-            ? "project.theme_updated"
-            : "project.updated",
+          : !navigationUnchanged && nextName === current.name && themeUnchanged
+            ? "project.navigation_updated"
+            : !themeUnchanged && nextName === current.name && navigationUnchanged
+              ? "project.theme_updated"
+              : "project.updated",
         before: projectAuditSnapshot(current),
         after: projectAuditSnapshot(updated),
       });
@@ -1127,12 +1243,18 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
           [replacementHomeId, project.id, req.companyId, req.userId],
         );
       }
+      const nextProjectNavigation = websiteProjectNavigationPayload(project.navigation);
+      if (nextStatus === "archived" && nextProjectNavigation.mode === "custom") {
+        nextProjectNavigation.items = nextProjectNavigation.items.filter(
+          (item) => item.page_id !== String(current.id),
+        );
+      }
       const updatedProject = (await client.query(
         `UPDATE website_projects
-            SET version = version + 1, updated_at = now(), updated_by = $3
+            SET navigation = $3::jsonb, version = version + 1, updated_at = now(), updated_by = $4
           WHERE id = $1 AND company_id = $2
           RETURNING *`,
-        [project.id, req.companyId, req.userId],
+        [project.id, req.companyId, JSON.stringify(nextProjectNavigation), req.userId],
       )).rows[0];
       await appendAudit(client, {
         companyId: req.companyId,

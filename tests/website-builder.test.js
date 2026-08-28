@@ -9,6 +9,7 @@ import {
   normalizeWebsitePageSeo,
   normalizeWebsitePageUpdate,
   normalizeWebsiteProjectCreate,
+  normalizeWebsiteProjectNavigation,
   normalizeWebsiteProjectTheme,
   normalizeWebsiteProjectUpdate,
   normalizeWebsiteSlug,
@@ -47,7 +48,7 @@ test("page paths normalize to bounded relative slugs", () => {
 test("project and page writes require optimistic versions and bounded mutations", () => {
   assert.deepEqual(
     normalizeWebsiteProjectUpdate({ expected_version: 4, lifecycle_status: "archived" }),
-    { expected_version: 4, name: undefined, lifecycle_status: "archived", theme: undefined },
+    { expected_version: 4, name: undefined, lifecycle_status: "archived", theme: undefined, navigation: undefined },
   );
   const page = normalizeWebsitePageCreate(
     { name: "Service Area", slug: "service-area", expected_project_version: "3" },
@@ -64,6 +65,26 @@ test("project and page writes require optimistic versions and bounded mutations"
     () => normalizeWebsitePageUpdate({ expected_version: 2, expected_project_version: 3, is_home: "yes" }),
     /must be true or false/,
   );
+});
+
+test("project navigation is bounded, page-linked, and data-only", () => {
+  const pageId = "123e4567-e89b-42d3-a456-426614174000";
+  const navigation = normalizeWebsiteProjectNavigation({
+    mode: "custom",
+    show_brand: false,
+    cta_label: "Get an estimate",
+    cta_href: "/contact",
+    items: [{ page_id: pageId, label: "Roofing" }],
+  });
+  assert.equal(navigation.items[0].page_id, pageId);
+  assert.equal(navigation.show_brand, false);
+  assert.deepEqual(
+    normalizeWebsiteProjectUpdate({ expected_version: 3, navigation }).navigation,
+    navigation,
+  );
+  assert.throws(() => normalizeWebsiteProjectNavigation({ ...navigation, cta_href: "javascript:alert(1)" }), /local path/);
+  assert.throws(() => normalizeWebsiteProjectNavigation({ ...navigation, script: "alert(1)" }), /unsupported script/);
+  assert.throws(() => normalizeWebsiteProjectNavigation({ ...navigation, items: [...navigation.items, navigation.items[0]] }), /only once/);
 });
 
 test("global project themes are complete, bounded data-only tokens", () => {
@@ -144,6 +165,7 @@ test("page SEO and social metadata is bounded and data-only", () => {
 test("schema enforces company/project integrity and recoverable active-page invariants", () => {
   assert.match(source, /CREATE TABLE IF NOT EXISTS website_projects/);
   assert.match(source, /ADD COLUMN IF NOT EXISTS theme JSONB NOT NULL/);
+  assert.match(source, /ADD COLUMN IF NOT EXISTS navigation JSONB NOT NULL/);
   assert.match(source, /FOREIGN KEY\(project_id, company_id\) REFERENCES website_projects\(id, company_id\) ON DELETE CASCADE/);
   assert.match(source, /website_pages_active_slug_uidx[\s\S]*WHERE archived_at IS NULL/);
   assert.match(source, /website_pages_active_home_uidx[\s\S]*WHERE is_home AND archived_at IS NULL/);
@@ -160,6 +182,7 @@ test("routes keep authentication, capabilities, and company scope authoritative"
   assert.match(source, /const current = await loadPage[\s\S]*const nextContent = input\.content \?\? current\.content[\s\S]*content = \$8::jsonb/);
   assert.match(source, /const nextSeo = input\.seo \?\? current\.seo[\s\S]*seo = \$9::jsonb/);
   assert.match(source, /const nextTheme = input\.theme \?\? websiteProjectThemePayload\(current\.theme\)[\s\S]*theme = \$5::jsonb/);
+  assert.match(source, /const nextNavigation = input\.navigation \?\? websiteProjectNavigationPayload\(current\.navigation\)[\s\S]*id = ANY\(\$3::uuid\[\]\)[\s\S]*navigation = \$6::jsonb/);
   assert.match(source, /WHERE id::text = \$1 AND company_id = \$2/);
   assert.match(source, /WHERE id::text = \$1 AND project_id::text = \$2 AND company_id = \$3/);
 });
