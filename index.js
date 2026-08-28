@@ -151,6 +151,14 @@ import { buildDesktopContactSearchPredicate } from "./contact-search.js";
 import { buildDesktopContactListFilters } from "./contact-list-filters.js";
 import { buildContactExportCSV, defaultContactExportFilename } from "./contact-export.js";
 import { ContactImportError, contactImportContactIsUnchanged, prepareContactImport } from "./contact-import.js";
+import {
+  MeasurementInputError,
+  measurementContactLinksEqual,
+  measurementEventPayload,
+  measurementMetrics,
+  normalizeMeasurementID,
+  normalizeMeasurementInput
+} from "./measurement-contract.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -15937,14 +15945,48 @@ app.get("/api/measurements", authRequired, requireCapability("operations.view"),
 });
 
 app.put("/api/measurements/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
-  const { name, points, created_at, linked_contact_ids, units } = req.body || {};
-  if (!Array.isArray(points)) {
-    return res.status(400).json({ error: "missing_points" });
-  }
-  const cleanUnits = units === "meters" ? "meters" : "feet";
-  const cleanLinkedContactIDs = Array.isArray(linked_contact_ids) ? linked_contact_ids : [];
+  let measurementID;
+  let input;
   try {
-    const before = (await pool.query(`SELECT * FROM measurements WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId])).rows[0] || null;
+    measurementID = normalizeMeasurementID(req.params.id);
+    input = normalizeMeasurementInput(req.body || {});
+  } catch (error) {
+    if (error instanceof MeasurementInputError) {
+      return res.status(400).json({ error: error.code, message: error.message, details: error.details });
+    }
+    throw error;
+  }
+  try {
+    const eventSource = req.get("x-wolfcrm-client") === "web" ? "web" : "ios";
+    const before = (await pool.query(
+      `SELECT * FROM measurements WHERE id = $1 AND user_id = $2`,
+      [measurementID, req.userId]
+    )).rows[0] || null;
+    const contactLinksChanged = !measurementContactLinksEqual(
+      before?.linked_contact_ids,
+      input.linked_contact_ids
+    );
+    const canViewLinkedContacts = hasCapability(req, "contacts.view");
+    if (contactLinksChanged && !canViewLinkedContacts) {
+      return res.status(403).json({ error: "permission_denied", message: "Contact access is required to change measurement links." });
+    }
+    if (input.linked_contact_ids.length && canViewLinkedContacts) {
+      const tenantColumn = req.companyId ? "company_id" : "user_id";
+      const tenantValue = req.companyId || req.userId;
+      const linkedRows = (await pool.query(
+        `SELECT id::text AS id
+           FROM contacts
+          WHERE id::text = ANY($1::text[])
+            AND ${tenantColumn} = $2`,
+        [input.linked_contact_ids, tenantValue]
+      )).rows;
+      if (linkedRows.length !== input.linked_contact_ids.length) {
+        return res.status(400).json({
+          error: "invalid_linked_contact_ids",
+          message: "One or more linked Contacts are unavailable in this workspace."
+        });
+      }
+    }
     const r = await pool.query(
       `INSERT INTO measurements (id, user_id, name, points, created_at, linked_contact_ids, units)
        VALUES ($1, $2, $3, $4::jsonb, COALESCE($5::timestamptz, now()), $6::jsonb, $7)
@@ -15957,28 +15999,47 @@ app.put("/api/measurements/:id", authRequired, requireCapability("operations.man
        WHERE measurements.user_id = $2
        RETURNING id, name, points, created_at, linked_contact_ids, units`,
       [
-        req.params.id,
+        measurementID,
         req.userId,
-        name || '',
-        JSON.stringify(points),
-        created_at || null,
-        JSON.stringify(cleanLinkedContactIDs),
-        cleanUnits
+        input.name,
+        JSON.stringify(input.points),
+        input.created_at,
+        JSON.stringify(input.linked_contact_ids),
+        input.units
       ]
     );
+    if (!r.rows.length) {
+      return res.status(409).json({
+        error: "measurement_id_unavailable",
+        message: "That measurement identifier is already in use. Start a new measurement and try again."
+      });
+    }
     try {
       const after = r.rows[0];
-      const payload = { measurement_id: after.id, name: after.name, units: after.units, point_count: Array.isArray(after.points) ? after.points.length : 0, linked_contact_ids: after.linked_contact_ids || [] };
+      const payload = measurementEventPayload(after);
       if (!before) {
-        await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.created", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: "ios", dedupeKey: `measurement.created:${after.id}`, payload });
-        if (Array.isArray(after.points) && after.points.length >= 2) await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.completed", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: "ios", dedupeKey: `measurement.completed:${after.id}`, payload });
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.created", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: eventSource, dedupeKey: `measurement.created:${after.id}`, payload });
+        if (Array.isArray(after.points) && after.points.length >= 2) await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.completed", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: eventSource, dedupeKey: `measurement.completed:${after.id}`, payload });
       } else {
         const changedFields = ["name", "points", "linked_contact_ids", "units"].filter((field) => JSON.stringify(before[field] ?? null) !== JSON.stringify(after[field] ?? null)).map((field) => ({ field, old_value: before[field] ?? null, new_value: after[field] ?? null }));
-        if (changedFields.length) await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.updated", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: "ios", payload: { ...payload, changed_fields: changedFields } });
+        if (changedFields.length) await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.updated", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: eventSource, payload: { ...payload, changed_fields: changedFields } });
+        const beforePoints = Array.isArray(before.points) ? before.points : [];
+        if (beforePoints.length < 2 && Array.isArray(after.points) && after.points.length >= 2) {
+          await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.completed", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: eventSource, dedupeKey: `measurement.completed:${after.id}`, payload });
+        }
+        if (changedFields.some((change) => change.field === "points")) {
+          const oldMetrics = measurementMetrics(beforePoints);
+          if (Math.abs(oldMetrics.distance - payload.distance) > 0.01) {
+            await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.distance_changed", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: eventSource, payload: { ...payload, old_distance: oldMetrics.distance } });
+          }
+          if (Math.abs(oldMetrics.area - payload.area) > 0.01) {
+            await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.area_changed", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: eventSource, payload: { ...payload, old_area: oldMetrics.area } });
+          }
+        }
         if (changedFields.some((c) => c.field === "linked_contact_ids")) {
           const oldIds = Array.isArray(before.linked_contact_ids) ? before.linked_contact_ids.map(String) : [];
-          for (const contactId of cleanLinkedContactIDs.map(String).filter((id) => !oldIds.includes(id))) {
-            await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.linked_to_contact", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: "ios", payload: { ...payload, contact_id: contactId } });
+          for (const contactId of input.linked_contact_ids.filter((id) => !oldIds.includes(id))) {
+            await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.linked_to_contact", subjectType: "measurement", subjectId: after.id, actorUserId: req.userId, source: eventSource, payload: { ...payload, contact_id: contactId } });
           }
         }
       }
@@ -15991,15 +16052,27 @@ app.put("/api/measurements/:id", authRequired, requireCapability("operations.man
 
 app.delete("/api/measurements/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
   try {
-    await pool.query(`DELETE FROM measurements WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.userId]);
-    try {
-      await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.deleted", subjectType: "measurement", subjectId: req.params.id, actorUserId: req.userId, source: "ios", payload: { measurement_id: req.params.id } });
-    } catch (automationErr) {
-      console.warn("[automations] measurement delete hook failed", automationErr?.message || automationErr);
+    const measurementID = normalizeMeasurementID(req.params.id);
+    const deleted = (await pool.query(
+      `DELETE FROM measurements WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [measurementID, req.userId]
+    )).rows[0] || null;
+    if (deleted) {
+      try {
+        const eventSource = req.get("x-wolfcrm-client") === "web" ? "web" : "ios";
+        await emitAutomationEvent({ companyId: req.companyId, eventType: "measurement.deleted", subjectType: "measurement", subjectId: measurementID, actorUserId: req.userId, source: eventSource, payload: { measurement_id: measurementID } });
+      } catch (automationErr) {
+        console.warn("[automations] measurement delete hook failed", automationErr?.message || automationErr);
+      }
     }
     res.status(204).end();
-  } catch (e) { console.error(e); res.status(500).json({ error: "failed_delete_measurement" }); }
+  } catch (error) {
+    if (error instanceof MeasurementInputError) {
+      return res.status(400).json({ error: error.code, message: error.message, details: error.details });
+    }
+    console.error(error);
+    res.status(500).json({ error: "failed_delete_measurement" });
+  }
 });
 
 // ---------- TO-DO: TASKS ----------
