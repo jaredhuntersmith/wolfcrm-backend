@@ -1868,6 +1868,15 @@ async function bootstrap() {
       reverses_transaction_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    -- Older inventory installs did not consistently carry the tenant key on
+    -- transaction rows. Add/backfill it before creating company-scoped indexes
+    -- so a production upgrade is additive instead of failing at bootstrap.
+    ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS company_id UUID;
+    UPDATE inventory_transactions inventory_transaction
+       SET company_id = item.company_id
+      FROM inventory_items item
+     WHERE inventory_transaction.company_id IS NULL
+       AND inventory_transaction.item_id = item.id;
     CREATE INDEX IF NOT EXISTS inventory_transactions_item_idx ON inventory_transactions(company_id, item_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS inventory_transactions_job_idx ON inventory_transactions(company_id, job_id);
     CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_idempotency_idx ON inventory_transactions(company_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -1912,6 +1921,12 @@ async function bootstrap() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE equipment_repairs ADD COLUMN IF NOT EXISTS company_id UUID;
+    UPDATE equipment_repairs repair
+       SET company_id = item.company_id
+      FROM inventory_items item
+     WHERE repair.company_id IS NULL
+       AND repair.item_id = item.id;
     CREATE INDEX IF NOT EXISTS equipment_repairs_company_idx ON equipment_repairs(company_id, status, created_at DESC);
     CREATE INDEX IF NOT EXISTS equipment_repairs_item_idx ON equipment_repairs(company_id, item_id, created_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS equipment_repairs_request_idx ON equipment_repairs(company_id, request_id) WHERE request_id IS NOT NULL;
@@ -1925,6 +1940,12 @@ async function bootstrap() {
       summary TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE equipment_asset_history ADD COLUMN IF NOT EXISTS company_id UUID;
+    UPDATE equipment_asset_history history
+       SET company_id = item.company_id
+      FROM inventory_items item
+     WHERE history.company_id IS NULL
+       AND history.item_id = item.id;
     CREATE INDEX IF NOT EXISTS equipment_asset_history_item_idx ON equipment_asset_history(company_id, item_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS inventory_count_schedules (
@@ -1944,6 +1965,7 @@ async function bootstrap() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE inventory_count_schedules ADD COLUMN IF NOT EXISTS company_id UUID;
     CREATE INDEX IF NOT EXISTS inventory_count_schedules_company_idx ON inventory_count_schedules(company_id, enabled, due_date);
 
     CREATE TABLE IF NOT EXISTS inventory_count_submissions (
@@ -1964,6 +1986,7 @@ async function bootstrap() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE inventory_count_submissions ADD COLUMN IF NOT EXISTS company_id UUID;
     CREATE INDEX IF NOT EXISTS inventory_count_submissions_company_idx ON inventory_count_submissions(company_id, status, due_date, created_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS inventory_count_submissions_schedule_due_idx ON inventory_count_submissions(company_id, schedule_id, due_date) WHERE schedule_id IS NOT NULL;
 
@@ -1981,6 +2004,7 @@ async function bootstrap() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(submission_id, item_id)
     );
+    ALTER TABLE inventory_count_submission_items ADD COLUMN IF NOT EXISTS company_id UUID;
     CREATE INDEX IF NOT EXISTS inventory_count_submission_items_idx ON inventory_count_submission_items(company_id, submission_id);
 
     CREATE TABLE IF NOT EXISTS mileage_company_settings (
