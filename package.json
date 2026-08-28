@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "NODE_ENV=development nodemon index.js",
-    "test": "npm run test:permissions && npm run test:customer-message-compose && npm run test:contact-update-events && npm run test:contact-search && npm run test:contact-list-filters && npm run test:contact-export && npm run test:navigation-tabs && npm run test:dashboard-layout && npm run test:schedule-team && npm run test:on-my-way && npm run test:weather && npm run test:assignment-recommendations && npm run test:smart-contact-lists && npm run test:business-exceptions && npm run test:sales-analytics && npm run test:routing && npm run test:finance && npm run test:google-sheets && npm run test:imessage",
+    "test": "npm run test:permissions && npm run test:customer-message-compose && npm run test:contact-update-events && npm run test:contact-search && npm run test:contact-list-filters && npm run test:contact-export && npm run test:contact-import && npm run test:navigation-tabs && npm run test:dashboard-layout && npm run test:schedule-team && npm run test:on-my-way && npm run test:weather && npm run test:assignment-recommendations && npm run test:smart-contact-lists && npm run test:business-exceptions && npm run test:sales-analytics && npm run test:routing && npm run test:finance && npm run test:google-sheets && npm run test:imessage",
     "test:automation-core": "node tests/automation-core.integration.js",
     "test:automation": "npm run test:automation-core",
     "test:finance": "node tests/finance-projection.test.js && node tests/finance-planning.test.js && node tests/finance-plaid.test.js && node tests/finance-receipts.test.js && node tests/finance-accounting.test.js && node tests/finance-general-ledger.test.js && node tests/finance-bank-sources.test.js && node tests/finance-bank-transfers.test.js && node tests/finance-operational-accounting.test.js && node tests/finance-operational-journals.test.js && node tests/finance-operational-applications.test.js && node tests/finance-stripe-settlements.test.js && node tests/finance-statement-readiness.test.js && node tests/finance-cost-allocations.test.js && node tests/finance-mileage-allocations.test.js && node tests/pay-structures.test.js && node tests/finance-payroll-costs.test.js && node tests/finance-payroll-authority.test.js && node tests/finance-payroll-evaluation.test.js && node tests/finance-payroll-journals.test.js && node tests/finance-ai.test.js",
@@ -20,6 +20,7 @@
     "test:contact-search": "node --test tests/contact-search.test.js",
     "test:contact-list-filters": "node --test tests/contact-list-filters.test.js",
     "test:contact-export": "node --test tests/contact-export.test.js",
+    "test:contact-import": "node --test tests/contact-import.test.js",
     "test:navigation-tabs": "node --test tests/navigation-tabs.test.js",
     "test:dashboard-layout": "node --test tests/dashboard-layout.test.js",
     "test:schedule-team": "node --test tests/schedule-team.test.js",

@@ -150,6 +150,7 @@ import { contactRequestChangedFields } from "./contact-update-events.js";
 import { buildDesktopContactSearchPredicate } from "./contact-search.js";
 import { buildDesktopContactListFilters } from "./contact-list-filters.js";
 import { buildContactExportCSV, defaultContactExportFilename } from "./contact-export.js";
+import { ContactImportError, contactImportContactIsUnchanged, prepareContactImport } from "./contact-import.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -977,6 +978,42 @@ async function bootstrap() {
     );
     CREATE INDEX IF NOT EXISTS contacts_updated_idx ON contacts(updated_at DESC);
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS lead_info JSONB;
+
+    CREATE TABLE IF NOT EXISTS contact_import_batches (
+      id UUID PRIMARY KEY,
+      company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
+      created_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      file_name TEXT NOT NULL,
+      file_fingerprint TEXT NOT NULL,
+      format TEXT NOT NULL CHECK (format IN ('header', 'legacy')),
+      status TEXT NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'completed', 'partial_undo', 'undone')),
+      total_rows INTEGER NOT NULL DEFAULT 0,
+      created_count INTEGER NOT NULL DEFAULT 0,
+      failed_count INTEGER NOT NULL DEFAULT 0,
+      notes_excluded_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      completed_at TIMESTAMPTZ,
+      undo_completed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS contact_import_batches_owner_latest_idx
+      ON contact_import_batches(created_by_user_id, company_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS contact_import_items (
+      id UUID PRIMARY KEY,
+      batch_id UUID NOT NULL REFERENCES contact_import_batches(id) ON DELETE CASCADE,
+      row_number INTEGER NOT NULL,
+      contact_id UUID,
+      contact_name TEXT,
+      contact_updated_at TIMESTAMPTZ,
+      status TEXT NOT NULL CHECK (status IN ('created', 'failed', 'undone', 'already_removed', 'skipped_modified')),
+      error_code TEXT,
+      error_message TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      undone_at TIMESTAMPTZ,
+      UNIQUE(batch_id, row_number)
+    );
+    CREATE INDEX IF NOT EXISTS contact_import_items_batch_status_idx
+      ON contact_import_items(batch_id, status, row_number);
 
     CREATE TABLE IF NOT EXISTS smart_contact_lists (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -8086,6 +8123,131 @@ function contactInsertStatements(req, body) {
   ];
 }
 
+function contactImportOwnerScope(req, alias = "") {
+  const prefix = alias ? `${alias}.` : "";
+  return req.companyId
+    ? { sql: `${prefix}company_id = $1 AND ${prefix}created_by_user_id = $2`, values: [req.companyId, req.userId] }
+    : { sql: `${prefix}company_id IS NULL AND ${prefix}created_by_user_id = $1`, values: [req.userId] };
+}
+
+function contactImportBatchPayload(row) {
+  if (!row) return null;
+  const undoableCount = Number(row.undoable_count ?? row.created_count ?? 0);
+  return {
+    id: row.id,
+    file_name: row.file_name,
+    format: row.format,
+    status: row.status,
+    total_rows: Number(row.total_rows || 0),
+    created_count: Number(row.created_count || 0),
+    failed_count: Number(row.failed_count || 0),
+    notes_excluded_count: Number(row.notes_excluded_count || 0),
+    undoable_count: undoableCount,
+    skipped_modified_count: Number(row.skipped_modified_count || 0),
+    created_at: row.created_at,
+    completed_at: row.completed_at,
+    undo_completed_at: row.undo_completed_at,
+    can_undo: undoableCount > 0
+  };
+}
+
+async function emitContactCreatedEffects(req, createdContact, origin = "manual") {
+  if (!req.companyId || !createdContact?.id) return;
+  try {
+    await emitAutomationEvent({
+      companyId: req.companyId,
+      eventType: "contact.created",
+      subjectType: "contact",
+      subjectId: createdContact.id,
+      actorUserId: req.userId,
+      source: "contacts.api",
+      dedupeKey: `contact.created:${createdContact.id}`,
+      payload: { contact_id: createdContact.id, name: createdContact.name, source: origin }
+    });
+    const sourceEvent = origin === "csv" ? "contact.imported_csv"
+      : origin === "phone" ? "contact.imported_phone"
+        : origin === "map" ? "contact.converted_from_map_pin"
+          : origin === "schedule" ? "contact.created_from_schedule"
+            : "contact.created_manually";
+    await emitAutomationEvent({
+      companyId: req.companyId,
+      eventType: sourceEvent,
+      subjectType: "contact",
+      subjectId: createdContact.id,
+      actorUserId: req.userId,
+      source: `contacts.${origin}`,
+      dedupeKey: `${sourceEvent}:${createdContact.id}`,
+      payload: { contact_id: createdContact.id, name: createdContact.name, source: origin }
+    });
+  } catch (eventError) {
+    console.warn("contact_create_automation_event_failed", {
+      companyId: req.companyId,
+      contactId: createdContact.id,
+      error: eventError.message
+    });
+  }
+  try {
+    await markGoogleSheetsContactDirty(pool, req.companyId, createdContact.id, "contact.created");
+  } catch (dirtyError) {
+    console.warn("contact_create_google_sheets_dirty_failed", {
+      companyId: req.companyId,
+      contactId: createdContact.id,
+      error: dirtyError.message
+    });
+  }
+}
+
+async function emitContactDeletedEffects(req, contact, source = "contacts.api") {
+  if (!req.companyId || !contact?.id) return;
+  try {
+    await emitAutomationEvent({
+      companyId: req.companyId,
+      eventType: "contact.deleted",
+      subjectType: "contact",
+      subjectId: contact.id,
+      actorUserId: req.userId,
+      source,
+      dedupeKey: `contact.deleted:${contact.id}`,
+      payload: { contact_id: contact.id, name: contact.name || null, tags: contactTagsArray(contact.tags) }
+    });
+  } catch (eventError) {
+    console.warn("contact_delete_automation_event_failed", {
+      companyId: req.companyId,
+      contactId: contact.id,
+      error: eventError.message
+    });
+  }
+  try {
+    await markGoogleSheetsContactDirty(pool, req.companyId, contact.id, "contact.deleted");
+  } catch (dirtyError) {
+    console.warn("contact_delete_google_sheets_dirty_failed", {
+      companyId: req.companyId,
+      contactId: contact.id,
+      error: dirtyError.message
+    });
+  }
+}
+
+async function emitContactEffectsWithBoundedConcurrency(contacts, effect) {
+  let nextIndex = 0;
+  const workerCount = Math.min(5, contacts.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < contacts.length) {
+      const contact = contacts[nextIndex];
+      nextIndex += 1;
+      await effect(contact);
+    }
+  }));
+}
+
+function sendContactImportError(res, error) {
+  if (error instanceof ContactImportError) {
+    return res.status(error.status).json({ error: error.code, message: error.message, details: error.details });
+  }
+  console.error("contact_import_failed", { code: error?.code, message: error?.message });
+  return res.status(500).json({ error: "contact_import_failed", message: "WolfCRM couldn't import this CSV." });
+}
+
 function contactCreateRecommendation(checks) {
   const firstFailed = checks.find((check) => !check.ok);
   if (!firstFailed) return "Contact create payload passed all dry-run checks.";
@@ -8147,6 +8309,247 @@ app.post("/api/contacts/create-diagnostics", authRequired, requireCapability("co
   }
 });
 
+app.post("/api/contact-imports/preview", authRequired, requireCapability("contacts.create"), (req, res) => {
+  try {
+    const prepared = prepareContactImport(req.body?.csv_text, { fileName: req.body?.file_name });
+    const { rows: _rows, ...preview } = prepared;
+    res.json(preview);
+  } catch (error) {
+    sendContactImportError(res, error);
+  }
+});
+
+app.get("/api/contact-imports/latest", authRequired, requireCapability("contacts.view"), async (req, res) => {
+  try {
+    const scope = contactImportOwnerScope(req, "b");
+    const { rows } = await pool.query(
+      `SELECT b.*,
+              COUNT(i.id) FILTER (WHERE i.status = 'created')::int AS undoable_count,
+              COUNT(i.id) FILTER (WHERE i.status = 'skipped_modified')::int AS skipped_modified_count
+         FROM contact_import_batches b
+         LEFT JOIN contact_import_items i ON i.batch_id = b.id
+        WHERE ${scope.sql}
+        GROUP BY b.id
+        ORDER BY b.created_at DESC, b.id DESC
+        LIMIT 1`,
+      scope.values
+    );
+    res.json({ batch: contactImportBatchPayload(rows[0]) });
+  } catch (error) {
+    console.error("contact_import_latest_failed", { companyId: req.companyId, userId: req.userId, message: error?.message });
+    res.status(500).json({ error: "contact_import_latest_failed", message: "WolfCRM couldn't load the latest Contact import." });
+  }
+});
+
+app.post("/api/contact-imports", authRequired, requireCapability("contacts.create"), async (req, res) => {
+  let prepared;
+  try {
+    prepared = prepareContactImport(req.body?.csv_text, { fileName: req.body?.file_name });
+    if (!req.body?.expected_fingerprint) {
+      throw new ContactImportError("csv_preview_required", "Preview the selected CSV before importing.", 409);
+    }
+    if (req.body.expected_fingerprint !== prepared.fingerprint) {
+      throw new ContactImportError("csv_changed_after_preview", "The selected CSV changed after preview. Preview it again before importing.", 409);
+    }
+  } catch (error) {
+    return sendContactImportError(res, error);
+  }
+
+  const batchId = randomUUID();
+  const client = await pool.connect();
+  const createdContacts = [];
+  const failures = [];
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO contact_import_batches (
+         id, company_id, created_by_user_id, file_name, file_fingerprint, format,
+         status, total_rows, notes_excluded_count
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'processing', $7, $8)`,
+      [batchId, req.companyId || null, req.userId, prepared.file_name, prepared.fingerprint, prepared.format, prepared.total_rows, prepared.notes_excluded_count]
+    );
+
+    for (let index = 0; index < prepared.rows.length; index += 1) {
+      const importRow = prepared.rows[index];
+      const savepoint = `contact_import_${index}`;
+      const contactId = randomUUID();
+      await client.query(`SAVEPOINT ${savepoint}`);
+      try {
+        const statement = contactInsertStatements(req, importRow.contact)[0];
+        statement.values[0] = contactId;
+        const inserted = (await client.query(statement.sql, statement.values)).rows[0];
+        await client.query(
+          `INSERT INTO contact_import_items (
+             id, batch_id, row_number, contact_id, contact_name, contact_updated_at, status
+           ) VALUES ($1, $2, $3, $4, $5, $6, 'created')`,
+          [randomUUID(), batchId, importRow.row_number, inserted.id, inserted.name, inserted.updated_at]
+        );
+        await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+        createdContacts.push(inserted);
+      } catch (error) {
+        await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        const classified = classifyContactCreateError(error);
+        await client.query(
+          `INSERT INTO contact_import_items (
+             id, batch_id, row_number, contact_name, status, error_code, error_message
+           ) VALUES ($1, $2, $3, $4, 'failed', $5, $6)`,
+          [randomUUID(), batchId, importRow.row_number, importRow.contact.name, classified.code, classified.message]
+        );
+        await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+        failures.push({ row_number: importRow.row_number, name: importRow.contact.name, code: classified.code, message: classified.message });
+      }
+    }
+
+    await client.query(
+      `UPDATE contact_import_batches
+          SET status = 'completed', created_count = $2, failed_count = $3, completed_at = now()
+        WHERE id = $1`,
+      [batchId, createdContacts.length, failures.length]
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    return sendContactImportError(res, error);
+  } finally {
+    client.release();
+  }
+
+  await emitContactEffectsWithBoundedConcurrency(
+    createdContacts,
+    (contact) => emitContactCreatedEffects(req, contact, "csv")
+  );
+
+  res.status(201).json({
+    batch: contactImportBatchPayload({
+      id: batchId,
+      file_name: prepared.file_name,
+      format: prepared.format,
+      status: "completed",
+      total_rows: prepared.total_rows,
+      created_count: createdContacts.length,
+      failed_count: failures.length,
+      notes_excluded_count: prepared.notes_excluded_count,
+      undoable_count: createdContacts.length,
+      skipped_modified_count: 0,
+      created_at: new Date().toISOString(),
+      completed_at: new Date().toISOString()
+    }),
+    failures: failures.slice(0, 50)
+  });
+});
+
+app.delete("/api/contact-imports/:id", authRequired, requireCapability("contacts.delete"), async (req, res) => {
+  if (!req.permissions.canDeleteContacts) return res.status(403).json({ error: "permission_denied" });
+  const client = await pool.connect();
+  const deletedContacts = [];
+  const skippedModified = [];
+  let alreadyRemovedCount = 0;
+  let batchRow;
+  try {
+    await client.query("BEGIN");
+    const ownerScope = contactImportOwnerScope(req, "b");
+    const batchValues = [...ownerScope.values, req.params.id];
+    batchRow = (await client.query(
+      `SELECT b.* FROM contact_import_batches b
+        WHERE ${ownerScope.sql} AND b.id = $${batchValues.length}
+        FOR UPDATE`,
+      batchValues
+    )).rows[0];
+    if (!batchRow) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "contact_import_not_found", message: "That Contact import is not available." });
+    }
+
+    const items = (await client.query(
+      `SELECT id, row_number, contact_id, contact_name, contact_updated_at
+         FROM contact_import_items
+        WHERE batch_id = $1 AND status = 'created'
+        ORDER BY row_number
+        FOR UPDATE`,
+      [batchRow.id]
+    )).rows;
+    const contactScope = companyOrUserContactWhere(req);
+    for (const item of items) {
+      const contact = (await client.query(
+        `SELECT id, name, tags, updated_at FROM contacts
+          WHERE id = $1 AND ${contactScope.sql.replace("$1", "$2")}
+          FOR UPDATE`,
+        [item.contact_id, ...contactScope.values]
+      )).rows[0];
+      if (!contact) {
+        alreadyRemovedCount += 1;
+        await client.query(
+          `UPDATE contact_import_items SET status = 'already_removed', undone_at = now() WHERE id = $1`,
+          [item.id]
+        );
+        continue;
+      }
+
+      if (!contactImportContactIsUnchanged(item.contact_updated_at, contact.updated_at)) {
+        skippedModified.push({ contact_id: contact.id, name: contact.name || item.contact_name || "Unnamed contact", row_number: item.row_number });
+        await client.query(
+          `UPDATE contact_import_items SET status = 'skipped_modified' WHERE id = $1`,
+          [item.id]
+        );
+        continue;
+      }
+
+      await client.query(
+        `UPDATE schedule_events SET contact_id = NULL, updated_at = now()
+          WHERE contact_id = $1 AND ${req.companyId ? "company_id = $2" : "user_id = $2"}`,
+        [contact.id, req.companyId || req.userId]
+      );
+      await client.query(
+        `DELETE FROM opportunities
+          WHERE contact_id = $1
+            AND user_id IN (SELECT id FROM users WHERE ${req.companyId ? "company_id = $2" : "id = $2"})`,
+        [contact.id, req.companyId || req.userId]
+      );
+      const deleted = await client.query(
+        `DELETE FROM contacts WHERE id = $1 AND ${contactScope.sql.replace("$1", "$2")}`,
+        [contact.id, ...contactScope.values]
+      );
+      if (!deleted.rowCount) throw new Error("contact_import_undo_delete_lost_scope");
+      await client.query(
+        `UPDATE contact_import_items SET status = 'undone', undone_at = now() WHERE id = $1`,
+        [item.id]
+      );
+      deletedContacts.push(contact);
+    }
+
+    const remaining = Number((await client.query(
+      `SELECT COUNT(*)::int AS count FROM contact_import_items WHERE batch_id = $1 AND status = 'created'`,
+      [batchRow.id]
+    )).rows[0]?.count || 0);
+    const finalStatus = remaining || skippedModified.length ? "partial_undo" : "undone";
+    batchRow = (await client.query(
+      `UPDATE contact_import_batches
+          SET status = $2, undo_completed_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [batchRow.id, finalStatus]
+    )).rows[0];
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("contact_import_undo_failed", { companyId: req.companyId, userId: req.userId, batchId: req.params.id, message: error?.message });
+    return res.status(500).json({ error: "contact_import_undo_failed", message: "WolfCRM couldn't undo this Contact import." });
+  } finally {
+    client.release();
+  }
+
+  await emitContactEffectsWithBoundedConcurrency(
+    deletedContacts,
+    (contact) => emitContactDeletedEffects(req, contact, "contacts.csv_import_undo")
+  );
+  res.json({
+    batch: contactImportBatchPayload({ ...batchRow, undoable_count: 0, skipped_modified_count: skippedModified.length }),
+    deleted_count: deletedContacts.length,
+    already_removed_count: alreadyRemovedCount,
+    skipped_modified: skippedModified
+  });
+});
+
 app.post("/api/contacts", authRequired, requireCapability("contacts.create"), async (req, res) => {
   const {
     name, phone, email, address,
@@ -8172,52 +8575,7 @@ app.post("/api/contacts", authRequired, requireCapability("contacts.create"), as
       });
       r = await pool.query(statements[1].sql, statements[1].values);
     }
-    if (req.companyId) {
-      const createdContact = r.rows[0];
-      const origin = source || "manual";
-      try {
-        await emitAutomationEvent({
-          companyId: req.companyId,
-          eventType: "contact.created",
-          subjectType: "contact",
-          subjectId: createdContact.id,
-          actorUserId: req.userId,
-          source: "contacts.api",
-          dedupeKey: `contact.created:${createdContact.id}`,
-          payload: { contact_id: createdContact.id, name: createdContact.name, source: origin }
-        });
-        const sourceEvent = origin === "csv" ? "contact.imported_csv"
-          : origin === "phone" ? "contact.imported_phone"
-            : origin === "map" ? "contact.converted_from_map_pin"
-              : origin === "schedule" ? "contact.created_from_schedule"
-                : "contact.created_manually";
-        await emitAutomationEvent({
-          companyId: req.companyId,
-          eventType: sourceEvent,
-          subjectType: "contact",
-          subjectId: createdContact.id,
-          actorUserId: req.userId,
-          source: `contacts.${origin}`,
-          dedupeKey: `${sourceEvent}:${createdContact.id}`,
-          payload: { contact_id: createdContact.id, name: createdContact.name, source: origin }
-        });
-      } catch (eventError) {
-        console.warn("contact_create_automation_event_failed", {
-          companyId: req.companyId,
-          contactId: createdContact.id,
-          error: eventError.message
-        });
-      }
-      try {
-        await markGoogleSheetsContactDirty(pool, req.companyId, createdContact.id, "contact.created");
-      } catch (dirtyError) {
-        console.warn("contact_create_google_sheets_dirty_failed", {
-          companyId: req.companyId,
-          contactId: createdContact.id,
-          error: dirtyError.message
-        });
-      }
-    }
+    await emitContactCreatedEffects(req, r.rows[0], source || "manual");
     res.status(201).json(r.rows[0]);
   } catch (e) {
     const classified = classifyContactCreateError(e);
@@ -9945,19 +10303,7 @@ app.delete("/api/contacts/:id", authRequired, requireCapability("contacts.delete
       `DELETE FROM contacts WHERE id = $1 AND ${scope.sql.replace("$1", "$2")}`,
       [req.params.id, ...scope.values]
     );
-    if (r.rowCount && req.companyId) {
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "contact.deleted",
-        subjectType: "contact",
-        subjectId: req.params.id,
-        actorUserId: req.userId,
-        source: "contacts.api",
-        dedupeKey: `contact.deleted:${req.params.id}`,
-        payload: { contact_id: req.params.id, name: before?.name || null, tags: contactTagsArray(before?.tags) }
-      });
-      await markGoogleSheetsContactDirty(pool, req.companyId, req.params.id, "contact.deleted");
-    }
+    if (r.rowCount) await emitContactDeletedEffects(req, { id: req.params.id, name: before?.name, tags: before?.tags });
     res.status(204).end();
   } catch (e) {
     console.error(e);
