@@ -6,6 +6,7 @@ import {
   normalizeWebsitePageCreate,
   normalizeWebsitePageContent,
   normalizeWebsitePageReorder,
+  normalizeWebsitePageSeo,
   normalizeWebsitePageUpdate,
   normalizeWebsiteProjectCreate,
   normalizeWebsiteProjectUpdate,
@@ -101,6 +102,25 @@ test("structured page content accepts only bounded data-only blocks", () => {
   );
 });
 
+test("page SEO and social metadata is bounded and data-only", () => {
+  const seo = normalizeWebsitePageSeo({
+    title: "  Roof repair in Austin  ",
+    description: "Fast local roof repair.",
+    social_title: "Storm damage help",
+    social_description: "Book a local inspection.",
+    hide_from_search: true,
+  });
+  assert.equal(seo.title, "Roof repair in Austin");
+  assert.equal(seo.hide_from_search, true);
+  assert.deepEqual(
+    normalizeWebsitePageUpdate({ expected_version: 2, expected_project_version: 3, seo }).seo,
+    seo,
+  );
+  assert.throws(() => normalizeWebsitePageSeo({ title: "x".repeat(71) }), /at most 70/);
+  assert.throws(() => normalizeWebsitePageSeo({ title: "Okay", script: "alert(1)" }), /unsupported script/);
+  assert.throws(() => normalizeWebsitePageSeo({ hide_from_search: "yes" }), /true or false/);
+});
+
 test("schema enforces company/project integrity and recoverable active-page invariants", () => {
   assert.match(source, /CREATE TABLE IF NOT EXISTS website_projects/);
   assert.match(source, /FOREIGN KEY\(project_id, company_id\) REFERENCES website_projects\(id, company_id\) ON DELETE CASCADE/);
@@ -117,6 +137,7 @@ test("routes keep authentication, capabilities, and company scope authoritative"
   assert.match(source, /app\.post\("\/api\/website-builder\/projects", authRequired, requireManage/);
   assert.match(source, /app\.patch\("\/api\/website-builder\/projects\/:projectId\/pages\/:pageId", authRequired, requireManage/);
   assert.match(source, /const current = await loadPage[\s\S]*const nextContent = input\.content \?\? current\.content[\s\S]*content = \$8::jsonb/);
+  assert.match(source, /const nextSeo = input\.seo \?\? current\.seo[\s\S]*seo = \$9::jsonb/);
   assert.match(source, /WHERE id::text = \$1 AND company_id = \$2/);
   assert.match(source, /WHERE id::text = \$1 AND project_id::text = \$2 AND company_id = \$3/);
 });

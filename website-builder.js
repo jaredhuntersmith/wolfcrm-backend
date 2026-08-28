@@ -15,6 +15,8 @@ const MAX_PROJECTS_PER_COMPANY = 100;
 const MAX_PAGES_PER_PROJECT = 250;
 const MAX_BLOCKS_PER_PAGE = 100;
 const MAX_PAGE_CONTENT_BYTES = 262144;
+const SEO_TITLE_LIMIT = 70;
+const SEO_DESCRIPTION_LIMIT = 200;
 const WEBSITE_BLOCK_TYPES = new Set(["hero", "text", "callout", "features", "spacer"]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -65,6 +67,10 @@ function requiredVersion(value, field = "expected_version") {
 
 function contentError(message) {
   return new WebsiteBuilderError("website_page_content_invalid", message);
+}
+
+function seoError(message) {
+  return new WebsiteBuilderError("website_page_seo_invalid", message);
 }
 
 function assertOnlyKeys(value, allowed, label) {
@@ -185,6 +191,52 @@ export function normalizeWebsitePageContent(value) {
   return content;
 }
 
+function seoText(value, label, maximumLength) {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") throw seoError(`${label} must be text.`);
+  const text = value.trim();
+  if (text.length > maximumLength) {
+    throw seoError(`${label} may be at most ${maximumLength} characters.`);
+  }
+  return text;
+}
+
+export function normalizeWebsitePageSeo(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw seoError("SEO metadata must be an object.");
+  }
+  const allowed = new Set([
+    "title",
+    "description",
+    "social_title",
+    "social_description",
+    "hide_from_search",
+  ]);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown) throw seoError(`SEO metadata contains an unsupported ${unknown} field.`);
+  if (value.hide_from_search !== undefined && typeof value.hide_from_search !== "boolean") {
+    throw seoError("Search visibility must be true or false.");
+  }
+  return {
+    title: seoText(value.title, "Search title", SEO_TITLE_LIMIT),
+    description: seoText(value.description, "Search description", SEO_DESCRIPTION_LIMIT),
+    social_title: seoText(value.social_title, "Social title", SEO_TITLE_LIMIT),
+    social_description: seoText(value.social_description, "Social description", SEO_DESCRIPTION_LIMIT),
+    hide_from_search: value.hide_from_search === true,
+  };
+}
+
+function websitePageSeoPayload(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    title: typeof source.title === "string" ? source.title.slice(0, SEO_TITLE_LIMIT) : "",
+    description: typeof source.description === "string" ? source.description.slice(0, SEO_DESCRIPTION_LIMIT) : "",
+    social_title: typeof source.social_title === "string" ? source.social_title.slice(0, SEO_TITLE_LIMIT) : "",
+    social_description: typeof source.social_description === "string" ? source.social_description.slice(0, SEO_DESCRIPTION_LIMIT) : "",
+    hide_from_search: source.hide_from_search === true,
+  };
+}
+
 function lifecycleStatus(value) {
   if (!WEBSITE_LIFECYCLE_STATUSES.includes(value)) {
     throw new WebsiteBuilderError(
@@ -298,7 +350,7 @@ export function starterPageForProject({ kind, projectName }) {
         },
       ],
     },
-    seo: { title: projectName, description: null },
+    seo: normalizeWebsitePageSeo({ title: projectName }),
   };
 }
 
@@ -331,6 +383,7 @@ export function normalizeWebsitePageUpdate(body = {}) {
       : lifecycleStatus(body.lifecycle_status),
     is_home: body.is_home === undefined ? undefined : body.is_home,
     content: body.content === undefined ? undefined : normalizeWebsitePageContent(body.content),
+    seo: body.seo === undefined ? undefined : normalizeWebsitePageSeo(body.seo),
   };
   if (update.is_home !== undefined && typeof update.is_home !== "boolean") {
     throw new WebsiteBuilderError(
@@ -343,7 +396,8 @@ export function normalizeWebsitePageUpdate(body = {}) {
     update.slug === undefined &&
     update.lifecycle_status === undefined &&
     update.is_home === undefined &&
-    update.content === undefined
+    update.content === undefined &&
+    update.seo === undefined
   ) {
     throw new WebsiteBuilderError(
       "website_page_update_empty",
@@ -409,7 +463,7 @@ function pagePayload(row) {
     is_home: row.is_home === true,
     sort_order: exactNumber(row.sort_order),
     content: row.content && typeof row.content === "object" ? row.content : { schema_version: 1, blocks: [] },
-    seo: row.seo && typeof row.seo === "object" ? row.seo : {},
+    seo: websitePageSeoPayload(row.seo),
     version: exactNumber(row.version),
     created_at: timestamp(row.created_at),
     updated_at: timestamp(row.updated_at),
@@ -440,6 +494,7 @@ function pageAuditSnapshot(row) {
     sort_order: exactNumber(row.sort_order),
     content_schema_version: exactNumber(content?.schema_version),
     content_block_count: Array.isArray(content?.blocks) ? content.blocks.length : 0,
+    seo: websitePageSeoPayload(row.seo),
     version: exactNumber(row.version),
   } : null;
 }
@@ -849,7 +904,7 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
           input.page_kind,
           exactNumber(count.rows[0]?.maximum) + 1,
           JSON.stringify(content),
-          JSON.stringify({ title: input.name, description: null }),
+          JSON.stringify(normalizeWebsitePageSeo({ title: input.name })),
           req.userId,
         ],
       )).rows[0];
@@ -904,6 +959,7 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       const nextSlug = input.slug ?? current.slug;
       const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
       const nextContent = input.content ?? current.content;
+      const nextSeo = input.seo ?? current.seo;
       let nextHome = input.is_home ?? current.is_home;
       let replacementHomeId = null;
 
@@ -947,7 +1003,8 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
         nextSlug === current.slug &&
         nextStatus === current.lifecycle_status &&
         nextHome === current.is_home &&
-        JSON.stringify(nextContent) === JSON.stringify(current.content);
+        JSON.stringify(nextContent) === JSON.stringify(current.content) &&
+        JSON.stringify(websitePageSeoPayload(nextSeo)) === JSON.stringify(websitePageSeoPayload(current.seo));
       if (unchanged) {
         await client.query("COMMIT");
         return res.json({ project: projectPayload(project), page: pagePayload(current) });
@@ -959,13 +1016,14 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
                 lifecycle_status = $6,
                 is_home = $7,
                 content = $8::jsonb,
+                seo = $9::jsonb,
                 archived_at = CASE WHEN $6 = 'archived' THEN COALESCE(archived_at, now()) ELSE NULL END,
-                updated_by = $9,
+                updated_by = $10,
                 updated_at = now(),
                 version = version + 1
           WHERE id = $1 AND project_id = $2 AND company_id = $3
           RETURNING *`,
-        [current.id, project.id, req.companyId, nextName, nextSlug, nextStatus, nextHome, JSON.stringify(nextContent), req.userId],
+        [current.id, project.id, req.companyId, nextName, nextSlug, nextStatus, nextHome, JSON.stringify(nextContent), JSON.stringify(websitePageSeoPayload(nextSeo)), req.userId],
       )).rows[0];
       if (replacementHomeId) {
         await client.query(
@@ -991,7 +1049,9 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
           ? `page.${nextStatus}`
           : input.content !== undefined
             ? "page.content_updated"
-            : "page.updated",
+            : input.seo !== undefined
+              ? "page.seo_updated"
+              : "page.updated",
         before: pageAuditSnapshot(current),
         after: pageAuditSnapshot(page),
       });
