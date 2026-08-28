@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   normalizeWebsitePageCreate,
+  normalizeWebsitePageContent,
   normalizeWebsitePageReorder,
   normalizeWebsitePageUpdate,
   normalizeWebsiteProjectCreate,
@@ -60,6 +61,43 @@ test("project and page writes require optimistic versions and bounded mutations"
   assert.throws(
     () => normalizeWebsitePageUpdate({ expected_version: 2, expected_project_version: 3, is_home: "yes" }),
     /must be true or false/,
+  );
+});
+
+test("structured page content accepts only bounded data-only blocks", () => {
+  const id = "123e4567-e89b-42d3-a456-426614174000";
+  const content = normalizeWebsitePageContent({
+    schema_version: 1,
+    blocks: [
+      {
+        id,
+        type: "hero",
+        data: {
+          heading: "Storm repair",
+          body: "Fast local help.",
+          button_label: "Call now",
+          button_href: "tel:+15551234567",
+          alignment: "center",
+        },
+      },
+    ],
+  });
+  assert.equal(content.blocks[0].data.button_href, "tel:+15551234567");
+  assert.deepEqual(
+    normalizeWebsitePageUpdate({ expected_version: 2, expected_project_version: 3, content }).content,
+    content,
+  );
+  assert.throws(
+    () => normalizeWebsitePageContent({ schema_version: 1, blocks: [{ id, type: "html", data: { html: "<script />" } }] }),
+    /unsupported type/,
+  );
+  assert.throws(
+    () => normalizeWebsitePageContent({ schema_version: 1, blocks: [{ id, type: "hero", data: { heading: "Bad", body: "", button_label: "Go", button_href: "javascript:alert(1)" } }] }),
+    /Button links must use/,
+  );
+  assert.throws(
+    () => normalizeWebsitePageContent({ schema_version: 1, blocks: [{ id, type: "spacer", data: {} }, { id, type: "spacer", data: {} }] }),
+    /unique identifier/,
   );
 });
 

@@ -13,6 +13,10 @@ const PAGE_NAME_LIMIT = 120;
 const PAGE_SLUG_LIMIT = 160;
 const MAX_PROJECTS_PER_COMPANY = 100;
 const MAX_PAGES_PER_PROJECT = 250;
+const MAX_BLOCKS_PER_PAGE = 100;
+const MAX_PAGE_CONTENT_BYTES = 262144;
+const WEBSITE_BLOCK_TYPES = new Set(["hero", "text", "callout", "features", "spacer"]);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export class WebsiteBuilderError extends Error {
   constructor(code, message, statusCode = 400, details = {}) {
@@ -57,6 +61,128 @@ function requiredVersion(value, field = "expected_version") {
     );
   }
   return parsed;
+}
+
+function contentError(message) {
+  return new WebsiteBuilderError("website_page_content_invalid", message);
+}
+
+function assertOnlyKeys(value, allowed, label) {
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown) throw contentError(`${label} contains an unsupported ${unknown} field.`);
+}
+
+function blockText(value, label, maximumLength, fallback = "") {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string") throw contentError(`${label} must be text.`);
+  if (value.length > maximumLength) {
+    throw contentError(`${label} may be at most ${maximumLength} characters.`);
+  }
+  return value;
+}
+
+function blockAlignment(value) {
+  if (value === undefined) return "left";
+  if (value !== "left" && value !== "center") {
+    throw contentError("Block alignment must be left or center.");
+  }
+  return value;
+}
+
+function blockLink(value) {
+  const link = blockText(value, "Button link", 500).trim();
+  if (!link) return "";
+  if (
+    (link.startsWith("/") && !link.startsWith("//") && !/\s/.test(link)) ||
+    /^https?:\/\/[^\s]+$/i.test(link) ||
+    /^mailto:[^\s@]+@[^\s@]+$/i.test(link) ||
+    /^tel:\+?[0-9(). -]{7,30}$/i.test(link)
+  ) return link;
+  throw contentError("Button links must use a local path, HTTP(S), mailto, or tel address.");
+}
+
+function normalizeWebsiteBlock(value, index) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw contentError(`Block ${index + 1} must be an object.`);
+  }
+  assertOnlyKeys(value, new Set(["id", "type", "data"]), `Block ${index + 1}`);
+  if (typeof value.id !== "string" || !UUID_PATTERN.test(value.id)) {
+    throw contentError(`Block ${index + 1} has an invalid identifier.`);
+  }
+  if (typeof value.type !== "string" || !WEBSITE_BLOCK_TYPES.has(value.type)) {
+    throw contentError(`Block ${index + 1} has an unsupported type.`);
+  }
+  if (!value.data || typeof value.data !== "object" || Array.isArray(value.data)) {
+    throw contentError(`Block ${index + 1} properties must be an object.`);
+  }
+  let data;
+  if (value.type === "hero" || value.type === "callout") {
+    assertOnlyKeys(
+      value.data,
+      new Set(["heading", "body", "button_label", "button_href", "alignment"]),
+      `${value.type} block`,
+    );
+    data = {
+      heading: blockText(value.data.heading, "Heading", 160),
+      body: blockText(value.data.body, "Body", 2000),
+      button_label: blockText(value.data.button_label, "Button label", 80),
+      button_href: blockLink(value.data.button_href),
+      alignment: blockAlignment(value.data.alignment),
+    };
+  } else if (value.type === "text") {
+    assertOnlyKeys(value.data, new Set(["heading", "body", "alignment"]), "Text block");
+    data = {
+      heading: blockText(value.data.heading, "Heading", 160),
+      body: blockText(value.data.body, "Body", 5000),
+      alignment: blockAlignment(value.data.alignment),
+    };
+  } else if (value.type === "features") {
+    assertOnlyKeys(value.data, new Set(["heading", "items", "columns"]), "Features block");
+    if (!Array.isArray(value.data.items) || value.data.items.length > 12) {
+      throw contentError("Features blocks may contain up to 12 items.");
+    }
+    const columns = value.data.columns === undefined ? 3 : value.data.columns;
+    if (![2, 3, 4].includes(columns)) {
+      throw contentError("Feature columns must be 2, 3, or 4.");
+    }
+    data = {
+      heading: blockText(value.data.heading, "Heading", 160),
+      items: value.data.items.map((item, itemIndex) =>
+        blockText(item, `Feature ${itemIndex + 1}`, 180).trim(),
+      ).filter(Boolean),
+      columns,
+    };
+  } else {
+    assertOnlyKeys(value.data, new Set(["size"]), "Spacer block");
+    const size = value.data.size === undefined ? "medium" : value.data.size;
+    if (!["small", "medium", "large"].includes(size)) {
+      throw contentError("Spacer size must be small, medium, or large.");
+    }
+    data = { size };
+  }
+  return { id: value.id, type: value.type, data };
+}
+
+export function normalizeWebsitePageContent(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw contentError("Page content must be a structured document.");
+  }
+  assertOnlyKeys(value, new Set(["schema_version", "blocks"]), "Page content");
+  if (value.schema_version !== 1 || !Array.isArray(value.blocks)) {
+    throw contentError("Page content must use block schema version 1.");
+  }
+  if (value.blocks.length > MAX_BLOCKS_PER_PAGE) {
+    throw contentError(`A page may contain up to ${MAX_BLOCKS_PER_PAGE} blocks.`);
+  }
+  const blocks = value.blocks.map(normalizeWebsiteBlock);
+  if (new Set(blocks.map((block) => block.id)).size !== blocks.length) {
+    throw contentError("Every block must have a unique identifier.");
+  }
+  const content = { schema_version: 1, blocks };
+  if (Buffer.byteLength(JSON.stringify(content), "utf8") > MAX_PAGE_CONTENT_BYTES) {
+    throw contentError("Page content is too large to save.");
+  }
+  return content;
 }
 
 function lifecycleStatus(value) {
@@ -204,6 +330,7 @@ export function normalizeWebsitePageUpdate(body = {}) {
       ? undefined
       : lifecycleStatus(body.lifecycle_status),
     is_home: body.is_home === undefined ? undefined : body.is_home,
+    content: body.content === undefined ? undefined : normalizeWebsitePageContent(body.content),
   };
   if (update.is_home !== undefined && typeof update.is_home !== "boolean") {
     throw new WebsiteBuilderError(
@@ -215,7 +342,8 @@ export function normalizeWebsitePageUpdate(body = {}) {
     update.name === undefined &&
     update.slug === undefined &&
     update.lifecycle_status === undefined &&
-    update.is_home === undefined
+    update.is_home === undefined &&
+    update.content === undefined
   ) {
     throw new WebsiteBuilderError(
       "website_page_update_empty",
@@ -300,6 +428,7 @@ function projectAuditSnapshot(row) {
 }
 
 function pageAuditSnapshot(row) {
+  const content = row?.content && typeof row.content === "object" ? row.content : null;
   return row ? {
     id: String(row.id),
     project_id: String(row.project_id),
@@ -309,6 +438,8 @@ function pageAuditSnapshot(row) {
     lifecycle_status: row.lifecycle_status,
     is_home: row.is_home === true,
     sort_order: exactNumber(row.sort_order),
+    content_schema_version: exactNumber(content?.schema_version),
+    content_block_count: Array.isArray(content?.blocks) ? content.blocks.length : 0,
     version: exactNumber(row.version),
   } : null;
 }
@@ -627,6 +758,7 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       }
       const nextName = input.name ?? current.name;
       const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
+      const nextContent = input.content ?? current.content;
       if (nextName === current.name && nextStatus === current.lifecycle_status) {
         await client.query("COMMIT");
         return res.json({ project: projectPayload(current) });
@@ -814,7 +946,8 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
         nextName === current.name &&
         nextSlug === current.slug &&
         nextStatus === current.lifecycle_status &&
-        nextHome === current.is_home;
+        nextHome === current.is_home &&
+        JSON.stringify(nextContent) === JSON.stringify(current.content);
       if (unchanged) {
         await client.query("COMMIT");
         return res.json({ project: projectPayload(project), page: pagePayload(current) });
@@ -825,13 +958,14 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
                 slug = $5,
                 lifecycle_status = $6,
                 is_home = $7,
+                content = $8::jsonb,
                 archived_at = CASE WHEN $6 = 'archived' THEN COALESCE(archived_at, now()) ELSE NULL END,
-                updated_by = $8,
+                updated_by = $9,
                 updated_at = now(),
                 version = version + 1
           WHERE id = $1 AND project_id = $2 AND company_id = $3
           RETURNING *`,
-        [current.id, project.id, req.companyId, nextName, nextSlug, nextStatus, nextHome, req.userId],
+        [current.id, project.id, req.companyId, nextName, nextSlug, nextStatus, nextHome, JSON.stringify(nextContent), req.userId],
       )).rows[0];
       if (replacementHomeId) {
         await client.query(
@@ -853,7 +987,11 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
         projectId: project.id,
         pageId: current.id,
         actorUserId: req.userId,
-        action: nextStatus !== current.lifecycle_status ? `page.${nextStatus}` : "page.updated",
+        action: nextStatus !== current.lifecycle_status
+          ? `page.${nextStatus}`
+          : input.content !== undefined
+            ? "page.content_updated"
+            : "page.updated",
         before: pageAuditSnapshot(current),
         after: pageAuditSnapshot(page),
       });
