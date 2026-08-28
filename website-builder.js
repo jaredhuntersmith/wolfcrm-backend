@@ -115,7 +115,21 @@ const WEBSITE_BLOCK_DESIGN_CHOICES = Object.freeze({
   button_style: new Set(["primary", "secondary", "outline", "text"]),
   button_size: new Set(["small", "medium", "large"]),
   button_width: new Set(["fit", "full"]),
+  snap_alignment: new Set(["start", "center", "end"]),
 });
+const WEBSITE_BLOCK_DESIGN_CUSTOM_COLOR_FIELDS = new Set([
+  "custom_text_color", "custom_background_color", "custom_border_color",
+  "custom_button_background_color", "custom_button_text_color",
+  "custom_card_background_color", "custom_card_text_color", "custom_card_border_color",
+]);
+const WEBSITE_BLOCK_DESIGN_CUSTOM_NUMBER_FIELDS = Object.freeze({
+  custom_width_percent: [10, 220],
+  custom_min_height_px: [0, 2400],
+  custom_padding_px: [0, 320],
+  custom_offset_x_px: [-800, 800],
+  custom_offset_y_px: [-800, 800],
+});
+const WEBSITE_BLOCK_DESIGN_BOOLEAN_FIELDS = new Set(["locked"]);
 const WEBSITE_RESPONSIVE_BREAKPOINTS = Object.freeze(["desktop", "tablet", "mobile"]);
 const WEBSITE_RESPONSIVE_LAYOUT_CHOICES = Object.freeze({
   gap: new Set(["none", "small", "medium", "large"]),
@@ -487,7 +501,7 @@ function normalizeWebsiteBlockDesign(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw contentError("Block design settings must be an object.");
   }
-  assertOnlyKeys(value, new Set(Object.keys(WEBSITE_BLOCK_DESIGN_CHOICES)), "Block design settings");
+  assertOnlyKeys(value, new Set([...Object.keys(WEBSITE_BLOCK_DESIGN_CHOICES), ...WEBSITE_BLOCK_DESIGN_CUSTOM_COLOR_FIELDS, ...Object.keys(WEBSITE_BLOCK_DESIGN_CUSTOM_NUMBER_FIELDS), ...WEBSITE_BLOCK_DESIGN_BOOLEAN_FIELDS]), "Block design settings");
   const design = {};
   for (const [field, choices] of Object.entries(WEBSITE_BLOCK_DESIGN_CHOICES)) {
     const choice = value[field];
@@ -496,6 +510,24 @@ function normalizeWebsiteBlockDesign(value) {
       throw contentError(`${field.replaceAll("_", " ")} design setting is invalid.`);
     }
     design[field] = choice;
+  }
+  for (const field of WEBSITE_BLOCK_DESIGN_CUSTOM_COLOR_FIELDS) {
+    const color = value[field];
+    if (color === undefined || color === "inherit") continue;
+    if (typeof color !== "string" || !/^#[0-9a-f]{6}$/i.test(color)) throw contentError(`${field.replaceAll("_", " ")} design color is invalid.`);
+    design[field] = color.toLowerCase();
+  }
+  for (const [field, [minimum, maximum]] of Object.entries(WEBSITE_BLOCK_DESIGN_CUSTOM_NUMBER_FIELDS)) {
+    const number = value[field];
+    if (number === undefined || number === "inherit") continue;
+    if (!Number.isSafeInteger(number) || number < minimum || number > maximum) throw contentError(`${field.replaceAll("_", " ")} design measurement is invalid.`);
+    design[field] = number;
+  }
+  for (const field of WEBSITE_BLOCK_DESIGN_BOOLEAN_FIELDS) {
+    const boolean = value[field];
+    if (boolean === undefined || boolean === "inherit") continue;
+    if (typeof boolean !== "boolean") throw contentError(`${field.replaceAll("_", " ")} design setting is invalid.`);
+    design[field] = boolean;
   }
   return design;
 }
