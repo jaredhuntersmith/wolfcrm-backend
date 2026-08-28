@@ -20,7 +20,7 @@ function testCatalogIsUniqueAndComplete() {
   assert.ok(PERMISSION_CAPABILITIES.every((item) => groupIds.has(item.group_id)));
   assert.ok(PERMISSION_CAPABILITIES.every((item) => item.depends_on.every((dependency) => keys.includes(dependency))));
   const payload = permissionCatalogPayload();
-  assert.equal(payload.version, 3);
+  assert.equal(payload.version, 4);
   assert.equal(Object.keys(payload.presets.find((item) => item.id === "admin").capabilities).length, keys.length);
 }
 
@@ -44,6 +44,22 @@ function testTechnicianPresetIsOperationalButRestricted() {
   assert.equal(access.capabilities["contacts.delete"], false);
   assert.equal(access.capabilities["dashboard.exceptions.view"], false);
   assert.equal(access.capabilities["dashboard.exceptions.manage"], false);
+  assert.equal(access.capabilities["website.view"], false);
+}
+
+function testWebsiteBuilderPresetsStayLeastPrivilege() {
+  const admin = resolveAccess({ role: "employee", preset: "admin" }).capabilities;
+  const manager = resolveAccess({ role: "employee", preset: "manager" }).capabilities;
+  const office = resolveAccess({ role: "employee", preset: "office" }).capabilities;
+  const sales = resolveAccess({ role: "employee", preset: "sales" }).capabilities;
+  const legacy = resolveAccess({ role: "employee", preset: "legacy_employee" }).capabilities;
+  assert.equal(admin["website.publish"], true);
+  assert.equal(manager["website.publish"], true);
+  assert.equal(office["website.view"], true);
+  assert.equal(office["website.manage"], true);
+  assert.equal(office["website.publish"], false);
+  assert.equal(sales["website.view"], false);
+  assert.equal(legacy["website.view"], false);
 }
 
 function testBusinessExceptionAccessIsLimitedToOperationalLeaders() {
@@ -206,6 +222,7 @@ const tests = [
   ["catalog uniqueness and completeness", testCatalogIsUniqueAndComplete],
   ["owner invariant", testOwnerAlwaysHasEveryCapability],
   ["technician preset", testTechnicianPresetIsOperationalButRestricted],
+  ["website builder preset boundaries", testWebsiteBuilderPresetsStayLeastPrivilege],
   ["business exception access", testBusinessExceptionAccessIsLimitedToOperationalLeaders],
   ["override dependency expansion", testSparseOverrideAddsDependencies],
   ["explicit parent deny", testExplicitViewDenyCascadesToActions],

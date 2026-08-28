@@ -159,6 +159,7 @@ import {
   normalizeMeasurementID,
   normalizeMeasurementInput
 } from "./measurement-contract.js";
+import { installWebsiteBuilderSystem } from "./website-builder.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -18196,6 +18197,13 @@ async function startServer() {
     pool,
     authRequired,
     requirePayManage: requireCapability("pay.manage")
+  });
+  await installWebsiteBuilderSystem({
+    app,
+    pool,
+    authRequired,
+    requireView: requireCapability("website.view"),
+    requireManage: requireCapability("website.manage")
   });
   await installFinanceSystem({
     app,

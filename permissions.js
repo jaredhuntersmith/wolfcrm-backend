@@ -1,4 +1,4 @@
-export const PERMISSION_CATALOG_VERSION = 3;
+export const PERMISSION_CATALOG_VERSION = 4;
 
 export const PERMISSION_GROUPS = Object.freeze([
   group("dashboard", "Dashboard", "Command center and daily business overview."),
@@ -15,6 +15,7 @@ export const PERMISSION_GROUPS = Object.freeze([
   group("team", "Employees & Team", "View the team and manage employee access."),
   group("automations", "Automations", "View, edit, test, run, and stop company automations."),
   group("integrations", "Integrations", "View and manage external providers, tokens, and synchronization."),
+  group("website", "Website, Landing Pages & Funnels", "Create structured company sites, funnels, forms, and publications."),
   group("settings", "Settings & Exports", "App settings, company configuration, and data exports."),
   group("ai", "AI Capabilities", "Use or administer WolfCRM AI/operator capabilities.")
 ]);
@@ -117,6 +118,10 @@ export const PERMISSION_CAPABILITIES = Object.freeze([
   capability("integrations.view", "integrations", "View integrations", "See integration connection and health status."),
   capability("integrations.manage", "integrations", "Manage integrations", "Change provider credentials, tokens, synchronization, and phone setup.", true, ["integrations.view"]),
 
+  capability("website.view", "website", "View Website Builder", "See company website, landing-page, funnel, and page structure."),
+  capability("website.manage", "website", "Manage Website Builder", "Create, edit, archive, and restore draft projects and pages.", true, ["website.view"]),
+  capability("website.publish", "website", "Publish websites", "Publish, roll back, and manage public website/domain state.", true, ["website.view", "website.manage"]),
+
   capability("settings.view", "settings", "View settings", "See app and permitted company settings."),
   capability("settings.manage_company", "settings", "Manage company settings", "Change company-wide configuration.", true, ["settings.view"]),
   capability("exports.run", "settings", "Run exports", "Export company or customer information.", true),
@@ -129,7 +134,7 @@ const ALL_KEYS = Object.freeze(PERMISSION_CAPABILITIES.map((item) => item.key));
 const KNOWN_KEYS = new Set(ALL_KEYS);
 const CAPABILITY_BY_KEY = new Map(PERMISSION_CAPABILITIES.map((item) => [item.key, item]));
 
-const legacyEmployee = new Set(ALL_KEYS.filter((key) => !key.startsWith("finance.") && !key.startsWith("accounting.") && ![
+const legacyEmployee = new Set(ALL_KEYS.filter((key) => !key.startsWith("finance.") && !key.startsWith("accounting.") && !key.startsWith("website.") && ![
   "dashboard.exceptions.view", "dashboard.exceptions.manage",
   "contacts.delete", "contacts.export", "sales.view_all", "sales.manage",
   "jobs.manage_templates", "routes.manage", "communications.manage",
@@ -146,7 +151,7 @@ const PRESET_KEYS = Object.freeze({
     "schedule.*", "jobs.*", "routes.*", "messaging.customer.*",
     "communications.*", "operations.*", "payments.collect", "payments.view",
     "pay.view_self", "pay.view_all", "time.*", "team.view", "automations.view",
-    "automations.run", "integrations.view", "settings.view", "exports.run", "ai.use"
+    "automations.run", "integrations.view", "website.*", "settings.view", "exports.run", "ai.use"
   ),
   sales: keys(
     "dashboard.view", "tasks.*", "contacts.view", "contacts.create", "contacts.edit",
@@ -170,7 +175,7 @@ const PRESET_KEYS = Object.freeze({
     "routes.edit", "messaging.customer.view", "messaging.customer.send",
     "communications.*", "operations.*", "payments.collect", "payments.view",
     "payments.manage", "pay.view_self", "time.view_self", "time.clock", "time.view_all", "team.view", "automations.view",
-    "integrations.view", "settings.view", "exports.run", "ai.use"
+    "integrations.view", "website.view", "website.manage", "settings.view", "exports.run", "ai.use"
   ),
   legacy_employee: legacyEmployee
 });

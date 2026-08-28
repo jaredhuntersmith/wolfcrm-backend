@@ -1,0 +1,931 @@
+import { randomUUID } from "node:crypto";
+
+export const WEBSITE_PROJECT_KINDS = Object.freeze([
+  "website",
+  "landing_page",
+  "funnel",
+]);
+
+export const WEBSITE_LIFECYCLE_STATUSES = Object.freeze(["draft", "archived"]);
+
+const PROJECT_NAME_LIMIT = 120;
+const PAGE_NAME_LIMIT = 120;
+const PAGE_SLUG_LIMIT = 160;
+const MAX_PROJECTS_PER_COMPANY = 100;
+const MAX_PAGES_PER_PROJECT = 250;
+
+export class WebsiteBuilderError extends Error {
+  constructor(code, message, statusCode = 400, details = {}) {
+    super(message);
+    this.name = "WebsiteBuilderError";
+    this.code = code;
+    this.statusCode = statusCode;
+    Object.assign(this, details);
+  }
+}
+
+function cleanString(value, maximumLength) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (text.length > maximumLength) {
+    throw new WebsiteBuilderError(
+      "website_field_too_long",
+      `Use at most ${maximumLength} characters.`,
+    );
+  }
+  return text;
+}
+
+function requiredName(value, label, maximumLength) {
+  const name = cleanString(value, maximumLength);
+  if (!name) {
+    throw new WebsiteBuilderError(
+      `${label.toLowerCase().replaceAll(" ", "_")}_required`,
+      `${label} is required.`,
+    );
+  }
+  return name;
+}
+
+function requiredVersion(value, field = "expected_version") {
+  const parsed = typeof value === "string" && /^\d+$/.test(value.trim())
+    ? Number(value.trim())
+    : value;
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new WebsiteBuilderError(
+      "website_version_invalid",
+      `${field.replaceAll("_", " ")} is invalid.`,
+    );
+  }
+  return parsed;
+}
+
+function lifecycleStatus(value) {
+  if (!WEBSITE_LIFECYCLE_STATUSES.includes(value)) {
+    throw new WebsiteBuilderError(
+      "website_status_invalid",
+      "Website lifecycle status is invalid.",
+    );
+  }
+  return value;
+}
+
+function projectKind(value) {
+  if (!WEBSITE_PROJECT_KINDS.includes(value)) {
+    throw new WebsiteBuilderError(
+      "website_project_kind_invalid",
+      "Choose Website, Landing Page, or Funnel.",
+    );
+  }
+  return value;
+}
+
+function slugSegment(value) {
+  return String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-+/g, "-");
+}
+
+export function normalizeWebsiteSlug(value, fallbackName = "page") {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (raw === "/") return "/";
+  const source = raw || fallbackName;
+  if (/^[a-z]+:\/\//i.test(source) || source.includes("?") || source.includes("#")) {
+    throw new WebsiteBuilderError(
+      "website_page_slug_invalid",
+      "Use a path such as /services or /roofing/estimate.",
+    );
+  }
+  const segments = source
+    .replace(/^\/+|\/+$/g, "")
+    .split("/")
+    .map(slugSegment)
+    .filter(Boolean);
+  if (!segments.length) {
+    throw new WebsiteBuilderError(
+      "website_page_slug_invalid",
+      "Page path is required.",
+    );
+  }
+  const slug = `/${segments.join("/")}`;
+  if (slug.length > PAGE_SLUG_LIMIT) {
+    throw new WebsiteBuilderError(
+      "website_page_slug_too_long",
+      `Page paths may be at most ${PAGE_SLUG_LIMIT} characters.`,
+    );
+  }
+  return slug;
+}
+
+export function normalizeWebsiteProjectCreate(body = {}) {
+  return {
+    name: requiredName(body.name, "Project name", PROJECT_NAME_LIMIT),
+    kind: projectKind(body.kind),
+  };
+}
+
+export function normalizeWebsiteProjectUpdate(body = {}) {
+  const update = {
+    expected_version: requiredVersion(body.expected_version),
+    name: body.name === undefined
+      ? undefined
+      : requiredName(body.name, "Project name", PROJECT_NAME_LIMIT),
+    lifecycle_status: body.lifecycle_status === undefined
+      ? undefined
+      : lifecycleStatus(body.lifecycle_status),
+  };
+  if (update.name === undefined && update.lifecycle_status === undefined) {
+    throw new WebsiteBuilderError(
+      "website_project_update_empty",
+      "Change the project name or lifecycle status before saving.",
+    );
+  }
+  return update;
+}
+
+export function pageKindForProject(kind) {
+  if (kind === "funnel") return "funnel_step";
+  if (kind === "landing_page") return "landing";
+  return "standard";
+}
+
+export function starterPageForProject({ kind, projectName }) {
+  const name = kind === "funnel" ? "Step 1" : kind === "landing_page" ? "Landing" : "Home";
+  const slug = kind === "funnel" ? "/step-1" : "/";
+  return {
+    name,
+    slug,
+    page_kind: pageKindForProject(kind),
+    content: {
+      schema_version: 1,
+      blocks: [
+        {
+          id: randomUUID(),
+          type: "hero",
+          data: {
+            heading: projectName,
+            body: "Tell visitors what makes your company the right choice.",
+          },
+        },
+      ],
+    },
+    seo: { title: projectName, description: null },
+  };
+}
+
+export function normalizeWebsitePageCreate(body = {}, kind = "website") {
+  const name = requiredName(body.name, "Page name", PAGE_NAME_LIMIT);
+  return {
+    name,
+    slug: normalizeWebsiteSlug(body.slug, name),
+    page_kind: pageKindForProject(projectKind(kind)),
+    expected_project_version: requiredVersion(
+      body.expected_project_version,
+      "expected_project_version",
+    ),
+  };
+}
+
+export function normalizeWebsitePageUpdate(body = {}) {
+  const update = {
+    expected_version: requiredVersion(body.expected_version),
+    expected_project_version: requiredVersion(
+      body.expected_project_version,
+      "expected_project_version",
+    ),
+    name: body.name === undefined
+      ? undefined
+      : requiredName(body.name, "Page name", PAGE_NAME_LIMIT),
+    slug: body.slug === undefined ? undefined : normalizeWebsiteSlug(body.slug),
+    lifecycle_status: body.lifecycle_status === undefined
+      ? undefined
+      : lifecycleStatus(body.lifecycle_status),
+    is_home: body.is_home === undefined ? undefined : body.is_home,
+  };
+  if (update.is_home !== undefined && typeof update.is_home !== "boolean") {
+    throw new WebsiteBuilderError(
+      "website_page_home_invalid",
+      "Home/entry selection must be true or false.",
+    );
+  }
+  if (
+    update.name === undefined &&
+    update.slug === undefined &&
+    update.lifecycle_status === undefined &&
+    update.is_home === undefined
+  ) {
+    throw new WebsiteBuilderError(
+      "website_page_update_empty",
+      "Change the page before saving.",
+    );
+  }
+  return update;
+}
+
+export function normalizeWebsitePageReorder(body = {}) {
+  const targetIndex = typeof body.target_index === "string" && /^\d+$/.test(body.target_index.trim())
+    ? Number(body.target_index.trim())
+    : body.target_index;
+  if (!Number.isSafeInteger(targetIndex) || targetIndex < 0 || targetIndex >= MAX_PAGES_PER_PROJECT) {
+    throw new WebsiteBuilderError(
+      "website_page_position_invalid",
+      "Page position is invalid.",
+    );
+  }
+  return {
+    target_index: targetIndex,
+    expected_project_version: requiredVersion(
+      body.expected_project_version,
+      "expected_project_version",
+    ),
+  };
+}
+
+function timestamp(value) {
+  if (!value) return null;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
+}
+
+function exactNumber(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) ? number : 0;
+}
+
+function projectPayload(row) {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    kind: row.kind,
+    lifecycle_status: row.lifecycle_status,
+    version: exactNumber(row.version),
+    active_page_count: exactNumber(row.active_page_count),
+    archived_page_count: exactNumber(row.archived_page_count),
+    created_at: timestamp(row.created_at),
+    updated_at: timestamp(row.updated_at),
+    archived_at: timestamp(row.archived_at),
+  };
+}
+
+function pagePayload(row) {
+  return {
+    id: String(row.id),
+    project_id: String(row.project_id),
+    name: String(row.name),
+    slug: String(row.slug),
+    page_kind: row.page_kind,
+    lifecycle_status: row.lifecycle_status,
+    is_home: row.is_home === true,
+    sort_order: exactNumber(row.sort_order),
+    content: row.content && typeof row.content === "object" ? row.content : { schema_version: 1, blocks: [] },
+    seo: row.seo && typeof row.seo === "object" ? row.seo : {},
+    version: exactNumber(row.version),
+    created_at: timestamp(row.created_at),
+    updated_at: timestamp(row.updated_at),
+    archived_at: timestamp(row.archived_at),
+  };
+}
+
+function projectAuditSnapshot(row) {
+  return row ? {
+    id: String(row.id),
+    name: row.name,
+    kind: row.kind,
+    lifecycle_status: row.lifecycle_status,
+    version: exactNumber(row.version),
+  } : null;
+}
+
+function pageAuditSnapshot(row) {
+  return row ? {
+    id: String(row.id),
+    project_id: String(row.project_id),
+    name: row.name,
+    slug: row.slug,
+    page_kind: row.page_kind,
+    lifecycle_status: row.lifecycle_status,
+    is_home: row.is_home === true,
+    sort_order: exactNumber(row.sort_order),
+    version: exactNumber(row.version),
+  } : null;
+}
+
+async function appendAudit(client, { companyId, projectId, pageId = null, actorUserId, action, before = null, after = null }) {
+  await client.query(
+    `INSERT INTO website_builder_audit (
+       company_id, project_id, page_id, actor_user_id, action, before_state, after_state
+     ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)`,
+    [
+      companyId,
+      projectId,
+      pageId,
+      actorUserId,
+      action,
+      before == null ? null : JSON.stringify(before),
+      after == null ? null : JSON.stringify(after),
+    ],
+  );
+}
+
+async function loadProject(client, companyId, projectId, lock = false) {
+  const { rows } = await client.query(
+    `SELECT * FROM website_projects
+      WHERE id::text = $1 AND company_id = $2${lock ? " FOR UPDATE" : ""}`,
+    [projectId, companyId],
+  );
+  if (!rows[0]) {
+    throw new WebsiteBuilderError(
+      "website_project_not_found",
+      "Website project was not found.",
+      404,
+    );
+  }
+  return rows[0];
+}
+
+async function loadPage(client, companyId, projectId, pageId, lock = false) {
+  const { rows } = await client.query(
+    `SELECT * FROM website_pages
+      WHERE id::text = $1 AND project_id::text = $2 AND company_id = $3${lock ? " FOR UPDATE" : ""}`,
+    [pageId, projectId, companyId],
+  );
+  if (!rows[0]) {
+    throw new WebsiteBuilderError(
+      "website_page_not_found",
+      "Website page was not found.",
+      404,
+    );
+  }
+  return rows[0];
+}
+
+function requireCompany(req) {
+  if (!req.companyId) {
+    throw new WebsiteBuilderError(
+      "company_required",
+      "Website Builder requires a company workspace.",
+      400,
+    );
+  }
+  return req.companyId;
+}
+
+function assertVersion(row, expected, subject) {
+  if (exactNumber(row.version) !== expected) {
+    throw new WebsiteBuilderError(
+      `website_${subject}_stale`,
+      `This ${subject} changed after it was loaded. Refresh before saving again.`,
+      409,
+      { current_version: exactNumber(row.version) },
+    );
+  }
+}
+
+function sendWebsiteBuilderError(res, error, fallbackCode) {
+  if (error instanceof WebsiteBuilderError || error?.statusCode) {
+    return res.status(error.statusCode || 400).json({
+      error: error.code || fallbackCode,
+      message: error.message,
+      current_version: error.current_version,
+    });
+  }
+  if (error?.code === "23505") {
+    return res.status(409).json({
+      error: "website_slug_conflict",
+      message: "That active page path is already used in this project.",
+    });
+  }
+  console.error("[website-builder]", fallbackCode, {
+    code: error?.code,
+    message: error?.message,
+  });
+  return res.status(500).json({
+    error: fallbackCode,
+    message: "Website Builder could not complete that request.",
+  });
+}
+
+export async function installWebsiteBuilderSchema(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS website_projects (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('website', 'landing_page', 'funnel')),
+      lifecycle_status TEXT NOT NULL DEFAULT 'draft' CHECK (lifecycle_status IN ('draft', 'archived')),
+      version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      archived_at TIMESTAMPTZ,
+      UNIQUE(id, company_id),
+      CHECK (char_length(name) BETWEEN 1 AND ${PROJECT_NAME_LIMIT})
+    );
+    CREATE INDEX IF NOT EXISTS website_projects_company_status_updated_idx
+      ON website_projects(company_id, lifecycle_status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS website_pages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      project_id UUID NOT NULL,
+      name TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      page_kind TEXT NOT NULL CHECK (page_kind IN ('standard', 'landing', 'funnel_step')),
+      lifecycle_status TEXT NOT NULL DEFAULT 'draft' CHECK (lifecycle_status IN ('draft', 'archived')),
+      is_home BOOLEAN NOT NULL DEFAULT false,
+      sort_order INTEGER NOT NULL DEFAULT 0 CHECK (sort_order >= 0),
+      content JSONB NOT NULL DEFAULT '{"schema_version":1,"blocks":[]}'::jsonb,
+      seo JSONB NOT NULL DEFAULT '{}'::jsonb,
+      version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      archived_at TIMESTAMPTZ,
+      UNIQUE(id, project_id, company_id),
+      FOREIGN KEY(project_id, company_id) REFERENCES website_projects(id, company_id) ON DELETE CASCADE,
+      CHECK (char_length(name) BETWEEN 1 AND ${PAGE_NAME_LIMIT}),
+      CHECK (char_length(slug) BETWEEN 1 AND ${PAGE_SLUG_LIMIT}),
+      CHECK (jsonb_typeof(content) = 'object'),
+      CHECK (jsonb_typeof(seo) = 'object'),
+      CHECK (octet_length(content::text) <= 262144),
+      CHECK (octet_length(seo::text) <= 32768)
+    );
+    CREATE INDEX IF NOT EXISTS website_pages_project_status_order_idx
+      ON website_pages(company_id, project_id, lifecycle_status, sort_order, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS website_pages_active_slug_uidx
+      ON website_pages(project_id, lower(slug)) WHERE archived_at IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS website_pages_active_home_uidx
+      ON website_pages(project_id) WHERE is_home AND archived_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS website_builder_audit (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      project_id UUID REFERENCES website_projects(id) ON DELETE SET NULL,
+      page_id UUID REFERENCES website_pages(id) ON DELETE SET NULL,
+      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL,
+      before_state JSONB,
+      after_state JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS website_builder_audit_company_project_idx
+      ON website_builder_audit(company_id, project_id, created_at DESC);
+  `);
+}
+
+export async function installWebsiteBuilderSystem({ app, pool, authRequired, requireView, requireManage }) {
+  await installWebsiteBuilderSchema(pool);
+
+  app.get("/api/website-builder/projects", authRequired, requireView, async (req, res) => {
+    try {
+      const companyId = requireCompany(req);
+      const status = req.query.status === "archived" ? "archived" : req.query.status === "all" ? "all" : "draft";
+      const values = [companyId];
+      const where = status === "all" ? "" : " AND p.lifecycle_status = $2";
+      if (status !== "all") values.push(status);
+      const { rows } = await pool.query(
+        `SELECT p.*,
+                COUNT(pg.id) FILTER (WHERE pg.archived_at IS NULL)::int AS active_page_count,
+                COUNT(pg.id) FILTER (WHERE pg.archived_at IS NOT NULL)::int AS archived_page_count
+           FROM website_projects p
+           LEFT JOIN website_pages pg ON pg.project_id = p.id AND pg.company_id = p.company_id
+          WHERE p.company_id = $1${where}
+          GROUP BY p.id
+          ORDER BY (p.lifecycle_status = 'archived') ASC, p.updated_at DESC, lower(p.name) ASC
+          LIMIT ${MAX_PROJECTS_PER_COMPANY}`,
+        values,
+      );
+      res.json({ projects: rows.map(projectPayload) });
+    } catch (error) {
+      sendWebsiteBuilderError(res, error, "website_projects_load_failed");
+    }
+  });
+
+  app.post("/api/website-builder/projects", authRequired, requireManage, async (req, res) => {
+    let input;
+    try {
+      input = normalizeWebsiteProjectCreate(req.body);
+      requireCompany(req);
+    } catch (error) {
+      return sendWebsiteBuilderError(res, error, "website_project_create_failed");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const count = await client.query(
+        `SELECT COUNT(*)::int AS count FROM website_projects WHERE company_id = $1`,
+        [req.companyId],
+      );
+      if (exactNumber(count.rows[0]?.count) >= MAX_PROJECTS_PER_COMPANY) {
+        throw new WebsiteBuilderError(
+          "website_project_limit_reached",
+          `A company may have up to ${MAX_PROJECTS_PER_COMPANY} Website Builder projects.`,
+          409,
+        );
+      }
+      const projectId = randomUUID();
+      const pageId = randomUUID();
+      const project = (await client.query(
+        `INSERT INTO website_projects (
+           id, company_id, name, kind, created_by, updated_by
+         ) VALUES ($1,$2,$3,$4,$5,$5)
+         RETURNING *`,
+        [projectId, req.companyId, input.name, input.kind, req.userId],
+      )).rows[0];
+      const starter = starterPageForProject({ kind: input.kind, projectName: input.name });
+      const page = (await client.query(
+        `INSERT INTO website_pages (
+           id, company_id, project_id, name, slug, page_kind, is_home,
+           sort_order, content, seo, created_by, updated_by
+         ) VALUES ($1,$2,$3,$4,$5,$6,true,0,$7::jsonb,$8::jsonb,$9,$9)
+         RETURNING *`,
+        [
+          pageId,
+          req.companyId,
+          projectId,
+          starter.name,
+          starter.slug,
+          starter.page_kind,
+          JSON.stringify(starter.content),
+          JSON.stringify(starter.seo),
+          req.userId,
+        ],
+      )).rows[0];
+      await appendAudit(client, {
+        companyId: req.companyId,
+        projectId,
+        pageId,
+        actorUserId: req.userId,
+        action: "project.created",
+        after: { project: projectAuditSnapshot(project), starter_page: pageAuditSnapshot(page) },
+      });
+      await client.query("COMMIT");
+      res.status(201).json({
+        project: projectPayload({ ...project, active_page_count: 1, archived_page_count: 0 }),
+        pages: [pagePayload(page)],
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      sendWebsiteBuilderError(res, error, "website_project_create_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/api/website-builder/projects/:projectId", authRequired, requireView, async (req, res) => {
+    try {
+      const companyId = requireCompany(req);
+      const project = await loadProject(pool, companyId, req.params.projectId);
+      const { rows } = await pool.query(
+        `SELECT * FROM website_pages
+          WHERE company_id = $1 AND project_id = $2
+          ORDER BY (archived_at IS NOT NULL) ASC, sort_order ASC, created_at ASC`,
+        [companyId, project.id],
+      );
+      const activeCount = rows.filter((row) => !row.archived_at).length;
+      res.json({
+        project: projectPayload({
+          ...project,
+          active_page_count: activeCount,
+          archived_page_count: rows.length - activeCount,
+        }),
+        pages: rows.map(pagePayload),
+      });
+    } catch (error) {
+      sendWebsiteBuilderError(res, error, "website_project_load_failed");
+    }
+  });
+
+  app.patch("/api/website-builder/projects/:projectId", authRequired, requireManage, async (req, res) => {
+    let input;
+    try {
+      input = normalizeWebsiteProjectUpdate(req.body);
+      requireCompany(req);
+    } catch (error) {
+      return sendWebsiteBuilderError(res, error, "website_project_update_failed");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const current = await loadProject(client, req.companyId, req.params.projectId, true);
+      assertVersion(current, input.expected_version, "project");
+      const nextName = input.name ?? current.name;
+      const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
+      if (nextName === current.name && nextStatus === current.lifecycle_status) {
+        await client.query("COMMIT");
+        return res.json({ project: projectPayload(current) });
+      }
+      const updated = (await client.query(
+        `UPDATE website_projects
+            SET name = $3,
+                lifecycle_status = $4,
+                archived_at = CASE WHEN $4 = 'archived' THEN COALESCE(archived_at, now()) ELSE NULL END,
+                updated_by = $5,
+                updated_at = now(),
+                version = version + 1
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [current.id, req.companyId, nextName, nextStatus, req.userId],
+      )).rows[0];
+      await appendAudit(client, {
+        companyId: req.companyId,
+        projectId: current.id,
+        actorUserId: req.userId,
+        action: nextStatus !== current.lifecycle_status ? `project.${nextStatus}` : "project.updated",
+        before: projectAuditSnapshot(current),
+        after: projectAuditSnapshot(updated),
+      });
+      await client.query("COMMIT");
+      res.json({ project: projectPayload(updated) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      sendWebsiteBuilderError(res, error, "website_project_update_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post("/api/website-builder/projects/:projectId/pages", authRequired, requireManage, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const companyId = requireCompany(req);
+      await client.query("BEGIN");
+      const project = await loadProject(client, companyId, req.params.projectId, true);
+      if (project.lifecycle_status === "archived") {
+        throw new WebsiteBuilderError(
+          "website_project_archived",
+          "Restore the project before adding pages.",
+          409,
+        );
+      }
+      const input = normalizeWebsitePageCreate(req.body, project.kind);
+      assertVersion(project, input.expected_project_version, "project");
+      const count = await client.query(
+        `SELECT COUNT(*)::int AS count,
+                COALESCE(MAX(sort_order) FILTER (WHERE archived_at IS NULL), -1)::int AS maximum
+           FROM website_pages WHERE company_id = $1 AND project_id = $2`,
+        [companyId, project.id],
+      );
+      if (exactNumber(count.rows[0]?.count) >= MAX_PAGES_PER_PROJECT) {
+        throw new WebsiteBuilderError(
+          "website_page_limit_reached",
+          `A project may have up to ${MAX_PAGES_PER_PROJECT} active pages.`,
+          409,
+        );
+      }
+      const pageId = randomUUID();
+      const content = {
+        schema_version: 1,
+        blocks: [{
+          id: randomUUID(),
+          type: "hero",
+          data: { heading: input.name, body: "Add the details visitors need to take the next step." },
+        }],
+      };
+      const page = (await client.query(
+        `INSERT INTO website_pages (
+           id, company_id, project_id, name, slug, page_kind, sort_order,
+           content, seo, created_by, updated_by
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$10)
+         RETURNING *`,
+        [
+          pageId,
+          companyId,
+          project.id,
+          input.name,
+          input.slug,
+          input.page_kind,
+          exactNumber(count.rows[0]?.maximum) + 1,
+          JSON.stringify(content),
+          JSON.stringify({ title: input.name, description: null }),
+          req.userId,
+        ],
+      )).rows[0];
+      const updatedProject = (await client.query(
+        `UPDATE website_projects
+            SET version = version + 1, updated_at = now(), updated_by = $3
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [project.id, companyId, req.userId],
+      )).rows[0];
+      await appendAudit(client, {
+        companyId,
+        projectId: project.id,
+        pageId,
+        actorUserId: req.userId,
+        action: "page.created",
+        after: pageAuditSnapshot(page),
+      });
+      await client.query("COMMIT");
+      res.status(201).json({ project: projectPayload(updatedProject), page: pagePayload(page) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      sendWebsiteBuilderError(res, error, "website_page_create_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.patch("/api/website-builder/projects/:projectId/pages/:pageId", authRequired, requireManage, async (req, res) => {
+    let input;
+    try {
+      input = normalizeWebsitePageUpdate(req.body);
+      requireCompany(req);
+    } catch (error) {
+      return sendWebsiteBuilderError(res, error, "website_page_update_failed");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const project = await loadProject(client, req.companyId, req.params.projectId, true);
+      if (project.lifecycle_status === "archived") {
+        throw new WebsiteBuilderError(
+          "website_project_archived",
+          "Restore the project before changing its pages.",
+          409,
+        );
+      }
+      assertVersion(project, input.expected_project_version, "project");
+      const current = await loadPage(client, req.companyId, project.id, req.params.pageId, true);
+      assertVersion(current, input.expected_version, "page");
+      const nextName = input.name ?? current.name;
+      const nextSlug = input.slug ?? current.slug;
+      const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
+      let nextHome = input.is_home ?? current.is_home;
+      let replacementHomeId = null;
+
+      if (nextStatus === "archived") nextHome = false;
+      if (current.is_home && nextStatus !== "archived" && nextHome === false) {
+        throw new WebsiteBuilderError(
+          "website_home_required",
+          "Choose another home/entry page before removing this one.",
+          409,
+        );
+      }
+      if (current.lifecycle_status !== "archived" && nextStatus === "archived") {
+        const siblings = (await client.query(
+          `SELECT * FROM website_pages
+            WHERE company_id = $1 AND project_id = $2 AND id <> $3 AND archived_at IS NULL
+            ORDER BY sort_order ASC, created_at ASC
+            FOR UPDATE`,
+          [req.companyId, project.id, current.id],
+        )).rows;
+        if (!siblings.length) {
+          throw new WebsiteBuilderError(
+            "website_last_page_required",
+            "A project must keep at least one active page.",
+            409,
+          );
+        }
+        if (current.is_home) {
+          replacementHomeId = siblings[0].id;
+        }
+      }
+      if (nextHome && nextStatus !== "archived") {
+        await client.query(
+          `UPDATE website_pages
+              SET is_home = false, version = version + 1, updated_at = now(), updated_by = $4
+            WHERE project_id = $1 AND company_id = $2 AND id <> $3 AND is_home = true AND archived_at IS NULL`,
+          [project.id, req.companyId, current.id, req.userId],
+        );
+      }
+      const unchanged =
+        nextName === current.name &&
+        nextSlug === current.slug &&
+        nextStatus === current.lifecycle_status &&
+        nextHome === current.is_home;
+      if (unchanged) {
+        await client.query("COMMIT");
+        return res.json({ project: projectPayload(project), page: pagePayload(current) });
+      }
+      const page = (await client.query(
+        `UPDATE website_pages
+            SET name = $4,
+                slug = $5,
+                lifecycle_status = $6,
+                is_home = $7,
+                archived_at = CASE WHEN $6 = 'archived' THEN COALESCE(archived_at, now()) ELSE NULL END,
+                updated_by = $8,
+                updated_at = now(),
+                version = version + 1
+          WHERE id = $1 AND project_id = $2 AND company_id = $3
+          RETURNING *`,
+        [current.id, project.id, req.companyId, nextName, nextSlug, nextStatus, nextHome, req.userId],
+      )).rows[0];
+      if (replacementHomeId) {
+        await client.query(
+          `UPDATE website_pages
+              SET is_home = true, version = version + 1, updated_at = now(), updated_by = $4
+            WHERE id = $1 AND project_id = $2 AND company_id = $3`,
+          [replacementHomeId, project.id, req.companyId, req.userId],
+        );
+      }
+      const updatedProject = (await client.query(
+        `UPDATE website_projects
+            SET version = version + 1, updated_at = now(), updated_by = $3
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [project.id, req.companyId, req.userId],
+      )).rows[0];
+      await appendAudit(client, {
+        companyId: req.companyId,
+        projectId: project.id,
+        pageId: current.id,
+        actorUserId: req.userId,
+        action: nextStatus !== current.lifecycle_status ? `page.${nextStatus}` : "page.updated",
+        before: pageAuditSnapshot(current),
+        after: pageAuditSnapshot(page),
+      });
+      await client.query("COMMIT");
+      res.json({ project: projectPayload(updatedProject), page: pagePayload(page) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      sendWebsiteBuilderError(res, error, "website_page_update_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post("/api/website-builder/projects/:projectId/pages/:pageId/reorder", authRequired, requireManage, async (req, res) => {
+    let input;
+    try {
+      input = normalizeWebsitePageReorder(req.body);
+      requireCompany(req);
+    } catch (error) {
+      return sendWebsiteBuilderError(res, error, "website_page_reorder_failed");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const project = await loadProject(client, req.companyId, req.params.projectId, true);
+      if (project.lifecycle_status === "archived") {
+        throw new WebsiteBuilderError(
+          "website_project_archived",
+          "Restore the project before reordering pages.",
+          409,
+        );
+      }
+      assertVersion(project, input.expected_project_version, "project");
+      const pages = (await client.query(
+        `SELECT * FROM website_pages
+          WHERE company_id = $1 AND project_id = $2 AND archived_at IS NULL
+          ORDER BY sort_order ASC, created_at ASC
+          FOR UPDATE`,
+        [req.companyId, project.id],
+      )).rows;
+      const currentIndex = pages.findIndex((page) => String(page.id) === req.params.pageId);
+      if (currentIndex < 0) {
+        throw new WebsiteBuilderError(
+          "website_page_not_found",
+          "Active website page was not found.",
+          404,
+        );
+      }
+      const targetIndex = Math.min(input.target_index, pages.length - 1);
+      if (targetIndex === currentIndex) {
+        await client.query("COMMIT");
+        return res.json({ project: projectPayload(project), pages: pages.map(pagePayload) });
+      }
+      const [moved] = pages.splice(currentIndex, 1);
+      pages.splice(targetIndex, 0, moved);
+      for (let index = 0; index < pages.length; index += 1) {
+        if (exactNumber(pages[index].sort_order) === index) continue;
+        pages[index] = (await client.query(
+          `UPDATE website_pages
+              SET sort_order = $4, version = version + 1, updated_at = now(), updated_by = $5
+            WHERE id = $1 AND project_id = $2 AND company_id = $3
+            RETURNING *`,
+          [pages[index].id, project.id, req.companyId, index, req.userId],
+        )).rows[0];
+      }
+      const updatedProject = (await client.query(
+        `UPDATE website_projects
+            SET version = version + 1, updated_at = now(), updated_by = $3
+          WHERE id = $1 AND company_id = $2
+          RETURNING *`,
+        [project.id, req.companyId, req.userId],
+      )).rows[0];
+      await appendAudit(client, {
+        companyId: req.companyId,
+        projectId: project.id,
+        pageId: moved.id,
+        actorUserId: req.userId,
+        action: "page.reordered",
+        before: { index: currentIndex },
+        after: { index: targetIndex },
+      });
+      await client.query("COMMIT");
+      res.json({ project: projectPayload(updatedProject), pages: pages.map(pagePayload) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      sendWebsiteBuilderError(res, error, "website_page_reorder_failed");
+    } finally {
+      client.release();
+    }
+  });
+}
