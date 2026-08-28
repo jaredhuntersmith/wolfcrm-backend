@@ -116,6 +116,7 @@ test("routes keep authentication, capabilities, and company scope authoritative"
   assert.match(source, /app\.get\("\/api\/website-builder\/projects", authRequired, requireView/);
   assert.match(source, /app\.post\("\/api\/website-builder\/projects", authRequired, requireManage/);
   assert.match(source, /app\.patch\("\/api\/website-builder\/projects\/:projectId\/pages\/:pageId", authRequired, requireManage/);
+  assert.match(source, /const current = await loadPage[\s\S]*const nextContent = input\.content \?\? current\.content[\s\S]*content = \$8::jsonb/);
   assert.match(source, /WHERE id::text = \$1 AND company_id = \$2/);
   assert.match(source, /WHERE id::text = \$1 AND project_id::text = \$2 AND company_id = \$3/);
 });

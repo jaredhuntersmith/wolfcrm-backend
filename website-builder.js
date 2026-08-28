@@ -758,7 +758,6 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       }
       const nextName = input.name ?? current.name;
       const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
-      const nextContent = input.content ?? current.content;
       if (nextName === current.name && nextStatus === current.lifecycle_status) {
         await client.query("COMMIT");
         return res.json({ project: projectPayload(current) });
@@ -904,6 +903,7 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       const nextName = input.name ?? current.name;
       const nextSlug = input.slug ?? current.slug;
       const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
+      const nextContent = input.content ?? current.content;
       let nextHome = input.is_home ?? current.is_home;
       let replacementHomeId = null;
 
