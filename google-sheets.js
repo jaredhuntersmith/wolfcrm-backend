@@ -1026,17 +1026,18 @@ async function handleOAuthCallback(pool, query, env = process.env) {
     [state, picked || null]
   )).rows[0];
   if (!stateRow) throw Object.assign(new Error("invalid_or_expired_state"), { statusCode: 400 });
-  if (error) throw Object.assign(new Error(error), { statusCode: 400, companyId: stateRow.company_id });
-  if (!code || !picked) throw Object.assign(new Error("google_authorization_incomplete"), { statusCode: 400, companyId: stateRow.company_id });
-  const fileId = picked.split(",").map((v) => v.trim()).filter(Boolean)[0];
-  const token = await exchangeAuthorizationCode(code, env);
-  if (!token.refresh_token) throw Object.assign(new Error("google_refresh_token_missing"), { statusCode: 409, companyId: stateRow.company_id });
-  const encrypted = encryptRefreshToken(token.refresh_token, env);
-  const file = await googleAPIWithAccessToken(token.access_token, `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType`);
-  if (file.mimeType !== GOOGLE_SHEETS_MIME) throw Object.assign(new Error("selected_file_not_google_sheet"), { statusCode: 400, companyId: stateRow.company_id });
-  const info = await userInfo(token.access_token);
-  const { rows } = await pool.query(
-    `INSERT INTO google_sheets_connections(
+  try {
+    if (error) throw Object.assign(new Error(error), { statusCode: 400, companyId: stateRow.company_id });
+    if (!code || !picked) throw Object.assign(new Error("google_authorization_incomplete"), { statusCode: 400, companyId: stateRow.company_id });
+    const fileId = picked.split(",").map((v) => v.trim()).filter(Boolean)[0];
+    const token = await exchangeAuthorizationCode(code, env);
+    if (!token.refresh_token) throw Object.assign(new Error("google_refresh_token_missing"), { statusCode: 409, companyId: stateRow.company_id });
+    const encrypted = encryptRefreshToken(token.refresh_token, env);
+    const file = await googleAPIWithAccessToken(token.access_token, `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType`);
+    if (file.mimeType !== GOOGLE_SHEETS_MIME) throw Object.assign(new Error("selected_file_not_google_sheet"), { statusCode: 400, companyId: stateRow.company_id });
+    const info = await userInfo(token.access_token);
+    const { rows } = await pool.query(
+      `INSERT INTO google_sheets_connections(
        company_id, created_by, google_account_email, google_account_id, authorized_scopes,
        refresh_token_ciphertext, refresh_token_iv, refresh_token_auth_tag, token_encryption_version,
        spreadsheet_id, spreadsheet_title, status, reconnect_required, disconnected_at
@@ -1060,10 +1061,26 @@ async function handleOAuthCallback(pool, query, env = process.env) {
        last_error = NULL,
        updated_at = now()
      RETURNING *`,
-    [stateRow.company_id, stateRow.user_id, info.email || null, info.sub || null, token.scope || GOOGLE_SHEETS_SCOPE, encrypted.refresh_token_ciphertext, encrypted.refresh_token_iv, encrypted.refresh_token_auth_tag, encrypted.token_encryption_version, file.id, file.name]
-  );
-  await pool.query(`DELETE FROM google_sheets_contact_sync_state WHERE connection_id = $1`, [rows[0].id]);
-  return rows[0];
+      [stateRow.company_id, stateRow.user_id, info.email || null, info.sub || null, token.scope || GOOGLE_SHEETS_SCOPE, encrypted.refresh_token_ciphertext, encrypted.refresh_token_iv, encrypted.refresh_token_auth_tag, encrypted.token_encryption_version, file.id, file.name]
+    );
+    await pool.query(`DELETE FROM google_sheets_contact_sync_state WHERE connection_id = $1`, [rows[0].id]);
+    return { connection: rows[0], purpose: stateRow.purpose };
+  } catch (callbackError) {
+    callbackError.oauthPurpose = stateRow.purpose;
+    throw callbackError;
+  }
+}
+
+function googleSheetsWebCallbackHTML(status) {
+  const connected = status === "connected";
+  const title = connected ? "Google Sheets connected" : "Google Sheets connection failed";
+  const detail = connected
+    ? "Return to WolfCRM to choose a tab and finish the first sync."
+    : "Return to WolfCRM and try connecting again.";
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head>
+<body style="font:16px system-ui,sans-serif;padding:32px;color:#183126"><main><h1>${title}</h1><p>${detail}</p><p>You may close this window.</p></main>
+<script>if(window.opener){window.opener.postMessage({type:"wolfcrm-google-sheets",status:${JSON.stringify(status)}},"*");window.close();}</script></body></html>`;
 }
 
 export function installGoogleSheetsSystem({ app, pool, authRequired, requireEmployer, requireIntegrationView = requireEmployer, env = process.env }) {
@@ -1088,10 +1105,20 @@ export function installGoogleSheetsSystem({ app, pool, authRequired, requireEmpl
 
   app.get("/api/integrations/google-sheets/oauth/callback", async (req, res) => {
     try {
-      const connection = await handleOAuthCallback(pool, req.query || {}, env);
-      res.redirect(`wolfcrm://google-sheets?status=connected&connection_id=${encodeURIComponent(connection.id)}`);
+      const result = await handleOAuthCallback(pool, req.query || {}, env);
+      if (result.purpose.startsWith("web_")) {
+        res.set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'");
+        res.set("X-Content-Type-Options", "nosniff");
+        return res.status(200).type("html").send(googleSheetsWebCallbackHTML("connected"));
+      }
+      res.redirect(`wolfcrm://google-sheets?status=connected&connection_id=${encodeURIComponent(result.connection.id)}`);
     } catch (e) {
       console.error("[google-sheets] oauth callback failed", { error: e.message, companyId: e.companyId || null });
+      if (String(e.oauthPurpose || "").startsWith("web_")) {
+        res.set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'");
+        res.set("X-Content-Type-Options", "nosniff");
+        return res.status(400).type("html").send(googleSheetsWebCallbackHTML("error"));
+      }
       res.redirect(`wolfcrm://google-sheets?status=error&error=${encodeURIComponent(e.message || "google_oauth_failed")}`);
     }
   });
@@ -1196,5 +1223,6 @@ export const googleSheetsTestHooks = {
   encryptRefreshToken,
   decryptRefreshToken,
   GOOGLE_SHEETS_SCOPE,
-  GOOGLE_SHEETS_CELL_LIMIT
+  GOOGLE_SHEETS_CELL_LIMIT,
+  googleSheetsWebCallbackHTML
 };

@@ -7,7 +7,8 @@ const {
   exportHash,
   encryptRefreshToken,
   decryptRefreshToken,
-  GOOGLE_SHEETS_CELL_LIMIT
+  GOOGLE_SHEETS_CELL_LIMIT,
+  googleSheetsWebCallbackHTML
 } = googleSheetsTestHooks;
 
 function makeContact(overrides = {}) {
@@ -110,10 +111,20 @@ async function testCredentialEncryptionRoundTrip() {
   assert.equal(decryptRefreshToken(encrypted, env), "refresh-token-value");
 }
 
+async function testWebOAuthCallbackBoundary() {
+  const connected = googleSheetsWebCallbackHTML("connected");
+  const failed = googleSheetsWebCallbackHTML("error");
+  assert.match(connected, /wolfcrm-google-sheets/);
+  assert.match(connected, /Google Sheets connected/);
+  assert.doesNotMatch(connected, /connection_id|refresh_token/);
+  assert.match(failed, /Google Sheets connection failed/);
+}
+
 await testExporterSchemaAndHistory();
 await testLongContinuationColumns();
 await testExportHashChangesOnlyWhenExportedRowChanges();
 await testOAuthURLScopeAndPicker();
 await testCredentialEncryptionRoundTrip();
+await testWebOAuthCallbackBoundary();
 
 console.log("google-sheets tests passed");
