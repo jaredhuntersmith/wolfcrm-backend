@@ -63,6 +63,19 @@ function contactTagMatchPredicate(alias, parameter) {
     SELECT 1
       FROM ${tagRows(alias)}
      WHERE LOWER(TRIM(BOTH '"' FROM contact_tag.value)) = LOWER(${parameter})
+        OR LOWER(TRIM(BOTH '"' FROM contact_tag.value)) LIKE '%' || LOWER(${parameter}) || '%'
+        OR LOWER(${parameter}) LIKE '%' || LOWER(TRIM(BOTH '"' FROM contact_tag.value)) || '%'
+  )`;
+}
+
+function contactTagExactPredicate(alias, parameter) {
+  if (!/^\$\d+$/.test(parameter)) {
+    throw new TypeError("Contact tag filters require a positional SQL parameter.");
+  }
+  return `EXISTS (
+    SELECT 1
+      FROM ${tagRows(alias)}
+     WHERE LOWER(TRIM(BOTH '"' FROM contact_tag.value)) = LOWER(${parameter})
   )`;
 }
 
@@ -117,7 +130,7 @@ export function buildDesktopContactListFilters(query = {}, { alias = "c", parame
   }
 
   const customerExpression = filters.groupCustomers
-    ? contactTagMatchPredicate(alias, bind("won"))
+    ? contactTagExactPredicate(alias, bind("won"))
     : null;
   return { ...filters, predicates, values, customerExpression };
 }

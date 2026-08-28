@@ -40,7 +40,9 @@ test("desktop Contact filter SQL keeps values bound and covers shared field pres
   assert.match(result.predicates.join(" "), /c\.lead_info ->> 2/);
   assert.match(result.predicates.join(" "), /LOWER\(\$3\)/);
   assert.match(result.predicates.join(" "), /LOWER\(\$5\)/);
+  assert.match(result.predicates.join(" "), /LIKE '%' \|\| LOWER\(\$3\) \|\| '%'/);
   assert.match(result.customerExpression, /LOWER\(\$6\)/);
+  assert.doesNotMatch(result.customerExpression, /LIKE/);
   assert.doesNotMatch(result.predicates.join(" "), /vip|lost/);
 });
 
