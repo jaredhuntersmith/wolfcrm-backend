@@ -614,6 +614,17 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       await client.query("BEGIN");
       const current = await loadProject(client, req.companyId, req.params.projectId, true);
       assertVersion(current, input.expected_version, "project");
+      if (
+        current.lifecycle_status === "archived" &&
+        input.name !== undefined &&
+        input.lifecycle_status !== "draft"
+      ) {
+        throw new WebsiteBuilderError(
+          "website_project_archived",
+          "Restore the project before changing its settings.",
+          409,
+        );
+      }
       const nextName = input.name ?? current.name;
       const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
       if (nextName === current.name && nextStatus === current.lifecycle_status) {
@@ -651,9 +662,14 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
   });
 
   app.post("/api/website-builder/projects/:projectId/pages", authRequired, requireManage, async (req, res) => {
+    let companyId;
+    try {
+      companyId = requireCompany(req);
+    } catch (error) {
+      return sendWebsiteBuilderError(res, error, "website_page_create_failed");
+    }
     const client = await pool.connect();
     try {
-      const companyId = requireCompany(req);
       await client.query("BEGIN");
       const project = await loadProject(client, companyId, req.params.projectId, true);
       if (project.lifecycle_status === "archived") {
@@ -674,7 +690,7 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       if (exactNumber(count.rows[0]?.count) >= MAX_PAGES_PER_PROJECT) {
         throw new WebsiteBuilderError(
           "website_page_limit_reached",
-          `A project may have up to ${MAX_PAGES_PER_PROJECT} active pages.`,
+          `A project may have up to ${MAX_PAGES_PER_PROJECT} total pages.`,
           409,
         );
       }
