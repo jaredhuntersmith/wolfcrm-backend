@@ -149,7 +149,7 @@ function normalizeWebsiteBlock(value, index) {
       heading: blockText(value.data.heading, "Heading", 160),
       items: value.data.items.map((item, itemIndex) =>
         blockText(item, `Feature ${itemIndex + 1}`, 180).trim(),
-      ).filter(Boolean),
+      ),
       columns,
     };
   } else {
