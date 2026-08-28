@@ -9,6 +9,7 @@ import {
   normalizeWebsitePageSeo,
   normalizeWebsitePageUpdate,
   normalizeWebsiteProjectCreate,
+  normalizeWebsiteProjectTheme,
   normalizeWebsiteProjectUpdate,
   normalizeWebsiteSlug,
   starterPageForProject,
@@ -46,7 +47,7 @@ test("page paths normalize to bounded relative slugs", () => {
 test("project and page writes require optimistic versions and bounded mutations", () => {
   assert.deepEqual(
     normalizeWebsiteProjectUpdate({ expected_version: 4, lifecycle_status: "archived" }),
-    { expected_version: 4, name: undefined, lifecycle_status: "archived" },
+    { expected_version: 4, name: undefined, lifecycle_status: "archived", theme: undefined },
   );
   const page = normalizeWebsitePageCreate(
     { name: "Service Area", slug: "service-area", expected_project_version: "3" },
@@ -63,6 +64,25 @@ test("project and page writes require optimistic versions and bounded mutations"
     () => normalizeWebsitePageUpdate({ expected_version: 2, expected_project_version: 3, is_home: "yes" }),
     /must be true or false/,
   );
+});
+
+test("global project themes are complete, bounded data-only tokens", () => {
+  const theme = normalizeWebsiteProjectTheme({
+    primary_color: "#0F766E",
+    heading_font: "classic",
+    corner_style: "soft",
+  });
+  assert.equal(theme.primary_color, "#0f766e");
+  assert.equal(theme.heading_font, "classic");
+  assert.equal(theme.body_font, "system");
+  assert.equal(theme.background_color, "#f8fafc");
+  assert.deepEqual(
+    normalizeWebsiteProjectUpdate({ expected_version: 3, theme }).theme,
+    theme,
+  );
+  assert.throws(() => normalizeWebsiteProjectTheme({ primary_color: "red" }), /six-digit hex/);
+  assert.throws(() => normalizeWebsiteProjectTheme({ heading_font: "remote-font" }), /unsupported/);
+  assert.throws(() => normalizeWebsiteProjectTheme({ script: "alert(1)" }), /unsupported script/);
 });
 
 test("structured page content accepts only bounded data-only blocks", () => {
@@ -123,6 +143,7 @@ test("page SEO and social metadata is bounded and data-only", () => {
 
 test("schema enforces company/project integrity and recoverable active-page invariants", () => {
   assert.match(source, /CREATE TABLE IF NOT EXISTS website_projects/);
+  assert.match(source, /ADD COLUMN IF NOT EXISTS theme JSONB NOT NULL/);
   assert.match(source, /FOREIGN KEY\(project_id, company_id\) REFERENCES website_projects\(id, company_id\) ON DELETE CASCADE/);
   assert.match(source, /website_pages_active_slug_uidx[\s\S]*WHERE archived_at IS NULL/);
   assert.match(source, /website_pages_active_home_uidx[\s\S]*WHERE is_home AND archived_at IS NULL/);
@@ -138,6 +159,7 @@ test("routes keep authentication, capabilities, and company scope authoritative"
   assert.match(source, /app\.patch\("\/api\/website-builder\/projects\/:projectId\/pages\/:pageId", authRequired, requireManage/);
   assert.match(source, /const current = await loadPage[\s\S]*const nextContent = input\.content \?\? current\.content[\s\S]*content = \$8::jsonb/);
   assert.match(source, /const nextSeo = input\.seo \?\? current\.seo[\s\S]*seo = \$9::jsonb/);
+  assert.match(source, /const nextTheme = input\.theme \?\? websiteProjectThemePayload\(current\.theme\)[\s\S]*theme = \$5::jsonb/);
   assert.match(source, /WHERE id::text = \$1 AND company_id = \$2/);
   assert.match(source, /WHERE id::text = \$1 AND project_id::text = \$2 AND company_id = \$3/);
 });

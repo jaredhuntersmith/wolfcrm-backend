@@ -17,6 +17,27 @@ const MAX_BLOCKS_PER_PAGE = 100;
 const MAX_PAGE_CONTENT_BYTES = 262144;
 const SEO_TITLE_LIMIT = 70;
 const SEO_DESCRIPTION_LIMIT = 200;
+const WEBSITE_THEME_DEFAULTS = Object.freeze({
+  primary_color: "#0f766e",
+  accent_color: "#f59e0b",
+  background_color: "#f8fafc",
+  surface_color: "#ffffff",
+  text_color: "#172033",
+  muted_text_color: "#64748b",
+  heading_font: "modern",
+  body_font: "system",
+  corner_style: "rounded",
+});
+const WEBSITE_THEME_COLOR_FIELDS = Object.freeze([
+  "primary_color",
+  "accent_color",
+  "background_color",
+  "surface_color",
+  "text_color",
+  "muted_text_color",
+]);
+const WEBSITE_THEME_FONT_CHOICES = new Set(["system", "modern", "classic"]);
+const WEBSITE_THEME_CORNER_CHOICES = new Set(["square", "soft", "rounded"]);
 const WEBSITE_BLOCK_TYPES = new Set(["hero", "text", "callout", "features", "spacer"]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -71,6 +92,10 @@ function contentError(message) {
 
 function seoError(message) {
   return new WebsiteBuilderError("website_page_seo_invalid", message);
+}
+
+function themeError(message) {
+  return new WebsiteBuilderError("website_project_theme_invalid", message);
 }
 
 function assertOnlyKeys(value, allowed, label) {
@@ -237,6 +262,54 @@ function websitePageSeoPayload(value) {
   };
 }
 
+export function normalizeWebsiteProjectTheme(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw themeError("Theme settings must be an object.");
+  }
+  const allowed = new Set([
+    ...WEBSITE_THEME_COLOR_FIELDS,
+    "heading_font",
+    "body_font",
+    "corner_style",
+  ]);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown) throw themeError(`Theme settings contain an unsupported ${unknown} field.`);
+  const theme = { ...WEBSITE_THEME_DEFAULTS };
+  for (const field of WEBSITE_THEME_COLOR_FIELDS) {
+    if (value[field] === undefined) continue;
+    if (typeof value[field] !== "string" || !/^#[0-9a-f]{6}$/i.test(value[field])) {
+      throw themeError(`${field.replaceAll("_", " ")} must be a six-digit hex color.`);
+    }
+    theme[field] = value[field].toLowerCase();
+  }
+  for (const field of ["heading_font", "body_font"]) {
+    if (value[field] === undefined) continue;
+    if (!WEBSITE_THEME_FONT_CHOICES.has(value[field])) {
+      throw themeError(`${field.replaceAll("_", " ")} is unsupported.`);
+    }
+    theme[field] = value[field];
+  }
+  if (value.corner_style !== undefined) {
+    if (!WEBSITE_THEME_CORNER_CHOICES.has(value.corner_style)) {
+      throw themeError("Corner style is unsupported.");
+    }
+    theme.corner_style = value.corner_style;
+  }
+  return theme;
+}
+
+function websiteProjectThemePayload(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const compatible = Object.fromEntries(
+    Object.entries(source).filter(([key]) => Object.hasOwn(WEBSITE_THEME_DEFAULTS, key)),
+  );
+  try {
+    return normalizeWebsiteProjectTheme(compatible);
+  } catch {
+    return { ...WEBSITE_THEME_DEFAULTS };
+  }
+}
+
 function lifecycleStatus(value) {
   if (!WEBSITE_LIFECYCLE_STATUSES.includes(value)) {
     throw new WebsiteBuilderError(
@@ -314,8 +387,15 @@ export function normalizeWebsiteProjectUpdate(body = {}) {
     lifecycle_status: body.lifecycle_status === undefined
       ? undefined
       : lifecycleStatus(body.lifecycle_status),
+    theme: body.theme === undefined
+      ? undefined
+      : normalizeWebsiteProjectTheme(body.theme),
   };
-  if (update.name === undefined && update.lifecycle_status === undefined) {
+  if (
+    update.name === undefined &&
+    update.lifecycle_status === undefined &&
+    update.theme === undefined
+  ) {
     throw new WebsiteBuilderError(
       "website_project_update_empty",
       "Change the project name or lifecycle status before saving.",
@@ -443,6 +523,7 @@ function projectPayload(row) {
     name: String(row.name),
     kind: row.kind,
     lifecycle_status: row.lifecycle_status,
+    theme: websiteProjectThemePayload(row.theme),
     version: exactNumber(row.version),
     active_page_count: exactNumber(row.active_page_count),
     archived_page_count: exactNumber(row.archived_page_count),
@@ -477,6 +558,7 @@ function projectAuditSnapshot(row) {
     name: row.name,
     kind: row.kind,
     lifecycle_status: row.lifecycle_status,
+    theme: websiteProjectThemePayload(row.theme),
     version: exactNumber(row.version),
   } : null;
 }
@@ -602,6 +684,7 @@ export async function installWebsiteBuilderSchema(pool) {
       name TEXT NOT NULL,
       kind TEXT NOT NULL CHECK (kind IN ('website', 'landing_page', 'funnel')),
       lifecycle_status TEXT NOT NULL DEFAULT 'draft' CHECK (lifecycle_status IN ('draft', 'archived')),
+      theme JSONB NOT NULL DEFAULT '{}'::jsonb,
       version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
       created_by UUID REFERENCES users(id) ON DELETE SET NULL,
       updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -609,8 +692,12 @@ export async function installWebsiteBuilderSchema(pool) {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       archived_at TIMESTAMPTZ,
       UNIQUE(id, company_id),
-      CHECK (char_length(name) BETWEEN 1 AND ${PROJECT_NAME_LIMIT})
+      CHECK (char_length(name) BETWEEN 1 AND ${PROJECT_NAME_LIMIT}),
+      CHECK (jsonb_typeof(theme) = 'object'),
+      CHECK (octet_length(theme::text) <= 8192)
     );
+    ALTER TABLE website_projects
+      ADD COLUMN IF NOT EXISTS theme JSONB NOT NULL DEFAULT '{}'::jsonb;
     CREATE INDEX IF NOT EXISTS website_projects_company_status_updated_idx
       ON website_projects(company_id, lifecycle_status, updated_at DESC);
 
@@ -802,7 +889,7 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       assertVersion(current, input.expected_version, "project");
       if (
         current.lifecycle_status === "archived" &&
-        input.name !== undefined &&
+        (input.name !== undefined || input.theme !== undefined) &&
         input.lifecycle_status !== "draft"
       ) {
         throw new WebsiteBuilderError(
@@ -813,7 +900,9 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
       }
       const nextName = input.name ?? current.name;
       const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
-      if (nextName === current.name && nextStatus === current.lifecycle_status) {
+      const nextTheme = input.theme ?? websiteProjectThemePayload(current.theme);
+      const themeUnchanged = JSON.stringify(nextTheme) === JSON.stringify(websiteProjectThemePayload(current.theme));
+      if (nextName === current.name && nextStatus === current.lifecycle_status && themeUnchanged) {
         await client.query("COMMIT");
         return res.json({ project: projectPayload(current) });
       }
@@ -821,19 +910,24 @@ export async function installWebsiteBuilderSystem({ app, pool, authRequired, req
         `UPDATE website_projects
             SET name = $3,
                 lifecycle_status = $4,
+                theme = $5::jsonb,
                 archived_at = CASE WHEN $4 = 'archived' THEN COALESCE(archived_at, now()) ELSE NULL END,
-                updated_by = $5,
+                updated_by = $6,
                 updated_at = now(),
                 version = version + 1
           WHERE id = $1 AND company_id = $2
           RETURNING *`,
-        [current.id, req.companyId, nextName, nextStatus, req.userId],
+        [current.id, req.companyId, nextName, nextStatus, JSON.stringify(nextTheme), req.userId],
       )).rows[0];
       await appendAudit(client, {
         companyId: req.companyId,
         projectId: current.id,
         actorUserId: req.userId,
-        action: nextStatus !== current.lifecycle_status ? `project.${nextStatus}` : "project.updated",
+        action: nextStatus !== current.lifecycle_status
+          ? `project.${nextStatus}`
+          : input.theme !== undefined && input.name === undefined
+            ? "project.theme_updated"
+            : "project.updated",
         before: projectAuditSnapshot(current),
         after: projectAuditSnapshot(updated),
       });
