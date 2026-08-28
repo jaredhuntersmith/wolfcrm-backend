@@ -214,6 +214,12 @@ function parseCoordinate(value, label, warnings) {
   return coordinate;
 }
 
+function validUTCDateParts(year, month, day) {
+  if (![year, month, day].every(Number.isInteger) || month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day ? date : null;
+}
+
 function parseDate(value, label, warnings) {
   const text = String(value ?? "").trim();
   if (!text) return null;
@@ -222,14 +228,15 @@ function parseDate(value, label, warnings) {
   const us = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/);
   let date;
   if (plain) {
-    date = new Date(Date.UTC(Number(plain[1]), Number(plain[2]) - 1, Number(plain[3])));
+    date = validUTCDateParts(Number(plain[1]), Number(plain[2]), Number(plain[3]));
   } else if (us) {
     const year = Number(us[3]) < 100 ? 2000 + Number(us[3]) : Number(us[3]);
-    date = new Date(Date.UTC(year, Number(us[1]) - 1, Number(us[2])));
+    date = validUTCDateParts(year, Number(us[1]), Number(us[2]));
   } else {
-    date = new Date(text);
+    const isoDate = text.match(/^(\d{4})-(\d{2})-(\d{2})T/);
+    date = isoDate && !validUTCDateParts(Number(isoDate[1]), Number(isoDate[2]), Number(isoDate[3])) ? null : new Date(text);
   }
-  if (Number.isNaN(date.getTime())) {
+  if (!date || Number.isNaN(date.getTime())) {
     warnings.push(`${label} was invalid and will be left blank.`);
     return null;
   }

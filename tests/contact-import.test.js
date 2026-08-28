@@ -70,3 +70,11 @@ test("Contact import bounds empty, oversized, and over-count payloads", () => {
     (error) => error.code === "csv_cell_too_large" && error.details.row_number === 2
   );
 });
+
+test("Contact import rejects calendar rollovers instead of changing customer dates", () => {
+  const result = prepareContactImport("Name,Lead Submitted At,Contact Created At\nInvalid dates,2021-02-31,13/40/2021");
+  assert.equal(result.rows[0].contact.lead_submitted_at, null);
+  assert.equal(result.rows[0].contact.created_at, null);
+  assert.equal(result.warning_count, 2);
+  assert.match(result.rows[0].warnings.join(" "), /Lead Submitted At was invalid/);
+});
