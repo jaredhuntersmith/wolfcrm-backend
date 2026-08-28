@@ -12,8 +12,11 @@ import {
   normalizeWebsiteProjectNavigation,
   normalizeWebsiteProjectTheme,
   normalizeWebsiteProjectUpdate,
+  normalizeWebsiteSectionCreate,
+  normalizeWebsiteSectionUpdate,
   normalizeWebsiteSlug,
   starterPageForProject,
+  websiteTemplatesForKind,
 } from "../website-builder.js";
 
 const source = readFileSync(new URL("../website-builder.js", import.meta.url), "utf8");
@@ -162,6 +165,24 @@ test("page SEO and social metadata is bounded and data-only", () => {
   assert.throws(() => normalizeWebsitePageSeo({ hide_from_search: "yes" }), /true or false/);
 });
 
+test("templates and reusable sections stay structured, bounded, and versioned", () => {
+  const templates = websiteTemplatesForKind("landing_page");
+  assert.ok(templates.length >= 2);
+  assert.ok(templates.every((template) => template.kinds.includes("landing_page")));
+  assert.equal(new Set(templates.flatMap((template) => template.content.blocks.map((block) => block.id))).size,
+    templates.reduce((count, template) => count + template.content.blocks.length, 0));
+  const content = { schema_version: 1, blocks: [templates[0].content.blocks[0]] };
+  assert.deepEqual(normalizeWebsiteSectionCreate({ name: " Hero CTA ", content }), { name: "Hero CTA", content });
+  assert.deepEqual(normalizeWebsiteSectionUpdate({ expected_version: 2, lifecycle_status: "archived" }), {
+    expected_version: 2,
+    name: undefined,
+    content: undefined,
+    lifecycle_status: "archived",
+  });
+  assert.throws(() => normalizeWebsiteSectionCreate({ name: "Empty", content: { schema_version: 1, blocks: [] } }), /at least one block/);
+  assert.throws(() => websiteTemplatesForKind("store"), /Website, Landing Page, or Funnel/);
+});
+
 test("schema enforces company/project integrity and recoverable active-page invariants", () => {
   assert.match(source, /CREATE TABLE IF NOT EXISTS website_projects/);
   assert.match(source, /ADD COLUMN IF NOT EXISTS theme JSONB NOT NULL/);
@@ -169,6 +190,8 @@ test("schema enforces company/project integrity and recoverable active-page inva
   assert.match(source, /FOREIGN KEY\(project_id, company_id\) REFERENCES website_projects\(id, company_id\) ON DELETE CASCADE/);
   assert.match(source, /website_pages_active_slug_uidx[\s\S]*WHERE archived_at IS NULL/);
   assert.match(source, /website_pages_active_home_uidx[\s\S]*WHERE is_home AND archived_at IS NULL/);
+  assert.match(source, /CREATE TABLE IF NOT EXISTS website_sections/);
+  assert.match(source, /website_sections_company_status_updated_idx/);
   assert.match(source, /website_last_page_required/);
   assert.doesNotMatch(source, /app\.delete\("\/api\/website-builder/);
 });
@@ -178,6 +201,10 @@ test("routes keep authentication, capabilities, and company scope authoritative"
   assert.match(indexSource, /requireManage: requireCapability\("website\.manage"\)/);
   assert.match(source, /app\.get\("\/api\/website-builder\/projects", authRequired, requireView/);
   assert.match(source, /app\.post\("\/api\/website-builder\/projects", authRequired, requireManage/);
+  assert.match(source, /app\.get\("\/api\/website-builder\/templates", authRequired, requireView/);
+  assert.match(source, /app\.get\("\/api\/website-builder\/sections", authRequired, requireView/);
+  assert.match(source, /app\.post\("\/api\/website-builder\/sections", authRequired, requireManage/);
+  assert.match(source, /app\.patch\("\/api\/website-builder\/sections\/:sectionId", authRequired, requireManage/);
   assert.match(source, /app\.patch\("\/api\/website-builder\/projects\/:projectId\/pages\/:pageId", authRequired, requireManage/);
   assert.match(source, /const current = await loadPage[\s\S]*const nextContent = input\.content \?\? current\.content[\s\S]*content = \$8::jsonb/);
   assert.match(source, /const nextSeo = input\.seo \?\? current\.seo[\s\S]*seo = \$9::jsonb/);

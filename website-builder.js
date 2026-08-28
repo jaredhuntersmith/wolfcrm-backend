@@ -19,6 +19,7 @@ const SEO_TITLE_LIMIT = 70;
 const SEO_DESCRIPTION_LIMIT = 200;
 const MAX_NAVIGATION_ITEMS = 30;
 const NAVIGATION_LABEL_LIMIT = 80;
+const MAX_REUSABLE_SECTIONS_PER_COMPANY = 100;
 const WEBSITE_THEME_DEFAULTS = Object.freeze({
   primary_color: "#0f766e",
   accent_color: "#f59e0b",
@@ -109,6 +110,10 @@ function themeError(message) {
 
 function navigationError(message) {
   return new WebsiteBuilderError("website_project_navigation_invalid", message);
+}
+
+function sectionError(message) {
+  return new WebsiteBuilderError("website_section_invalid", message);
 }
 
 function assertOnlyKeys(value, allowed, label) {
@@ -235,6 +240,94 @@ export function normalizeWebsitePageContent(value) {
     throw contentError("Page content is too large to save.");
   }
   return content;
+}
+
+export function normalizeWebsiteSectionCreate(body = {}) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw sectionError("Reusable section details must be an object.");
+  }
+  const unknown = Object.keys(body).find((key) => !["name", "content"].includes(key));
+  if (unknown) throw sectionError(`Reusable section contains an unsupported ${unknown} field.`);
+  const content = normalizeWebsitePageContent(body.content);
+  if (!content.blocks.length) throw sectionError("A reusable section must contain at least one block.");
+  return { name: requiredName(body.name, "Reusable section name", PAGE_NAME_LIMIT), content };
+}
+
+export function normalizeWebsiteSectionUpdate(body = {}) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw sectionError("Reusable section changes must be an object.");
+  }
+  const unknown = Object.keys(body).find((key) => !["expected_version", "name", "content", "lifecycle_status"].includes(key));
+  if (unknown) throw sectionError(`Reusable section changes contain an unsupported ${unknown} field.`);
+  const update = {
+    expected_version: requiredVersion(body.expected_version),
+    name: body.name === undefined ? undefined : requiredName(body.name, "Reusable section name", PAGE_NAME_LIMIT),
+    content: body.content === undefined ? undefined : normalizeWebsitePageContent(body.content),
+    lifecycle_status: body.lifecycle_status === undefined ? undefined : lifecycleStatus(body.lifecycle_status),
+  };
+  if (update.content && !update.content.blocks.length) throw sectionError("A reusable section must contain at least one block.");
+  if (update.name === undefined && update.content === undefined && update.lifecycle_status === undefined) {
+    throw sectionError("Change the reusable section before saving.");
+  }
+  return update;
+}
+
+const WEBSITE_TEMPLATE_BLUEPRINTS = Object.freeze([
+  {
+    id: "service-authority",
+    name: "Service authority",
+    description: "A trust-first service page with benefits and a direct next step.",
+    kinds: ["website", "landing_page"],
+    blocks: [
+      ["hero", { heading: "Local service you can count on", body: "Explain the result your team delivers, where you work, and why customers trust you.", button_label: "Request an estimate", button_href: "/contact", alignment: "left" }],
+      ["features", { heading: "Why homeowners choose us", items: ["Responsive communication", "Experienced local team", "Work backed by clear expectations"], columns: 3 }],
+      ["callout", { heading: "Ready to plan your project?", body: "Tell us what you need and our team will follow up.", button_label: "Get started", button_href: "/contact", alignment: "center" }],
+    ],
+  },
+  {
+    id: "campaign-offer",
+    name: "Campaign offer",
+    description: "A focused landing page for one seasonal service or promotion.",
+    kinds: ["landing_page", "website"],
+    blocks: [
+      ["hero", { heading: "A timely offer for your home", body: "State the offer, who it helps, and the deadline in plain language.", button_label: "Claim this offer", button_href: "/contact", alignment: "center" }],
+      ["text", { heading: "What is included", body: "Describe the service, eligibility, and what customers should expect next.", alignment: "left" }],
+      ["callout", { heading: "Reserve your appointment", body: "Availability is limited. Contact the team to choose a time.", button_label: "Check availability", button_href: "/contact", alignment: "center" }],
+    ],
+  },
+  {
+    id: "funnel-conversion-step",
+    name: "Conversion step",
+    description: "A concise funnel step that reinforces value and advances one action.",
+    kinds: ["funnel"],
+    blocks: [
+      ["hero", { heading: "Take the next step", body: "Keep this step focused on one decision and remove unnecessary distractions.", button_label: "Continue", button_href: "/next-step", alignment: "center" }],
+      ["features", { heading: "What happens next", items: ["Share a few details", "Choose the right option", "Hear from the team"], columns: 3 }],
+    ],
+  },
+]);
+
+export function websiteTemplatesForKind(kind) {
+  const projectKind = projectKindForTemplate(kind);
+  return WEBSITE_TEMPLATE_BLUEPRINTS
+    .filter((template) => template.kinds.includes(projectKind))
+    .map((template) => ({
+      id: template.id,
+      name: template.name,
+      description: template.description,
+      kinds: [...template.kinds],
+      content: normalizeWebsitePageContent({
+        schema_version: 1,
+        blocks: template.blocks.map(([type, data]) => ({ id: randomUUID(), type, data })),
+      }),
+    }));
+}
+
+function projectKindForTemplate(value) {
+  if (!WEBSITE_PROJECT_KINDS.includes(value)) {
+    throw new WebsiteBuilderError("website_project_kind_invalid", "Choose Website, Landing Page, or Funnel.");
+  }
+  return value;
 }
 
 function seoText(value, label, maximumLength) {
@@ -639,6 +732,19 @@ function pagePayload(row) {
   };
 }
 
+function sectionPayload(row) {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    lifecycle_status: row.lifecycle_status,
+    content: row.content && typeof row.content === "object" ? row.content : { schema_version: 1, blocks: [] },
+    version: exactNumber(row.version),
+    created_at: timestamp(row.created_at),
+    updated_at: timestamp(row.updated_at),
+    archived_at: timestamp(row.archived_at),
+  };
+}
+
 function projectAuditSnapshot(row) {
   return row ? {
     id: String(row.id),
@@ -669,15 +775,28 @@ function pageAuditSnapshot(row) {
   } : null;
 }
 
-async function appendAudit(client, { companyId, projectId, pageId = null, actorUserId, action, before = null, after = null }) {
+function sectionAuditSnapshot(row) {
+  const content = row?.content && typeof row.content === "object" ? row.content : null;
+  return row ? {
+    id: String(row.id),
+    name: row.name,
+    lifecycle_status: row.lifecycle_status,
+    content_schema_version: exactNumber(content?.schema_version),
+    content_block_count: Array.isArray(content?.blocks) ? content.blocks.length : 0,
+    version: exactNumber(row.version),
+  } : null;
+}
+
+async function appendAudit(client, { companyId, projectId = null, pageId = null, sectionId = null, actorUserId, action, before = null, after = null }) {
   await client.query(
     `INSERT INTO website_builder_audit (
-       company_id, project_id, page_id, actor_user_id, action, before_state, after_state
-     ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)`,
+       company_id, project_id, page_id, section_id, actor_user_id, action, before_state, after_state
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb)`,
     [
       companyId,
       projectId,
       pageId,
+      sectionId,
       actorUserId,
       action,
       before == null ? null : JSON.stringify(before),
@@ -714,6 +833,18 @@ async function loadPage(client, companyId, projectId, pageId, lock = false) {
       "Website page was not found.",
       404,
     );
+  }
+  return rows[0];
+}
+
+async function loadSection(client, companyId, sectionId, lock = false) {
+  const { rows } = await client.query(
+    `SELECT * FROM website_sections
+      WHERE id::text = $1 AND company_id = $2${lock ? " FOR UPDATE" : ""}`,
+    [sectionId, companyId],
+  );
+  if (!rows[0]) {
+    throw new WebsiteBuilderError("website_section_not_found", "Reusable section was not found.", 404);
   }
   return rows[0];
 }
@@ -828,17 +959,40 @@ export async function installWebsiteBuilderSchema(pool) {
     CREATE UNIQUE INDEX IF NOT EXISTS website_pages_active_home_uidx
       ON website_pages(project_id) WHERE is_home AND archived_at IS NULL;
 
+    CREATE TABLE IF NOT EXISTS website_sections (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      lifecycle_status TEXT NOT NULL DEFAULT 'draft' CHECK (lifecycle_status IN ('draft', 'archived')),
+      content JSONB NOT NULL,
+      version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      archived_at TIMESTAMPTZ,
+      UNIQUE(id, company_id),
+      CHECK (char_length(name) BETWEEN 1 AND ${PAGE_NAME_LIMIT}),
+      CHECK (jsonb_typeof(content) = 'object'),
+      CHECK (octet_length(content::text) <= ${MAX_PAGE_CONTENT_BYTES})
+    );
+    CREATE INDEX IF NOT EXISTS website_sections_company_status_updated_idx
+      ON website_sections(company_id, lifecycle_status, updated_at DESC);
+
     CREATE TABLE IF NOT EXISTS website_builder_audit (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
       project_id UUID REFERENCES website_projects(id) ON DELETE SET NULL,
       page_id UUID REFERENCES website_pages(id) ON DELETE SET NULL,
+      section_id UUID REFERENCES website_sections(id) ON DELETE SET NULL,
       actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       action TEXT NOT NULL,
       before_state JSONB,
       after_state JSONB,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE website_builder_audit
+      ADD COLUMN IF NOT EXISTS section_id UUID REFERENCES website_sections(id) ON DELETE SET NULL;
     CREATE INDEX IF NOT EXISTS website_builder_audit_company_project_idx
       ON website_builder_audit(company_id, project_id, created_at DESC);
   `);
@@ -846,6 +1000,121 @@ export async function installWebsiteBuilderSchema(pool) {
 
 export async function installWebsiteBuilderSystem({ app, pool, authRequired, requireView, requireManage }) {
   await installWebsiteBuilderSchema(pool);
+
+  app.get("/api/website-builder/templates", authRequired, requireView, async (req, res) => {
+    try {
+      requireCompany(req);
+      res.json({ templates: websiteTemplatesForKind(req.query.kind) });
+    } catch (error) {
+      sendWebsiteBuilderError(res, error, "website_templates_load_failed");
+    }
+  });
+
+  app.get("/api/website-builder/sections", authRequired, requireView, async (req, res) => {
+    try {
+      const companyId = requireCompany(req);
+      const status = req.query.status === "all" ? "all" : req.query.status === "archived" ? "archived" : "draft";
+      const values = [companyId];
+      const statusWhere = status === "all" ? "" : " AND lifecycle_status = $2";
+      if (status !== "all") values.push(status);
+      const { rows } = await pool.query(
+        `SELECT * FROM website_sections
+          WHERE company_id = $1${statusWhere}
+          ORDER BY (archived_at IS NOT NULL) ASC, updated_at DESC, lower(name) ASC
+          LIMIT ${MAX_REUSABLE_SECTIONS_PER_COMPANY}`,
+        values,
+      );
+      res.json({ sections: rows.map(sectionPayload) });
+    } catch (error) {
+      sendWebsiteBuilderError(res, error, "website_sections_load_failed");
+    }
+  });
+
+  app.post("/api/website-builder/sections", authRequired, requireManage, async (req, res) => {
+    let input;
+    try {
+      requireCompany(req);
+      input = normalizeWebsiteSectionCreate(req.body);
+    } catch (error) {
+      return sendWebsiteBuilderError(res, error, "website_section_create_failed");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const count = await client.query(`SELECT COUNT(*)::int AS count FROM website_sections WHERE company_id = $1`, [req.companyId]);
+      if (exactNumber(count.rows[0]?.count) >= MAX_REUSABLE_SECTIONS_PER_COMPANY) {
+        throw new WebsiteBuilderError("website_section_limit_reached", `A company may have up to ${MAX_REUSABLE_SECTIONS_PER_COMPANY} reusable sections.`, 409);
+      }
+      const section = (await client.query(
+        `INSERT INTO website_sections (company_id, name, content, created_by, updated_by)
+         VALUES ($1,$2,$3::jsonb,$4,$4) RETURNING *`,
+        [req.companyId, input.name, JSON.stringify(input.content), req.userId],
+      )).rows[0];
+      await appendAudit(client, {
+        companyId: req.companyId,
+        sectionId: section.id,
+        actorUserId: req.userId,
+        action: "section.created",
+        after: sectionAuditSnapshot(section),
+      });
+      await client.query("COMMIT");
+      res.status(201).json({ section: sectionPayload(section) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      sendWebsiteBuilderError(res, error, "website_section_create_failed");
+    } finally {
+      client.release();
+    }
+  });
+
+  app.patch("/api/website-builder/sections/:sectionId", authRequired, requireManage, async (req, res) => {
+    let input;
+    try {
+      requireCompany(req);
+      input = normalizeWebsiteSectionUpdate(req.body);
+    } catch (error) {
+      return sendWebsiteBuilderError(res, error, "website_section_update_failed");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const current = await loadSection(client, req.companyId, req.params.sectionId, true);
+      assertVersion(current, input.expected_version, "section");
+      if (current.lifecycle_status === "archived" && (input.name !== undefined || input.content !== undefined) && input.lifecycle_status !== "draft") {
+        throw new WebsiteBuilderError("website_section_archived", "Restore the reusable section before changing it.", 409);
+      }
+      const nextName = input.name ?? current.name;
+      const nextContent = input.content ?? current.content;
+      const nextStatus = input.lifecycle_status ?? current.lifecycle_status;
+      if (nextName === current.name && nextStatus === current.lifecycle_status && JSON.stringify(nextContent) === JSON.stringify(current.content)) {
+        await client.query("COMMIT");
+        return res.json({ section: sectionPayload(current) });
+      }
+      const section = (await client.query(
+        `UPDATE website_sections
+            SET name = $3, content = $4::jsonb, lifecycle_status = $5,
+                archived_at = CASE WHEN $5 = 'archived' THEN COALESCE(archived_at, now()) ELSE NULL END,
+                updated_by = $6, updated_at = now(), version = version + 1
+          WHERE id = $1 AND company_id = $2 RETURNING *`,
+        [current.id, req.companyId, nextName, JSON.stringify(nextContent), nextStatus, req.userId],
+      )).rows[0];
+      await appendAudit(client, {
+        companyId: req.companyId,
+        sectionId: current.id,
+        actorUserId: req.userId,
+        action: nextStatus !== current.lifecycle_status ? `section.${nextStatus}` : "section.updated",
+        before: sectionAuditSnapshot(current),
+        after: sectionAuditSnapshot(section),
+      });
+      await client.query("COMMIT");
+      res.json({ section: sectionPayload(section) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      sendWebsiteBuilderError(res, error, "website_section_update_failed");
+    } finally {
+      client.release();
+    }
+  });
 
   app.get("/api/website-builder/projects", authRequired, requireView, async (req, res) => {
     try {
