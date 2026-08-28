@@ -148,6 +148,7 @@ import {
 } from "./sales-analytics.js";
 import { contactRequestChangedFields } from "./contact-update-events.js";
 import { buildDesktopContactSearchPredicate } from "./contact-search.js";
+import { buildDesktopContactListFilters } from "./contact-list-filters.js";
 import { buildContactExportCSV, defaultContactExportFilename } from "./contact-export.js";
 
 const { Pool } = pkg;
@@ -7712,7 +7713,7 @@ app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async
         where.push(buildDesktopContactSearchPredicate(term, "c"));
       }
       const tag = String(req.query.tag || "").trim();
-      if (tag) where.push(`COALESCE(c.tags, '') ILIKE ${bind(`%${tag}%`)}`);
+      if (tag) where.push(`COALESCE(c.tags::text, '') ILIKE ${bind(`%${tag}%`)}`);
       const source = String(req.query.source || "").trim();
       if (source) where.push(`COALESCE(c.source, '') = ${bind(source)}`);
       const stage = String(req.query.stage || "").trim();
@@ -7721,6 +7722,12 @@ app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async
         else if (["lost", "won"].includes(stage)) where.push(`lp.state = ${bind(stage)}`);
         else where.push(`lp.stage_id = ${bind(stage)}`);
       }
+      const advancedFilters = buildDesktopContactListFilters(req.query, {
+        alias: "c",
+        parameterOffset: values.length
+      });
+      values.push(...advancedFilters.values);
+      where.push(...advancedFilters.predicates);
       const pipelineCTE = includePipeline
         ? `WITH latest_pipeline AS (
              SELECT DISTINCT ON (o.contact_id) o.contact_id, o.state, o.stage_id, o.updated_at, s.name AS stage_name
@@ -7735,21 +7742,36 @@ app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async
         ? "lp.stage_id, lp.stage_name, lp.state AS stage_state"
         : "NULL::text AS stage_id, NULL::text AS stage_name, NULL::text AS stage_state";
       const whereSQL = where.join(" AND ");
-      const countQuery = `${pipelineCTE} SELECT COUNT(*)::int AS total FROM contacts c ${pipelineJoin} WHERE ${whereSQL}`;
+      const customerCount = advancedFilters.customerExpression
+        ? `, COUNT(*) FILTER (WHERE ${advancedFilters.customerExpression})::int AS customer_total`
+        : "";
+      const countQuery = `${pipelineCTE} SELECT COUNT(*)::int AS total${customerCount} FROM contacts c ${pipelineJoin} WHERE ${whereSQL}`;
       const countResult = await pool.query(countQuery, values);
       const listValues = [...values, limit, offset];
+      const customerOrder = advancedFilters.customerExpression
+        ? `CASE WHEN ${advancedFilters.customerExpression} THEN 0 ELSE 1 END ASC, `
+        : "";
       const rows = (await pool.query(
         `${pipelineCTE}
          SELECT c.*, ${pipelineColumns}, c.updated_at AS last_activity_at
            FROM contacts c
            ${pipelineJoin}
           WHERE ${whereSQL}
-          ORDER BY ${sort} ${direction} NULLS LAST, c.id ASC
+          ORDER BY ${customerOrder}${sort} ${direction} NULLS LAST, c.id ASC
           LIMIT $${listValues.length - 1} OFFSET $${listValues.length}`,
         listValues
       )).rows;
       const total = Number(countResult.rows[0]?.total || 0);
-      return res.json({ items: rows, total, limit, offset, has_more: offset + rows.length < total });
+      return res.json({
+        items: rows,
+        total,
+        limit,
+        offset,
+        has_more: offset + rows.length < total,
+        ...(advancedFilters.customerExpression
+          ? { customer_total: Number(countResult.rows[0]?.customer_total || 0) }
+          : {})
+      });
     }
     const scope = companyOrUserContactWhere(req);
     let rows;
