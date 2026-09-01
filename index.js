@@ -179,6 +179,13 @@ import {
   repairLifecycleTimestamps,
 } from "./operations-repairs.js";
 import { installWebsiteBuilderSystem } from "./website-builder.js";
+import { installRoutineGroupSystem } from "./routine-groups.js";
+import {
+  LightingInputError,
+  assertLightingAssetKey,
+  lightingAssetPrefix,
+  normalizeLightingProjectInput,
+} from "./lighting-designer.js";
 
 const { Pool } = pkg;
 const app = express();
@@ -1730,6 +1737,7 @@ async function bootstrap() {
     CREATE TABLE IF NOT EXISTS todo_routines (
       id TEXT PRIMARY KEY,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
       title TEXT NOT NULL,
       time TIMESTAMPTZ,
       weekdays JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -1739,6 +1747,8 @@ async function bootstrap() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS todo_routines_user_idx ON todo_routines(user_id);
+    ALTER TABLE todo_routines ADD COLUMN IF NOT EXISTS company_id UUID REFERENCES companies(id) ON DELETE CASCADE;
+    CREATE INDEX IF NOT EXISTS todo_routines_company_user_idx ON todo_routines(company_id, user_id);
 
     CREATE TABLE IF NOT EXISTS todo_routine_done (
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1820,6 +1830,24 @@ async function bootstrap() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS job_photos_job_idx ON job_photos(company_id, job_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS lighting_projects (
+      id UUID PRIMARY KEY,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      contact_id TEXT,
+      job_id TEXT,
+      name TEXT NOT NULL,
+      property_address TEXT,
+      source_object_key TEXT,
+      preview_object_key TEXT,
+      thumbnail_object_key TEXT,
+      document JSONB NOT NULL,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS lighting_projects_company_updated_idx
+      ON lighting_projects(company_id, updated_at DESC);
 
     CREATE TABLE IF NOT EXISTS inventory_locations (
       id TEXT PRIMARY KEY,
@@ -7022,7 +7050,7 @@ app.post("/api/internal/conversations/private", authRequired, requireCapability(
       [req.userId, otherUserId]
     );
     if (existing.rows.length) return res.json({ id: existing.rows[0].id });
-    const id = randomUUID();
+    const id = project.id || randomUUID();
     await pool.query(`INSERT INTO conversations(id, company_id, is_group, created_by) VALUES($1,$2,false,$3)`, [id, req.companyId || null, req.userId]);
     await pool.query(
       `INSERT INTO conversation_participants(id, conversation_id, user_id) VALUES($1,$2,$3),($4,$2,$5)`,
@@ -14080,6 +14108,152 @@ app.delete("/api/job-workflow-templates/:id", authRequired, requireCapability("j
   } catch (e) { console.error(e); res.status(500).json({ error: "workflow_template_archive_failed" }); }
 });
 
+// ---------- LIGHTING DESIGNER ----------
+const lightingProjectPayload = (row) => ({
+  id: row.id,
+  contact_id: row.contact_id,
+  job_id: row.job_id,
+  name: row.name,
+  property_address: row.property_address,
+  source_object_key: row.source_object_key,
+  preview_object_key: row.preview_object_key,
+  thumbnail_object_key: row.thumbnail_object_key,
+  document: row.document,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
+function sendLightingInputError(res, error) {
+  if (error instanceof LightingInputError) {
+    return res.status(error.statusCode).json({ error: error.code, message: error.message });
+  }
+  return false;
+}
+
+app.get("/api/lighting/projects", authRequired, requireCapability("operations.view"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, contact_id, job_id, name, property_address, source_object_key, preview_object_key, thumbnail_object_key, document, created_at, updated_at
+         FROM lighting_projects WHERE company_id = $1 ORDER BY updated_at DESC`,
+      [req.companyId]
+    );
+    res.json(rows.map(lightingProjectPayload));
+  } catch (error) {
+    console.error("[lighting] list failed:", error);
+    res.status(500).json({ error: "lighting_projects_failed" });
+  }
+});
+
+app.post("/api/lighting/projects", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const project = normalizeLightingProjectInput(req.body);
+    const id = randomUUID();
+    for (const key of ["source_object_key", "preview_object_key", "thumbnail_object_key"]) {
+      project[key] = assertLightingAssetKey(req.companyId, id, project[key]);
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO lighting_projects(id, company_id, contact_id, job_id, name, property_address, source_object_key, preview_object_key, thumbnail_object_key, document, created_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
+       ON CONFLICT(id) DO UPDATE SET contact_id = EXCLUDED.contact_id, job_id = EXCLUDED.job_id, name = EXCLUDED.name,
+         property_address = EXCLUDED.property_address, source_object_key = EXCLUDED.source_object_key,
+         preview_object_key = EXCLUDED.preview_object_key, thumbnail_object_key = EXCLUDED.thumbnail_object_key,
+         document = EXCLUDED.document, updated_at = now()
+       WHERE lighting_projects.company_id = $2
+       RETURNING id, contact_id, job_id, name, property_address, source_object_key, preview_object_key, thumbnail_object_key, document, created_at, updated_at`,
+      [id, req.companyId, project.contact_id, project.job_id, project.name, project.property_address, project.source_object_key, project.preview_object_key, project.thumbnail_object_key, JSON.stringify(project.document), req.userId]
+    );
+    if (!rows.length) return res.status(409).json({ error: "lighting_project_conflict" });
+    res.status(201).json(lightingProjectPayload(rows[0]));
+  } catch (error) {
+    if (sendLightingInputError(res, error)) return;
+    console.error("[lighting] create failed:", error);
+    res.status(500).json({ error: "lighting_project_create_failed" });
+  }
+});
+
+app.patch("/api/lighting/projects/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const project = normalizeLightingProjectInput(req.body, { partial: true });
+    for (const key of ["source_object_key", "preview_object_key", "thumbnail_object_key"]) {
+      if (Object.hasOwn(project, key)) project[key] = assertLightingAssetKey(req.companyId, req.params.id, project[key]);
+    }
+    const fields = Object.keys(project);
+    if (!fields.length) throw new LightingInputError("Change at least one project field.");
+    const values = [req.companyId, req.params.id];
+    const sets = fields.map((key, index) => {
+      values.push(key === "document" ? JSON.stringify(project[key]) : project[key]);
+      return `${key} = $${index + 3}${key === "document" ? "::jsonb" : ""}`;
+    });
+    const { rows } = await pool.query(
+      `UPDATE lighting_projects SET ${sets.join(", ")}, updated_at = now()
+       WHERE company_id = $1 AND id = $2
+       RETURNING id, contact_id, job_id, name, property_address, source_object_key, preview_object_key, thumbnail_object_key, document, created_at, updated_at`,
+      values
+    );
+    if (!rows.length) return res.status(404).json({ error: "lighting_project_not_found" });
+    res.json(lightingProjectPayload(rows[0]));
+  } catch (error) {
+    if (sendLightingInputError(res, error)) return;
+    console.error("[lighting] update failed:", error);
+    res.status(500).json({ error: "lighting_project_update_failed" });
+  }
+});
+
+app.delete("/api/lighting/projects/:id", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const result = await pool.query("DELETE FROM lighting_projects WHERE company_id = $1 AND id = $2", [req.companyId, req.params.id]);
+    if (!result.rowCount) return res.status(404).json({ error: "lighting_project_not_found" });
+    res.status(204).end();
+  } catch (error) {
+    console.error("[lighting] delete failed:", error);
+    res.status(500).json({ error: "lighting_project_delete_failed" });
+  }
+});
+
+app.post("/api/lighting/projects/:id/assets/upload-url", authRequired, requireCapability("operations.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const project = await pool.query("SELECT id FROM lighting_projects WHERE company_id = $1 AND id = $2", [req.companyId, req.params.id]);
+    if (!project.rowCount) return res.status(404).json({ error: "lighting_project_not_found" });
+    const cfg = mediaBucketConfig();
+    const s3 = getMediaS3Client();
+    if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured" });
+    const kind = ["source", "preview", "thumbnail", "mask"].includes(req.body?.kind) ? req.body.kind : "source";
+    const mimeType = String(req.body?.mime_type || "image/jpeg").slice(0, 120);
+    const byteSize = Number(req.body?.byte_size || 0);
+    if (!Number.isFinite(byteSize) || byteSize <= 0 || byteSize > 50 * 1024 * 1024) return res.status(400).json({ error: "lighting_asset_size_invalid" });
+    if (!mimeType.startsWith("image/") && kind !== "mask") return res.status(400).json({ error: "lighting_asset_type_invalid" });
+    const extension = mimeType === "image/png" ? "png" : "jpg";
+    const object_key = `${lightingAssetPrefix(req.companyId, req.params.id)}${kind}-${randomUUID()}.${extension}`;
+    const upload_url = await getSignedUrl(s3, new PutObjectCommand({ Bucket: cfg.bucket, Key: object_key, ContentType: mimeType, ContentLength: byteSize }), { expiresIn: 900 });
+    res.json({ object_key, upload_url });
+  } catch (error) {
+    console.error("[lighting] asset upload URL failed:", error);
+    res.status(500).json({ error: "lighting_asset_upload_failed" });
+  }
+});
+
+app.get("/api/lighting/projects/:id/assets/download-url", authRequired, requireCapability("operations.view"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const objectKey = String(req.query.object_key || "");
+    assertLightingAssetKey(req.companyId, req.params.id, objectKey);
+    const owned = await pool.query("SELECT id FROM lighting_projects WHERE company_id = $1 AND id = $2", [req.companyId, req.params.id]);
+    if (!owned.rowCount) return res.status(404).json({ error: "lighting_project_not_found" });
+    const cfg = mediaBucketConfig(); const s3 = getMediaS3Client();
+    if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured" });
+    res.json({ download_url: await getSignedUrl(s3, new GetObjectCommand({ Bucket: cfg.bucket, Key: objectKey }), { expiresIn: 900 }) });
+  } catch (error) {
+    if (sendLightingInputError(res, error)) return;
+    console.error("[lighting] asset download URL failed:", error);
+    res.status(500).json({ error: "lighting_asset_download_failed" });
+  }
+});
+
 app.get("/api/jobs/:id/photos", authRequired, requireCapability("jobs.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
@@ -17181,8 +17355,10 @@ app.get("/api/todo/routines", authRequired, requireCapability("tasks.view"), asy
   try {
     const { rows } = await pool.query(
       `SELECT id, title, time, weekdays, reminders, enabled, color_hex
-       FROM todo_routines WHERE user_id = $1 ORDER BY updated_at DESC`,
-      [req.userId]
+       FROM todo_routines
+       WHERE user_id = $1 AND ($2::uuid IS NULL OR company_id IS NULL OR company_id = $2)
+       ORDER BY updated_at DESC`,
+      [req.userId, req.companyId || null]
     );
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_routines" }); }
@@ -17192,23 +17368,27 @@ app.put("/api/todo/routines/:id", authRequired, requireCapability("tasks.manage"
   const { title, time, weekdays, reminders, enabled, color_hex } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
   try {
-    const previous = await pool.query(`SELECT * FROM todo_routines WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    const previous = await pool.query(
+      `SELECT * FROM todo_routines WHERE id = $1 AND user_id = $2 AND ($3::uuid IS NULL OR company_id IS NULL OR company_id = $3)`,
+      [req.params.id, req.userId, req.companyId || null]
+    );
     const r = await pool.query(
       `INSERT INTO todo_routines
-        (id, user_id, title, time, weekdays, reminders, enabled, color_hex)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8)
+        (id, user_id, company_id, title, time, weekdays, reminders, enabled, color_hex)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
+             company_id = COALESCE(todo_routines.company_id, EXCLUDED.company_id),
              time = EXCLUDED.time,
              weekdays = EXCLUDED.weekdays,
              reminders = EXCLUDED.reminders,
              enabled = EXCLUDED.enabled,
              color_hex = EXCLUDED.color_hex,
              updated_at = now()
-       WHERE todo_routines.user_id = $2
+       WHERE todo_routines.user_id = $2 AND ($3::uuid IS NULL OR todo_routines.company_id IS NULL OR todo_routines.company_id = $3)
        RETURNING id, title, time, weekdays, reminders, enabled, color_hex`,
       [
-        req.params.id, req.userId, title, time || null,
+        req.params.id, req.userId, req.companyId || null, title, time || null,
         JSON.stringify(weekdays || []), JSON.stringify(reminders || []),
         toBool(enabled, true), color_hex || null
       ]
@@ -17227,8 +17407,10 @@ app.put("/api/todo/routines/:id", authRequired, requireCapability("tasks.manage"
 
 app.delete("/api/todo/routines/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   try {
-    const before = (await pool.query(`DELETE FROM todo_routines WHERE id = $1 AND user_id = $2 RETURNING *`,
-      [req.params.id, req.userId])).rows[0];
+    const before = (await pool.query(
+      `DELETE FROM todo_routines WHERE id = $1 AND user_id = $2 AND ($3::uuid IS NULL OR company_id IS NULL OR company_id = $3) RETURNING *`,
+      [req.params.id, req.userId, req.companyId || null]
+    )).rows[0];
     await pool.query(`DELETE FROM todo_routine_done WHERE routine_id = $1 AND user_id = $2`,
       [req.params.id, req.userId]);
     if (before && req.companyId) {
@@ -19186,6 +19368,14 @@ async function startServer() {
     pool,
     authRequired,
     requirePayManage: requireCapability("pay.manage")
+  });
+  await installRoutineGroupSystem({
+    app,
+    pool,
+    authRequired,
+    requireView: requireCapability("tasks.view"),
+    requireManage: requireCapability("tasks.manage"),
+    emitAutomationEvent
   });
   await installWebsiteBuilderSystem({
     app,
