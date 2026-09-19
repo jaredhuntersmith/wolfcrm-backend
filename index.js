@@ -1494,6 +1494,42 @@ async function bootstrap() {
       END IF;
     END $$;
 
+    CREATE TABLE IF NOT EXISTS pipelines (
+      id TEXT PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID,
+      name TEXT NOT NULL,
+      order_idx INTEGER NOT NULL DEFAULT 0,
+      is_default BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS pipelines_company_idx ON pipelines(company_id, order_idx);
+    CREATE INDEX IF NOT EXISTS pipelines_user_idx ON pipelines(user_id, order_idx);
+    CREATE UNIQUE INDEX IF NOT EXISTS pipelines_company_default_unique_idx
+      ON pipelines(company_id)
+      WHERE company_id IS NOT NULL AND is_default = true;
+    CREATE UNIQUE INDEX IF NOT EXISTS pipelines_user_default_unique_idx
+      ON pipelines(user_id)
+      WHERE company_id IS NULL AND is_default = true;
+    INSERT INTO pipelines (id, user_id, company_id, name, order_idx, is_default)
+    SELECT gen_random_uuid()::text,
+           COALESCE(c.owner_user_id, (array_agg(u.id ORDER BY u.created_at ASC))[1]),
+           u.company_id,
+           'Main Pipeline',
+           0,
+           true
+      FROM users u
+      LEFT JOIN companies c ON c.id = u.company_id
+     WHERE u.company_id IS NOT NULL
+     GROUP BY u.company_id, c.owner_user_id
+    ON CONFLICT DO NOTHING;
+    INSERT INTO pipelines (id, user_id, company_id, name, order_idx, is_default)
+    SELECT gen_random_uuid()::text, u.id, NULL, 'Main Pipeline', 0, true
+      FROM users u
+     WHERE u.company_id IS NULL
+    ON CONFLICT DO NOTHING;
+
     CREATE TABLE IF NOT EXISTS stages (
       id TEXT PRIMARY KEY,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1511,7 +1547,9 @@ async function bootstrap() {
       WHERE u.id = s.user_id
         AND s.company_id IS NULL
         AND u.company_id IS NOT NULL;
+    ALTER TABLE stages ADD COLUMN IF NOT EXISTS pipeline_id TEXT;
     CREATE INDEX IF NOT EXISTS stages_company_idx ON stages(company_id, order_idx);
+    CREATE INDEX IF NOT EXISTS stages_pipeline_idx ON stages(pipeline_id, order_idx);
 
     CREATE TABLE IF NOT EXISTS opportunities (
       id TEXT PRIMARY KEY,
@@ -1529,6 +1567,7 @@ async function bootstrap() {
     -- Same for opportunities so auto-assigned webhook leads are visible company-wide.
     ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS company_id UUID;
     ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ;
+    ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS pipeline_id TEXT;
     ALTER TABLE opportunities ALTER COLUMN stage_entered_at SET DEFAULT now();
     UPDATE opportunities
        SET stage_entered_at = COALESCE(created_at, now())
@@ -1540,6 +1579,7 @@ async function bootstrap() {
         AND o.company_id IS NULL
         AND u.company_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS opportunities_company_idx ON opportunities(company_id);
+    CREATE INDEX IF NOT EXISTS opportunities_pipeline_idx ON opportunities(pipeline_id);
 
     CREATE TABLE IF NOT EXISTS schedule_events (
       id TEXT PRIMARY KEY,
@@ -11548,7 +11588,7 @@ app.post("/webhooks/leads/:token", async (req, res) => {
     zLog("stage_assignment_attempted", { stageId: autoStageId });
     try {
       const stageCheck = await pool.query(
-        `SELECT id FROM stages
+        `SELECT id, pipeline_id FROM stages
          WHERE id = $1
            AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))
          LIMIT 1`,
@@ -11566,10 +11606,11 @@ app.post("/webhooks/leads/:token", async (req, res) => {
         } catch (_) { /* ignore */ }
       } else {
         const oppId = randomUUID();
+        const stagePipelineID = stageCheck.rows[0].pipeline_id || null;
         await pool.query(
-          `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id)
-           VALUES ($1, $2, $3, $4, 'stage', $5)`,
-          [oppId, userId, companyId || null, contactId, autoStageId]
+          `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id, pipeline_id)
+           VALUES ($1, $2, $3, $4, 'stage', $5, $6)`,
+          [oppId, userId, companyId || null, contactId, autoStageId, stagePipelineID]
         );
         stageResult.applied = true;
         stageResult.stage_id = autoStageId;
@@ -11969,25 +12010,145 @@ app.delete("/api/quotes/:id", authRequired, requireCapability("quotes.delete"), 
   }
 });
 
-// ---------- STAGES ----------
+// ---------- PIPELINES / STAGES ----------
 // Stages are company-scoped when the user belongs to a company; otherwise they
 // fall back to the individual user. This is the SAME set of rows both the
 // Stages tab and the Integrations "auto-assign" picker read from.
-app.get("/api/stages", authRequired, requireCapability("pipeline.view"), async (req, res) => {
+async function getDefaultPipelineID(req) {
+  const { rows } = req.companyId
+    ? await pool.query(
+        `SELECT id FROM pipelines WHERE company_id = $1 AND is_default = true ORDER BY order_idx ASC LIMIT 1`,
+        [req.companyId]
+      )
+    : await pool.query(
+        `SELECT id FROM pipelines WHERE company_id IS NULL AND user_id = $1 AND is_default = true ORDER BY order_idx ASC LIMIT 1`,
+        [req.userId]
+      );
+  return rows[0]?.id || null;
+}
+
+async function resolvePipelineID(req, requestedPipelineID) {
+  if (requestedPipelineID) {
+    const { rows } = req.companyId
+      ? await pool.query(`SELECT id FROM pipelines WHERE id = $1 AND company_id = $2 LIMIT 1`, [requestedPipelineID, req.companyId])
+      : await pool.query(`SELECT id FROM pipelines WHERE id = $1 AND company_id IS NULL AND user_id = $2 LIMIT 1`, [requestedPipelineID, req.userId]);
+    if (rows[0]?.id) return rows[0].id;
+  }
+  return getDefaultPipelineID(req);
+}
+
+async function isDefaultPipeline(req, pipelineID) {
+  if (!pipelineID) return true;
+  const { rows } = req.companyId
+    ? await pool.query(`SELECT is_default FROM pipelines WHERE id = $1 AND company_id = $2 LIMIT 1`, [pipelineID, req.companyId])
+    : await pool.query(`SELECT is_default FROM pipelines WHERE id = $1 AND company_id IS NULL AND user_id = $2 LIMIT 1`, [pipelineID, req.userId]);
+  return rows[0]?.is_default === true;
+}
+
+app.get("/api/pipelines", authRequired, requireCapability("pipeline.view"), async (req, res) => {
   try {
     const { rows } = req.companyId
       ? await pool.query(
-          `SELECT id, name, order_idx FROM stages
-           WHERE company_id = $1
-              OR (company_id IS NULL AND user_id = $2)
-           ORDER BY order_idx ASC`,
-          [req.companyId, req.userId]
+          `SELECT id, name, order_idx, is_default FROM pipelines WHERE company_id = $1 ORDER BY order_idx ASC, created_at ASC`,
+          [req.companyId]
         )
       : await pool.query(
-          `SELECT id, name, order_idx FROM stages
-           WHERE user_id = $1
-           ORDER BY order_idx ASC`,
+          `SELECT id, name, order_idx, is_default FROM pipelines WHERE company_id IS NULL AND user_id = $1 ORDER BY order_idx ASC, created_at ASC`,
           [req.userId]
+        );
+    res.json(rows);
+  } catch (e) {
+    console.error("[pipelines] list failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_list_pipelines" });
+  }
+});
+
+app.put("/api/pipelines/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
+  const { name, order_idx, is_default } = req.body || {};
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return res.status(400).json({ error: "name_required" });
+  try {
+    const makeDefault = is_default === true;
+    if (makeDefault) {
+      await pool.query(
+        `UPDATE pipelines SET is_default = false WHERE ${req.companyId ? "company_id = $1" : "company_id IS NULL AND user_id = $1"}`,
+        [req.companyId || req.userId]
+      );
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO pipelines (id, user_id, company_id, name, order_idx, is_default)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (id) DO UPDATE
+         SET name = EXCLUDED.name,
+             order_idx = EXCLUDED.order_idx,
+             is_default = CASE WHEN EXCLUDED.is_default THEN true ELSE pipelines.is_default END,
+             updated_at = now()
+       WHERE pipelines.user_id = $2
+          OR (pipelines.company_id IS NOT NULL AND pipelines.company_id = $3)
+       RETURNING id, name, order_idx, is_default`,
+      [req.params.id, req.userId, req.companyId || null, trimmed, Number(order_idx) || 0, makeDefault]
+    );
+    if (!rows.length) return res.status(404).json({ error: "not_found" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("[pipelines] upsert failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_upsert_pipeline" });
+  }
+});
+
+app.delete("/api/pipelines/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const fallbackID = await getDefaultPipelineID(req);
+    if (!fallbackID || fallbackID === req.params.id) {
+      return res.status(400).json({ error: "cannot_delete_default_pipeline" });
+    }
+    await client.query("BEGIN");
+    await client.query(
+      `UPDATE stages SET pipeline_id = NULL, updated_at = now()
+       WHERE pipeline_id = $1 AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))`,
+      [req.params.id, req.userId, req.companyId || null]
+    );
+    await client.query(
+      `UPDATE opportunities SET pipeline_id = NULL, updated_at = now()
+       WHERE pipeline_id = $1 AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))`,
+      [req.params.id, req.userId, req.companyId || null]
+    );
+    await client.query(
+      `DELETE FROM pipelines
+       WHERE id = $1 AND is_default = false
+         AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))`,
+      [req.params.id, req.userId, req.companyId || null]
+    );
+    await client.query("COMMIT");
+    res.status(204).end();
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[pipelines] delete failed:", e && e.message ? e.message : e);
+    res.status(500).json({ error: "failed_delete_pipeline" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/stages", authRequired, requireCapability("pipeline.view"), async (req, res) => {
+  try {
+    const pipelineID = await resolvePipelineID(req, req.query.pipeline_id);
+    const defaultPipeline = await isDefaultPipeline(req, pipelineID);
+    const { rows } = req.companyId
+      ? await pool.query(
+          `SELECT id, name, order_idx, COALESCE(pipeline_id, $2) AS pipeline_id FROM stages
+           WHERE (company_id = $1 OR (company_id IS NULL AND user_id = $3))
+             AND (${defaultPipeline ? "(pipeline_id IS NULL OR pipeline_id = $2)" : "pipeline_id = $2"})
+           ORDER BY order_idx ASC`,
+          [req.companyId, pipelineID, req.userId]
+        )
+      : await pool.query(
+          `SELECT id, name, order_idx, COALESCE(pipeline_id, $2) AS pipeline_id FROM stages
+           WHERE user_id = $1
+             AND (${defaultPipeline ? "(pipeline_id IS NULL OR pipeline_id = $2)" : "pipeline_id = $2"})
+           ORDER BY order_idx ASC`,
+          [req.userId, pipelineID]
         );
     console.log("[stages] list", {
       userId: req.userId,
@@ -12003,21 +12164,24 @@ app.get("/api/stages", authRequired, requireCapability("pipeline.view"), async (
 });
 
 app.put("/api/stages/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
-  const { name, order_idx } = req.body || {};
+  const { name, order_idx, pipeline_id } = req.body || {};
   if (!name) return res.status(400).json({ error: "name_required" });
   try {
+    const pipelineID = await resolvePipelineID(req, pipeline_id);
+    const storedPipelineID = await isDefaultPipeline(req, pipelineID) ? null : pipelineID;
     const r = await pool.query(
-      `INSERT INTO stages (id, user_id, company_id, name, order_idx)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO stages (id, user_id, company_id, pipeline_id, name, order_idx)
+       VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (id) DO UPDATE
          SET name = EXCLUDED.name,
              order_idx = EXCLUDED.order_idx,
+             pipeline_id = EXCLUDED.pipeline_id,
              company_id = COALESCE(EXCLUDED.company_id, stages.company_id),
              updated_at = now()
        WHERE stages.user_id = $2
           OR (stages.company_id IS NOT NULL AND stages.company_id = $3)
-       RETURNING id, name, order_idx`,
-      [req.params.id, req.userId, req.companyId || null, name, Number(order_idx) || 0]
+       RETURNING id, name, order_idx, COALESCE(pipeline_id, $7) AS pipeline_id`,
+      [req.params.id, req.userId, req.companyId || null, storedPipelineID, name, Number(order_idx) || 0, pipelineID]
     );
     if (req.companyId) {
       const affected = await pool.query(
@@ -12035,6 +12199,33 @@ app.put("/api/stages/:id", authRequired, requireCapability("pipeline.manage"), a
 
 app.delete("/api/stages/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
   try {
+    const stage = (await pool.query(
+      `SELECT * FROM stages WHERE id = $1 AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))`,
+      [req.params.id, req.userId, req.companyId || null]
+    )).rows[0];
+    if (!stage) return res.status(404).json({ error: "not_found" });
+    const defaultPipelineID = await getDefaultPipelineID(req);
+    const stagePipelineID = stage.pipeline_id || defaultPipelineID;
+    const defaultPipeline = !stage.pipeline_id || await isDefaultPipeline(req, stagePipelineID);
+    const fallback = (await pool.query(
+      `SELECT id FROM stages
+        WHERE id <> $1
+          AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3))
+          AND (${defaultPipeline ? "(pipeline_id IS NULL OR pipeline_id = $4)" : "pipeline_id = $4"})
+        ORDER BY order_idx ASC
+        LIMIT 1`,
+      [req.params.id, req.userId, req.companyId || null, stagePipelineID]
+    )).rows[0];
+    if (fallback) {
+      await pool.query(
+        `UPDATE opportunities
+            SET stage_id = $2,
+                updated_at = now()
+          WHERE stage_id = $1
+            AND (user_id = $3 OR (company_id IS NOT NULL AND company_id = $4))`,
+        [req.params.id, fallback.id, req.userId, req.companyId || null]
+      );
+    }
     // Null out any zapier_tokens auto-assign refs that pointed here so future
     // webhooks don't try to assign to a deleted stage.
     await pool.query(
@@ -12068,48 +12259,102 @@ app.delete("/api/stages/:id", authRequired, requireCapability("pipeline.manage")
 // This is important so webhook-created opportunities show up for every teammate.
 app.get("/api/opportunities", authRequired, requireCapability("pipeline.view"), async (req, res) => {
   try {
+    const pipelineID = await resolvePipelineID(req, req.query.pipeline_id);
+    const defaultPipeline = await isDefaultPipeline(req, pipelineID);
     const { rows } = req.companyId
       ? await pool.query(
-          `SELECT id, contact_id, state, stage_id, created_at, stage_entered_at
+          `SELECT id, contact_id, state, stage_id, COALESCE(pipeline_id, $3) AS pipeline_id, created_at, stage_entered_at
            FROM opportunities
-           WHERE company_id = $1 OR (company_id IS NULL AND user_id = $2)`,
-          [req.companyId, req.userId]
+           WHERE (company_id = $1 OR (company_id IS NULL AND user_id = $2))
+             AND (${defaultPipeline ? "(pipeline_id IS NULL OR pipeline_id = $3)" : "pipeline_id = $3"})`,
+          [req.companyId, req.userId, pipelineID]
         )
       : await pool.query(
-          `SELECT id, contact_id, state, stage_id, created_at, stage_entered_at
-           FROM opportunities WHERE user_id = $1`,
-          [req.userId]
+          `SELECT id, contact_id, state, stage_id, COALESCE(pipeline_id, $2) AS pipeline_id, created_at, stage_entered_at
+           FROM opportunities
+           WHERE user_id = $1
+             AND (${defaultPipeline ? "(pipeline_id IS NULL OR pipeline_id = $2)" : "pipeline_id = $2"})`,
+          [req.userId, pipelineID]
         );
     res.json(rows);
   } catch (e) { console.error("[opportunities] list failed:", e); res.status(500).json({ error: "failed_list_opportunities" }); }
 });
 
 app.put("/api/opportunities/:id", authRequired, requireCapability("pipeline.manage"), async (req, res) => {
-  const { contact_id, state, stage_id, created_at, stage_entered_at } = req.body || {};
+  const { contact_id, state, stage_id, pipeline_id, created_at, stage_entered_at } = req.body || {};
   if (!contact_id || !state) return res.status(400).json({ error: "missing_params" });
   try {
-    const previous = await pool.query(
-      `SELECT * FROM opportunities WHERE id = $1 AND (user_id = $2 OR company_id = $3) LIMIT 1`,
-      [req.params.id, req.userId, req.companyId || null]
-    );
+    let nextPipelineID = pipeline_id || null;
+    if (stage_id) {
+      const stageCheck = await pool.query(
+        `SELECT pipeline_id FROM stages WHERE id = $1 AND (user_id = $2 OR (company_id IS NOT NULL AND company_id = $3)) LIMIT 1`,
+        [stage_id, req.userId, req.companyId || null]
+      );
+      if (!stageCheck.rowCount) return res.status(400).json({ error: "stage_not_found" });
+      nextPipelineID = stageCheck.rows[0].pipeline_id || await getDefaultPipelineID(req);
+    }
+    nextPipelineID = await resolvePipelineID(req, nextPipelineID);
+    const storedPipelineID = await isDefaultPipeline(req, nextPipelineID) ? null : nextPipelineID;
+    const previous = req.companyId
+      ? await pool.query(
+          `SELECT * FROM opportunities
+            WHERE company_id = $1
+              AND (id = $2 OR contact_id = $3)
+            ORDER BY (id = $2) DESC, updated_at DESC, stage_entered_at DESC, created_at DESC
+            LIMIT 1`,
+          [req.companyId, req.params.id, contact_id]
+        )
+      : await pool.query(
+          `SELECT * FROM opportunities
+            WHERE user_id = $1
+              AND (id = $2 OR contact_id = $3)
+            ORDER BY (id = $2) DESC, updated_at DESC, stage_entered_at DESC, created_at DESC
+            LIMIT 1`,
+          [req.userId, req.params.id, contact_id]
+        );
     const before = previous.rows[0] || null;
-    const r = await pool.query(
-      `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id, created_at, stage_entered_at)
-       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, $7, now()))
-       ON CONFLICT (user_id, contact_id) DO UPDATE
-         SET state = EXCLUDED.state,
-             stage_id = EXCLUDED.stage_id,
-             company_id = COALESCE(EXCLUDED.company_id, opportunities.company_id),
-             stage_entered_at = CASE
-               WHEN opportunities.state IS DISTINCT FROM EXCLUDED.state
-                 OR opportunities.stage_id IS DISTINCT FROM EXCLUDED.stage_id
-               THEN now()
-               ELSE COALESCE(opportunities.stage_entered_at, opportunities.created_at, now())
-             END,
-             updated_at = now()
-       RETURNING id, contact_id, state, stage_id, created_at, stage_entered_at`,
-      [req.params.id, req.userId, req.companyId || null, contact_id, state, stage_id || null, created_at || null, stage_entered_at || null]
-    );
+    let r;
+    if (before) {
+      r = await pool.query(
+        `UPDATE opportunities
+            SET state = $2,
+                stage_id = $3,
+                pipeline_id = $4,
+                company_id = COALESCE($7, opportunities.company_id),
+                stage_entered_at = CASE
+                  WHEN opportunities.state IS DISTINCT FROM $2
+                    OR opportunities.stage_id IS DISTINCT FROM $3
+                    OR opportunities.pipeline_id IS DISTINCT FROM $4
+                  THEN now()
+                  ELSE COALESCE(opportunities.stage_entered_at, opportunities.created_at, now())
+                END,
+                updated_at = now()
+          WHERE id = $1
+            AND (user_id = $5 OR (company_id IS NOT NULL AND company_id = $6))
+          RETURNING id, contact_id, state, stage_id, COALESCE(pipeline_id, $8) AS pipeline_id, created_at, stage_entered_at`,
+        [before.id, state, stage_id || null, storedPipelineID, req.userId, req.companyId || null, req.companyId || null, nextPipelineID]
+      );
+    } else {
+      r = await pool.query(
+        `INSERT INTO opportunities (id, user_id, company_id, contact_id, state, stage_id, pipeline_id, created_at, stage_entered_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()), COALESCE($9, $8, now()))
+         ON CONFLICT (user_id, contact_id) DO UPDATE
+           SET state = EXCLUDED.state,
+               stage_id = EXCLUDED.stage_id,
+               pipeline_id = EXCLUDED.pipeline_id,
+               company_id = COALESCE(EXCLUDED.company_id, opportunities.company_id),
+               stage_entered_at = CASE
+                 WHEN opportunities.state IS DISTINCT FROM EXCLUDED.state
+                   OR opportunities.stage_id IS DISTINCT FROM EXCLUDED.stage_id
+                   OR opportunities.pipeline_id IS DISTINCT FROM EXCLUDED.pipeline_id
+                 THEN now()
+                 ELSE COALESCE(opportunities.stage_entered_at, opportunities.created_at, now())
+               END,
+               updated_at = now()
+         RETURNING id, contact_id, state, stage_id, COALESCE(pipeline_id, $10) AS pipeline_id, created_at, stage_entered_at`,
+        [req.params.id, req.userId, req.companyId || null, contact_id, state, stage_id || null, storedPipelineID, created_at || null, stage_entered_at || null, nextPipelineID]
+      );
+    }
     if (req.companyId) {
       const after = r.rows[0];
       const base = { opportunity_id: after.id, contact_id, state: after.state, stage_id: after.stage_id, previous_state: before?.state || null, previous_stage_id: before?.stage_id || null };

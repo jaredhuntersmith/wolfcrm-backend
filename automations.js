@@ -6302,18 +6302,30 @@ async function executePipelineMoveStage(run, node, config, scopeKey = "root") {
   const context = await buildRunContext(run, { scopeKey });
   const contactId = await resolveContactId(run, context, config);
   const stageId = resolveTemplate(config.stage_id || "", context);
-  const stage = await ctx.pool.query(`SELECT id FROM stages WHERE id = $1 AND company_id = $2`, [stageId, run.company_id]);
+  const stage = await ctx.pool.query(`SELECT id, pipeline_id FROM stages WHERE id = $1 AND company_id = $2`, [stageId, run.company_id]);
   if (!stage.rowCount) throw new Error("stage_not_found");
   const existing = (await ctx.pool.query(`SELECT * FROM opportunities WHERE company_id = $1 AND contact_id = $2 LIMIT 1`, [run.company_id, contactId])).rows[0];
   if (!existing && (config.if_missing || "fail") !== "create") throw new Error("opportunity_not_found");
   const id = existing?.id || config.opportunity_id || randomUUID();
-  const { rows } = await ctx.pool.query(
-    `INSERT INTO opportunities(id, user_id, company_id, contact_id, state, stage_id)
-     VALUES($1, (SELECT owner_user_id FROM companies WHERE id = $2), $2, $3, 'stage', $4)
-     ON CONFLICT(user_id, contact_id) DO UPDATE SET state = 'stage', stage_id = EXCLUDED.stage_id, updated_at = now()
-     RETURNING id, stage_id`,
-    [id, run.company_id, contactId, stageId]
-  );
+  const pipelineId = stage.rows[0].pipeline_id || null;
+  const { rows } = existing
+    ? await ctx.pool.query(
+        `UPDATE opportunities
+            SET state = 'stage',
+                stage_id = $3,
+                pipeline_id = $4,
+                updated_at = now()
+          WHERE id = $1 AND company_id = $2
+          RETURNING id, stage_id, pipeline_id`,
+        [id, run.company_id, stageId, pipelineId]
+      )
+    : await ctx.pool.query(
+        `INSERT INTO opportunities(id, user_id, company_id, contact_id, state, stage_id, pipeline_id)
+         VALUES($1, (SELECT owner_user_id FROM companies WHERE id = $2), $2, $3, 'stage', $4, $5)
+         ON CONFLICT(user_id, contact_id) DO UPDATE SET state = 'stage', stage_id = EXCLUDED.stage_id, pipeline_id = EXCLUDED.pipeline_id, updated_at = now()
+         RETURNING id, stage_id, pipeline_id`,
+        [id, run.company_id, contactId, stageId, pipelineId]
+      );
   await emitPipelineStageEvents(run.company_id, rows[0].id, contactId, existing, rows[0], "automation", automationPayload(run, node, {}));
   return { opportunity_id: rows[0].id, previous_stage_id: existing?.stage_id || null, stage_id: rows[0].stage_id };
 }
@@ -6329,13 +6341,13 @@ async function executePipelineCreateOpportunity(run, node, config, scopeKey = "r
   }
   const stageId = resolveTemplate(config.stage_id || "", context);
   if (!stageId) throw new Error("stage_id_required");
-  const stage = await ctx.pool.query(`SELECT id FROM stages WHERE id = $1 AND company_id = $2`, [stageId, run.company_id]);
+  const stage = await ctx.pool.query(`SELECT id, pipeline_id FROM stages WHERE id = $1 AND company_id = $2`, [stageId, run.company_id]);
   if (!stage.rowCount) throw new Error("stage_not_found");
   const owner = await resolveCompanyUser(run.company_id, "");
   const id = randomUUID();
   const { rows } = await ctx.pool.query(
-    `INSERT INTO opportunities(id, user_id, company_id, contact_id, state, stage_id) VALUES($1,$2,$3,$4,'stage',$5) RETURNING *`,
-    [id, owner, run.company_id, contactId, stageId]
+    `INSERT INTO opportunities(id, user_id, company_id, contact_id, state, stage_id, pipeline_id) VALUES($1,$2,$3,$4,'stage',$5,$6) RETURNING *`,
+    [id, owner, run.company_id, contactId, stageId, stage.rows[0].pipeline_id || null]
   );
   await emitAutomationEvent({ companyId: run.company_id, eventType: "pipeline.opportunity_created", subjectType: "opportunity", subjectId: id, source: "automation", dedupeKey: `pipeline.opportunity_created:${id}`, payload: automationPayload(run, node, { opportunity_id: id, contact_id: contactId, stage_id: stageId }) });
   await emitPipelineStageEvents(run.company_id, id, contactId, null, rows[0], "automation", automationPayload(run, node, {}));
@@ -6366,8 +6378,10 @@ async function executePipelineReopen(run, node, config) {
   const contactId = await resolveContactId(run, context, config);
   const stageId = resolveTemplate(config.stage_id || "", context);
   if (!stageId) throw new Error("stage_id_required");
+  const stage = await ctx.pool.query(`SELECT id, pipeline_id FROM stages WHERE id = $1 AND company_id = $2`, [stageId, run.company_id]);
+  if (!stage.rowCount) throw new Error("stage_not_found");
   const opp = await resolveOpportunity(run.company_id, contactId, config.opportunity_id);
-  const { rows } = await ctx.pool.query(`UPDATE opportunities SET state = 'stage', stage_id = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [opp.id, run.company_id, stageId]);
+  const { rows } = await ctx.pool.query(`UPDATE opportunities SET state = 'stage', stage_id = $3, pipeline_id = $4, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [opp.id, run.company_id, stageId, stage.rows[0].pipeline_id || null]);
   const payload = automationPayload(run, node, { opportunity_id: opp.id, contact_id: contactId, previous_state: opp.state, stage_id: stageId, previous_stage_id: opp.stage_id });
   await emitAutomationEvent({ companyId: run.company_id, eventType: "pipeline.reopened", subjectType: "opportunity", subjectId: opp.id, source: "automation", payload });
   await emitPipelineStageEvents(run.company_id, opp.id, contactId, opp, rows[0], "automation", payload);
