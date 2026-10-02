@@ -37,12 +37,12 @@ test("real PostgreSQL calendar guard and public booking",{timeout:90000},async t
     const env={QUOTE_LINK_SECRET:"fixture-booking-link-secret-more-than-32-characters",QUOTE_PUBLIC_BASE_URL:"https://example.invalid"};
     const service=createAgreementService({pool,env});
     const effects=[];
-    const adapter=await installAgreementBooking({app:backend.app,pool,service,env,now:()=>instant,onScheduleChange:async job=>effects.push(job),startWorker:false,authRequired:(req,res,next)=>{if(req.headers.authorization!=="Bearer booking-fixture")return res.sendStatus(401);req.companyId=company;req.userId=owner;next();},requireCapability:()=> (_req,_res,next)=>next()});
+    const adapter=await installAgreementBooking({app:backend.app,pool,service,env,now:()=>instant,onScheduleChange:async job=>effects.push(job),startWorker:false,authRequired:(req,res,next)=>{if(req.headers.authorization!=="Bearer booking-fixture")return res.sendStatus(401);req.companyId=req.headers["x-test-foreign"] ? randomUUID() : company;req.userId=owner;next();},requireCapability:cap=> (req,res,next)=>{if(req.path.includes("/customer-bookings/"))assert.equal(cap,"schedule.edit");if(req.headers["x-test-denied"])return res.sendStatus(403);next();}});
     const bundle={id:randomUUID(),name:"Qualified crew",worker_user_ids:[worker],service_ids:[],all_services:true,enabled:true};
     await adapter.settings({companyId:company},{expected_version:1,enabled:true,resource_bundles:[bundle],minimum_notice_minutes:0,horizon_days:10,start_increment_minutes:30,allow_customer_cancel:true,allow_customer_reschedule:true,change_cutoff_minutes:0});
     server=await new Promise(resolve=>{const listener=backend.app.listen(0,"127.0.0.1",()=>resolve(listener));});
     const base=`http://127.0.0.1:${server.address().port}`;
-    async function request(path,{method="GET",body,staff=false}={}){const response=await fetch(base+path,{method,headers:{...(body?{"content-type":"application/json"}:{}),...(staff?{authorization:"Bearer booking-fixture"}:{})},body:body?JSON.stringify(body):undefined});let result;try{result=await response.json();}catch{result=null;}return{status:response.status,body:result};}
+    async function request(path,{method="GET",body,staff=false,headers={}}={}){const response=await fetch(base+path,{method,headers:{...headers,...(body?{"content-type":"application/json"}:{}),...(staff?{authorization:"Bearer booking-fixture"}:{})},body:body?JSON.stringify(body):undefined});let result;try{result=await response.json();}catch{result=null;}return{status:response.status,body:result};}
     let sequence=0;
     async function agreement({signed=true,deposit=0,paid=0,duration=60,roles=["customer"]}={}){
       const id=randomUUID(),quote=randomUUID();sequence++;
@@ -137,6 +137,43 @@ test("real PostgreSQL calendar guard and public booking",{timeout:90000},async t
       await pool.query("UPDATE schedule_events SET quote_id=$2,contact_id=$3 WHERE id=$1",[job.id,item.row.quote_id,contact]);
       const summary=await adapter.bookingSummary(pool,item.row);assert.equal(summary.job_id,job.id);assert.equal(summary.arranged_by_business,true);assert.equal(summary.can_reschedule,false);
       assert.equal((await service.state(pool,item.row)).booking,"booked");await assert.rejects(slots(item),e=>e.code==="booking_already_booked");
+    });
+    await t.test("booking review requires permission/company, is idempotent, and rejects a stale confirmation",async()=>{
+      const item=await agreement(),slot=(await slots(item)).slots[0];
+      const created=await book(item,slot);assert.equal(created.status,200);
+      const id=created.body.booking.id,path=`/api/schedule/customer-bookings/${id}/confirm`;
+      const pending=()=>request("/api/schedule/customer-bookings/pending",{staff:true});
+      assert.equal((await request("/api/schedule/customer-bookings/pending")).status,401);
+      assert.equal((await request("/api/schedule/customer-bookings/pending",{staff:true,headers:{"x-test-denied":"1"}})).status,403);
+      assert.deepEqual((await request("/api/schedule/customer-bookings/pending",{staff:true,headers:{"x-test-foreign":"1"}})).body.bookings,[]);
+      const first=(await pending()).body.bookings.find(b=>b.id===id);assert.equal(first.review_version,1);assert.equal(first.customer_name,"Test customer");
+      const confirm=(version,headers={})=>request(path,{staff:true,method:"POST",headers,body:{review_version:version}});
+      assert.equal((await confirm(1,{"x-test-foreign":"1"})).status,404);
+      assert.equal((await confirm(1,{"x-test-denied":"1"})).status,403);
+      const results=await Promise.all([confirm(1),confirm(1)]);assert.ok(results.every(r=>r.status===200),JSON.stringify(results));
+      assert.ok(!(await pending()).body.bookings.some(b=>b.id===id));
+      assert.equal((await pool.query("SELECT count(*)::int n FROM agreement_events WHERE agreement_id=$1 AND type='booking_confirmed_by_business'",[item.row.id])).rows[0].n,1);
+      const available=await adapter.availability(item.token,{reschedule:"true"});
+      await adapter.change(item.token,{action:"reschedule",request_id:randomUUID(),slot_token:available.slots.find(s=>s.start_at!==slot.start_at).slot_token});
+      const moved=(await pending()).body.bookings.find(b=>b.id===id);assert.equal(moved.review_version,2);assert.notEqual(moved.start_at,first.start_at);
+      assert.equal((await confirm(1)).status,409);assert.equal((await confirm(2)).status,200);
+      await pool.query("UPDATE schedule_events SET finished_at=now() WHERE id=$1",[first.job_id]);
+      assert.equal((await confirm(2)).status,404);assert.ok(!(await pending()).body.bookings.some(b=>b.id===id));
+    });
+    await t.test("template booking controls override global defaults and cancellation removes review",async()=>{
+      const item=await agreement(),slot=(await slots(item)).slots[0];await book(item,slot);
+      const page={show_manage_booking:false,allow_reschedule:true,allow_cancel:true};
+      const setPage=async value=>{item.row.snapshot.customer_page=value;await pool.query("UPDATE quote_agreements SET snapshot=$2::jsonb WHERE id=$1",[item.row.id,JSON.stringify(item.row.snapshot)]);};
+      await setPage(page);
+      let summary=await adapter.bookingSummary(pool,item.row);assert.equal(summary.can_reschedule,false);assert.equal(summary.can_cancel,false);
+      await assert.rejects(adapter.change(item.token,{action:"cancel",request_id:randomUUID()}),e=>e.status===409);
+      await assert.rejects(adapter.availability(item.token,{reschedule:"true"}),e=>e.status===409);
+      await setPage({...page,show_manage_booking:true,allow_reschedule:false,allow_cancel:false});
+      summary=await adapter.bookingSummary(pool,item.row);assert.equal(summary.can_reschedule,false);assert.equal(summary.can_cancel,false);
+      await setPage({...page,show_manage_booking:true});
+      summary=await adapter.bookingSummary(pool,item.row);assert.equal(summary.can_reschedule,true);assert.equal(summary.can_cancel,true);
+      await adapter.change(item.token,{action:"cancel",request_id:randomUUID()});
+      const pending=await request("/api/schedule/customer-bookings/pending",{staff:true});assert.ok(!pending.body.bookings.some(b=>b.id===summary.id));
     });
     await t.test("settings endpoint avoids legacy schedule id route, and foreign resources are rejected",async()=>{
       const current=await request("/api/schedule/booking/settings",{staff:true});assert.equal(current.status,200);

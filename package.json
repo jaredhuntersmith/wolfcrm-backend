@@ -33,7 +33,7 @@
     "test:smart-contact-lists": "node --test tests/smart-contact-lists.test.js",
     "test:business-exceptions": "node --test tests/business-exceptions.test.js",
     "test:sales-analytics": "node --test tests/sales-analytics.test.js",
-    "test:quote-contracts": "node --test tests/quote-contract-domain.test.js tests/services-catalog.test.js tests/quote-agreement-documents.test.js tests/agreement-notifications.test.js tests/agreement-plans-domain.test.js tests/agreement-evidence-export.test.js tests/service-plan-metrics.test.js",
+    "test:quote-contracts": "node --test tests/quote-contract-domain.test.js tests/services-catalog.test.js tests/quote-agreement-documents.test.js tests/agreement-notifications.test.js tests/agreement-plans-domain.test.js tests/agreement-evidence-export.test.js tests/service-plan-metrics.test.js tests/agreement-presentation.test.js",
     "test:quote-contracts:db": "node --test tests/quote-catalog.integration.test.js",
     "test:agreement-payments:db": "node --test tests/agreement-payments.integration.test.js",
     "test:agreements:db": "node --test tests/quote-agreements.integration.test.js tests/agreement-template-history.integration.test.js",
