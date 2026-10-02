@@ -242,6 +242,19 @@ test("signed plan billing is durable, scoped and exact against PostgreSQL and fa
       const draft=await enrollment({mode:'prepaid'}),held=stripe.hold('invoice'),starting=begin(draft);await held.ready;await cancellation.publicCancel(draft.token,draft.row.id,{request_id:randomUUID()});held.release();await starting;
       stripe.lose('delete');await cancellation.processPending();assert.equal((await stored(draft)).canceled_at,null);await cancellation.processPending();assert.ok((await stored(draft)).canceled_at);assert.equal((await obligations(draft))[0].state,'canceled');
     });
+    await t.test("replacement waits through notice without extending it or running both memberships",async()=>{
+      const prior=await enrollment({mode:'manual_per_visit',notice:7});await begin(prior);
+      const next=await enrollment({mode:'manual_per_visit'});
+      await pool.query("UPDATE agreement_plan_enrollments SET snapshot=jsonb_set(snapshot,'{replaces}',$2::jsonb) WHERE id=$1",[next.row.id,JSON.stringify({enrollment_id:prior.row.id,plan_name:'Quarterly care',cancellation_notice_days:7})]);
+      const pending=await plans.reconcileEnrollment(next.row.id);assert.equal(pending.state,'replacement_pending');assert.equal(pending.service_plan_id,null);
+      const old=await stored(prior);assert.ok(old.cancellation_effective_at);assert.equal(old.canceled_at,null);
+      await plans.reconcileEnrollment(next.row.id);assert.equal((await stored(prior)).cancellation_effective_at.toISOString(),old.cancellation_effective_at.toISOString());
+      const original=clock.date;clock.date=new Date(old.cancellation_effective_at.getTime()+1);
+      try { await adapter.processDue();await plans.reconcileEnrollment(next.row.id);
+        assert.ok((await stored(prior)).canceled_at);assert.ok((await stored(next)).service_plan_id);
+        const states=(await pool.query('SELECT status FROM service_plans WHERE enrollment_id=ANY($1::uuid[])',[ [prior.row.id,next.row.id] ])).rows.map(row=>row.status).sort();assert.deepEqual(states,['active','canceled']);
+      } finally { clock.date=original; }
+    });
     await t.test("active cancellation preserves unpaid completed-visit money for settlement",async()=>{
       const item=await enrollment({mode:'manual_per_visit'});await begin(item);const enrolled=await stored(item),plan=(await pool.query('SELECT * FROM service_plans WHERE id=$1',[enrolled.service_plan_id])).rows[0],visit=(await pool.query('SELECT * FROM agreement_plan_visits WHERE enrollment_id=$1 ORDER BY sequence LIMIT 1',[item.row.id])).rows[0],job=randomUUID();
       await pool.query("INSERT INTO schedule_events(id,user_id,company_id,contact_id,service_plan_id,title,start_at,end_at,finished_at,service_items) VALUES($1,$2,$3,$4,$5,'Earned visit',now()-interval '2 hours',now()-interval '1 hour',now()-interval '1 hour',$6::jsonb)",[job,owner,company,contact,plan.id,JSON.stringify(item.row.snapshot.future_visit.line_items)]);await pool.query("UPDATE agreement_plan_visits SET job_id=$2,state='completed',completed_at=now() WHERE id=$1",[visit.id,job]);
