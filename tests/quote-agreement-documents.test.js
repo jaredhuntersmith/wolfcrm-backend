@@ -36,14 +36,31 @@ test("valid blank PDF pages retain geometry and accept later signing fields",asy
   assert.equal((await PDFDocument.load(filled)).getPageCount(),1);
 });
 
-test("actual PDF parsing rejects compressed scripts, signed inputs, attachments and corrupt content", async () => {
-  for (const [key, value] of [["OpenAction", { S: "JavaScript", JS: "alert(1)" }], ["ByteRange", [0, 1, 2, 3]], ["EmbeddedFiles", {}]]) {
-    const doc = await sourcePDF();
-    doc.catalog.set(PDFName.of(key), doc.context.obj(value));
-    await assert.rejects(validateAndNormalizeAgreementPDF(Buffer.from(await doc.save())), /scripts|digital-signature/);
+test("PDF normalization removes actions/attachments but preserves source and rejects signed/corrupt evidence", async () => {
+  for (const [key, value] of [["OpenAction", { S: "JavaScript", JS: "alert(1)" }], ["EmbeddedFiles", {}], ["OpenAction", [0, "Fit"]]]) {
+    const doc = await sourcePDF(); doc.catalog.set(PDFName.of(key), doc.context.obj(value));
+    const bytes = Buffer.from(await doc.save()), original = Buffer.from(bytes);
+    const cleaned = await validateAndNormalizeAgreementPDF(bytes);
+    assert.deepEqual(bytes, original); assert.ok(cleaned.removed_features.includes(key));
+    const output = await PDFDocument.load(cleaned.normalized);
+    assert.equal(output.catalog.has(PDFName.of(key)), false);
+    assert.equal(output.getPageCount(), 1);
+    await assert.rejects(validateAndNormalizeAgreementPDF(bytes, { allowSanitize: false }), /printable content/);
   }
+  const signed = await sourcePDF(); signed.catalog.set(PDFName.of("ByteRange"), signed.context.obj([0, 1, 2, 3]));
+  await assert.rejects(validateAndNormalizeAgreementPDF(Buffer.from(await signed.save())), /digital-signature/);
   await assert.rejects(validateAndNormalizeAgreementPDF(Buffer.from("%PDF-corrupt")), /corrupt/);
   await assert.rejects(validateAndNormalizeAgreementPDF(Buffer.from("image.png")), /valid PDF/);
+});
+
+test("existing visible PDF form values survive passive normalization", async () => {
+  const doc = await sourcePDF(), field = doc.getForm().createTextField('existing_name');
+  field.setText('Existing customer'); field.addToPage(doc.getPage(0), { x: 30, y: 500, width: 240, height: 24 });
+  const cleaned = await validateAndNormalizeAgreementPDF(Buffer.from(await doc.save()));
+  const output = await PDFDocument.load(cleaned.normalized);
+  assert.equal(output.getForm().getFields().length, 0);
+  assert.ok(output.getPage(0).node.Contents());
+  assert.ok(cleaned.normalized.length > 1000);
 });
 
 test("field definitions enforce page/bounds/role/type and prohibit rotation", () => {

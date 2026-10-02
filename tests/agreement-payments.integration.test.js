@@ -189,19 +189,16 @@ test("agreement payments enforce durable gates, idempotency and provider reconci
       assert.equal(stripe.counts().sessions - before, 1);
       assert.equal(Number((await pool.query("SELECT count(*) AS count FROM agreement_payment_attempts WHERE agreement_id=$1", [retryItem.row.id])).rows[0].count), 1);
     });
-    await t.test("after-service balance waits for every actual quote job and never bypasses the deposit",async()=>{
+    await t.test("full balance can be prepaid after signing before deposit, booking or service completion",async()=>{
       const later=await agreement();later.row.snapshot.balance_payment_timing='after_service';
       await pool.query('UPDATE quote_agreements SET snapshot=$2::jsonb WHERE id=$1',[later.row.id,JSON.stringify(later.row.snapshot)]);
-      assert.equal((await checkout(later,'balance')).body.error,'payment_deposit_required');
-      assert.equal((await checkout(later,'deposit')).status,200);
-      const deposit=await attemptFor(later.row);stripe.begin(deposit.checkout_session_id,'succeeded');await adapter.reconcileAttempt(deposit);
-      assert.equal((await checkout(later,'balance')).body.error,'payment_balance_not_due');
-      const completed=randomUUID(),remaining=randomUUID();
-      await pool.query("INSERT INTO schedule_events(id,user_id,company_id,contact_id,quote_id,title,start_at,end_at,finished_at) VALUES($1,$3,$4,$5,$6,'First portion',now()-interval '2 hours',now()-interval '1 hour',now()),($2,$3,$4,$5,$6,'Remaining portion',now()+interval '1 day',now()+interval '1 day 1 hour',NULL)",[completed,remaining,ownerID,companyID,contactID,later.row.quote_id]);
-      assert.equal((await adapter.paymentSummary(pool,later.row)).can_pay_balance,false);
-      await pool.query('UPDATE schedule_events SET finished_at=now() WHERE id=$1',[remaining]);
       assert.equal((await adapter.paymentSummary(pool,later.row)).can_pay_balance,true);
-      const due=await checkout(later,'balance');assert.equal(due.status,200);assert.equal((await attemptFor(later.row)).amount_cents,55000);
+      const full=await checkout(later,'balance');assert.equal(full.status,200);
+      const attempt=await attemptFor(later.row);assert.equal(attempt.amount_cents,70000);
+      stripe.begin(attempt.checkout_session_id,'succeeded');await adapter.reconcileAttempt(attempt);
+      const paid=await adapter.paymentSummary(pool,later.row);
+      assert.equal(paid.balance_cents,0);assert.equal(paid.deposit_due_cents,0);assert.equal(paid.can_pay_balance,false);
+      assert.equal((await pool.query('SELECT count(*)::integer AS count FROM schedule_events WHERE quote_id=$1',[later.row.quote_id])).rows[0].count,0);
     });
     await t.test("unknown creation beyond provider idempotency retention blocks recharging", async () => {
       const old = await agreement(); stripe.loseResponse(); await checkout(old);
