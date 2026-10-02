@@ -107,16 +107,16 @@ export function createAgreementBooking({pool,service,env=service.env,now=()=>new
   }
   async function summary(db,row){
     if(!row.quote_id)return null;
-    const booking=(await db.query("SELECT b.*,e.start_at,e.finished_at,e.started_at FROM agreement_bookings b LEFT JOIN schedule_events e ON e.id=b.job_id AND e.company_id=b.company_id WHERE b.company_id=$1 AND b.quote_id=$2 ORDER BY b.created_at DESC LIMIT 1",[row.company_id,row.quote_id])).rows[0];
+    const booking=(await db.query("SELECT b.*,e.start_at,e.end_at,e.finished_at,e.started_at FROM agreement_bookings b LEFT JOIN schedule_events e ON e.id=b.job_id AND e.company_id=b.company_id WHERE b.company_id=$1 AND b.quote_id=$2 ORDER BY b.created_at DESC LIMIT 1",[row.company_id,row.quote_id])).rows[0];
     if(!booking||booking.status==="canceled"){
-      const scheduled=(await db.query("SELECT id,start_at,started_at,finished_at FROM schedule_events WHERE company_id=$1 AND quote_id=$2 ORDER BY finished_at IS NOT NULL,start_at LIMIT 25",[row.company_id,row.quote_id])).rows;
-      if(scheduled.length){const company=(await db.query("SELECT timezone FROM companies WHERE id=$1",[row.company_id])).rows[0],first=scheduled[0];return{booking_id:first.id,id:first.id,job_id:first.id,status:"booked",start_at:first.start_at,timezone:company?.timezone||"America/New_York",service_state:first.finished_at?"completed":first.started_at?"in_progress":"upcoming",can_reschedule:false,can_cancel:false,arranged_by_business:true,appointments:scheduled.map(e=>({job_id:e.id,start_at:e.start_at,service_state:e.finished_at?"completed":e.started_at?"in_progress":"upcoming"}))};}
+      const scheduled=(await db.query("SELECT id,start_at,end_at,started_at,finished_at FROM schedule_events WHERE company_id=$1 AND quote_id=$2 ORDER BY finished_at IS NOT NULL,start_at LIMIT 25",[row.company_id,row.quote_id])).rows;
+      if(scheduled.length){const company=(await db.query("SELECT timezone FROM companies WHERE id=$1",[row.company_id])).rows[0],first=scheduled[0];return{booking_id:first.id,id:first.id,job_id:first.id,status:"booked",start_at:first.start_at,end_at:first.end_at,timezone:company?.timezone||"America/New_York",service_state:first.finished_at?"completed":first.started_at?"in_progress":"upcoming",can_reschedule:false,can_cancel:false,arranged_by_business:true,appointments:scheduled.map(e=>({job_id:e.id,start_at:e.start_at,end_at:e.end_at,service_state:e.finished_at?"completed":e.started_at?"in_progress":"upcoming"}))};}
       if(!booking)return null;
     }
     const company=(await db.query("SELECT timezone,customer_booking_settings FROM companies WHERE id=$1",[row.company_id])).rows[0];
     const settings=normalizeBookingSettings(company?.customer_booking_settings),active=booking.status!=="canceled"&&booking.start_at!=null;
     const changeAllowed=active&&!booking.started_at&&!booking.finished_at&&new Date(booking.start_at).getTime()-now().getTime()>=settings.change_cutoff_minutes*60000;
-    return{booking_id:active?booking.id:null,id:booking.id,job_id:booking.job_id,status:active?booking.status:"canceled",start_at:booking.start_at??booking.job_snapshot.start_at,timezone:company?.timezone||"America/New_York",service_state:booking.finished_at?"completed":booking.started_at?"in_progress":active?"upcoming":"canceled",can_reschedule:changeAllowed&&settings.enabled&&settings.allow_customer_reschedule,can_cancel:changeAllowed&&settings.allow_customer_cancel};
+    return{booking_id:active?booking.id:null,id:booking.id,job_id:booking.job_id,status:active?booking.status:"canceled",start_at:booking.start_at??booking.job_snapshot.start_at,end_at:booking.end_at??booking.job_snapshot.end_at,timezone:company?.timezone||"America/New_York",service_state:booking.finished_at?"completed":booking.started_at?"in_progress":active?"upcoming":"canceled",can_reschedule:changeAllowed&&settings.enabled&&settings.allow_customer_reschedule,can_cancel:changeAllowed&&settings.allow_customer_cancel};
   }
   async function gate(db,row){
     if(!row.quote_id||!row.snapshot.allow_customer_booking)fail("booking_not_offered","The business will arrange scheduling for this agreement.");
