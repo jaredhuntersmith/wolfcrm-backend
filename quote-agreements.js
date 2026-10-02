@@ -347,6 +347,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         if(predecessor.quote_id||predecessor.snapshot.kind!=='standalone'||predecessor.contact_id!==quote.contact_id)problem('agreement_revision_mismatch','Choose a standalone agreement for this customer.',409);
         if((await db.query('SELECT 1 FROM quote_agreements WHERE predecessor_id=$1 LIMIT 1',[predecessor.id])).rowCount)problem('agreement_revision_changed','A newer revision exists. Open it before preparing another replacement.',409);
       }
+      if (quoteId && predecessor?.revoked_at) problem("agreement_link_revoked", "Regenerate the customer link before issuing a revision.", 409);
       if (raw.predecessor_id && predecessor?.id !== uuid(raw.predecessor_id)) problem("agreement_revision_changed", "A newer quote revision exists. Reload it before revising.", 409);
       if (!preview && quote.id && service.paymentSummary && predecessor) {
         const payments = await service.paymentSummary(db, predecessor);
