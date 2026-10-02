@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { PDFDocument, PDFString, PDFDict, PDFArray, PDFName, degrees, rgb } from "pdf-lib";
+import { PDFDocument, PDFString, PDFDict, PDFArray, PDFName, PDFNull, degrees, rgb } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import { QuoteContractError, quoteText, quoteInteger } from "./quote-contract-domain.js";
 
@@ -48,7 +48,7 @@ export async function validateAndNormalizeAgreementPDF(bytes, { allowSanitize = 
     if (object instanceof PDFDict) {
       for (const [key, value] of object.entries()) {
         const name = key.decodeText();
-        if (name === "ByteRange" || (name === "FT" && value.toString() === "/Sig" && object.get(PDFName.of("V")))) fail("agreement_pdf_already_signed", "This PDF contains digital-signature fields or evidence. Preserve its original and upload an unsigned source for this signing workflow.");
+        if (name === "ByteRange" || (name === "FT" && value.toString() === "/Sig" && object.lookup(PDFName.of("V")) != null && object.lookup(PDFName.of("V")) !== PDFNull)) fail("agreement_pdf_already_signed", "This PDF contains digital-signature fields or evidence. Preserve its original and upload an unsigned source for this signing workflow.");
         if (forbidden.has(name)) {
           if (!allowSanitize) fail("agreement_pdf_active_content", "The generated quote PDF must contain only its printable content.");
           removed.add(name); object.delete(key); continue;

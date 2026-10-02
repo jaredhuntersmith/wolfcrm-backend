@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PDFDocument, PDFName, degrees } from "pdf-lib";
+import { PDFDocument, PDFName, PDFNull, degrees } from "pdf-lib";
 import { validateAndNormalizeAgreementPDF, normalizeAgreementFields, validateAgreementSignature, validateAgreementSubmission, populateAgreementPDF, generateQuoteAgreementPDF, resolveAgreementText, validateAgreementSignerText } from "../quote-agreement-documents.js";
 import { calculateQuotePricing } from "../quote-contract-domain.js";
 
@@ -61,6 +61,16 @@ test("existing visible PDF form values survive passive normalization", async () 
   assert.equal(output.getForm().getFields().length, 0);
   assert.ok(output.getPage(0).node.Contents());
   assert.ok(cleaned.normalized.length > 1000);
+});
+
+test("unsigned signature widgets with null values are accepted as blank source fields", async () => {
+  const doc = await sourcePDF(), field = doc.getForm().createTextField('unsigned_signature');
+  field.addToPage(doc.getPage(0), { x: 30, y: 450, width: 240, height: 40 });
+  field.acroField.dict.set(PDFName.of('FT'), PDFName.of('Sig'));
+  field.acroField.dict.set(PDFName.of('V'), PDFNull);
+  const cleaned = await validateAndNormalizeAgreementPDF(Buffer.from(await doc.save()));
+  assert.equal((await PDFDocument.load(cleaned.normalized)).getForm().getFields().length, 0);
+  assert.equal(cleaned.pages.length, 1);
 });
 
 test("field definitions enforce page/bounds/role/type and prohibit rotation", () => {
