@@ -11745,14 +11745,16 @@ function sendQuoteValidationError(res, error) {
 app.post("/api/quotes/pricing", authRequired, requireAnyCapability("quotes.create", "quotes.edit"), async (req, res) => {
   try {
     const line_items = normalizeQuoteLines(req.body?.line_items ?? []);
-    const quote_options = normalizeQuoteOptions(req.body?.quote_options ?? {});
+    let previousOptions = null;
     let existing_lines = [];
     if (req.body?.quote_id) {
       const scope = quoteScopeSQL(req);
       const existing = (await pool.query(`SELECT line_items,quote_options FROM quotes q WHERE ${scope.sql} AND id::text = $${scope.values.length + 1}`, [...scope.values, req.body.quote_id])).rows[0];
       if (!existing) return res.status(404).json({ error: "not_found" });
+      previousOptions = existing.quote_options;
       existing_lines = [...existing.line_items, ...normalizeQuoteOptions(existing.quote_options || {}).optional_addons];
     }
+    const quote_options = await resolveQuoteTemplateOptions(pool, req, req.body?.quote_options ?? {}, {previous:previousOptions});
     validateQuoteAddonScope(line_items, quote_options);
     await assertQuoteReferences(pool, req, { line_items: [...line_items,...quote_options.optional_addons], existing_lines });
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
@@ -12089,7 +12091,7 @@ app.delete("/api/quotes/:id", authRequired, requireCapability("quotes.delete"), 
     }
     res.status(204).end();
   } catch (e) {
-    if (e?.code === "23503" && e?.constraint?.includes("quote_agreements")) return res.status(409).json({ error: "quote_has_agreements", message: "This quote has published agreements. Preserve its evidence; revoke its public link or issue a revision instead." });
+    if (sendQuoteValidationError(res, e)) return;
     console.error("[quotes] delete failed:", e && e.message ? e.message : e);
     res.status(500).json({ error: "failed_delete_quote" });
   }
@@ -12787,7 +12789,7 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
     if (contact_id && !(await db.query(`SELECT id FROM contacts WHERE id=$1 AND (${req.companyId ? "company_id=$2" : "user_id=$2"})`, [contact_id, req.companyId || req.userId])).rowCount) {
       await db.query("ROLLBACK"); return res.status(404).json({ error: "contact_not_found" });
     }
-    if (quote_id && !(await db.query(`SELECT id FROM quotes WHERE id=$1 AND (${req.companyId ? "company_id=$2" : "user_id=$2"}) AND ($3::text IS NULL OR contact_id=$3)`, [quote_id, req.companyId || req.userId, contact_id || null])).rowCount) {
+    if (quote_id && !(await db.query(`SELECT id FROM quotes WHERE id=$1 AND (deleted_at IS NULL OR id::text=$4) AND (${req.companyId ? "company_id=$2" : "user_id=$2"}) AND ($3::text IS NULL OR contact_id=$3)`, [quote_id, req.companyId || req.userId, contact_id || null, previous.rows[0]?.quote_id || null])).rowCount) {
       await db.query("ROLLBACK"); return res.status(404).json({ error: "quote_not_found" });
     }
     const selectedScope = await selectedQuoteScheduleScope(db,{companyId:req.companyId,quoteId:quote_id,previous:previous.rows[0],start,end});

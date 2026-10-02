@@ -31,13 +31,11 @@ export async function ensureDefaultQuoteTemplate(db, req) {
     const current = (await db.query('SELECT * FROM agreement_templates WHERE company_id=$1 AND template_id=$2 AND archived_at IS NULL ORDER BY version DESC LIMIT 1', [req.companyId, settings.default_template_id])).rows[0];
     if (current) return { ...current, content: completeTemplateContent(current.content), is_default: true };
   }
-  let template = (await db.query('SELECT * FROM agreement_templates WHERE company_id=$1 AND archived_at IS NULL ORDER BY created_at,template_id,version DESC LIMIT 1', [req.companyId])).rows[0];
-  if (template) template = (await db.query('SELECT * FROM agreement_templates WHERE template_id=$1 AND company_id=$2 AND archived_at IS NULL ORDER BY version DESC LIMIT 1', [template.template_id, req.companyId])).rows[0];
-  else {
-    const content = completeTemplateContent(settings?.content || {});
-    if (!content.consent_text.trim()) content.consent_text = 'I agree to this quote and its displayed agreement and terms, and consent to signing electronically.';
-    template = (await db.query('INSERT INTO agreement_templates(template_id,version,company_id,name,content,created_by) VALUES($1,1,$2,$3,$4::jsonb,$5) RETURNING *', [randomUUID(), req.companyId, 'Default Quote', JSON.stringify(content), req.userId])).rows[0];
-  }
+  // Existing optional templates are not company defaults. Seed from the actual
+  // legacy defaults rather than arbitrarily choosing the oldest template.
+  const content = completeTemplateContent(settings?.content || {});
+  if (!content.consent_text.trim()) content.consent_text = 'I agree to this quote and its displayed agreement and terms, and consent to signing electronically.';
+  const template = (await db.query('INSERT INTO agreement_templates(template_id,version,company_id,name,content,created_by) VALUES($1,1,$2,$3,$4::jsonb,$5) RETURNING *', [randomUUID(), req.companyId, 'Default Quote', JSON.stringify(content), req.userId])).rows[0];
   await db.query('INSERT INTO agreement_settings(company_id,default_template_id) VALUES($1,$2) ON CONFLICT(company_id) DO UPDATE SET default_template_id=EXCLUDED.default_template_id,updated_at=now()', [req.companyId, template.template_id]);
   return { ...template, content: completeTemplateContent(template.content), is_default: true };
 }
