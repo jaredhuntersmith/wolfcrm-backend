@@ -1,3 +1,4 @@
+import { installStripeAccountManagementSchema, installStripeAccountManagement, stripeConnectionOptions } from "./stripe-account-management.js";
 import { priceQuoteForPlan } from "./plan-quote-publication.js";
 import { monthlyPlanRevenueCents } from "./service-plan-metrics.js";
 /* WolfCRM backend — email/password auth + user-scoped CRM data */
@@ -2691,6 +2692,7 @@ async function bootstrap() {
     END $$;
   `);
 
+  await installStripeAccountManagementSchema(pool);
   await installServiceCatalogSchema(pool);
   await installAgreementSchema(pool);
   console.log(`[bootstrap] DB ready @ ${nowIso()}`);
@@ -2882,6 +2884,7 @@ function sanitizeBusinessSettings(row) {
     user_id: row.user_id,
     company_id: row.company_id,
     business_name: row.business_name,
+    ...stripeConnectionOptions(),
     stripe_account_id: row.stripe_account_id,
     stripe_connect_status: row.stripe_connect_status,
     stripe_charges_enabled: row.stripe_charges_enabled,
@@ -18050,7 +18053,9 @@ app.delete("/api/todo/logs/:id", authRequired, requireCapability("tasks.manage")
 // All of these are employer-only. Employees never touch Stripe onboarding
 // or account settings.
 
-app.get("/api/payments/connect/status", authRequired, requireCapability("payments.manage"), async (req, res) => {
+installStripeAccountManagement({ app, pool, authRequired, requireEmployer, requireCapability, getStripe, ensureBusinessSettings, sanitizeBusinessSettings });
+
+app.get("/api/payments/connect/status", authRequired, requireEmployer, requireCapability("payments.manage"), async (req, res) => {
   try {
     const settings = await ensureBusinessSettings(req.userId, req.companyId);
     const stripe = getStripe();
@@ -18068,7 +18073,7 @@ app.get("/api/payments/connect/status", authRequired, requireCapability("payment
                   stripe_default_currency = COALESCE($5, stripe_default_currency),
                   stripe_connect_status = $6,
                   updated_at = now()
-            WHERE user_id = $1
+            WHERE user_id = $1 AND stripe_account_id = $7
             RETURNING *`,
           [
             req.userId,
@@ -18076,10 +18081,10 @@ app.get("/api/payments/connect/status", authRequired, requireCapability("payment
             !!acct.payouts_enabled,
             !!acct.details_submitted,
             acct.default_currency || null,
-            status
+            status, settings.stripe_account_id
           ]
         );
-        return res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
+        return res.json({ settings: sanitizeBusinessSettings(updated.rows[0] || await ensureBusinessSettings(req.userId, req.companyId)) });
       } catch (err) {
         console.error("stripe accounts.retrieve failed:", err.message);
       }
@@ -18091,7 +18096,7 @@ app.get("/api/payments/connect/status", authRequired, requireCapability("payment
   }
 });
 
-app.post("/api/payments/connect/create-account", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.post("/api/payments/connect/create-account", authRequired, requireEmployer, requireCapability("payments.manage"), async (req, res) => {
   const stripe = requireStripe(res); if (!stripe) return;
   try {
     const settings = await ensureBusinessSettings(req.userId, req.companyId);
@@ -18112,14 +18117,14 @@ app.post("/api/payments/connect/create-account", authRequired, requireCapability
         RETURNING *`,
       [req.userId, account.id]
     );
-    res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
+    res.json({ settings: sanitizeBusinessSettings(updated.rows[0] || await ensureBusinessSettings(req.userId, req.companyId)) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "connect_create_account_failed", detail: e.message });
   }
 });
 
-app.post("/api/payments/connect/create-account-link", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.post("/api/payments/connect/create-account-link", authRequired, requireEmployer, requireCapability("payments.manage"), async (req, res) => {
   const stripe = requireStripe(res); if (!stripe) return;
   try {
     let settings = await ensureBusinessSettings(req.userId, req.companyId);
@@ -18157,7 +18162,7 @@ app.post("/api/payments/connect/create-account-link", authRequired, requireCapab
   }
 });
 
-app.post("/api/payments/connect/refresh-status", authRequired, requireCapability("payments.manage"), async (req, res) => {
+app.post("/api/payments/connect/refresh-status", authRequired, requireEmployer, requireCapability("payments.manage"), async (req, res) => {
   const stripe = requireStripe(res); if (!stripe) return;
   try {
     const settings = await ensureBusinessSettings(req.userId, req.companyId);
@@ -18176,7 +18181,7 @@ app.post("/api/payments/connect/refresh-status", authRequired, requireCapability
               stripe_default_currency = COALESCE($5, stripe_default_currency),
               stripe_connect_status = $6,
               updated_at = now()
-        WHERE user_id = $1
+        WHERE user_id = $1 AND stripe_account_id = $7
         RETURNING *`,
       [
         req.userId,
@@ -18184,10 +18189,10 @@ app.post("/api/payments/connect/refresh-status", authRequired, requireCapability
         !!acct.payouts_enabled,
         !!acct.details_submitted,
         acct.default_currency || null,
-        status
+        status, settings.stripe_account_id
       ]
     );
-    res.json({ settings: sanitizeBusinessSettings(updated.rows[0]) });
+    res.json({ settings: sanitizeBusinessSettings(updated.rows[0] || await ensureBusinessSettings(req.userId, req.companyId)) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "connect_refresh_failed", detail: e.message });
@@ -18199,7 +18204,7 @@ app.post("/api/payments/connect/refresh-status", authRequired, requireCapability
 // to the app; the app itself will call /refresh-status when it comes back.
 app.get("/stripe/connect/return", (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>WolfCRM — Stripe Setup</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0F1420;color:#F5F7FA;text-align:center;padding:60px 24px"><h1 style="font-weight:800">All set</h1><p style="opacity:.75">Stripe onboarding is complete. You can close this window and return to WolfCRM.</p></body></html>`);
+  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>WolfCRM — Stripe Setup</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0F1420;color:#F5F7FA;text-align:center;padding:60px 24px"><h1 style="font-weight:800">Return to WolfCRM</h1><p style="opacity:.75">Return to WolfCRM to check whether Stripe setup is complete. You can close this window.</p></body></html>`);
 });
 app.get("/stripe/connect/refresh", (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
