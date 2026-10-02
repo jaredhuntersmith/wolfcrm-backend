@@ -64,11 +64,11 @@ test("signed plan billing is durable, scoped and exact against PostgreSQL and fa
     const today=()=>new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).format(clock.date);
     async function sign(row){const session=randomUUID();await pool.query("INSERT INTO agreement_signing_sessions(id,agreement_id,role,token_hash,token_generation,expires_at,verification_method) VALUES($1,$2,'customer',$3,1,now()+interval '1 day','link')",[session,row.id,randomUUID()]);await pool.query("INSERT INTO agreement_signatures(id,agreement_id,session_id,role,request_id,request_hash,printed_name,consent_text,signature,field_values,packet_hash,verification_method,submitted_at) VALUES($1,$2,$3,'customer',$4,'fixture','Signer','Consent','{}','{}',$5,'link',now())",[randomUUID(),row.id,session,randomUUID(),row.packet_hash]);}
     async function packet(snapshot,quote=null){const id=randomUUID();sequence++;return(await pool.query("INSERT INTO quote_agreements(id,company_id,quote_id,contact_id,created_by,number,revision,request_id,title,snapshot,packet_hash) VALUES($1,$2,$3,$4,$5,$6,1,$7,'Service',$8::jsonb,$9) RETURNING *",[id,company,quote,contact,owner,String(sequence),randomUUID(),JSON.stringify(snapshot),randomUUID()])).rows[0];}
-    async function enrollment({mode="calendar_installments",signed=true,fee=0,delay=0,term="finite",notice=0}={}){
+    async function enrollment({mode="calendar_installments",signed=true,fee=0,delay=0,term="finite",notice=0,saveCard=false,completion=false,interval=1}={}){
       const line={id:randomUUID(),service_id:serviceID,name:"Windows",qty:1,price_cents:30000,description:"All exterior windows"},quote=randomUUID();
       await pool.query("INSERT INTO quotes(id,user_id,company_id,contact_id,line_items,total_cents) VALUES($1,$2,$3,$4,$5::jsonb,30000)",[quote,owner,company,contact,JSON.stringify([line])]);
       const baseRow=await packet({kind:"quote",required_signers:["customer"],allow_customer_booking:false,offer_service_plans:true,pricing:calculateQuotePricing({line_items:[line]}),business:{name:"Plan business",address:"Business address",phone:"",email:"",logo_data_url:""},customer:{name:"Customer",address:"Service address",billing_address:"Billing address"}},quote);await sign(baseRow);
-      const config=normalizePlanTier({name:"Quarterly care",agreement:{agreement_text:"Membership terms",consent_text:"I authorize the stated agreement.",required_signers:["customer"]},cancellation_policy:"Cancel under the stated notice. No automatic refund.",cancellation_notice_days:notice,allow_pause:true,discount:{type:"percent",value:1500},term:{kind:term,visit_count:4},service_interval:{unit:"month",count:3},billing:{mode,interval:{unit:"month",count:1},installment_count:12,first_charge_delay_days:delay,enrollment_fee_cents:fee}});
+      const config=normalizePlanTier({name:"Quarterly care",agreement:{agreement_text:"Membership terms",consent_text:"I authorize the stated agreement.",required_signers:["customer"]},cancellation_policy:"Cancel under the stated notice. No automatic refund.",cancellation_notice_days:notice,allow_pause:true,discount:{type:"percent",value:1500},term:{kind:term,visit_count:4},service_interval:{unit:"month",count:3},billing:{mode,save_payment_method:saveCard,calendar_requires_completed_service:completion,interval:{unit:"month",count:interval},installment_count:12,first_charge_delay_days:delay,enrollment_fee_cents:fee}});
       const tier={tier_id:randomUUID(),version:1,configuration:config};await pool.query("INSERT INTO service_plan_tiers(tier_id,version,company_id,configuration,created_by) VALUES($1,1,$2,$3::jsonb,$4)",[tier.tier_id,company,JSON.stringify(config),owner]);
       const offer=buildPlanOffer({agreement:baseRow,tier,eligible_service_ids:[serviceID],today:today()});
       const planRow=await packet({kind:"plan",required_signers:["customer"],pricing:null,allow_customer_booking:false,financial_terms:offer});if(signed)await sign(planRow);
@@ -133,6 +133,32 @@ test("signed plan billing is durable, scoped and exact against PostgreSQL and fa
     await t.test("manual membership without fee needs no card, prepaid and fee use hosted one-time invoices",async()=>{
       const free=await enrollment({mode:"manual_per_visit"}),before=stripe.counts().calls;assert.equal((await begin(free)).status,"ready");assert.equal(stripe.counts().calls,before);
       for(const mode of ["manual_per_visit","prepaid"]){const item=await enrollment({mode,fee:500});const result=await begin(item);assert.equal(result.kind,"payment");assert.ok(result.url);assert.equal((await stored(item)).stripe_payment_method_id,null);assert.equal((await stored(item)).service_plan_id,null);const due=(await obligations(item))[0];assert.equal(due.amount_cents,mode==="prepaid"?102500:500);stripe.settle(due.invoice_id);await plans.reconcileEnrollment(item.row.id);assert.ok((await stored(item)).service_plan_id);}
+    });
+    await t.test("manual plan saves a customer-authorized card without enabling automatic debits",async()=>{
+      const item=await enrollment({mode:"manual_per_visit",saveCard:true});const before=stripe.counts().pays;
+      const setup=await begin(item);assert.equal(setup.kind,"setup");assert.equal((await stored(item)).service_plan_id,null);
+      const done=await finishSetup(item);assert.equal(done.enrollment.state,"active");assert.ok((await stored(item)).stripe_payment_method_id);assert.equal(stripe.counts().pays,before);
+    });
+    await t.test("ongoing calendar payments keep one future date and collect exactly once on each cadence",async()=>{
+      const original=clock.date;
+      try{
+        const item=await enrollment({mode:"calendar_recurring",term:"ongoing",interval:6});await begin(item);await finishSetup(item);
+        const first=await obligations(item);assert.equal(first.length,2);assert.equal(first[0].state,"succeeded");assert.equal(first[0].amount_cents,25500);
+        for(let i=0;i<4;i++)await adapter.reconcileEnrollment(item.row.id);
+        assert.equal((await obligations(item)).length,2,"polling must not append distant future charges");
+        clock.date=new Date(first[1].due_date+"T18:00:00Z");await Promise.all([1,2,3].map(()=>adapter.reconcileEnrollment(item.row.id)));
+        const after=await obligations(item);assert.equal(after.filter(row=>row.state==="succeeded").length,2);assert.equal(after.length,3);
+      }finally{clock.date=original;}
+    });
+    await t.test("calendar completion gate waits for the corresponding finished job, then charges once",async()=>{
+      const item=await enrollment({mode:"calendar_recurring",term:"ongoing",interval:3,completion:true});await begin(item);await finishSetup(item);
+      const enrolled=await stored(item);assert.ok(enrolled.service_plan_id);assert.ok((await obligations(item)).every(row=>row.state==="scheduled"));
+      const visit=(await pool.query('SELECT * FROM agreement_plan_visits WHERE enrollment_id=$1 ORDER BY sequence',[item.row.id])).rows[0],job=randomUUID();
+      await pool.query("INSERT INTO schedule_events(id,user_id,company_id,contact_id,title,start_at,end_at,service_items) VALUES($1,$2,$3,$4,'Completed plan visit',now(),now()+interval '1 hour',$5::jsonb)",[job,owner,company,contact,JSON.stringify(enrolled.snapshot.future_visit.line_items)]);
+      await plans.linkVisit({companyId:company,userId:owner},item.row.id,visit.id,{job_id:job});await adapter.reconcileEnrollment(item.row.id);assert.ok((await obligations(item)).every(row=>row.state==="scheduled"));
+      await pool.query('UPDATE schedule_events SET finished_at=now() WHERE id=$1',[job]);await plans.processMemberships();
+      await Promise.all([1,2,3].map(()=>adapter.reconcileEnrollment(item.row.id)));
+      const after=await obligations(item);assert.equal(after.filter(row=>row.state==="succeeded").length,1);assert.equal(after[0].job_id,job);
     });
     await t.test("manual and automatic per-visit billing use one actual completed visit, including final expired entitlement",async()=>{
       for(const mode of ["manual_per_visit","automatic_per_visit"]){

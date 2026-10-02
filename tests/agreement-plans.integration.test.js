@@ -46,6 +46,34 @@ test('tier offers, separate consent, conditional adjustments and existing member
       const result=await request(`/api/public/agreements/${token}/plan-offers`,{token:null});assert.equal(result.status,200,JSON.stringify(result.body));offer=result.body.offers[0];
       assert.equal(offer.current_total_cents,65500);assert.equal(offer.current_balance_cents,50500);assert.equal(offer.future_visit.total_cents,25500);assert.deepEqual(offer.eligible_line_ids,[lines[0].id]);
     });
+    await t.test('plan-specific quote freezes its tier, discounts once, signs and activates the actual membership',async()=>{
+      const planQuote=randomUUID();
+      await pool.query("INSERT INTO quotes(id,user_id,company_id,contact_id,title,line_items,total_cents,quote_options) VALUES($1,$2,$3,$4,'Direct plan',$5::jsonb,70000,$6::jsonb)",[planQuote,owner,company,contact,JSON.stringify(lines),JSON.stringify({duration_minutes:60})]);
+      const draft={request_id:randomUUID(),content:{plan_tier_id:tier.tier_id}};
+      const result=await request(`/api/quotes/${planQuote}/publish`,{method:'POST',body:draft});assert.equal(result.status,201,JSON.stringify(result.body));
+      const direct=result.body; assert.equal(direct.snapshot.pricing.total_cents,65500);assert.equal(direct.snapshot.offer_service_plans,false);assert.equal(direct.snapshot.plan_quote.tier_version,1);
+      assert.equal(direct.snapshot.pricing.line_items.reduce((sum,line)=>sum+line.total_cents,0),65500);
+      assert.equal(direct.plan.service_plan_id,null);assert.equal(direct.plan.plan_agreement_id,direct.id);
+      await sign(direct);
+      const link=direct.customer_url.split('/').at(-1);
+      const ready=await request(`/api/public/agreements/${link}/enrollments/${direct.plan.id}/reconcile`,{method:'POST',token:null,body:{}});assert.equal(ready.status,200,JSON.stringify(ready.body));assert.ok(ready.body.service_plan_id);
+      const after=(await request(`/api/agreements/${direct.id}`)).body;assert.equal(after.payments.total_cents,65500);assert.equal(after.payments.adjustment_cents,0);
+      assert.equal(after.plan.snapshot.configuration.name,config.name);
+      // Preserve this fixture while keeping legacy count assertions below local to the original enrollment.
+      await pool.query("UPDATE service_plans SET status='canceled' WHERE id=$1",[ready.body.service_plan_id]);
+      await pool.query("UPDATE agreement_plan_enrollments SET canceled_at=now(),state='canceled' WHERE id=$1",[direct.plan.id]);
+    });
+    await t.test('employee removal commits, revokes login and keeps historical identity out of active rosters',async()=>{
+      const worker=randomUUID(),email='former-worker@example.invalid';
+      await pool.query("INSERT INTO users(id,email,role,company_id,display_name,password_hash) VALUES($1,$2,'employee',$3,'Former worker','fixture')",[worker,email,company]);
+      await pool.query("INSERT INTO sessions(token,user_id) VALUES('former-worker-session',$1)",[worker]);
+      await pool.query("INSERT INTO magic_tokens(email,code,expires_at) VALUES($1,'fixture',now()+interval '1 hour')",[email]);
+      const result=await request(`/api/company/employees/${worker}`,{method:'DELETE'});assert.equal(result.status,200,JSON.stringify(result.body));
+      const saved=(await pool.query('SELECT * FROM users WHERE id=$1',[worker])).rows[0];assert.ok(saved.deleted_at);assert.equal(saved.display_name,'Former worker');assert.equal(saved.password_hash,null);
+      assert.equal((await pool.query('SELECT 1 FROM sessions WHERE user_id=$1',[worker])).rowCount,0);assert.equal((await pool.query('SELECT 1 FROM magic_tokens WHERE email=$1',[email])).rowCount,0);
+      assert.equal((await request('/api/company/users',{token:'former-worker-session'})).status,401);
+      assert.ok(!(await request('/api/company/users')).body.some(user=>user.id===worker));
+    });
     await t.test('concurrent selection creates one pending enrollment and no discount before separate signing',async()=>{
       const body={request_id:randomUUID(),tier_id:tier.tier_id,tier_version:tier.version,offer_hash:offer.offer_hash};
       const results=await Promise.all([1,2,3].map(()=>request(`/api/public/agreements/${token}/enrollments`,{method:'POST',token:null,body})));
@@ -53,7 +81,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
       assert.equal(enrollment.state,'agreement_pending');assert.equal(enrollment.service_plan_id,null);
       assert.equal((await request(`/api/agreements/${published.id}`)).body.payments.balance_cents,55000);
       const reconciled=await request(`/api/public/agreements/${token}/enrollments/${enrollment.id}/reconcile`,{method:'POST',token:null,body:{}});assert.equal(reconciled.body.state,'agreement_pending');
-      assert.equal((await pool.query('SELECT count(*)::integer n FROM service_plans')).rows[0].n,0);
+      assert.equal((await pool.query("SELECT count(*)::integer n FROM service_plans WHERE status='active'")).rows[0].n,0);
       const planAgreement=(await request(`/api/agreements/${enrollment.plan_agreement_id}`)).body;
       assert.match(planAgreement.snapshot.agreement_text,/initial job.*original \$700.00/i);assert.equal(planAgreement.snapshot.kind,'plan');
       await sign(planAgreement);
@@ -61,11 +89,11 @@ test('tier offers, separate consent, conditional adjustments and existing member
       // An already signed enrollment retains the offered scope when defaults change.
       const activations=await Promise.all([1,2,3].map(()=>request(`/api/public/agreements/${token}/enrollments/${enrollment.id}/reconcile`,{method:'POST',token:null,body:{}})));
       assert.ok(activations.every(result=>result.status===200),JSON.stringify(activations));assert.ok(activations.every(result=>result.body.state==='active'),JSON.stringify(activations));
-      assert.equal((await pool.query('SELECT count(*)::integer n FROM service_plans')).rows[0].n,1);
+      assert.equal((await pool.query("SELECT count(*)::integer n FROM service_plans WHERE status='active'")).rows[0].n,1);
       assert.equal((await pool.query('SELECT count(*)::integer n FROM agreement_quote_adjustments')).rows[0].n,1);
       const after=(await request(`/api/agreements/${published.id}`)).body;assert.equal(after.snapshot.pricing.total_cents,70000);assert.equal(after.payments.total_cents,65500);assert.equal(after.payments.paid_cents,15000);assert.equal(after.payments.balance_cents,50500);assert.ok(after.plan.service_plan_id);
       const membership=(await request(`/api/service-plans/${after.plan.service_plan_id}`)).body;assert.ok(membership.id,JSON.stringify(membership));assert.equal(membership.price_cents,25500);
-      assert.equal((await pool.query('SELECT count(*)::integer n FROM agreement_plan_visits')).rows[0].n,4);
+      assert.equal((await pool.query('SELECT count(*)::integer n FROM agreement_plan_visits WHERE enrollment_id=$1',[enrollment.id])).rows[0].n,4);
     });
     await t.test('actual linked completed jobs consume one entitlement and preserve next obligation',async()=>{
       const current=(await request(`/api/agreements/${published.id}`)).body.plan;
