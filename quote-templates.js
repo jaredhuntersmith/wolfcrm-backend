@@ -69,7 +69,8 @@ export async function resolveQuoteTemplateOptions(pool, req, raw = {}, { previou
     // An older client can still change commercial options. Incorporate only its
     // explicitly submitted keys into the saved override; new clients send the template.
     if (!explicit) {
-      const legacy = Object.fromEntries(QUOTE_TEMPLATE_OPTION_KEYS.filter(key => Object.hasOwn(raw, key)).map(key => [key, raw[key]]));
+      const legacySource = selection ? raw : { ...previous, ...raw };
+      const legacy = Object.fromEntries(QUOTE_TEMPLATE_OPTION_KEYS.filter(key => Object.hasOwn(legacySource, key)).map(key => [key, legacySource[key]]));
       content.quote_defaults = normalizeQuoteTemplateDefaults({ ...content.quote_defaults, ...legacy });
       content.booking_preference = content.quote_defaults.allow_customer_booking;
       content.plan_offer_preference = content.quote_defaults.offer_service_plans;

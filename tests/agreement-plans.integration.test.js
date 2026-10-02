@@ -1,3 +1,4 @@
+import { drawnSignature } from "./helpers/signatures.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -30,7 +31,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
     const request=async(path,{method='GET',body,token='plan-owner'}={})=>{const response=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})},body:body===undefined?undefined:JSON.stringify(body)});return{status:response.status,body:await response.json()};};
     const config={name:'Quarterly windows',discount:{type:'percent',value:1500},discount_first_visit:true,allow_skip:true,service_interval:{unit:'month',count:3},billing:{mode:'manual_per_visit'},term:{kind:'finite',visit_count:4},cancellation_policy:'Cancel future unperformed services with30 days notice. No automatic renewal.',agreement:{agreement_text:'Window plan for {{customer_name}}. {{billing_information}}',consent_text:'I separately agree to this service plan.'}};
     let tier,published,token,offer,enrollment;
-    const sign=async(agreement)=>{const link=agreement.customer_url.split('/').at(-1);const session=(await request(`/api/public/agreements/${link}/session`,{method:'POST',token:null,body:{}})).body;const result=await request(`/api/public/agreements/${link}/sign`,{method:'POST',token:null,body:{request_id:randomUUID(),session_token:session.session_token,packet_hash:agreement.packet_hash,printed_name:'Plan Customer',consent:true,signature:{type:'typed',text:'Plan Customer'},values:{}}});assert.equal(result.status,200,JSON.stringify(result.body));return result;};
+    const sign=async(agreement)=>{const link=agreement.customer_url.split('/').at(-1);const session=(await request(`/api/public/agreements/${link}/session`,{method:'POST',token:null,body:{}})).body;const result=await request(`/api/public/agreements/${link}/sign`,{method:'POST',token:null,body:{request_id:randomUUID(),session_token:session.session_token,packet_hash:agreement.packet_hash,printed_name:'Plan Customer',consent:true,signature:drawnSignature(),values:{}}});assert.equal(result.status,200,JSON.stringify(result.body));return result;};
     await t.test('tenant-owned tiers and eligibility use stable catalog references and version checks',async()=>{
       const saved=await request('/api/service-plan-tiers',{method:'POST',body:{configuration:config}});assert.equal(saved.status,201,JSON.stringify(saved.body));tier=saved.body;
       assert.equal((await request('/api/service-plan-tiers',{token:'plan-other'})).body.tiers.length,0);
@@ -141,7 +142,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
       const view=(await request(`/api/public/agreements/${secondary}`,{token:null})).body;assert.equal(view.viewer_role,'customer_2');assert.equal(view.plan.plan_agreement_url,null);
       assert.equal((await request(`/api/public/agreements/${secondary}/plan-offers`,{token:null})).body.offers.length,0);
       const secondarySession=(await request(`/api/public/agreements/${secondary}/session`,{token:null,method:'POST',body:{}})).body;
-      const secondarySigned=(await request(`/api/public/agreements/${secondary}/sign`,{token:null,method:'POST',body:{request_id:randomUUID(),session_token:secondarySession.session_token,packet_hash:row.packet_hash,printed_name:'Second Customer',consent:true,signature:{type:'typed',text:'Second Customer'},values:{}}}));
+      const secondarySigned=(await request(`/api/public/agreements/${secondary}/sign`,{token:null,method:'POST',body:{request_id:randomUUID(),session_token:secondarySession.session_token,packet_hash:row.packet_hash,printed_name:'Second Customer',consent:true,signature:drawnSignature(),values:{}}}));
       assert.equal(secondarySigned.status,200,JSON.stringify(secondarySigned.body));
       assert.equal(secondarySigned.body.plan.plan_agreement_url,null);
       const completedSession=(await request(`/api/public/agreements/${secondary}/session`,{token:null,method:'POST',body:{}})).body;

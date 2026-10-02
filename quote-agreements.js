@@ -6,7 +6,7 @@ import { lockCompanySchedule } from "./schedule-booking-guard.js";
 import { assertQuoteReferences, ServiceCatalogError } from "./services-catalog.js";
 import { normalizeAgreementContent } from "./agreement-content.js";
 export { normalizeAgreementContent } from "./agreement-content.js";
-import { ensureDefaultQuoteTemplate, listQuoteTemplates, resolveQuoteTemplateOptions } from "./quote-templates.js";
+import { ensureDefaultQuoteTemplate, listQuoteTemplates, quoteTemplateTransaction, completeTemplateContent } from "./quote-templates.js";
 import { createQuoteAddonSelection } from "./quote-addons.js";
 
 const problem = (code, message, status = 400) => { throw new QuoteContractError(code, message, status); };
@@ -20,7 +20,7 @@ const equal = (a, b) => typeof a === "string" && typeof b === "string" && a.leng
 const safeJSON = (value) => JSON.stringify(value);
 const packetCoverSnapshot = (snapshot) => snapshot.kind !== "quote" || snapshot.quote_position !== "excluded" ? snapshot : {
   ...snapshot, pricing: null, public_notes: "", scope_exclusions: "",
-  agreement_text: `The accepted scope and price are preserved in the separately downloadable Estimate #${snapshot.number}, revision ${snapshot.revision}. This scope attachment is part of this agreement and must be reviewed before signing. Scope integrity hash: ${snapshot.scope_reference_hash}.\n\n${snapshot.agreement_text || ""}`,
+  agreement_text: `The accepted scope and price are preserved in the separately downloadable Quote #${snapshot.number}, revision ${snapshot.revision}. This scope attachment is part of this agreement and must be reviewed before signing. Scope integrity hash: ${snapshot.scope_reference_hash}.\n\n${snapshot.agreement_text || ""}`,
 };
 
 export async function installAgreementSchema(pool) {
@@ -258,12 +258,13 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
   }
   async function publish(req, quoteId, raw, { preview = false } = {}) {
     publicBase(); secret();
+    const defaultTemplate = await quoteTemplateTransaction(pool, db => ensureDefaultQuoteTemplate(db, req));
     const requestId = uuid(raw.request_id);
     const { request_id: ignoredRequestID, ...requestContent } = raw;
     const publicationRequestHash = quoteContentHash({ quote_id: quoteId, ...requestContent });
     return transaction(pool, async (db) => {
       await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, [`agreement-publish:${req.companyId}:${requestId}`]);
-      const quote = quoteId ? (await db.query(`SELECT * FROM quotes WHERE id=$1 AND (company_id=$2 OR (company_id IS NULL AND user_id=$3)) FOR UPDATE`, [uuid(quoteId), req.companyId, req.userId])).rows[0] : { id: null, contact_id: quoteText(raw.contact_id, "Customer ID", 200), title: quoteText(raw.title, "Agreement title", 200).trim() || "Agreement", line_items: [], quote_options: {}, updated_at: null };
+      const quote = quoteId ? (await db.query(`SELECT * FROM quotes WHERE id=$1 AND deleted_at IS NULL AND (company_id=$2 OR (company_id IS NULL AND user_id=$3)) FOR UPDATE`, [uuid(quoteId), req.companyId, req.userId])).rows[0] : { id: null, contact_id: quoteText(raw.contact_id, "Customer ID", 200), title: quoteText(raw.title, "Agreement title", 200).trim() || "Agreement", line_items: [], quote_options: {}, updated_at: null };
       if (!quote) problem("quote_not_found", "Save a quote in this company before publishing.", 404);
       const priorRequest = (await db.query(`SELECT * FROM quote_agreements WHERE company_id=$1 AND request_id=$2`, [req.companyId, requestId])).rows[0];
       if (priorRequest) { if (priorRequest.quote_id !== quote.id || (priorRequest.publication_request_hash && priorRequest.publication_request_hash !== publicationRequestHash)) problem("agreement_request_conflict", "This publication request was already used for different content.", 409); return detail(db, priorRequest, { staff: true }); }
@@ -271,7 +272,24 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       const contact = (await db.query(`SELECT name,address,phone,email FROM contacts WHERE id::text=$1 AND company_id=$2`, [quote.contact_id, req.companyId])).rows[0];
       if (!contact) problem("agreement_contact_missing", "The quote's customer is unavailable in this company.", 404);
       const settings = await getQuoteSettings(db, req.companyId);
-      const options = normalizeQuoteOptions(quote.quote_options);
+      const savedTemplate = quote.quote_options?.template;
+      let sourceTemplate = defaultTemplate;
+      const selectedID = raw.template_id || savedTemplate?.id;
+      const selectedVersion = raw.template_version || (raw.template_id ? null : savedTemplate?.version);
+      if (selectedID) {
+        sourceTemplate = (await db.query(`SELECT * FROM agreement_templates WHERE template_id=$1 AND company_id=$2 ${selectedVersion ? "AND version=$3" : ""} ORDER BY version DESC LIMIT 1`, selectedVersion ? [uuid(selectedID), req.companyId, selectedVersion] : [uuid(selectedID), req.companyId])).rows[0];
+        if (!sourceTemplate || (sourceTemplate.archived_at && savedTemplate?.id !== sourceTemplate.template_id)) problem("agreement_template_missing", "The selected template is unavailable.", 404);
+      }
+      const templateRef = { id: sourceTemplate.template_id, version: sourceTemplate.version };
+      const contentSource = !raw.template_id && savedTemplate ? savedTemplate.content : sourceTemplate.content;
+      const content = normalizeAgreementContent({ ...contentSource, ...(raw.content || {}) });
+      // Legacy drafts retain their explicitly saved commercial settings until a
+      // template is deliberately chosen. New drafts already hold a frozen selection.
+      const useTemplateDefaults = !!savedTemplate || !!raw.template_id || raw.content?.quote_defaults != null;
+      const options = normalizeQuoteOptions({ ...quote.quote_options, ...(useTemplateDefaults ? content.quote_defaults : {}),
+        optional_addons: [], billing_address: "", public_notes: "", scope_exclusions: "" });
+      delete options.template; // The issued packet carries only the immutable id/version below.
+
       validateQuoteAddonScope(quote.line_items, options);
       await assertQuoteReferences(db,req,{contact_id:quote.contact_id,line_items:[...quote.line_items,...options.optional_addons],existing_lines:[...quote.line_items,...options.optional_addons]});
       if (quoteId && !options.duration_minutes) problem("quote_duration_required", "Enter the estimated job duration before publishing this quote.");
@@ -282,20 +300,14 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       // not a cosmetic option. Follow-on adapters lift these checks when wired.
       if (pricing.deposit_cents > 0 && !service.paymentReady) problem("agreement_payment_not_ready", "Deposit checkout must be configured before publishing a deposit quote.", 409);
       if (pricing.deposit_cents > 0) await service.validatePaymentReadiness(db, req.companyId, pricing.deposit_cents);
-      let contentSource = (await db.query(`SELECT content FROM agreement_settings WHERE company_id=$1`, [req.companyId])).rows[0]?.content || {};
-      let templateRef = null;
-      if (raw.template_id) {
-        const template = (await db.query(`SELECT * FROM agreement_templates WHERE template_id=$1 AND company_id=$2 AND archived_at IS NULL ${raw.template_version ? "AND version=$3" : ""} ORDER BY version DESC LIMIT 1`, raw.template_version ? [uuid(raw.template_id), req.companyId, raw.template_version] : [uuid(raw.template_id), req.companyId])).rows[0];
-        if (!template) problem("agreement_template_missing", "The selected template is unavailable.", 404);
-        contentSource = template.content; templateRef = { id: template.template_id, version: template.version };
-      }
-      const content = normalizeAgreementContent({ ...contentSource, ...(raw.content || {}) });
-      const bookingEnabled=!!quoteId&&(content.booking_preference??options.allow_customer_booking),plansEnabled=!!quoteId&&(content.plan_offer_preference??options.offer_service_plans);
+      const bookingEnabled=!!quoteId&&(useTemplateDefaults ? options.allow_customer_booking : raw.content?.booking_preference??quote.quote_options?.allow_customer_booking??content.booking_preference??false),plansEnabled=!!quoteId&&(useTemplateDefaults ? options.offer_service_plans : raw.content?.plan_offer_preference??quote.quote_options?.offer_service_plans??content.plan_offer_preference??false);
       if (bookingEnabled && !service.bookingReady) problem("agreement_booking_not_ready", "Customer booking is not ready. Finish schedule integration before publishing with booking enabled.", 409);
       if (bookingEnabled) await service.validateBookingReadiness(db, req.companyId, { quote_id: quote.id, duration_minutes: options.duration_minutes, line_items: pricing.line_items });
       if (plansEnabled && !service.plansReady) problem("agreement_plans_not_ready", "Customer plan enrollment is not ready. Finish plan integration before enabling offers.", 409);
       if (!quoteId && !content.agreement_text.trim() && !content.documents.length) problem("standalone_agreement_content_required", "Add agreement text or a contract PDF before publishing a standalone agreement.");
       if (!content.consent_text.trim()) problem("agreement_consent_required", "Configure the electronic signing consent wording in Quotes & Contracts.");
+      if (!content.show_agreement) content.agreement_text = "";
+      if (!content.show_terms) { content.terms_text = ""; content.terms_asset_id = null; }
       const termsAsset = content.terms_asset_id ? (await db.query(`SELECT id,name,normalized_sha256,normalized_bytes FROM agreement_assets WHERE id=$1 AND company_id=$2`, [content.terms_asset_id, req.companyId])).rows[0] : null;
       if (content.terms_asset_id && !termsAsset) problem("agreement_terms_missing", "The Terms & Conditions PDF is unavailable in this company.", 404);
       let predecessor = (await db.query(`SELECT * FROM quote_agreements WHERE company_id=$1 AND quote_id=$2 ORDER BY revision DESC LIMIT 1`, [req.companyId, quote.id])).rows[0];
@@ -313,13 +325,13 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       values.billing_address=options.billing_address||contact.address;
       const snapshot = {
         kind: quoteId ? "quote" : "standalone",
-        title: quote.title || "Estimate", number, revision: (predecessor?.revision || 0) + 1, issued_at: issuedAt, expires_at: new Date(expires).toISOString(),
+        title: quote.title || "Quote", number, revision: (predecessor?.revision || 0) + 1, issued_at: issuedAt, expires_at: new Date(expires).toISOString(),
         business: { name: values.business_name || "", address: settings.company_address || "", phone: settings.phone || settings.company_phone || "", email: settings.email || settings.company_email || "", logo_data_url: content.branding.show_logo ? settings.company_logo_data_url || "" : "" },
         customer: { name: contact.name || "", address: contact.address || "", billing_address:values.billing_address||"", phone: content.show_customer_phone ? contact.phone : null, email: content.show_customer_email ? contact.email : null },
         pricing: quoteId ? pricing : null, ...options, ...content, template: templateRef,
         discount_stacking_policy:settings.discount_stacking_policy||"best_price",tax_provenance:{source:"business_settings",settings_updated_at:settings.updated_at??null,tax_rate_basis_points:pricing.tax_rate_basis_points,tax_inclusive:pricing.tax_inclusive},
         allow_customer_booking:bookingEnabled,offer_service_plans:plansEnabled,
-        scope_exclusions:[content.scope_exclusions,options.scope_exclusions].filter(Boolean).join('\n\n'),
+        scope_exclusions:"",
         agreement_text: resolveAgreementText(content.agreement_text, values), terms_text: resolveAgreementText(content.terms_text, values), consent_text: resolveAgreementText(content.consent_text, values),
         documents: await validateDocuments(db, req.companyId, content, values),
         terms_document: termsAsset ? { asset_id: termsAsset.id, name: termsAsset.name, sha256: termsAsset.normalized_sha256 } : null,
@@ -407,7 +419,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       const { row, role } = staffReq ? { row: await loadStaff(db, staffReq, token, true), role: "business" } : await loadPublic(db, token, true);
       if (!row.snapshot.required_signers.includes(role)) problem("agreement_signer_not_required", "This agreement does not request this signer role.", 409);
       const requestId = uuid(raw.request_id);
-      const requestHash = quoteContentHash({ packet_hash: raw.packet_hash, printed_name: raw.printed_name, consent: raw.consent, signature: raw.signature, values: raw.values || {} });
+      const requestHash = quoteContentHash({ packet_hash: raw.packet_hash ?? null, printed_name: raw.printed_name ?? "", consent: raw.consent ?? false, signature: raw.signature ?? null, values: raw.values || {} });
       const prior = (await db.query(`SELECT * FROM agreement_signatures WHERE agreement_id=$1 AND role=$2`, [row.id, role])).rows[0];
       if (prior) {
         if (prior.request_id === requestId && prior.request_hash !== requestHash) problem("agreement_request_conflict", "This submission ID was already used for different content.", 409);
@@ -422,12 +434,12 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       if (raw.packet_hash !== row.packet_hash) problem("agreement_version_changed", "Reload and review the current agreement before signing.", 409);
       if (raw.consent !== true) problem("agreement_consent_required", "Affirm electronic signing consent before submitting.");
       const name = quoteText(raw.printed_name, "Printed signer name", 200).trim();
-      if (name.length < 2) problem("agreement_signer_name_required", "Enter your printed name.");
-      const signature = validateAgreementSignature(raw.signature), submittedAt = new Date().toISOString();
+      if ([...name].filter(letter => /[\p{L}\p{N}]/u.test(letter)).length < 2) problem("agreement_signer_name_required", "Enter your printed name.");
+      const signature = validateAgreementSignature(raw.signature, { requireDrawn: !staffReq }), submittedAt = new Date().toISOString();
       await validateAgreementSignerText(name,signature);
       const fields = row.snapshot.documents.flatMap((doc) => doc.fields);
       if (new Set(fields.map((field) => field.id)).size !== fields.length) problem("agreement_field_id_collision", "The document packet has duplicate field IDs. Ask the business to correct the template.", 409);
-      const fieldValues = validateAgreementSubmission(fields, raw.values || {}, { role, printed_name: name, submitted_at: submittedAt });
+      const fieldValues = validateAgreementSubmission(fields, raw.values || {}, { role, printed_name: name, submitted_at: submittedAt, require_drawn: !staffReq });
       // Validate actual layout before final execution; artifact rendering after
       // this point may retry from immutable values without seeking a new signature.
       for (const doc of row.snapshot.documents) {
@@ -549,7 +561,20 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
     if (!row) problem("agreement_settings_changed", "Settings changed. Reload before saving.", 409);
     res.json(row);
   }));
-  app.get("/api/agreements/templates", ...staff("quotes.view"), wrap(async (req, res) => res.json((await pool.query(`SELECT DISTINCT ON(template_id) template_id,version,name,content,created_at FROM agreement_templates WHERE company_id=$1 AND archived_at IS NULL ORDER BY template_id,version DESC`, [req.companyId])).rows)));
+  app.get("/api/agreements/templates", ...staff("quotes.view"), wrap(async (req, res) => res.json(await listQuoteTemplates(pool, req))));
+  app.put("/api/agreements/templates/:id/default", ...staff("settings.manage_company"), wrap(async (req, res) => {
+    const result = await transaction(pool, async db => {
+      await ensureDefaultQuoteTemplate(db, req);
+      const id = uuid(req.params.id);
+      await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`agreement-template:${id}`]);
+      const row = (await db.query('SELECT * FROM agreement_templates WHERE company_id=$1 AND template_id=$2 AND archived_at IS NULL ORDER BY version DESC LIMIT 1', [req.companyId,id])).rows[0];
+      if (!row) problem('agreement_template_missing', 'This template is unavailable.', 404);
+      if (row.version !== req.body.expected_version) problem('agreement_template_changed', 'This template changed. Reload before selecting it.', 409);
+      await db.query('UPDATE agreement_settings SET default_template_id=$2,updated_at=now() WHERE company_id=$1', [req.companyId,id]);
+      return { ...row, content: completeTemplateContent(row.content), is_default: true };
+    });
+    res.json(result);
+  }));
   app.get('/api/agreements/templates/:id/versions',...staff('quotes.view'),wrap(async(req,res)=>{
     const rows=(await pool.query('SELECT template_id,version,name,content,created_at,archived_at FROM agreement_templates WHERE template_id=$1 AND company_id=$2 ORDER BY version DESC',[uuid(req.params.id),req.companyId])).rows;
     if(!rows.length)problem('agreement_template_missing','This template is unavailable.',404);res.json(rows);
@@ -557,6 +582,8 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
   app.post('/api/agreements/templates/:id/archive',...staff('settings.manage_company'),wrap(async(req,res)=>{
     const id=uuid(req.params.id);
     await transaction(pool,async(db)=>{
+      const fallback = await ensureDefaultQuoteTemplate(db, req);
+      if (fallback.template_id === id) problem('agreement_default_template_required', 'Select another default template before archiving this one.', 409);
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`agreement-template:${id}`]);
       const latest=(await db.query('SELECT version FROM agreement_templates WHERE template_id=$1 AND company_id=$2 ORDER BY version DESC LIMIT 1',[id,req.companyId])).rows[0];
       if(!latest)problem('agreement_template_missing','This template is unavailable.',404);
@@ -565,7 +592,7 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
     });res.json({archived:true});
   }));
   app.post("/api/agreements/templates", ...staff("settings.manage_company"), wrap(async (req, res) => {
-    const content = normalizeAgreementContent(req.body.content), id = req.body.template_id ? uuid(req.body.template_id) : randomUUID();
+    const content = completeTemplateContent(req.body.content), id = req.body.template_id ? uuid(req.body.template_id) : randomUUID();
     const name = quoteText(req.body.name, "Template name", 200).trim();
     if (!name) problem("agreement_template_name_required", "Name this template.");
     await service.validateDocuments(pool, req.companyId, content);
@@ -575,7 +602,8 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
       if (prior && (prior.company_id !== req.companyId || prior.version !== req.body.expected_version)) problem("agreement_template_changed", "Template unavailable or changed. Reload before saving.", 409);
       return (await db.query(`INSERT INTO agreement_templates(template_id,version,company_id,name,content,created_by) VALUES($1,$2,$3,$4,$5::jsonb,$6) RETURNING *`, [id, (prior?.version || 0) + 1, req.companyId, name, safeJSON(content), req.userId])).rows[0];
     });
-    res.status(201).json(row);
+    const defaults = (await pool.query("SELECT default_template_id FROM agreement_settings WHERE company_id=$1", [req.companyId])).rows[0];
+    res.status(201).json({ ...row, is_default: defaults?.default_template_id === row.template_id });
   }));
   app.post("/api/agreements/assets", ...staff("settings.manage_company"), wrap(async (req, res) => {
     const name = quoteText(req.body.name, "PDF name", 200).trim();

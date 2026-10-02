@@ -109,18 +109,19 @@ export function normalizeAgreementFields(raw, pages) {
   });
 }
 
-export function validateAgreementSignature(raw) {
+export function validateAgreementSignature(raw, { requireDrawn = false } = {}) {
   if (!raw || typeof raw !== "object") fail("signature_required", "Enter your signature.");
+  if (requireDrawn && raw.type !== "drawn") fail("signature_drawing_required", "Enter your printed name and draw your signature.");
   if (raw.type === "typed") {
     const text = quoteText(raw.text, "Signature", 160).trim();
     if ([...text].filter((letter) => /[\p{L}\p{N}]/u.test(letter)).length < 2) fail("signature_empty", "Enter a meaningful signature with at least two letters or numbers.");
     return { type: "typed", text };
   }
-  if (raw.type !== "drawn" || !Array.isArray(raw.strokes) || !raw.strokes.length || raw.strokes.length > 100) fail("signature_invalid", "Draw or type your signature.");
+  if (raw.type !== "drawn" || !Array.isArray(raw.strokes) || !raw.strokes.length || raw.strokes.length > 100) fail("signature_invalid", "Draw your signature.");
   let count = 0;
   const points = [];
   const strokes = raw.strokes.map((stroke) => {
-    if (!Array.isArray(stroke) || stroke.length < 2) fail("signature_empty", "Draw a complete signature or use a typed signature.");
+    if (!Array.isArray(stroke) || stroke.length < 2) fail("signature_empty", "Draw a complete signature.");
     return stroke.map((point) => {
       if (++count > 10000 || !Array.isArray(point) || point.length !== 2 || point.some((v) => typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1)) fail("signature_invalid", "The signature drawing is invalid.");
       points.push(point);
@@ -128,11 +129,11 @@ export function validateAgreementSignature(raw) {
     });
   });
   const xs = points.map((p) => p[0]), ys = points.map((p) => p[1]);
-  if (new Set(points.map((p) => p.join(","))).size < 6 || Math.max(...xs) - Math.min(...xs) < 0.04 || Math.max(...ys) - Math.min(...ys) < 0.02) fail("signature_empty", "The drawing is too small to be a meaningful signature. Draw again or type your name.");
+  if (new Set(points.map((p) => p.join(","))).size < 6 || Math.max(...xs) - Math.min(...xs) < 0.04 || Math.max(...ys) - Math.min(...ys) < 0.02) fail("signature_empty", "The drawing is too small to be a meaningful signature. Please draw it again.");
   return { type: "drawn", strokes };
 }
 
-export function validateAgreementSubmission(fields, values, { role, printed_name, submitted_at }) {
+export function validateAgreementSubmission(fields, values, { role, printed_name, submitted_at, require_drawn = false }) {
   if (!values || typeof values !== "object" || Array.isArray(values)) fail("agreement_values_invalid", "Signing values must be an object.");
   const allowed = new Map(fields.filter((field) => field.role === role && !["merge", "date_signed"].includes(field.type)).map((field) => [field.id, field]));
   for (const id of Object.keys(values)) if (!allowed.has(id)) fail("agreement_field_unauthorized", "A submitted field does not belong to this signer or document version.");
@@ -143,7 +144,7 @@ export function validateAgreementSubmission(fields, values, { role, printed_name
       if (field.required) fail("agreement_field_missing", `Complete ${field.label || field.id}.`);
       continue;
     }
-    if (field.type === "signature") result[field.id] = validateAgreementSignature(value);
+    if (field.type === "signature") result[field.id] = validateAgreementSignature(value, { requireDrawn: require_drawn });
     else if (field.type === "checkbox") {
       if (typeof value !== "boolean") fail("agreement_checkbox_invalid", "Checkbox values must be true or false.");
       result[field.id] = value;

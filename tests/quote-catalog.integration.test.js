@@ -72,7 +72,8 @@ test("real PostgreSQL quote and service routes preserve ownership, history, opti
       assert.equal(quote.total_cents, 30863);
       assert.equal(quote.line_items[0].description, line.description);
       assert.equal(quote.notes, "Private CRM note");
-      assert.equal(quote.quote_options.public_notes, "Customer message");
+      assert.equal(quote.quote_options.public_notes, "");
+      assert.ok(quote.quote_options.template?.id);
       const update = await request(`/api/quotes/${quote.id}`, { method: "PUT", body: { title: "Updated" } });
       assert.equal(update.status, 200, JSON.stringify(update.body));
       assert.deepEqual(update.body.line_items, quote.line_items);

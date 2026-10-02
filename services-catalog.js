@@ -75,6 +75,8 @@ export async function installServiceCatalogSchema(pool) {
     );
     CREATE INDEX IF NOT EXISTS saved_services_company_name_idx ON saved_services(company_id, name, id) WHERE archived_at IS NULL;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS quote_options JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS quotes_active_company_updated_idx ON quotes(company_id,updated_at DESC) WHERE deleted_at IS NULL;
   `);
 }
 

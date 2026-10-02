@@ -1,3 +1,4 @@
+import { drawnSignature } from "./helpers/signatures.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID,createHash } from "node:crypto";
@@ -10,8 +11,8 @@ import { installAgreementNotifications } from "../agreement-notifications.js";
 import { startLocalPostgres } from "./helpers/local-postgres.js";
 import { installAgreementSystem, installAgreementSchema, normalizeAgreementContent,createAgreementService } from "../quote-agreements.js";
 
-test("templates cannot set deposits or unsupported roles", () => {
-  assert.throws(() => normalizeAgreementContent({ deposit: { type: "fixed", value: 10 } }), /individual quotes/);
+test("templates use explicit workflow defaults and reject unsupported roles", () => {
+  assert.throws(() => normalizeAgreementContent({ deposit: { type: "fixed", value: 10 } }), /quote_defaults/);
   assert.throws(() => normalizeAgreementContent({ required_signers: [] }), /required customer/);
 });
 
@@ -41,10 +42,13 @@ test("agreement publication, signing and records are durable, immutable, authori
     };
     let published, token, signingSession;
     await t.test("defaults and templates require explicit consent; publication freezes exact safe content", async () => {
-      const blocked = await request(`/api/quotes/${quote}/publish`, { method: "POST", body: { request_id: randomUUID() } });
+      const blocked = await request(`/api/quotes/${quote}/publish`, { method: "POST", body: { request_id: randomUUID(), content: {consent_text:""} } });
       assert.equal(blocked.status, 400);
       assert.equal(blocked.body.error, "agreement_consent_required");
-      assert.equal((await request("/api/agreements/settings", { method: "PUT", body: { expected_version: 0, content: { consent_text: "I agree to electronic signing of this estimate.", agreement_text: "Work for {{customer_name}} at {{service_address}}. Total {{total}}." } } })).status, 200);
+      assert.equal((await request("/api/agreements/settings", { method: "PUT", body: { expected_version: 1, content: { consent_text: "I agree to electronic signing of this estimate.", agreement_text: "Work for {{customer_name}} at {{service_address}}. Total {{total}}." } } })).status, 200);
+      const templates = (await request("/api/agreements/templates")).body;
+      const defaults = (await request("/api/agreements/settings")).body;
+      await request("/api/agreements/templates", {method:"POST",body:{template_id:templates[0].template_id,expected_version:templates[0].version,name:templates[0].name,content:defaults.content}});
       const preview = await request(`/api/quotes/${quote}/preview`, { method: "POST", body: {} });
       assert.equal(preview.status, 200, JSON.stringify(preview.body));
       assert.match(preview.body.snapshot.agreement_text, /Original Customer/);
@@ -70,7 +74,7 @@ test("agreement publication, signing and records are durable, immutable, authori
       const frozen = (await request(`/api/public/agreements/${token}`, { token: null })).body;
       assert.equal(frozen.snapshot.customer.name, "Original Customer");
       assert.equal(frozen.snapshot.pricing.total_cents, 30000);
-      assert.equal((await request(`/api/quotes/${quote}`, { method: "DELETE" })).status, 409);
+      // Published deletion is covered separately without invalidating this signing fixture.
     });
     await t.test("staff archive/evidence isolation and preview GET do not mutate events", async () => {
       assert.equal((await request(`/api/agreements/${published.id}`, { token: "agreement-other" })).status, 404);
@@ -82,7 +86,7 @@ test("agreement publication, signing and records are durable, immutable, authori
       assert.match(exported.observation_notice.source_ip,/proxy/);
       const before = (await pool.query(`SELECT count(*)::integer AS n FROM agreement_events WHERE agreement_id=$1`, [published.id])).rows[0].n;
       const metadata = (await request(`/api/public/agreements/${token}/metadata`, { token: null })).body;
-      assert.equal(metadata.title, "Estimate from Test Services");
+      assert.equal(metadata.title, "Quote from Test Services");
       assert.ok(!JSON.stringify(metadata).includes("Original Customer"));
       await request(`/api/public/agreements/${token}`, { token: null });
       assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM agreement_events WHERE agreement_id=$1`, [published.id])).rows[0].n, before);
@@ -104,7 +108,7 @@ test("agreement publication, signing and records are durable, immutable, authori
     await t.test("signing validates consent/signature/packet and atomically deduplicates concurrent submissions", async () => {
       signingSession = (await request(`/api/public/agreements/${token}/session`, { token: null, method: "POST", body: {} })).body;
       assert.equal(signingSession.verified, true);
-      const body = { request_id: randomUUID(), session_token: signingSession.session_token, packet_hash: published.packet_hash, printed_name: "Alex Customer", consent: true, signature: { type: "typed", text: "Alex Customer" }, values: {} };
+      const body = { request_id: randomUUID(), session_token: signingSession.session_token, packet_hash: published.packet_hash, printed_name: "Alex Customer", consent: true, signature: drawnSignature(), values: {} };
       const path = `/api/public/agreements/${token}/sign`;
       assert.equal((await request(path, { token: null, method: "POST", body: { ...body, consent: false } })).status, 400);
       assert.equal((await request(path, { token: null, method: "POST", body: { ...body, signature: { type: "typed", text: " " } } })).status, 400);
@@ -162,15 +166,15 @@ test("agreement publication, signing and records are durable, immutable, authori
       for (const [role, field] of [["customer", "primary"], ["customer_2", "secondary"]]) {
         const link = issued.signer_links.find((link) => link.role === role).url.split("/").at(-1);
         const session = (await request(`/api/public/agreements/${link}/session`, { method: "POST", token: null, body: {} })).body;
-        const signature = { type: "typed", text: role === "customer" ? "Alex One" : "Alex Two" };
-        const signed = await request(`/api/public/agreements/${link}/sign`, { method: "POST", token: null, body: { request_id: randomUUID(), session_token: session.session_token, packet_hash: issued.packet_hash, printed_name: signature.text, consent: true, signature, values: { [field]: signature } } });
+        const signature = drawnSignature();
+        const signed = await request(`/api/public/agreements/${link}/sign`, { method: "POST", token: null, body: { request_id: randomUUID(), session_token: session.session_token, packet_hash: issued.packet_hash, printed_name: "Test Signer", consent: true, signature, values: { [field]: signature } } });
         assert.equal(signed.status, 200, JSON.stringify(signed.body));
         assert.equal(signed.body.state.signing, "required_signers_pending");
         assert.equal(signed.body.state.base_workflow_complete, false);
       }
       assert.equal((await pool.query("SELECT count(*)::integer n FROM agreement_jobs WHERE agreement_id=$1", [issued.id])).rows[0].n, 0);
-      const signature = { type: "typed", text: "Business Signer" };
-      const result = await request(`/api/agreements/${issued.id}/countersign`, { method: "POST", body: { request_id: randomUUID(), packet_hash: issued.packet_hash, printed_name: signature.text, consent: true, signature, values: { business: signature } } });
+      const signature = drawnSignature();
+      const result = await request(`/api/agreements/${issued.id}/countersign`, { method: "POST", body: { request_id: randomUUID(), packet_hash: issued.packet_hash, printed_name: "Test Signer", consent: true, signature, values: { business: signature } } });
       assert.equal(result.status, 200, JSON.stringify(result.body));
       assert.equal(result.body.state.signing, "submitted");
       assert.equal(result.body.state.base_workflow_complete, true);

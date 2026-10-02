@@ -34,6 +34,8 @@ import { installFinanceSystem, loadProjection } from "./finance.js";
 import { normalizeQuoteLines, normalizeQuoteOptions, validateQuoteAddonScope, calculateQuotePricing, QuoteContractError } from "./quote-contract-domain.js";
 import { installServiceCatalogSchema, installServiceCatalogRoutes, assertQuoteReferences, ServiceCatalogError } from "./services-catalog.js";
 import { installAgreementSchema, installAgreementSystem } from "./quote-agreements.js";
+import { resolveQuoteTemplateOptions } from "./quote-templates.js";
+import { removeQuote } from "./quote-removal.js";
 import { selectedQuoteScheduleScope } from "./quote-addons.js";
 import { installAgreementPlanCancellation } from "./agreement-plan-cancellation.js";
 import { installAgreementPayments } from "./agreement-payments.js";
@@ -7841,7 +7843,7 @@ function companyOrUserContactWhere(req, alias = "") {
   const p = alias ? `${alias}.` : "";
   return req.companyId
     ? { sql: `${p}company_id = $1`, values: [req.companyId] }
-    : { sql: `${p}user_id = $1`, values: [req.userId] };
+    : { sql: `${p}deleted_at IS NULL AND ${p}user_id = $1`, values: [req.userId] };
 }
 
 function contactTagsArray(value) {
@@ -11821,8 +11823,8 @@ async function getQuoteSettings(pool, companyId) {
 function quoteScopeSQL(req, alias = "q") {
   const p = `${alias}.`;
   return req.companyId
-    ? { sql: `(${p}company_id = $1 OR (${p}company_id IS NULL AND ${p}user_id = $2))`, values: [req.companyId, req.userId] }
-    : { sql: `${p}user_id = $1`, values: [req.userId] };
+    ? { sql: `${p}deleted_at IS NULL AND (${p}company_id = $1 OR (${p}company_id IS NULL AND ${p}user_id = $2))`, values: [req.companyId, req.userId] }
+    : { sql: `${p}deleted_at IS NULL AND ${p}user_id = $1`, values: [req.userId] };
 }
 
 app.get("/api/quotes/settings", authRequired, requireCapability("quotes.view"), async (req, res) => {
@@ -11934,7 +11936,7 @@ app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async 
   const initialStatus = ["draft","sent","accepted","declined","expired","converted"].includes(status) ? status : "draft";
   try {
     items = normalizeQuoteLines(line_items ?? []);
-    options = normalizeQuoteOptions(req.body?.quote_options ?? {});
+    options = await resolveQuoteTemplateOptions(pool, req, req.body?.quote_options ?? {});
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
     const pricing = calculateQuotePricing({ line_items: items, deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
       tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 });
@@ -11994,7 +11996,7 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
     const previous = before.rows[0];
     const items = line_items === undefined ? null : normalizeQuoteLines(line_items);
     if (req.body.quote_options !== undefined && (!req.body.quote_options || typeof req.body.quote_options !== "object" || Array.isArray(req.body.quote_options))) throw new QuoteContractError("quote_options_invalid","Quote options must be an object.");
-    const options = req.body.quote_options === undefined ? null : normalizeQuoteOptions({...previous.quote_options,...req.body.quote_options});
+    const options = req.body.quote_options === undefined ? null : await resolveQuoteTemplateOptions(pool, req, req.body.quote_options, { previous: previous.quote_options });
     const effectiveOptions = options || normalizeQuoteOptions(previous.quote_options || {});
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
     const pricing = calculateQuotePricing({ line_items: items || previous.line_items, deposit: effectiveOptions.deposit, discount:effectiveOptions.discount,tax_inclusive:settings.tax_inclusive??false,
@@ -12035,7 +12037,7 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
          accepted_at = CASE WHEN $6 = 'accepted' THEN COALESCE(accepted_at, now()) ELSE accepted_at END,
          declined_at = CASE WHEN $6 = 'declined' THEN COALESCE(declined_at, now()) ELSE declined_at END,
          updated_at = now()
-       WHERE id = $1 AND ${whereScope}
+       WHERE id = $1 AND q.deleted_at IS NULL AND ${whereScope}
        RETURNING id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
       params
     );
@@ -12068,23 +12070,9 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
 
 app.delete("/api/quotes/:id", authRequired, requireCapability("quotes.delete"), async (req, res) => {
   try {
-    // Fixed placeholder numbering (see PUT above).
-    const params = [req.params.id];
-    let whereScope;
-    if (req.companyId) {
-      params.push(req.companyId, req.userId);
-      whereScope = `(q.company_id = $2 OR (q.company_id IS NULL AND q.user_id = $3))`;
-    } else {
-      params.push(req.userId);
-      whereScope = `q.user_id = $2`;
-    }
-    const result = await pool.query(
-      `DELETE FROM quotes q WHERE id = $1 AND ${whereScope}
-       RETURNING id, company_id, contact_id, status, total_cents`,
-      params
-    );
-    console.log("[quotes] delete", { id: req.params.id, deleted: result.rowCount });
-    if (!result.rowCount) return res.status(404).json({ error: "not_found" });
+    const removed = await removeQuote(pool, req, req.params.id);
+    if (!removed) return res.status(404).json({ error: "not_found" });
+    const result = { rows: [removed] };
     if (req.companyId) {
       await cancelAutomationSchedulesForSubject(req.companyId, "quote", req.params.id);
       await emitAutomationEvent({

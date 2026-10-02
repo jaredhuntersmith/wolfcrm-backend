@@ -1,3 +1,4 @@
+import { drawnSignature } from "./helpers/signatures.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -5,7 +6,7 @@ import { PDFDocument } from 'pdf-lib';
 import { startLocalPostgres } from './helpers/local-postgres.js';
 import { installAgreementSystem, normalizeAgreementContent } from '../quote-agreements.js';
 
-test('template presentation preferences validate without acquiring deposit authority',()=>{
+test('template presentation and commercial defaults validate',()=>{
   for(const input of [{deposit:{type:'none'}},{validity_days:0},{validity_days:366},{booking_preference:'yes'},{branding:{accent_color:'url(script)'}},{branding:{show_logo:'false'}},{estimate_label:'Arbitrary'}])assert.throws(()=>normalizeAgreementContent(input));
   const defaults=normalizeAgreementContent();assert.equal(defaults.validity_days,null);assert.equal(defaults.booking_preference,null);assert.equal(defaults.branding.show_logo,true);
 });
@@ -32,7 +33,7 @@ test('template versions, frozen preferences, standalone revisions and private hi
       const preview=await request(`/api/quotes/${quote}/preview`,{method:'POST',body:{template_id:template.template_id}});assert.equal(preview.status,200,JSON.stringify(preview.body));
       issued=(await request(`/api/quotes/${quote}/publish`,{method:'POST',body:{request_id:randomUUID(),template_id:template.template_id,expected_preview_hash:preview.body.preview_hash}})).body;
       assert.equal(issued.snapshot.business.name,'Exterior Division');assert.equal(issued.snapshot.business.logo_data_url,'');assert.equal(issued.snapshot.pricing.deposit_cents,0);assert.equal(issued.snapshot.estimate_label,'Quote');
-      assert.match(issued.snapshot.scope_exclusions,/No interior work\n\nNo roof work/);
+      assert.equal(issued.snapshot.scope_exclusions, "");
       assert.equal(Math.round((new Date(issued.expires_at)-new Date(issued.snapshot.issued_at))/86400000),7);
       const version2=await request('/api/agreements/templates',{method:'POST',body:{template_id:template.template_id,expected_version:1,name:'Changed defaults',content:{...content,validity_days:14,branding:{display_name:'New brand'}}}});assert.equal(version2.status,201);
       settings={...settings,company_name:'Changed company'};
@@ -41,8 +42,10 @@ test('template versions, frozen preferences, standalone revisions and private hi
       const versions=await request(`/api/agreements/templates/${template.template_id}/versions`);assert.deepEqual(versions.body.map(item=>item.version),[2,1]);
       assert.equal((await request(`/api/agreements/templates/${template.template_id}/versions`,{token:'template-other'})).status,404);
       assert.equal((await request(`/api/agreements/templates/${template.template_id}/archive`,{method:'POST',body:{expected_version:1}})).status,409);
+      const replacementDefault = (await request('/api/agreements/templates',{method:'POST',body:{name:'Replacement default',content}})).body;
+      assert.equal((await request(`/api/agreements/templates/${replacementDefault.template_id}/default`,{method:'PUT',body:{expected_version:replacementDefault.version}})).status,200);
       assert.equal((await request(`/api/agreements/templates/${template.template_id}/archive`,{method:'POST',body:{expected_version:2}})).status,200);
-      assert.equal((await request('/api/agreements/templates')).body.length,0);
+      assert.equal((await request('/api/agreements/templates')).body.some(item => item.template_id === template.template_id),false);
       assert.equal((await request(`/api/agreements/templates/${template.template_id}/versions`)).body.length,2);
       assert.equal((await request(`/api/agreements/${issued.id}/documents/quote`)).status,200);
     });
@@ -57,7 +60,7 @@ test('template versions, frozen preferences, standalone revisions and private hi
     await t.test('standalone replacements keep signed evidence and expose tenant-protected revision history',async()=>{
       standalone=(await request('/api/agreements',{method:'POST',body:{contact_id:contact,title:'Standalone terms',request_id:randomUUID(),content}})).body;
       const token=standalone.customer_url.split('/').at(-1),session=(await request(`/api/public/agreements/${token}/session`,{method:'POST',token:null,body:{}})).body;
-      assert.equal((await request(`/api/public/agreements/${token}/sign`,{method:'POST',token:null,body:{request_id:randomUUID(),session_token:session.session_token,packet_hash:standalone.packet_hash,printed_name:'Customer',consent:true,signature:{type:'typed',text:'Customer'},values:{}}})).status,200);
+      assert.equal((await request(`/api/public/agreements/${token}/sign`,{method:'POST',token:null,body:{request_id:randomUUID(),session_token:session.session_token,packet_hash:standalone.packet_hash,printed_name:'Customer',consent:true,signature:drawnSignature(),values:{}}})).status,200);
       const replacement=await request('/api/agreements',{method:'POST',body:{contact_id:contact,title:'Revised standalone terms',predecessor_id:standalone.id,request_id:randomUUID(),content:{...content,agreement_text:'New reviewed terms'}}});assert.equal(replacement.status,201,JSON.stringify(replacement.body));
       assert.equal(replacement.body.number,standalone.number);assert.equal(replacement.body.revision,2);assert.equal(replacement.body.predecessor_id,standalone.id);
       const old=(await request(`/api/agreements/${standalone.id}`)).body;assert.equal(old.state.signing,'submitted');assert.notEqual(old.state.decision,'superseded');assert.equal(old.related_agreements.length,2);

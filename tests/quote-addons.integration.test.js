@@ -1,3 +1,4 @@
+import { drawnSignature } from "./helpers/signatures.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {randomUUID} from "node:crypto";
@@ -45,7 +46,7 @@ test("optional services produce immutable exact revisions before every signer",{
     async function sign(item,role="customer"){
       const row=(await pool.query("SELECT * FROM quote_agreements WHERE id=$1",[item.published.id])).rows[0];
       const token=service.makeToken(row,role),session=role==="business"?null:await service.publicSession(token);
-      return service.sign(role==="business"?row.id:token,{request_id:randomUUID(),packet_hash:row.packet_hash,session_token:session?.session_token,printed_name:"Original Customer",consent:true,signature:{type:"typed",text:"Original Customer"},values:{}},{},role==="business"?req:null);
+      return service.sign(role==="business"?row.id:token,{request_id:randomUUID(),packet_hash:row.packet_hash,session_token:session?.session_token,printed_name:"Original Customer",consent:true,signature:drawnSignature(),values:{}},{},role==="business"?req:null);
     }
     await t.test("all signers must wait for explicit choice, including an empty selection",async()=>{
       const item=await packet();assert.equal(item.published.state.addon_selection_required,true);assert.equal(item.published.state.can_sign,false);assert.equal(item.published.state.can_decide,true);
