@@ -33,6 +33,7 @@ export async function installAgreementPlanSchema(pool) {
       UNIQUE(company_id,request_id), FOREIGN KEY(tier_id,tier_version) REFERENCES service_plan_tiers(tier_id,version) ON DELETE RESTRICT
     );
     CREATE UNIQUE INDEX IF NOT EXISTS agreement_plan_enrollment_scope_idx ON agreement_plan_enrollments(company_id,collection_key) WHERE canceled_at IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS agreement_plan_replacement_once_idx ON agreement_plan_enrollments((snapshot#>>'{replaces,enrollment_id}')) WHERE canceled_at IS NULL AND snapshot#>>'{replaces,enrollment_id}' IS NOT NULL;
     CREATE INDEX IF NOT EXISTS agreement_plan_enrollments_due_idx ON agreement_plan_enrollments(next_reconcile_at);
     CREATE TABLE IF NOT EXISTS agreement_quote_adjustments (
       id UUID PRIMARY KEY, company_id UUID NOT NULL REFERENCES companies(id) ON DELETE RESTRICT, collection_key TEXT NOT NULL,
@@ -171,7 +172,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       const priorRequest = (await db.query('SELECT * FROM agreement_plan_enrollments WHERE company_id=$1 AND request_id=$2', [row.company_id, requestID])).rows[0];
       if (priorRequest) { if (priorRequest.request_hash !== requestHash || priorRequest.base_agreement_id !== row.id) fail('plan_request_conflict', 'This enrollment request was already used for different terms.'); return detail(db, priorRequest); }
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`plan-contact:${row.company_id}:${row.contact_id}`]);
-      const existing = (await db.query('SELECT * FROM agreement_plan_enrollments WHERE company_id=$1 AND contact_id=$2 AND service_plan_id IS NULL AND canceled_at IS NULL', [row.company_id, row.contact_id])).rows[0];
+      const existing = (await db.query('SELECT * FROM agreement_plan_enrollments WHERE company_id=$1 AND base_agreement_id=$2 AND service_plan_id IS NULL AND canceled_at IS NULL', [row.company_id, row.id])).rows[0];
       if (existing) { if (existing.offer_hash !== raw.offer_hash) fail('plan_enrollment_exists', 'Resume or cancel the existing enrollment before choosing another tier.'); return detail(db, existing); }
       const offer = (await offers(db, row)).find((entry) => entry.tier_id === raw.tier_id && entry.tier_version === raw.tier_version);
       if (offer?.switch_unavailable) fail('plan_switch_review_required',offer.switch_unavailable);

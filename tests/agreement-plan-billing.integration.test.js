@@ -217,6 +217,9 @@ test("signed plan billing is durable, scoped and exact against PostgreSQL and fa
         assert.equal((await pool.query("SELECT count(*)::int n FROM agreement_events WHERE agreement_id=$1 AND type='plan_pending_canceled'",[item.planRow.id])).rows[0].n,1);
         if(mode==='calendar_installments'){const setup=(await pool.query('SELECT * FROM agreement_plan_setups WHERE enrollment_id=$1',[item.row.id])).rows[0];assert.equal(stripe.objects.sessions.get(setup.session_id).status,'expired');}
         else assert.ok((await obligations(item)).every(item=>item.state==='canceled'));
+        // Each reselection scenario represents a separate customer; other test memberships must not be treated as overlapping plans for this customer.
+        const freshContact=randomUUID();await pool.query("INSERT INTO contacts(id,user_id,company_id,name) VALUES($1,$2,$3,'Reselection customer')",[freshContact,owner,company]);
+        await pool.query('UPDATE quote_agreements SET contact_id=$2 WHERE id=$1',[item.baseRow.id,freshContact]);item.baseRow.contact_id=freshContact;
         const offered=(await plans.offers(pool,item.baseRow)).find(offer=>offer.tier_id!==item.row.tier_id);assert.ok(offered);
         const replacement=await plans.createEnrollment(item.token,{request_id:randomUUID(),tier_id:offered.tier_id,tier_version:offered.tier_version,offer_hash:offered.offer_hash});assert.notEqual(replacement.id,item.row.id);
       }

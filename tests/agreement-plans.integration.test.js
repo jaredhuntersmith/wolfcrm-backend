@@ -142,7 +142,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
       const result=await request('/api/agreements?kind=quote&signing=submitted&plan=active');
       assert.equal(result.status,200,JSON.stringify(result.body));assert.equal(result.body.total,1);assert.equal(result.body.agreements[0].id,published.id);assert.equal(result.body.agreements[0].payments.balance_cents,50500);
       assert.equal((await request('/api/agreements?signing=submitted',{token:'plan-other'})).body.total,0);
-      const beyond=await request('/api/agreements?signing=submitted&offset=100');assert.equal(beyond.body.agreements.length,0);assert.equal(beyond.body.total,2);
+      const beyond=await request('/api/agreements?signing=submitted&offset=100');assert.equal(beyond.body.agreements.length,0);assert.equal(beyond.body.total,3);
       assert.equal((await request('/api/agreements?from_date=2026-02-30')).status,400);
       assert.equal((await request('/api/agreements?from_date=2100-01-01')).body.total,0);
       const originalCreated=(await pool.query('SELECT created_at FROM quote_agreements WHERE id=$1',[published.id])).rows[0].created_at;
