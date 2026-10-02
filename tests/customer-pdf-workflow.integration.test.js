@@ -146,12 +146,37 @@ test('customer PDF workflow preserves drafts, exact exports, signer evidence and
       const removed=await request(`/api/quotes/${quote.id}`,{method:'DELETE'});expectStatus(removed,204);
       const retained=expectStatus(await request(publicPath(original),{token:null}),200);assert.equal(retained.id,original.id);
     });
+    await t.test('revision waits for a concurrent checkout reservation and cannot orphan its unknown outcome',async()=>{
+      const quote=await makeQuote(),packet=await publish(quote);expectStatus(await sign(packet),200);
+      const body=await prepare(quote,baseContent,{predecessor_id:packet.id});
+      const db=await pool.connect(),attempt=randomUUID(),obligation=randomUUID();let revision;
+      try {
+        await db.query('BEGIN');
+        await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`payment:${company}:quote:${quote.id}`]);
+        const record=(await db.query("INSERT INTO payment_records(user_id,company_id,contact_id,quote_id,agreement_id,payment_type,status,amount_cents,currency) VALUES($1,$2,$3,$4,$5,'stripe','pending',20000,'usd') RETURNING id",[owner,company,contact,quote.id,packet.id])).rows[0].id;
+        await db.query("INSERT INTO agreement_payment_obligations(id,company_id,agreement_id,kind,amount_cents,currency,packet_hash) VALUES($1,$2,$3,'balance',20000,'usd',$4)",[obligation,company,packet.id,packet.packet_hash]);
+        await db.query("INSERT INTO agreement_payment_attempts(id,company_id,agreement_id,obligation_id,payment_record_id,collection_key,kind,transport,connected_account_id,livemode,amount_cents,currency,state,create_parameters) VALUES($1,$2,$3,$4,$5,$6,'balance','checkout','acct_fixture',false,20000,'usd','creating','{}')",[attempt,company,packet.id,obligation,record,`quote:${quote.id}`]);
+        revision=post(`/api/quotes/${quote.id}/publish`,body);
+        let waiting=false;const deadline=Date.now()+3000;
+        while(Date.now()<deadline){
+          waiting=(await pool.query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event='advisory' AND query LIKE 'SELECT pg_advisory_xact_lock%') AS waiting")).rows[0].waiting;
+          if(waiting)break;await new Promise(resolve=>setTimeout(resolve,5));
+        }
+        assert.equal(waiting,true,'publication must share the checkout reservation lock');
+        await db.query('COMMIT');
+        assert.equal(expectStatus(await revision,409).error,'agreement_checkout_pending');
+      } finally {await db.query('ROLLBACK');db.release();if(revision)await revision;}
+      assert.equal((await pool.query('SELECT count(*)::int n FROM quote_agreements WHERE quote_id=$1',[quote.id])).rows[0].n,1);
+      await pool.query("UPDATE agreement_payment_attempts SET state='canceled' WHERE id=$1",[attempt]);
+      assert.equal(expectStatus(await post(`/api/quotes/${quote.id}/publish`,body),201).customer_url,packet.customer_url);
+    });
     await t.test('revocation and regeneration invalidate every former revision URL together',async()=>{
       const quote=await makeQuote(),first=await publish(quote),second=await publish(quote,baseContent,{predecessor_id:first.id});
       const legacy=(await pool.query('SELECT * FROM quote_agreements WHERE id=$1',[second.id])).rows[0];
       const oldDirectToken=service.makeToken({...legacy,link_root_id:legacy.id});
       expectStatus(await post(`/api/agreements/${second.id}/link`,{request_id:randomUUID(),action:'revoke'}),200);
       for(const token of [first.customer_url.split('/').at(-1),oldDirectToken])expectStatus(await request(`/api/public/agreements/${token}`,{token:null}),404);
+      assert.equal(expectStatus(await post(`/api/quotes/${quote.id}/preview`,{content:baseContent,predecessor_id:second.id}),409).error,'agreement_link_revoked');
       const restored=expectStatus(await post(`/api/agreements/${second.id}/link`,{request_id:randomUUID(),action:'regenerate'}),200);
       assert.equal(expectStatus(await request(publicPath(restored),{token:null}),200).id,second.id);
     });
