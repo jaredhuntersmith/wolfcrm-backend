@@ -1,3 +1,4 @@
+import { installBookingReview } from './agreement-booking-review.js';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { QuoteContractError } from "./quote-contract-domain.js";
 import { installScheduleBookingGuard, lockCompanySchedule, scheduleConflict } from "./schedule-booking-guard.js";
@@ -62,6 +63,10 @@ export async function installAgreementBookingSchema(pool){
     CREATE TABLE IF NOT EXISTS agreement_booking_requests(company_id UUID NOT NULL,request_id UUID NOT NULL,agreement_id UUID NOT NULL REFERENCES quote_agreements(id) ON DELETE RESTRICT,request_hash TEXT NOT NULL,result JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(company_id,request_id));
     CREATE TABLE IF NOT EXISTS agreement_booking_outbox(id UUID PRIMARY KEY,company_id UUID NOT NULL,agreement_id UUID NOT NULL,job_id TEXT NOT NULL,operation TEXT NOT NULL,job_snapshot JSONB NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),completed_at TIMESTAMPTZ,error_code TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
     CREATE INDEX IF NOT EXISTS agreement_booking_outbox_due_idx ON agreement_booking_outbox(next_attempt_at) WHERE completed_at IS NULL;
+    ALTER TABLE agreement_bookings ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ;
+    ALTER TABLE agreement_bookings ADD COLUMN IF NOT EXISTS confirmed_by UUID;
+    ALTER TABLE agreement_bookings ADD COLUMN IF NOT EXISTS review_version INTEGER NOT NULL DEFAULT 1;
+    CREATE INDEX IF NOT EXISTS agreement_booking_review_idx ON agreement_bookings(company_id,created_at) WHERE status<>'canceled' AND confirmed_at IS NULL;
     CREATE OR REPLACE FUNCTION wolfcrm_booking_history() RETURNS trigger LANGUAGE plpgsql AS $$
     DECLARE booking agreement_bookings; payload jsonb; event_type text; saved schedule_events;
     BEGIN
@@ -73,7 +78,7 @@ export async function installAgreementBookingSchema(pool){
       ELSE RETURN NULL; END IF;
       payload:=jsonb_build_object('booking_id',booking.id,'job_id',saved.id,'start_at',saved.start_at,'previous_start_at',OLD.start_at);
       INSERT INTO agreement_booking_history(id,booking_id,operation,before_snapshot,after_snapshot) VALUES(gen_random_uuid(),booking.id,event_type,to_jsonb(OLD),CASE WHEN TG_OP='DELETE' THEN NULL ELSE to_jsonb(NEW) END);
-      UPDATE agreement_bookings SET status=CASE WHEN TG_OP='DELETE' THEN 'canceled' ELSE 'rescheduled' END,job_snapshot=to_jsonb(saved),updated_at=now() WHERE id=booking.id;
+      UPDATE agreement_bookings SET confirmed_at=NULL,confirmed_by=NULL,review_version=review_version+1,status=CASE WHEN TG_OP='DELETE' THEN 'canceled' ELSE 'rescheduled' END,job_snapshot=to_jsonb(saved),updated_at=now() WHERE id=booking.id;
       INSERT INTO agreement_events(id,agreement_id,type,actor_type,payload) VALUES(gen_random_uuid(),booking.agreement_id,event_type,'system',payload);
       INSERT INTO agreement_booking_outbox(id,company_id,agreement_id,job_id,operation,job_snapshot) VALUES(gen_random_uuid(),booking.company_id,booking.agreement_id,saved.id,event_type,to_jsonb(saved));
       RETURN NULL;
@@ -116,7 +121,7 @@ export function createAgreementBooking({pool,service,env=service.env,now=()=>new
     const company=(await db.query("SELECT timezone,customer_booking_settings FROM companies WHERE id=$1",[row.company_id])).rows[0];
     const settings=normalizeBookingSettings(company?.customer_booking_settings),active=booking.status!=="canceled"&&booking.start_at!=null;
     const changeAllowed=active&&!booking.started_at&&!booking.finished_at&&new Date(booking.start_at).getTime()-now().getTime()>=settings.change_cutoff_minutes*60000;
-    return{booking_id:active?booking.id:null,id:booking.id,job_id:booking.job_id,status:active?booking.status:"canceled",start_at:booking.start_at??booking.job_snapshot.start_at,end_at:booking.end_at??booking.job_snapshot.end_at,timezone:company?.timezone||"America/New_York",service_state:booking.finished_at?"completed":booking.started_at?"in_progress":active?"upcoming":"canceled",can_reschedule:changeAllowed&&settings.enabled&&settings.allow_customer_reschedule,can_cancel:changeAllowed&&settings.allow_customer_cancel};
+    return{booking_id:active?booking.id:null,id:booking.id,job_id:booking.job_id,status:active?booking.status:"canceled",start_at:booking.start_at??booking.job_snapshot.start_at,end_at:booking.end_at??booking.job_snapshot.end_at,timezone:company?.timezone||"America/New_York",service_state:booking.finished_at?"completed":booking.started_at?"in_progress":active?"upcoming":"canceled",confirmed_at:booking.confirmed_at,can_reschedule:changeAllowed&&settings.enabled&&row.snapshot.customer_page?.show_manage_booking!==false&&(row.snapshot.customer_page?.allow_reschedule??settings.allow_customer_reschedule),can_cancel:changeAllowed&&row.snapshot.customer_page?.show_manage_booking!==false&&(row.snapshot.customer_page?.allow_cancel??settings.allow_customer_cancel)};
   }
   async function gate(db,row){
     if(!row.quote_id||!row.snapshot.allow_customer_booking)fail("booking_not_offered","The business will arrange scheduling for this agreement.");
@@ -216,6 +221,7 @@ export function createAgreementBooking({pool,service,env=service.env,now=()=>new
 }
 export async function installAgreementBooking({app,pool,service,env=service.env,authRequired,requireCapability,onScheduleChange,startWorker=true,now}){
   await installAgreementBookingSchema(pool);const adapter=createAgreementBooking({pool,service,env,onScheduleChange,now});
+  installBookingReview({app,pool,service,authRequired,requireCapability});
   service.bookingReady=true;service.bookingSummary=adapter.bookingSummary;service.validateBookingReadiness=adapter.validateBookingReadiness;app.locals.agreementBooking=adapter;
   const route=action=>async(req,res)=>{res.set({"Cache-Control":"private, no-store","Referrer-Policy":"no-referrer","X-Content-Type-Options":"nosniff"});
     if(req.method!=="GET"&&(!req.is("application/json")))return res.status(415).json({error:"json_required"});

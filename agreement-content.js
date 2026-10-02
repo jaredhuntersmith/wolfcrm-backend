@@ -1,3 +1,4 @@
+import { normalizeCustomerPage } from "./agreement-presentation.js";
 import { QuoteContractError, quoteText, quoteInteger, normalizeQuoteTemplateDefaults } from "./quote-contract-domain.js";
 const problem = (code, message, status = 400) => { throw new QuoteContractError(code, message, status); };
 const uuid = value => {
@@ -27,6 +28,7 @@ export function normalizeAgreementContent(raw = {}) {
   if (!["text", "pdf"].includes(agreementMode)) problem("agreement_mode_invalid", "Choose written text or PDF for the agreement.");
   const requirePageSignature = raw.require_page_signature == null ? true : boolean("require_page_signature");
   return {
+    customer_page: normalizeCustomerPage(raw.customer_page),
     plan_tier_id: raw.plan_tier_id ? uuid(raw.plan_tier_id) : null,
     agreement_mode: agreementMode, require_page_signature: requirePageSignature,
     agreement_text: quoteText(raw.agreement_text, "Agreement text", 100000),
