@@ -114,7 +114,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
   async function offers(db, row) {
     if (!row.snapshot.offer_service_plans || !row.snapshot.pricing || row.snapshot.kind === 'plan' || row.revoked_at || ['declined', 'superseded'].includes(row.decision)) return [];
     const state = await service.state(db, row);
-    if (!state.base_workflow_complete) return [];
+    if (state.signing !== 'submitted') return [];
     const catalog = (await db.query('SELECT id FROM saved_services WHERE company_id=$1 AND plan_eligible AND archived_at IS NULL', [row.company_id])).rows;
     const payments = await service.paymentSummary(db, row);
     if (payments.payment_review_required) return [];
@@ -209,7 +209,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
           if (offer.current_adjustment_cents > 0 && activeAttempt) state = 'payment_conflict';
           else {
             const baseState = await service.state(db, base);
-            if (!baseState.base_workflow_complete || ['revoked','declined','superseded'].includes(baseState.decision)) state = 'base_review_required';
+            if (baseState.signing !== 'submitted' || ['revoked','declined','superseded','expired'].includes(baseState.decision)) state = 'base_review_required';
             else {
               const owner = (await db.query('SELECT owner_user_id FROM companies WHERE id=$1', [enrollment.company_id])).rows[0]?.owner_user_id;
               if (!owner) fail('plan_business_owner_missing', 'Configure the business owner before activating a membership.');

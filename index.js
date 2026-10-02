@@ -1,3 +1,4 @@
+import { monthlyPlanRevenueCents } from "./service-plan-metrics.js";
 /* WolfCRM backend — email/password auth + user-scoped CRM data */
 /* WolfCRM backend auto-sync verification */
 /* Railway deploy smoke-test touch: 2026-08-12 */
@@ -18252,21 +18253,12 @@ app.get("/api/service-plans/dashboard", authRequired, requireCapability("payment
     }
     // Estimated MRR: normalize each active plan's price to a monthly figure.
     const active_plans = await pool.query(
-      `SELECT price_cents, billing_interval, billing_interval_count
+      `SELECT price_cents, status, billing_interval, billing_interval_count, service_interval, service_interval_count, billing_mode, plan_snapshot, remaining_visits
          FROM service_plans
         WHERE user_id = $1 AND status = 'active'`,
       [employerId]
     );
-    for (const p of active_plans.rows) {
-      const cnt = Math.max(1, p.billing_interval_count || 1);
-      const iv = (p.billing_interval || "month").toLowerCase();
-      let monthly = 0;
-      if (iv === "day")   monthly = (p.price_cents / cnt) * 30;
-      if (iv === "week")  monthly = (p.price_cents / cnt) * (30 / 7);
-      if (iv === "month") monthly = p.price_cents / cnt;
-      if (iv === "year")  monthly = p.price_cents / (cnt * 12);
-      mrrCents += monthly;
-    }
+    for (const p of active_plans.rows) mrrCents += monthlyPlanRevenueCents(p);
     const { rows: upcoming } = await pool.query(
       `SELECT sp.*, c.name AS contact_name
          FROM service_plans sp
