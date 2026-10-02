@@ -4,6 +4,20 @@ import { buildPlanOffer } from "./agreement-plans-domain.js";
 
 const fail = (code, message) => { throw new QuoteContractError(code, message, 409); };
 export function installPlanQuotePublication(service, supportedBillingModes, plans) {
+  service.preparePlanQuoteRevision = async (db, req, quote) => {
+    if (!quote.id) return;
+    // Publication owns the same payment-scope lock as activation. An unsigned
+    // direct enrollment can be superseded atomically, including back to one-time.
+    const prior = (await db.query(`SELECT * FROM agreement_plan_enrollments WHERE company_id=$1 AND collection_key=$2
+      AND base_agreement_id=plan_agreement_id AND canceled_at IS NULL FOR UPDATE`, [req.companyId, `quote:${quote.id}`])).rows[0];
+    if (!prior) return;
+    const signed = (await db.query("SELECT 1 FROM agreement_signatures WHERE agreement_id=$1 LIMIT 1", [prior.plan_agreement_id])).rowCount;
+    if (signed || prior.service_plan_id || prior.stripe_payment_method_id || prior.connected_account_id) {
+      fail("plan_quote_already_issued", "This plan already has signatures or payment setup. Manage or cancel that enrollment before replacing its plan terms; its signed agreement and charges remain preserved.");
+    }
+    await db.query("UPDATE agreement_plan_enrollments SET state='canceled',canceled_at=now(),updated_at=now() WHERE id=$1", [prior.id]);
+    await service.event(db, prior.plan_agreement_id, "unsigned_plan_revised", {actor_type:"staff",actor_id:req.userId,payload:{enrollment_id:prior.id}});
+  };
   service.preparePlanQuote = async (db, req, { quote, content, pricing, options, settings }) => {
     if (!content.plan_tier_id) return null;
     if (!quote.id) fail("plan_quote_scope_required", "Create a quote with the covered services before choosing a plan tier.");

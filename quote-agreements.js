@@ -296,6 +296,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       if (!quote) problem("quote_not_found", "Save a quote in this company before publishing.", 404);
       const priorRequest = (await db.query(`SELECT * FROM quote_agreements WHERE company_id=$1 AND request_id=$2`, [req.companyId, requestId])).rows[0];
       if (priorRequest) { if (priorRequest.quote_id !== quote.id || (priorRequest.publication_request_hash && priorRequest.publication_request_hash !== publicationRequestHash)) problem("agreement_request_conflict", "This publication request was already used for different content.", 409); return detail(db, priorRequest, { staff: true }); }
+      if (service.preparePlanQuoteRevision) await service.preparePlanQuoteRevision(db,req,quote);
       if (raw.expected_updated_at && new Date(raw.expected_updated_at).getTime() !== new Date(quote.updated_at).getTime()) problem("quote_changed", "The quote changed. Reload and preview it before publishing.", 409);
       const contact = (await db.query(`SELECT name,address,phone,email FROM contacts WHERE id::text=$1 AND company_id=$2`, [quote.contact_id, req.companyId])).rows[0];
       if (!contact) problem("agreement_contact_missing", "The quote's customer is unavailable in this company.", 404);

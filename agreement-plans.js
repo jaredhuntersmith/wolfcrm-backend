@@ -120,8 +120,8 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       ORDER BY e.activated_at DESC,e.id`,[row.company_id,row.contact_id])).rows;
     return rows;
   }
-  async function withReplacement(db,row,offer,current = null) {
-    const existing=(current || await currentMemberships(db,row)).filter(enrollment=>enrollment.snapshot.future_visit.line_items.some(line=>offer.future_visit.line_items.some(candidate=>candidate.service_id===line.service_id)));
+  async function withReplacement(db,row,offer,memberships = null) {
+    const existing=(memberships || await currentMemberships(db,row)).filter(enrollment=>enrollment.snapshot.future_visit.line_items.some(line=>offer.future_visit.line_items.some(candidate=>candidate.service_id===line.service_id)));
     if(existing.length>1) return {...offer,switch_unavailable:'Multiple memberships cover these services. Ask the business to reconcile them before switching.'};
     if(!existing.length)return offer;
     const current=existing[0];

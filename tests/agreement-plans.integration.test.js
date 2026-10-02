@@ -52,10 +52,17 @@ test('tier offers, separate consent, conditional adjustments and existing member
       await pool.query("INSERT INTO quotes(id,user_id,company_id,contact_id,title,line_items,total_cents,quote_options) VALUES($1,$2,$3,$4,'Direct plan',$5::jsonb,70000,$6::jsonb)",[planQuote,owner,company,contact,JSON.stringify(lines),JSON.stringify({duration_minutes:60})]);
       const draft={request_id:randomUUID(),content:{plan_tier_id:tier.tier_id}};
       const result=await request(`/api/quotes/${planQuote}/publish`,{method:'POST',body:draft});assert.equal(result.status,201,JSON.stringify(result.body));
-      const direct=result.body; assert.equal(direct.snapshot.pricing.total_cents,65500);assert.equal(direct.snapshot.offer_service_plans,false);assert.equal(direct.snapshot.plan_quote.tier_version,1);
+      let direct=result.body;
+      const revised=await request(`/api/quotes/${planQuote}/publish`,{method:'POST',body:{...draft,request_id:randomUUID()}});
+      assert.equal(revised.status,201,JSON.stringify(revised.body));assert.equal(revised.body.customer_url,direct.customer_url);
+      assert.equal(revised.body.revision,2);assert.equal((await pool.query('SELECT state FROM agreement_plan_enrollments WHERE id=$1',[direct.plan.id])).rows[0].state,'canceled');
+      assert.equal((await pool.query('SELECT count(*)::int AS count FROM agreement_plan_enrollments WHERE collection_key=$1 AND canceled_at IS NULL',[`quote:${planQuote}`])).rows[0].count,1);
+      direct=revised.body; assert.equal(direct.snapshot.pricing.total_cents,65500);assert.equal(direct.snapshot.offer_service_plans,false);assert.equal(direct.snapshot.plan_quote.tier_version,1);
       assert.equal(direct.snapshot.pricing.line_items.reduce((sum,line)=>sum+line.total_cents,0),65500);
       assert.equal(direct.plan.service_plan_id,null);assert.equal(direct.plan.plan_agreement_id,direct.id);
       await sign(direct);
+      const blockedRevision=await request(`/api/quotes/${planQuote}/publish`,{method:'POST',body:{request_id:randomUUID(),content:{plan_tier_id:null}}});
+      assert.equal(blockedRevision.status,409);assert.equal(blockedRevision.body.error,'plan_quote_already_issued');
       const link=direct.customer_url.split('/').at(-1);
       const ready=await request(`/api/public/agreements/${link}/enrollments/${direct.plan.id}/reconcile`,{method:'POST',token:null,body:{}});assert.equal(ready.status,200,JSON.stringify(ready.body));assert.ok(ready.body.service_plan_id);
       const after=(await request(`/api/agreements/${direct.id}`)).body;assert.equal(after.payments.total_cents,65500);assert.equal(after.payments.adjustment_cents,0);
