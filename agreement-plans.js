@@ -120,8 +120,8 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       ORDER BY e.activated_at DESC,e.id`,[row.company_id,row.contact_id])).rows;
     return rows;
   }
-  async function withReplacement(db,row,offer) {
-    const existing=(await currentMemberships(db,row)).filter(enrollment=>enrollment.snapshot.future_visit.line_items.some(line=>offer.future_visit.line_items.some(candidate=>candidate.service_id===line.service_id)));
+  async function withReplacement(db,row,offer,current = null) {
+    const existing=(current || await currentMemberships(db,row)).filter(enrollment=>enrollment.snapshot.future_visit.line_items.some(line=>offer.future_visit.line_items.some(candidate=>candidate.service_id===line.service_id)));
     if(existing.length>1) return {...offer,switch_unavailable:'Multiple memberships cover these services. Ask the business to reconcile them before switching.'};
     if(!existing.length)return offer;
     const current=existing[0];
@@ -144,7 +144,8 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     let today;
     try { today = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now()); } catch { today = now().toISOString().slice(0, 10); }
     const offered=(await tiers(db, row.company_id)).filter((tier) => supportedBillingModes.includes(tier.configuration.billing.mode)).map((tier) => buildPlanOffer({ agreement: row, tier, eligible_service_ids: catalog.map((item) => item.id), payments_cents: payments.paid_cents, today, serviced,prior_adjustment_cents:payments.adjustment_cents||0,initial_visit_already_counted:previouslyCounted })).filter(Boolean);
-    return (await Promise.all(offered.map(offer=>withReplacement(db,row,offer)))).filter(Boolean);
+    const current=await currentMemberships(db,row);
+    return (await Promise.all(offered.map(offer=>withReplacement(db,row,offer,current)))).filter(Boolean);
   }
   async function load(db, row, enrollmentID, lock = false) {
     const result = (await db.query(`SELECT * FROM agreement_plan_enrollments WHERE id=$1 AND company_id=$2 AND (base_agreement_id=$3 OR plan_agreement_id=$3) ${lock ? 'FOR UPDATE' : ''}`, [id(enrollmentID), row.company_id, row.id])).rows[0];

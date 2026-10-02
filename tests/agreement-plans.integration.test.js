@@ -207,7 +207,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
       const ready=await request(`/api/public/agreements/${token}/enrollments/${selected.body.id}/reconcile`,{method:'POST',token:null,body:{}});assert.equal(ready.status,200,JSON.stringify(ready.body));assert.equal(ready.body.state,'active');
       const live=(await pool.query("SELECT * FROM service_plans WHERE company_id=$1 AND status='active'",[company])).rows;assert.equal(live.length,1);assert.equal(live[0].plan_name,'Monthly care');
       assert.ok((await pool.query('SELECT canceled_at FROM agreement_plan_enrollments WHERE id=$1',[enrollment.id])).rows[0].canceled_at);
-      adapter.stop();
+
     });
   } finally {if(server)await new Promise(resolve=>server.close(resolve));if(pool)await pool.end();postgres.stop();}
 });
