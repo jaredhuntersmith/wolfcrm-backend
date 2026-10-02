@@ -163,7 +163,8 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     const row = followsRevisions
       ? (await db.query(`SELECT * FROM quote_agreements WHERE quote_id=$1 AND company_id=$2 AND revoked_at IS NULL ORDER BY revision DESC LIMIT 1 ${lock ? "FOR UPDATE" : ""}`, [anchor.quote_id, anchor.company_id])).rows[0]
       : lock ? (await db.query('SELECT * FROM quote_agreements WHERE id=$1 FOR UPDATE', [anchor.id])).rows[0] : anchor;
-    if (!row || row.revoked_at || !row.snapshot.required_signers.includes(role)) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
+    const currentAnchor = lock ? (await db.query("SELECT token_generation,revoked_at FROM quote_agreements WHERE id=$1", [id])).rows[0] : anchor;
+    if (!row || row.revoked_at || currentAnchor.revoked_at || currentAnchor.token_generation !== Number(generation) || !row.snapshot.required_signers.includes(role)) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
     return { row, role };
   }
   async function event(db, agreementId, type, { request_id = null, request_hash = null, actor_type = "system", actor_id = null, payload = {} } = {}) {
@@ -218,6 +219,13 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
           const seen=new Set(result.related_agreements.map(item=>item.id));for(const item of associated)if(!seen.has(item.id))result.related_agreements.push(item);
         }
       }
+    }
+    if (!staff && publicRole && row.quote_id) {
+      result.history = (await db.query(`SELECT a.id,a.revision,a.title,a.created_at,a.signed_at,a.documents_ready,
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('kind',f.kind) ORDER BY f.kind) FROM agreement_artifacts f WHERE f.agreement_id=a.id AND f.kind IN ('quote','terms','signed','packet','scope-certificate')),'[]'::jsonb) AS documents
+        FROM quote_agreements a WHERE a.company_id=$1 AND a.quote_id=$2 AND a.contact_id=$3 AND a.id<>$4 AND a.revision<$5 AND a.revoked_at IS NULL AND a.snapshot->'required_signers' ? $6
+        AND (EXISTS(SELECT 1 FROM agreement_signatures s WHERE s.agreement_id=a.id) OR EXISTS(SELECT 1 FROM payment_records p WHERE p.agreement_id=a.id))
+        ORDER BY a.revision DESC`,[row.company_id,row.quote_id,row.contact_id,row.id,row.revision,publicRole])).rows;
     }
     if (staff && !row.revoked_at) {
       result.customer_url = customerURL(row);
@@ -281,6 +289,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     const publicationRequestHash = quoteContentHash({ quote_id: quoteId, ...requestContent });
     return transaction(pool, async (db) => {
       await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, [`agreement-publish:${req.companyId}:${requestId}`]);
+      if (quoteId) await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, [`payment:${req.companyId}:quote:${uuid(quoteId)}`]);
       const quote = quoteId ? (await db.query(`SELECT * FROM quotes WHERE id=$1 AND deleted_at IS NULL AND (company_id=$2 OR (company_id IS NULL AND user_id=$3)) FOR UPDATE`, [uuid(quoteId), req.companyId, req.userId])).rows[0] : { id: null, contact_id: quoteText(raw.contact_id, "Customer ID", 200), title: quoteText(raw.title, "Agreement title", 200).trim() || "Agreement", line_items: [], quote_options: {}, updated_at: null };
       if (!quote) problem("quote_not_found", "Save a quote in this company before publishing.", 404);
       const priorRequest = (await db.query(`SELECT * FROM quote_agreements WHERE company_id=$1 AND request_id=$2`, [req.companyId, requestId])).rows[0];
@@ -718,7 +727,13 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
   }));
   const artifact = async (req, res, publicAccess) => {
     const access = publicAccess ? await service.loadPublic(pool, req.params.token) : {row:await service.loadStaff(pool, req, req.params.id)};
-    const {row,role}=access;
+    let {row}=access; const {role}=access;
+    if (publicAccess && req.params.historyID) {
+      const previous = (await pool.query(`SELECT a.* FROM quote_agreements a WHERE a.id=$1 AND a.company_id=$2 AND a.quote_id=$3 AND a.contact_id=$4 AND a.revision<$5 AND a.revoked_at IS NULL AND a.snapshot->'required_signers' ? $6
+        AND (EXISTS(SELECT 1 FROM agreement_signatures s WHERE s.agreement_id=a.id) OR EXISTS(SELECT 1 FROM payment_records p WHERE p.agreement_id=a.id))`, [uuid(req.params.historyID),row.company_id,row.quote_id,row.contact_id,row.revision,role])).rows[0];
+      if (!previous) problem("agreement_document_missing", "This document is unavailable.", 404);
+      row = previous;
+    }
     const kind = req.params.kind;
     if (publicAccess && kind === "audit") problem("agreement_document_private", "Detailed audit records are staff-only.", 403);
     const assetId = kind.startsWith("contract-") ? kind.slice(9) : null;
@@ -758,6 +773,7 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
     const { row, role } = await service.loadPublic(pool, req.params.token);
     res.json({ ...await service.detail(pool, row, {publicRole:role}), viewer_role: role });
   }));
+  app.get("/api/public/agreements/:token/history/:historyID/documents/:kind", wrap((req, res) => artifact(req, res, true)));
   app.get("/api/public/agreements/:token/documents/:kind", wrap((req, res) => artifact(req, res, true)));
   app.post("/api/public/agreements/:token/session", publicWrite, wrap(async (req, res) => res.json(await service.publicSession(req.params.token, req.body))));
   app.post("/api/public/agreements/:token/sign", publicWrite, wrap(async (req, res) => res.json(await service.sign(req.params.token, req.body, { ip: req.ip, user_agent: req.get("user-agent") || "" }))));
