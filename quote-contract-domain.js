@@ -96,6 +96,27 @@ export function normalizeQuoteDiscount(raw = { type: "none", value: 0 }) {
   return{type:raw.type,value};
 }
 
+export const QUOTE_TEMPLATE_OPTION_KEYS = [
+  "deposit", "discount", "allow_customer_booking", "offer_service_plans", "customer_notes_enabled",
+  "customer_notes_label", "customer_notes_help", "customer_notes_limit", "balance_payment_timing", "balance_due_days_after_service",
+];
+
+export function normalizeQuoteTemplateDefaults(raw = {}) {
+  if (!record(raw)) fail("template_defaults_invalid", "Template quote settings must be an object.");
+  // Duration belongs to the job. Use a sentinel only to validate booking settings.
+  const normalized = normalizeQuoteOptions({ ...Object.fromEntries(QUOTE_TEMPLATE_OPTION_KEYS.filter(key => raw[key] !== undefined).map(key => [key, raw[key]])), duration_minutes: 1 });
+  return Object.fromEntries(QUOTE_TEMPLATE_OPTION_KEYS.map(key => [key, normalized[key]]));
+}
+
+function normalizeQuoteTemplateSelection(raw) {
+  if (raw == null) return null;
+  if (!record(raw) || !record(raw.content)) fail("quote_template_invalid", "Select a quote template.");
+  const id = identifier(raw.id, "Template ID");
+  if (JSON.stringify(raw.content).length > 500000) fail("quote_template_invalid", "The template content is too large.");
+  if (raw.is_customized != null && typeof raw.is_customized !== "boolean") fail("quote_template_invalid", "Template customization must be true or false.");
+  return { id, version: quoteInteger(raw.version, "Template version", 2147483647, 1), name: quoteText(raw.name, "Template name", 200), content: raw.content, is_customized: raw.is_customized ?? false };
+}
+
 export function normalizeQuoteOptions(raw = {}) {
   if (!record(raw)) fail("quote_options_invalid", "Quote options must be an object.");
   const bool = (key) => {
@@ -108,6 +129,7 @@ export function normalizeQuoteOptions(raw = {}) {
   if(!["after_signing","after_service"].includes(balanceTiming))fail("quote_balance_timing_invalid","Choose balance collection after signing or after completed service.");
   if (booking && duration === null) fail("quote_duration_required", "Enter the estimated job duration before enabling customer booking.");
   return {
+    template: normalizeQuoteTemplateSelection(raw.template),
     duration_minutes: duration,
     deposit: normalizeDeposit(raw.deposit),
     discount: normalizeQuoteDiscount(raw.discount),
