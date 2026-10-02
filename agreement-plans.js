@@ -136,9 +136,10 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
   }
   async function detail(db, enrollment,{publicRole='customer'}={}) {
     const agreement = (await db.query('SELECT * FROM quote_agreements WHERE id=$1', [enrollment.plan_agreement_id])).rows[0];
+    const base = (await db.query('SELECT * FROM quote_agreements WHERE id=$1 AND company_id=$2', [enrollment.base_agreement_id, enrollment.company_id])).rows[0];
     const membership=enrollment.service_plan_id?(await db.query('SELECT status,remaining_visits FROM service_plans WHERE id=$1 AND company_id=$2',[enrollment.service_plan_id,enrollment.company_id])).rows[0]:null;
     const visits = (await db.query('SELECT id,sequence,due_date,job_id,state,completed_at FROM agreement_plan_visits WHERE enrollment_id=$1 ORDER BY sequence', [enrollment.id])).rows;
-    return { id: enrollment.id, state: membership?.status || enrollment.state, enrollment_state:enrollment.state,cancellation_effective_at:enrollment.cancellation_effective_at||null, remaining_visits:membership?.remaining_visits??null, service_plan_id: enrollment.service_plan_id, plan_agreement_id: agreement.id, plan_agreement_url: agreement.snapshot.required_signers.includes(publicRole)?service.customerURL(agreement,publicRole):null, signed_state: await service.state(db, agreement), snapshot: enrollment.snapshot, card: enrollment.card_metadata || null, activated_at: enrollment.activated_at, visits };
+    return { return_url: base?.snapshot.required_signers.includes(publicRole) ? service.customerURL(base, publicRole) : null, id: enrollment.id, state: membership?.status || enrollment.state, enrollment_state:enrollment.state,cancellation_effective_at:enrollment.cancellation_effective_at||null, remaining_visits:membership?.remaining_visits??null, service_plan_id: enrollment.service_plan_id, plan_agreement_id: agreement.id, plan_agreement_url: agreement.snapshot.required_signers.includes(publicRole)?service.customerURL(agreement,publicRole):null, signed_state: await service.state(db, agreement), snapshot: enrollment.snapshot, card: enrollment.card_metadata || null, activated_at: enrollment.activated_at, visits };
   }
   async function createEnrollment(token, raw) {
     const { row,role } = await service.loadPublic(pool, token);
