@@ -8,6 +8,7 @@ import { normalizeAgreementContent } from "./agreement-content.js";
 export { normalizeAgreementContent } from "./agreement-content.js";
 import { ensureDefaultQuoteTemplate, listQuoteTemplates, quoteTemplateTransaction, completeTemplateContent } from "./quote-templates.js";
 import { createQuoteAddonSelection } from "./quote-addons.js";
+import { installAgreementAuthoringSchema, installAgreementDraftRoutes, authoringRequest } from "./agreement-authoring.js";
 
 const problem = (code, message, status = 400) => { throw new QuoteContractError(code, message, status); };
 const digest = (text) => createHash("sha256").update(text).digest("hex");
@@ -67,6 +68,9 @@ export async function installAgreementSchema(pool) {
     CREATE INDEX IF NOT EXISTS quote_agreements_contact_idx ON quote_agreements(company_id,contact_id,created_at DESC);
     CREATE INDEX IF NOT EXISTS quote_agreements_quote_idx ON quote_agreements(quote_id,revision DESC);
     ALTER TABLE quote_agreements ADD COLUMN IF NOT EXISTS publication_request_hash TEXT;
+    ALTER TABLE quote_agreements ADD COLUMN IF NOT EXISTS link_root_id UUID REFERENCES quote_agreements(id) ON DELETE RESTRICT;
+    UPDATE quote_agreements a SET link_root_id=COALESCE((SELECT first.id FROM quote_agreements first WHERE first.quote_id=a.quote_id AND first.company_id=a.company_id ORDER BY first.revision,first.created_at LIMIT 1),a.id) WHERE a.link_root_id IS NULL;
+    CREATE INDEX IF NOT EXISTS quote_agreements_link_root_idx ON quote_agreements(link_root_id);
     CREATE TABLE IF NOT EXISTS agreement_signing_sessions (
       id UUID PRIMARY KEY, agreement_id UUID NOT NULL REFERENCES quote_agreements(id) ON DELETE RESTRICT,
       role TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, token_generation INTEGER NOT NULL,
@@ -116,6 +120,7 @@ export async function installAgreementSchema(pool) {
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS customer_note_entries JSONB NOT NULL DEFAULT '[]'::jsonb;
     CREATE INDEX IF NOT EXISTS payment_records_agreement_idx ON payment_records(company_id,agreement_id);
   `);
+  await installAgreementAuthoringSchema(pool);
 }
 
 
@@ -137,7 +142,8 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     if (url.protocol !== "https:" && !(env.NODE_ENV !== "production" && ["localhost", "127.0.0.1"].includes(url.hostname))) problem("agreement_public_url_invalid", "Customer links require an HTTPS origin.", 503);
     return url.origin;
   };
-  const makeToken = (agreement, role = "customer") => `${agreement.id}.${agreement.token_generation}.${role}.${createHmac("sha256", secret()).update(`${agreement.id}:${agreement.token_generation}:${role}`).digest("base64url")}`;
+  const tokenFor = (id, generation, role) => `${id}.${generation}.${role}.${createHmac("sha256", secret()).update(`${id}:${generation}:${role}`).digest("base64url")}`;
+  const makeToken = (agreement, role = "customer") => tokenFor(agreement.link_root_id || agreement.id, agreement.token_generation, role);
   const customerURL = (agreement, role) => `${publicBase()}/estimates/${makeToken(agreement, role)}`;
 
   async function loadStaff(db, req, id, lock = false) {
@@ -149,8 +155,12 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     if (typeof token !== "string" || token.length > 200) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
     const [id, generation, role, mac, extra] = token.split(".");
     if (extra || !["customer", "customer_2"].includes(role) || !/^\d+$/.test(generation || "") || !mac || !/^[0-9a-f-]{36}$/i.test(id || "")) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
-    const row = (await db.query(`SELECT * FROM quote_agreements WHERE id=$1 ${lock ? "FOR UPDATE" : ""}`, [id])).rows[0];
-    if (!row || row.revoked_at || row.token_generation !== Number(generation) || !row.snapshot.required_signers.includes(role) || !equal(token, makeToken(row, role))) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
+    const anchor = (await db.query('SELECT * FROM quote_agreements WHERE id=$1', [id])).rows[0];
+    if (!anchor || anchor.revoked_at || anchor.token_generation !== Number(generation) || !anchor.snapshot.required_signers.includes(role) || !equal(token, tokenFor(id, Number(generation), role))) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
+    const row = anchor.quote_id
+      ? (await db.query(`SELECT * FROM quote_agreements WHERE quote_id=$1 AND company_id=$2 ORDER BY revision DESC LIMIT 1 ${lock ? "FOR UPDATE" : ""}`, [anchor.quote_id, anchor.company_id])).rows[0]
+      : lock ? (await db.query('SELECT * FROM quote_agreements WHERE id=$1 FOR UPDATE', [anchor.id])).rows[0] : anchor;
+    if (!row || row.revoked_at || row.token_generation !== Number(generation) || !row.snapshot.required_signers.includes(role)) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
     return { row, role };
   }
   async function event(db, agreementId, type, { request_id = null, request_hash = null, actor_type = "system", actor_id = null, payload = {} } = {}) {
@@ -224,13 +234,16 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     return result;
   }
   async function validateDocuments(db, companyId, content, values = null) {
+    if (content.show_agreement === false || content.agreement_mode === "text") {
+      if (content.require_page_signature === false) problem("agreement_page_signature_required", "A customer-page signature is required unless the selected agreement PDF has a required customer signature.");
+      return [];
+    }
     const docs = [];
     for (const doc of content.documents) {
       const asset = (await db.query(`SELECT id,name,pages,normalized_bytes,normalized_sha256 FROM agreement_assets WHERE id=$1 AND company_id=$2`, [doc.asset_id, companyId])).rows[0];
       if (!asset) problem("agreement_asset_not_found", "A contract PDF is unavailable in this company.", 404);
       const fields = normalizeAgreementFields(doc.fields, asset.pages);
       if (fields.some((field) => field.role !== "staff" && !content.required_signers.includes(field.role))) problem("agreement_signer_role_unconfigured", "Every document signer role must be included in the agreement's required signers.");
-      if (!fields.some((field) => field.type === "signature" && field.role === "customer" && field.required)) problem("agreement_pdf_signature_required", "Place a required customer signature field on each signing PDF.");
       const prefills = {};
       if (values) {
         for (const field of fields) {
@@ -252,6 +265,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       }
       docs.push({ asset_id: asset.id, name: asset.name, pages: asset.pages, sha256: asset.normalized_sha256, fields, prefilled_values: prefills });
     }
+    if (content.require_page_signature === false && !docs.some(doc => doc.fields.some(field => field.type === "signature" && field.role === "customer" && field.required))) problem("agreement_pdf_signature_required", "Place a required customer signature on the agreement PDF before turning off the customer-page signature.");
     const allIDs=docs.flatMap(document=>document.fields.map(field=>field.id));
     if(new Set(allIDs).size!==allIDs.length)problem("agreement_field_id_collision","Use unique field IDs across the entire document packet.");
     return docs;
@@ -306,7 +320,9 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       if (plansEnabled && !service.plansReady) problem("agreement_plans_not_ready", "Customer plan enrollment is not ready. Finish plan integration before enabling offers.", 409);
       if (!quoteId && !(content.show_agreement && content.agreement_text.trim()) && !content.documents.length) problem("standalone_agreement_content_required", "Add agreement text or a contract PDF before publishing a standalone agreement.");
       if (!content.consent_text.trim()) problem("agreement_consent_required", "Configure the electronic signing consent wording in Quotes & Contracts.");
-      if (!content.show_agreement) content.agreement_text = "";
+      if (!content.show_agreement || content.agreement_mode === "pdf") content.agreement_text = "";
+      if (!content.show_agreement || content.agreement_mode === "text") content.documents = [];
+      content.terms_text = "";
       if (!content.show_terms) { content.terms_text = ""; content.terms_asset_id = null; }
       const termsAsset = content.terms_asset_id ? (await db.query(`SELECT id,name,normalized_sha256,normalized_bytes FROM agreement_assets WHERE id=$1 AND company_id=$2`, [content.terms_asset_id, req.companyId])).rows[0] : null;
       if (content.terms_asset_id && !termsAsset) problem("agreement_terms_missing", "The Terms & Conditions PDF is unavailable in this company.", 404);
@@ -315,6 +331,17 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         predecessor=await service.loadStaff(db,req,uuid(raw.predecessor_id),true);
         if(predecessor.quote_id||predecessor.snapshot.kind!=='standalone'||predecessor.contact_id!==quote.contact_id)problem('agreement_revision_mismatch','Choose a standalone agreement for this customer.',409);
         if((await db.query('SELECT 1 FROM quote_agreements WHERE predecessor_id=$1 LIMIT 1',[predecessor.id])).rowCount)problem('agreement_revision_changed','A newer revision exists. Open it before preparing another replacement.',409);
+      }
+      if (raw.predecessor_id && predecessor?.id !== uuid(raw.predecessor_id)) problem("agreement_revision_changed", "A newer quote revision exists. Reload it before revising.", 409);
+      if (!preview && quote.id && service.paymentSummary && predecessor) {
+        const payments = await service.paymentSummary(db, predecessor);
+        if (payments?.active_checkout) problem("agreement_checkout_pending", "Resolve or cancel the current checkout before revising this quote. Its payment result must be preserved.", 409);
+      }
+      let suppliedQuotePDF = null;
+      if (!preview && quote.id && raw.quote_pdf_base64 != null) {
+        if (typeof raw.quote_pdf_base64 !== "string" || raw.quote_pdf_base64.length > 14000000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw.quote_pdf_base64)) problem("quote_pdf_invalid", "The quote PDF could not be prepared. Try creating the link again.");
+        suppliedQuotePDF = Buffer.from(raw.quote_pdf_base64, "base64");
+        await validateAndNormalizeAgreementPDF(suppliedQuotePDF, { allowSanitize: false });
       }
       let number = predecessor?.number;
       if (!number) number = String((await db.query(`INSERT INTO agreement_number_sequences(company_id,last_number) VALUES($1,1) ON CONFLICT(company_id) DO UPDATE SET last_number=agreement_number_sequences.last_number+1 RETURNING last_number`, [req.companyId])).rows[0].last_number);
@@ -325,6 +352,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       values.billing_address=options.billing_address||contact.address;
       const snapshot = {
         kind: quoteId ? "quote" : "standalone",
+        ...(suppliedQuotePDF ? { quote_pdf_sha256: agreementBytesHash(suppliedQuotePDF), quote_pdf_source: "client_export" } : {}),
         title: quote.title || "Quote", number, revision: (predecessor?.revision || 0) + 1, issued_at: issuedAt, expires_at: new Date(expires).toISOString(),
         business: { name: values.business_name || "", address: settings.company_address || "", phone: settings.phone || settings.company_phone || "", email: settings.email || settings.company_email || "", logo_data_url: content.branding.show_logo ? settings.company_logo_data_url || "" : "" },
         customer: { name: contact.name || "", address: contact.address || "", billing_address:values.billing_address||"", phone: content.show_customer_phone ? contact.phone : null, email: content.show_customer_email ? contact.email : null },
@@ -365,17 +393,25 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
           packet.push(termsAsset ? await combineAgreementPDFs([cover, termsAsset.normalized_bytes]) : cover);
         }
         const pdf = await combineAgreementPDFs(packet);
-        return { snapshot: safeSnapshot, packet_hash: quoteContentHash(snapshot), preview_hash: previewHash, quote_updated_at: quote.updated_at, pdf_base64: pdf.toString("base64"), validation: { ready: true, number_is_preview: true } };
+        const exportPayload = quoteId ? {
+          settings: { ...settings, company_name: snapshot.business.name, company_logo_data_url: snapshot.business.logo_data_url,
+            phone: snapshot.business.phone, email: snapshot.business.email, notes: "", valid_for_days: content.validity_days || settings.valid_for_days },
+          contact: { id: quote.contact_id, name: snapshot.customer.name, address: snapshot.customer.address, phone: snapshot.customer.phone || "", email: snapshot.customer.email || "" },
+          quote: { ...quote, quote_options: options, notes: "", expires_at: snapshot.expires_at }, pricing,
+        } : null;
+        return { quote_export_payload: exportPayload, snapshot: safeSnapshot, packet_hash: quoteContentHash(snapshot), preview_hash: previewHash, quote_updated_at: quote.updated_at, pdf_base64: pdf.toString("base64"), validation: { ready: true, number_is_preview: true } };
       }
       const row = (await db.query(`INSERT INTO quote_agreements(id,company_id,quote_id,contact_id,created_by,number,revision,predecessor_id,request_id,title,snapshot,packet_hash,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13) RETURNING *`, [id, req.companyId, quote.id, quote.contact_id, req.userId, number, snapshot.revision, predecessor?.id || null, requestId, snapshot.title, safeJSON(snapshot), quoteContentHash(snapshot), expires])).rows[0];
-      await db.query(`UPDATE quote_agreements SET publication_request_hash=$2 WHERE id=$1`, [id, publicationRequestHash]);
-      const pdf = await generateQuoteAgreementPDF(snapshot, { customer_url: customerURL(row) });
+      row.link_root_id = predecessor?.link_root_id || predecessor?.id || row.id;
+      row.token_generation = predecessor?.token_generation || 1;
+      await db.query(`UPDATE quote_agreements SET publication_request_hash=$2,link_root_id=$3,token_generation=$4 WHERE id=$1`, [id, publicationRequestHash, row.link_root_id, row.token_generation]);
+      const pdf = suppliedQuotePDF || await generateQuoteAgreementPDF(snapshot, { customer_url: customerURL(row) });
       await storeArtifact(db, id, "quote", pdf);
       if (snapshot.terms_text || termsAsset) {
         const cover = await generateQuoteAgreementPDF({ ...snapshot, title: "Terms & Conditions", pricing: null, agreement_text: "", public_notes: "", scope_exclusions: "", documents: [], consent_text: "" }, { customer_url: customerURL(row) });
-        await storeArtifact(db, id, "terms", termsAsset ? await combineAgreementPDFs([cover, termsAsset.normalized_bytes]) : cover);
+        await storeArtifact(db, id, "terms", termsAsset ? termsAsset.normalized_bytes : cover);
       }
-      if (predecessor && !predecessor.signed_at) await db.query(`UPDATE quote_agreements SET decision='superseded',updated_at=now() WHERE id=$1`, [predecessor.id]);
+      if (predecessor) await db.query(`UPDATE quote_agreements SET decision='superseded',updated_at=now() WHERE id=$1`, [predecessor.id]);
       await event(db, id, "link_created", { actor_type: "staff", actor_id: req.userId, payload: { revision: row.revision, predecessor_id: row.predecessor_id } });
       return detail(db, row, { staff: true });
     }, { rollback: preview });
@@ -436,11 +472,13 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       if (raw.consent !== true) problem("agreement_consent_required", "Affirm electronic signing consent before submitting.");
       const name = quoteText(raw.printed_name, "Printed signer name", 200).trim();
       if ([...name].filter(letter => /[\p{L}\p{N}]/u.test(letter)).length < 2) problem("agreement_signer_name_required", "Enter your printed name.");
-      const signature = validateAgreementSignature(raw.signature, { requireDrawn: !staffReq }), submittedAt = new Date().toISOString();
-      await validateAgreementSignerText(name,signature);
+      const submittedAt = new Date().toISOString();
       const fields = row.snapshot.documents.flatMap((doc) => doc.fields);
       if (new Set(fields.map((field) => field.id)).size !== fields.length) problem("agreement_field_id_collision", "The document packet has duplicate field IDs. Ask the business to correct the template.", 409);
       const fieldValues = validateAgreementSubmission(fields, raw.values || {}, { role, printed_name: name, submitted_at: submittedAt, require_drawn: !staffReq });
+      const pdfSignature = row.snapshot.require_page_signature === false ? fields.find(field => field.role === role && field.type === "signature" && field.required && fieldValues[field.id]) : null;
+      const signature = validateAgreementSignature(raw.signature ?? (pdfSignature ? fieldValues[pdfSignature.id] : null), { requireDrawn: !staffReq });
+      await validateAgreementSignerText(name, signature);
       // Validate actual layout before final execution; artifact rendering after
       // this point may retry from immutable values without seeking a new signature.
       for (const doc of row.snapshot.documents) {
@@ -551,6 +589,8 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
     next();
   };
 
+  installAgreementDraftRoutes({ app, pool, staff, wrap });
+
   app.get("/api/agreements/settings", ...staff("quotes.view"), wrap(async (req, res) => {
     const row = (await pool.query(`SELECT * FROM agreement_settings WHERE company_id=$1`, [req.companyId])).rows[0];
     res.json({ content: normalizeAgreementContent(row?.content), version: row?.version || 0, merge_fields: AGREEMENT_MERGE_FIELDS, link_ready: Boolean(env.QUOTE_LINK_SECRET?.length >= 32 && env.QUOTE_PUBLIC_BASE_URL) });
@@ -597,13 +637,13 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
     const name = quoteText(req.body.name, "Template name", 200).trim();
     if (!name) problem("agreement_template_name_required", "Name this template.");
     await service.validateDocuments(pool, req.companyId, content);
-    const row = await transaction(pool, async (db) => {
+    const row = await transaction(pool, async (db) => authoringRequest(db, req, "template", req.body, async () => {
       await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, [`agreement-template:${id}`]);
       const prior = (await db.query(`SELECT company_id,version,archived_at FROM agreement_templates WHERE template_id=$1 ORDER BY version DESC LIMIT 1`, [id])).rows[0];
       if (prior?.archived_at) problem("agreement_template_archived", "This template was archived. Save a new template instead.", 409);
       if (prior && (prior.company_id !== req.companyId || prior.version !== req.body.expected_version)) problem("agreement_template_changed", "Template unavailable or changed. Reload before saving.", 409);
       return (await db.query(`INSERT INTO agreement_templates(template_id,version,company_id,name,content,created_by) VALUES($1,$2,$3,$4,$5::jsonb,$6) RETURNING *`, [id, (prior?.version || 0) + 1, req.companyId, name, safeJSON(content), req.userId])).rows[0];
-    });
+    }));
     const defaults = (await pool.query("SELECT default_template_id FROM agreement_settings WHERE company_id=$1", [req.companyId])).rows[0];
     res.status(201).json({ ...row, is_default: defaults?.default_template_id === row.template_id });
   }));
@@ -612,7 +652,7 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
     if (!name || typeof req.body.base64 !== "string" || req.body.base64.length > 14_000_000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(req.body.base64)) problem("agreement_pdf_invalid", "Choose a valid PDF up to 10 MB and provide its name.");
     const bytes = Buffer.from(req.body.base64, "base64"), pdf = await validateAndNormalizeAgreementPDF(bytes), id = randomUUID();
     await pool.query(`INSERT INTO agreement_assets(id,company_id,name,original_bytes,normalized_bytes,source_sha256,normalized_sha256,pages,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, [id, req.companyId, name, bytes, pdf.normalized, pdf.source_sha256, pdf.normalized_sha256, safeJSON(pdf.pages), req.userId]);
-    res.status(201).json({ id, name, pages: pdf.pages, sha256: pdf.normalized_sha256 });
+    res.status(201).json({ id, name, pages: pdf.pages, sha256: pdf.normalized_sha256, removed_features: pdf.removed_features });
   }));
   app.get("/api/agreements/assets/:id", ...staff("quotes.view"), wrap(async (req, res) => {
     const row = (await pool.query(`SELECT normalized_bytes FROM agreement_assets WHERE id=$1 AND company_id=$2`, [uuid(req.params.id), req.companyId])).rows[0];
@@ -672,7 +712,7 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
     const output = (await pool.query(`SELECT id,bytes,sha256 FROM agreement_artifacts WHERE agreement_id=$1 AND kind=$2`, [row.id, kind])).rows[0];
     if (output) {
       let bytes=output.bytes;
-      if(publicAccess&&(role!=='customer'||row.token_generation!==1)){
+      if(publicAccess && !(kind === "quote" && row.snapshot.quote_pdf_source === "client_export") && (role!=='customer'||row.token_generation!==1)){
         const cached=(await pool.query('SELECT bytes FROM agreement_artifact_deliveries WHERE artifact_id=$1 AND role=$2 AND token_generation=$3',[output.id,role,row.token_generation])).rows[0];
         if(cached)bytes=cached.bytes;
         else{
@@ -683,7 +723,7 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
           }
         }
       }
-      return res.type("application/pdf").set("Content-Disposition", `inline; filename="estimate-${row.number}-${kind}.pdf"`).send(bytes);
+      return res.type("application/pdf").set("Content-Disposition", `inline; filename="quote-${row.number}-${kind}.pdf"`).send(bytes);
     }
     if (assetId) {
       const doc = row.snapshot.documents.find((item) => item.asset_id === assetId);

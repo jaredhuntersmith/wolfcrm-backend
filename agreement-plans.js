@@ -1,3 +1,4 @@
+import { authoringRequest } from "./agreement-authoring.js";
 import { randomUUID } from 'node:crypto';
 import { QuoteContractError, quoteContentHash, quoteText } from './quote-contract-domain.js';
 import { normalizePlanTier, buildPlanOffer, advancePlanDate } from './agreement-plans-domain.js';
@@ -97,7 +98,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
   }
   async function saveTier(req, raw) {
     const configuration = normalizePlanTier(raw.configuration), tierID = raw.tier_id ? id(raw.tier_id) : randomUUID();
-    return txn(pool, async (db) => {
+    return txn(pool, async (db) => authoringRequest(db, req, "tier", raw, async () => {
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`plan-tier:${tierID}`]);
       const prior = (await db.query('SELECT * FROM service_plan_tiers WHERE tier_id=$1 ORDER BY version DESC LIMIT 1', [tierID])).rows[0];
       if (prior && (prior.company_id !== req.companyId || prior.version !== raw.expected_version)) fail('plan_tier_changed', 'This tier changed or is unavailable. Reload before saving.');
@@ -107,7 +108,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       }
       await service.validateDocuments(db, req.companyId, configuration.agreement);
       return (await db.query('INSERT INTO service_plan_tiers(tier_id,version,company_id,configuration,created_by) VALUES($1,$2,$3,$4::jsonb,$5) RETURNING *', [tierID, (prior?.version || 0) + 1, req.companyId, JSON.stringify(configuration), req.userId])).rows[0];
-    });
+    }));
   }
   async function offers(db, row) {
     if (!row.snapshot.offer_service_plans || !row.snapshot.pricing || row.snapshot.kind === 'plan' || row.revoked_at || ['declined', 'superseded'].includes(row.decision)) return [];
