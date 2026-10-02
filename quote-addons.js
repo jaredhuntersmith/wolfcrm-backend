@@ -14,7 +14,10 @@ export async function selectedQuoteScheduleScope(db,{companyId,quoteId,previous,
   if (!companyId || !(quoteId || previous?.agreement_id)) return null;
   if (!(await db.query("SELECT to_regclass('quote_agreements') IS NOT NULL AS present")).rows[0].present) return null;
   const targetQuote = previous?.quote_id || quoteId;
-  if (targetQuote) await db.query("SELECT id FROM quotes WHERE id=$1 FOR UPDATE",[targetQuote]);
+  if (targetQuote) {
+    const quote = (await db.query("SELECT id,deleted_at FROM quotes WHERE id=$1 AND company_id=$2 FOR UPDATE",[targetQuote,companyId])).rows[0];
+    if (!quote || (quote.deleted_at && previous?.quote_id !== targetQuote)) fail("quote_not_found", "This quote was removed. Select an active quote for new work.", 404);
+  }
   const row = previous?.agreement_id
     ? (await db.query("SELECT * FROM quote_agreements WHERE id=$1 AND company_id=$2",[previous.agreement_id,companyId])).rows[0]
     : (await db.query("SELECT * FROM quote_agreements WHERE quote_id=$1 AND company_id=$2 ORDER BY revision DESC LIMIT 1",[quoteId,companyId])).rows[0];

@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import net from "net";
 import { removeQuote } from "./quote-removal.js";
 import { markGoogleSheetsContactDirty } from "./google-sheets.js";
+import { lockCompanySchedule } from "./schedule-booking-guard.js";
 
 const AUTOMATION_LIMITS = {
   maxNodesPerRun: 5000,
@@ -8108,7 +8109,10 @@ async function executeJobCreate(run, node, config, scopeKey = "root", { sourceQu
   const id = randomUUID();
   const title = resolveTemplate(config.title || "Automation job", context);
   const start = resolveDateExpression(config.start_at || config.start || "", context) || new Date();
-  const end = resolveDateExpression(config.end_at || config.end || "", context) || new Date(start.getTime() + 3600000);
+  // The shared expression parser treats an empty expression as now. An omitted
+  // end must instead use the job's default duration, not create a zero interval.
+  const endExpression = config.end_at || config.end;
+  const end = (endExpression ? resolveDateExpression(endExpression, context) : null) || new Date(start.getTime() + 3600000);
   const contactId = config.contact_id ? resolveTemplate(config.contact_id, context) : (run.subject_type === "contact" ? run.subject_id : null);
   if (contactId) await validateSubject(run.company_id, "contact", contactId);
   const sales = await resolveCompanyUsers(run.company_id, config.sales_user_ids || [owner]);
@@ -8125,6 +8129,9 @@ async function executeJobCreate(run, node, config, scopeKey = "root", { sourceQu
     const db = await ctx.pool.connect();
     try {
       await db.query("BEGIN");
+      // Staff scheduling takes the company lock before the quote row. Keep the
+      // same order before the shared Schedule trigger takes this lock again.
+      await lockCompanySchedule(db, run.company_id);
       const active = (await db.query("SELECT updated_at FROM quotes WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL FOR UPDATE", [sourceQuote.id, run.company_id])).rows[0];
       if (!active) throw new Error("quote_not_found");
       if (new Date(active.updated_at).getTime() !== new Date(sourceQuote.updated_at).getTime()) throw new Error("quote_changed");

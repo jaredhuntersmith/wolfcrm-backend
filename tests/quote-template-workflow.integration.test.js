@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { startLocalPostgres } from './helpers/local-postgres.js';
 import { drawnSignature } from './helpers/signatures.js';
 import { installAgreementSystem } from '../quote-agreements.js';
+import { selectedQuoteScheduleScope } from '../quote-addons.js';
 import { validateAgreementSignature } from '../quote-agreement-documents.js';
 
 test('template defaults, persisted overrides, visibility, drawing and removal work against PostgreSQL', {timeout:120000}, async t => {
@@ -83,6 +84,7 @@ test('template defaults, persisted overrides, visibility, drawing and removal wo
       assert.equal((await request('/api/quotes')).body.some(row=>row.id===saved.id),false);
       assert.equal((await request(`/api/quotes/${saved.id}`,{method:'PUT',body:{title:'Bring it back'}})).status,404);
       assert.equal((await request(`/api/quotes/${saved.id}/preview`,{method:'POST',body:{}})).status,404);
+      await assert.rejects(selectedQuoteScheduleScope(pool,{companyId:company,quoteId:saved.id,start:new Date(),end:new Date(Date.now()+5400000)}),error=>error.code==='quote_not_found');
       assert.equal((await request(`/api/public/agreements/${issued.customer_url.split('/').at(-1)}`,{token:null})).status,200);
       assert.deepEqual((await pool.query('SELECT packet_hash,snapshot FROM quote_agreements WHERE id=$1',[issued.id])).rows[0],before);
       assert.equal((await pool.query("SELECT count(*)::int n FROM agreement_events WHERE agreement_id=$1 AND type='quote_removed'",[issued.id])).rows[0].n,1);
