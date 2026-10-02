@@ -129,7 +129,7 @@ export function createAgreementPayments({ pool, service, getStripe = service.get
     const attempts = (await db.query(`SELECT id,payment_record_id,kind,state,transport FROM agreement_payment_attempts WHERE company_id=$1 AND collection_key=$2 AND state=ANY($3::text[]) ORDER BY created_at DESC`, [row.company_id, scopeKey(row), activeStates])).rows;
     if (attempts.some((attempt) => attempt.state === "review")) review = true;
     const roles = (await db.query("SELECT role FROM agreement_signatures WHERE agreement_id=$1", [row.id])).rows.map((signature) => signature.role);
-    const signed = row.snapshot.required_signers.every((role) => roles.includes(role));
+    const signed = row.snapshot.required_signers.every((role) => roles.includes(role)) && (!service.planQuoteReady || await service.planQuoteReady(db,row));
     return { total_cents: total, original_total_cents: originalTotal, adjustment_cents: adjustment.discount_cents, adjustment_ids: adjustment.adjustment_ids, gross_paid_cents: gross, refunded_cents: refunds, paid_cents: paid,
       balance_cents: Math.max(0, total - paid), credit_cents: Math.max(0, paid - total), deposit_due_cents: Math.max(0, deposit - paid),
       payment_review_required: review, processing: attempts.some((attempt) => attempt.state === "processing"), receipts,
@@ -152,6 +152,7 @@ export function createAgreementPayments({ pool, service, getStripe = service.get
       const roles = (await db.query("SELECT role FROM agreement_signatures WHERE agreement_id=$1", [row.id])).rows.map((signature) => signature.role);
       if (!row.snapshot.required_signers.every((role) => roles.includes(role))) fail("payment_signatures_required", "Complete all required signatures before payment.");
       if (row.revoked_at || ["declined", "superseded"].includes(row.decision)) fail("payment_agreement_unavailable", "This estimate is no longer available for payment. Contact the business.");
+      if (service.planQuoteReady && !(await service.planQuoteReady(db,row))) fail("plan_setup_required", "Complete your service-plan enrollment and card setup before paying for this job.");
       if (summary.payment_review_required) fail("payment_adjustment_review_required", "A payment adjustment needs the business's review before another charge.");
       if (kind === "balance" && summary.balance_cents > 0 && !summary.can_pay_balance) fail("payment_balance_not_due", "The remaining balance is not yet available for payment.");
       const amount = kind === "deposit" ? Math.min(summary.deposit_due_cents, summary.balance_cents) : summary.balance_cents;

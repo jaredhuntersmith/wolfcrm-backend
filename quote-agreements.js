@@ -191,6 +191,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     result.addon_selection_required = Boolean(row.snapshot.optional_addons?.length && row.snapshot.addon_selection_finalized !== true);
     result.can_decide = result.can_sign && roles.length === 0;
     if (result.addon_selection_required) { result.can_sign = false; result.can_checkout = false; result.can_view_availability = false; result.base_workflow_complete = false; }
+    if (service.planQuoteReady && !(await service.planQuoteReady(db,row))) { result.can_checkout=false; result.can_view_availability=false; result.base_workflow_complete=false; }
     return result;
   }
   async function detail(db, row, { staff = false, includeActivity = false, publicRole = null } = {}) {
@@ -311,7 +312,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       const mergedContent = { ...contentSource, ...(raw.content || {}) };
       // Older clients attach PDFs without knowing the text/PDF mode field.
       if (raw.content?.documents && raw.content.agreement_mode == null) mergedContent.agreement_mode = raw.content.documents.length ? "pdf" : "text";
-      const content = normalizeAgreementContent(mergedContent);
+      let content = normalizeAgreementContent(mergedContent);
       // Legacy drafts retain their explicitly saved commercial settings until a
       // template is deliberately chosen. New drafts already hold a frozen selection.
       const useTemplateDefaults = !!savedTemplate || !!raw.template_id || raw.content?.quote_defaults != null;
@@ -322,7 +323,9 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       validateQuoteAddonScope(quote.line_items, options);
       await assertQuoteReferences(db,req,{contact_id:quote.contact_id,line_items:[...quote.line_items,...options.optional_addons],existing_lines:[...quote.line_items,...options.optional_addons]});
       if (quoteId && !options.duration_minutes) problem("quote_duration_required", "Enter the estimated job duration before publishing this quote.");
-      const pricing = calculateQuotePricing({ line_items: quote.line_items, tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0, tax_inclusive:settings.tax_inclusive??false,discount:options.discount,deposit: options.deposit });
+      let pricing = calculateQuotePricing({ line_items: quote.line_items, tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0, tax_inclusive:settings.tax_inclusive??false,discount:options.discount,deposit: options.deposit });
+      const planQuote = content.plan_tier_id && service.preparePlanQuote ? await service.preparePlanQuote(db, req, {quote,content,pricing,options,settings}) : null;
+      if (planQuote) { pricing=planQuote.pricing; content=planQuote.content; }
       if (options.optional_addons.length) calculateQuotePricing({line_items:[...quote.line_items,...options.optional_addons],tax_rate_basis_points:pricing.tax_rate_basis_points,tax_inclusive:pricing.tax_inclusive,discount:options.discount,deposit:options.deposit});
       if (quoteId && !pricing.line_items.length) problem("quote_lines_required", "Add the actual service scope before publishing.");
       // Publication of dependent features is gated by implementation readiness,
@@ -373,8 +376,9 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         business: { name: values.business_name || "", address: settings.company_address || "", phone: settings.phone || settings.company_phone || "", email: settings.email || settings.company_email || "", logo_data_url: content.branding.show_logo ? settings.company_logo_data_url || "" : "" },
         customer: { name: contact.name || "", address: contact.address || "", billing_address:values.billing_address||"", phone: content.show_customer_phone ? contact.phone : null, email: content.show_customer_email ? contact.email : null },
         pricing: quoteId ? pricing : null, ...options, ...content, template: templateRef,
+        ...(planQuote ? {plan_quote:planQuote.offer,financial_text:planQuote.offer.financial_text} : {}),
         discount_stacking_policy:settings.discount_stacking_policy||"best_price",tax_provenance:{source:"business_settings",settings_updated_at:settings.updated_at??null,tax_rate_basis_points:pricing.tax_rate_basis_points,tax_inclusive:pricing.tax_inclusive},
-        allow_customer_booking:bookingEnabled,offer_service_plans:plansEnabled,
+        allow_customer_booking:bookingEnabled,offer_service_plans:planQuote ? false : plansEnabled,
         scope_exclusions:"",
         agreement_text: resolveAgreementText(content.agreement_text, values), terms_text: resolveAgreementText(content.terms_text, values), consent_text: resolveAgreementText(content.consent_text, values),
         documents: await validateDocuments(db, req.companyId, content, values),
@@ -388,7 +392,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       if (snapshot.quote_position === "excluded") snapshot.scope_reference_hash = quoteContentHash({ number, revision: snapshot.revision, pricing: snapshot.pricing, public_notes: snapshot.public_notes, scope_exclusions: snapshot.scope_exclusions });
       const previewHash = quoteContentHash({
         quote: { id: quote.id, contact_id: quote.contact_id, title: quote.title, line_items: quote.line_items, options, expires_at: quote.expires_at || null, updated_at: quote.updated_at },
-        contact, settings, content, template: templateRef,
+        contact, settings, content, template: templateRef, plan_quote:planQuote?.offer ?? null,
         documents: snapshot.documents.map(({ prefilled_values, ...document }) => document), terms_document: snapshot.terms_document,
       });
       if (!preview && !raw.expected_preview_hash) problem("agreement_preview_required", "Prepare and review the exact preview before creating the customer link.", 409);
@@ -418,6 +422,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         return { quote_export_payload: exportPayload, snapshot: safeSnapshot, packet_hash: quoteContentHash(snapshot), preview_hash: previewHash, quote_updated_at: quote.updated_at, pdf_base64: pdf.toString("base64"), validation: { ready: true, number_is_preview: true } };
       }
       const row = (await db.query(`INSERT INTO quote_agreements(id,company_id,quote_id,contact_id,created_by,number,revision,predecessor_id,request_id,title,snapshot,packet_hash,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13) RETURNING *`, [id, req.companyId, quote.id, quote.contact_id, req.userId, number, snapshot.revision, predecessor?.id || null, requestId, snapshot.title, safeJSON(snapshot), quoteContentHash(snapshot), expires])).rows[0];
+      if (service.createPlanQuoteEnrollment) await service.createPlanQuoteEnrollment(db,row);
       row.link_root_id = quoteId ? predecessor?.link_root_id || predecessor?.id || row.id : row.id;
       row.token_generation = quoteId ? predecessor?.token_generation || 1 : 1;
       await db.query(`UPDATE quote_agreements SET publication_request_hash=$2,link_root_id=$3,token_generation=$4 WHERE id=$1`, [id, publicationRequestHash, row.link_root_id, row.token_generation]);

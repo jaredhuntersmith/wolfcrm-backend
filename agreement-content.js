@@ -27,6 +27,7 @@ export function normalizeAgreementContent(raw = {}) {
   if (!["text", "pdf"].includes(agreementMode)) problem("agreement_mode_invalid", "Choose written text or PDF for the agreement.");
   const requirePageSignature = raw.require_page_signature == null ? true : boolean("require_page_signature");
   return {
+    plan_tier_id: raw.plan_tier_id ? uuid(raw.plan_tier_id) : null,
     agreement_mode: agreementMode, require_page_signature: requirePageSignature,
     agreement_text: quoteText(raw.agreement_text, "Agreement text", 100000),
     terms_text: "", // Newly edited terms are an uploaded PDF; issued historical snapshots are untouched.

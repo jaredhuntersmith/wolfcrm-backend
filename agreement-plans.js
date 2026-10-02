@@ -1,3 +1,4 @@
+import { installPlanQuotePublication } from "./plan-quote-publication.js";
 import { authoringRequest } from "./agreement-authoring.js";
 import { randomUUID } from 'node:crypto';
 import { QuoteContractError, quoteContentHash, quoteText } from './quote-contract-domain.js';
@@ -221,7 +222,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
                 config.billing.interval.count, config.service_interval.unit, config.service_interval.count, offer.next_service_date, offer.future_visit.line_items.map((line) => `${line.qty} × ${line.name}: ${line.description}`).join('\n'), 'Signed plan enrollment; see linked agreement for the preserved terms.', enrollment.id, JSON.stringify(offer), config.billing.mode, offer.future_visit_count, enrollment.connected_account_id, enrollment.stripe_customer_id])).rows[0];
               const count = offer.future_visit_count === null ? 1 : offer.future_visit_count;
               for (let visit = 0; visit < count; visit++) await db.query('INSERT INTO agreement_plan_visits(id,enrollment_id,service_plan_id,sequence,due_date) VALUES($1,$2,$3,$4,$5)', [randomUUID(), enrollment.id, membershipID, visit + 1, advancePlanDate(offer.next_service_date, config.service_interval, visit)]);
-              if (offer.current_adjustment_cents > 0) await db.query(`INSERT INTO agreement_quote_adjustments(id,company_id,collection_key,base_agreement_id,enrollment_id,discount_cents,original_total_cents,adjusted_total_cents,signed_agreement_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [randomUUID(), enrollment.company_id, enrollment.collection_key, base.id, enrollment.id, offer.current_adjustment_cents, offer.original_total_cents, offer.current_total_cents, planAgreement.id]);
+              if (offer.current_adjustment_cents > 0 && !offer.price_in_quote) await db.query(`INSERT INTO agreement_quote_adjustments(id,company_id,collection_key,base_agreement_id,enrollment_id,discount_cents,original_total_cents,adjusted_total_cents,signed_agreement_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [randomUUID(), enrollment.company_id, enrollment.collection_key, base.id, enrollment.id, offer.current_adjustment_cents, offer.original_total_cents, offer.current_total_cents, planAgreement.id]);
               await db.query(`INSERT INTO service_plan_events(user_id,company_id,created_by_user_id,service_plan_id,contact_id,event_type,notes) VALUES($1,$2,$3,$4,$5,'created','Activated from a separately signed plan enrollment')`, [owner,enrollment.company_id,base.created_by,membershipID,enrollment.contact_id]);
               await db.query(`UPDATE agreement_plan_enrollments SET service_plan_id=$2,state='active',activated_at=now(),updated_at=now() WHERE id=$1`, [enrollment.id,membershipID]);
               await db.query('UPDATE payment_records SET service_plan_id=$2 WHERE enrollment_id=$1',[enrollment.id,membershipID]);
@@ -340,6 +341,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
 export async function installAgreementPlans({ app, pool, service, authRequired, requireCapability, onPlanActivated, startWorker = true, ...options }) {
   await installAgreementPlanSchema(pool);
   const plans = createAgreementPlans({ pool, service, onPlanActivated, ...options });
+  installPlanQuotePublication(service, plans.supportedBillingModes);
   service.plansReady = true; service.planSummary = plans.summary; service.paymentAdjustmentSummary = plans.paymentAdjustmentSummary;
   service.planFollowupContext = plans.followupContext;
   const wrap = (fn) => async (req,res) => { res.set({ 'Cache-Control':'private, no-store','Referrer-Policy':'no-referrer' }); try { await fn(req,res); } catch(error) { if(error instanceof QuoteContractError) return res.status(error.status).json({error:error.code,message:error.message}); console.error('[plans] operation failed',{code:error.code||'internal'}); res.status(500).json({error:'plan_operation_failed',message:'The plan could not be updated. Your existing agreement remains saved.'}); } };

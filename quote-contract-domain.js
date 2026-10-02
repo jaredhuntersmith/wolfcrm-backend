@@ -241,10 +241,22 @@ export function calculatePlanOffer({ line_items, eligible_service_ids, tier, pay
   const eligibleTotal=signedEligible.reduce((sum,line)=>sum+quoteInteger(line.total_cents,"Signed line total"),0);
   // Exact allocated cents become one-unit calculation inputs only for the
   // incremental discount. The actual future scope retains its original qty.
-  const stacked=discount_stacking_policy==="quote_then_plan"?calculateQuotePricing({...pricingOptions,line_items:signedEligible.map(line=>({...line,qty:1,price_cents:quoteInteger(line.line_total_cents-line.discount_cents,"Remaining eligible line amount")})),discount:tier.discount}).total_cents:future.total_cents;
+  const stackedPricing=discount_stacking_policy==="quote_then_plan"?calculateQuotePricing({...pricingOptions,line_items:signedEligible.map(line=>({...line,qty:1,price_cents:quoteInteger(line.line_total_cents-line.discount_cents,"Remaining eligible line amount")})),discount:tier.discount}):future;
+  const stacked=stackedPricing.total_cents;
   const adjustment = tier.discount_first_visit === true ? Math.max(0,eligibleTotal-stacked) : 0;
   const currentTotal = original.total_cents - adjustment;
+  const currentLines = original.line_items.map(line => {
+    const replacement = adjustment > 0 ? stackedPricing.line_items.find(candidate => candidate.id === line.id) : null;
+    if (!replacement) return line;
+    const net = replacement.line_total_cents - replacement.discount_cents;
+    return { ...line, discount_cents: line.line_total_cents - net, tax_cents: replacement.tax_cents, total_cents: replacement.total_cents };
+  });
+  const currentPricing = { ...original, line_items: currentLines, total_cents: currentTotal,
+    discount_cents: currentLines.reduce((sum,line) => sum + line.discount_cents, 0),
+    tax_cents: currentLines.reduce((sum,line) => sum + line.tax_cents, 0),
+    balance_cents: Math.max(0,currentTotal-payments_cents), credit_cents: Math.max(0,payments_cents-currentTotal) };
   return {
+    current_pricing: currentPricing,
     eligible_line_ids: scoped.map((line) => line.id), future_visit: future,
     discount_stacking_policy, existing_quote_discount_cents: original.discount_cents,
     original_total_cents: original.total_cents, current_adjustment_cents: adjustment,
