@@ -468,11 +468,21 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
       if(action==="cancel")await db.query("UPDATE agreement_plan_enrollments SET cancellation_effective_at=$2,canceled_at=CASE WHEN $3=0 THEN now() ELSE NULL END,state=CASE WHEN $3=0 THEN 'canceled' ELSE 'cancellation_scheduled' END,updated_at=now() WHERE id=$1",[enrollment.id,effective,notice]);
       await db.query("INSERT INTO agreement_plan_lifecycle_requests(enrollment_id,request_id,action) VALUES($1,$2,$3)",[enrollment.id,requestID,action]);
       await db.query("INSERT INTO service_plan_events(user_id,company_id,created_by_user_id,service_plan_id,contact_id,event_type,notes) VALUES($1,$2,$3,$4,$5,$6,$7)",[plan.user_id,req.companyId,req.userId,plan.id,plan.contact_id,action==='pause'?'paused':action==='resume'?'resumed':notice?'cancellation_scheduled':'canceled',notice?`Cancellation effective ${effective.toISOString()}`:'Updated under the signed membership policy']);
-      await service.event(db,enrollment.base_agreement_id,`plan_${action}`,{actor_type:"staff",actor_id:req.userId,payload:{enrollment_id:enrollment.id,service_plan_id:plan.id,cancellation_effective_at:effective?.toISOString()||null}});
+      await service.event(db,enrollment.base_agreement_id,`plan_${action}`,{actor_type:req.actorType || "staff",actor_id:req.actorType === "customer" ? "customer" : req.userId,payload:{enrollment_id:enrollment.id,service_plan_id:plan.id,cancellation_effective_at:effective?.toISOString()||null}});
       return {plan:updated,enrollment:{...enrollment,canceled_at:action==='cancel'&&!notice?now():enrollment.canceled_at,cancellation_effective_at:effective}};
     });
     if(action==='cancel'&&result.enrollment.canceled_at)await stopUnpaidInvoices(result.enrollment,true);
     return {...result.plan,cancellation_effective_at:result.enrollment.cancellation_effective_at};
+  }
+  async function prepareReplacement(enrollment) {
+    if(!enrollment.snapshot.replaces || enrollment.service_plan_id || enrollment.canceled_at || enrollment.cancel_requested_at)return;
+    try { await gate(enrollment); } catch(error) { if(error.code === "plan_signatures_required")return; throw error; }
+    if(!(await prerequisites(pool,await load(enrollment.id))).ready)return;
+    const prior=(await pool.query("SELECT e.*,p.id AS membership_id FROM agreement_plan_enrollments e JOIN service_plans p ON p.id=e.service_plan_id WHERE e.id=$1 AND e.company_id=$2 AND e.contact_id=$3",[enrollment.snapshot.replaces.enrollment_id,enrollment.company_id,enrollment.contact_id])).rows[0];
+    if(!prior)fail("plan_replacement_unavailable","The membership being replaced needs business review.");
+    if(prior.canceled_at)return;
+    const plan=(await pool.query('SELECT * FROM service_plans WHERE id=$1',[prior.membership_id])).rows[0];
+    await changeMembership({companyId:enrollment.company_id,userId:plan.user_id,actorType:"customer"},plan,"cancel",{request_id:enrollment.id});
   }
   async function staffSummary(req,enrollmentID) {
     const enrollment=await load(enrollmentID);
@@ -540,7 +550,7 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
     }
     return{ready:true};
   }
-  return { begin, reconcileEnrollment, planActivationPrerequisites: prerequisites, billingSummary, handleWebhook, processDue, reconcileInvoice, changeMembership, beginStaff, staffSummary,followupContext,preparePendingCancellation };
+  return { begin, reconcileEnrollment, prepareReplacement, planActivationPrerequisites: prerequisites, billingSummary, handleWebhook, processDue, reconcileInvoice, changeMembership, beginStaff, staffSummary,followupContext,preparePendingCancellation };
 }
 
 export async function installAgreementPlanBilling({ app,pool,service,plans,getStripe=service.getStripe,env=service.env,authRequired,requireCapability,startWorker=true,now }) {
@@ -548,6 +558,7 @@ export async function installAgreementPlanBilling({ app,pool,service,plans,getSt
   const adapter = createAgreementPlanBilling({ pool,service,plans,getStripe,env,now });
   service.planActivationPrerequisites = adapter.planActivationPrerequisites;
   service.reconcilePlanBilling = adapter.reconcileEnrollment;
+  service.preparePlanReplacement = adapter.prepareReplacement;
   service.planBillingFollowupContext=adapter.followupContext;
   for (const mode of ["manual_per_visit","automatic_per_visit","calendar_installments","calendar_recurring","prepaid"]) if (!plans.supportedBillingModes.includes(mode)) plans.supportedBillingModes.push(mode);
   app.locals.agreementPlanBilling = adapter;

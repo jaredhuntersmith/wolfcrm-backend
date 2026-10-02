@@ -3,7 +3,7 @@ import { QuoteContractError, quoteContentHash, calculateQuotePricing, calculateP
 import { buildPlanOffer } from "./agreement-plans-domain.js";
 
 const fail = (code, message) => { throw new QuoteContractError(code, message, 409); };
-export function installPlanQuotePublication(service, supportedBillingModes) {
+export function installPlanQuotePublication(service, supportedBillingModes, plans) {
   service.preparePlanQuote = async (db, req, { quote, content, pricing, options, settings }) => {
     if (!content.plan_tier_id) return null;
     if (!quote.id) fail("plan_quote_scope_required", "Create a quote with the covered services before choosing a plan tier.");
@@ -16,8 +16,11 @@ export function installPlanQuotePublication(service, supportedBillingModes) {
     const company = (await db.query("SELECT timezone FROM companies WHERE id=$1", [req.companyId])).rows[0];
     const today = new Intl.DateTimeFormat("en-CA", {timeZone: company?.timezone || "America/New_York",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
     // Hidden tiers may be intentionally sent as direct plan quotes by staff.
-    const offer = buildPlanOffer({ agreement: { id:quote.id, packet_hash:quoteContentHash(pricing), snapshot:{pricing,discount_stacking_policy:settings.discount_stacking_policy} }, tier:{...tier,configuration:{...tier.configuration,visible:true}}, eligible_service_ids:catalog.map(row=>row.id), today });
+    let offer = buildPlanOffer({ agreement: { id:quote.id, packet_hash:quoteContentHash(pricing), snapshot:{pricing,discount_stacking_policy:settings.discount_stacking_policy} }, tier:{...tier,configuration:{...tier.configuration,visible:true}}, eligible_service_ids:catalog.map(row=>row.id), today });
     if (!offer) fail("plan_scope_required", "Add at least one saved service eligible for this plan tier.");
+    offer=await plans.withReplacement(db,{company_id:req.companyId,contact_id:quote.contact_id},offer);
+    if(!offer) fail("plan_already_current","This customer already has this tier. Use their existing membership for recurring visits.");
+    if(offer.switch_unavailable) fail("plan_switch_review_required",offer.switch_unavailable);
     const price = {...offer.current_pricing};
     const deposit = calculateQuotePricing({line_items:[{id:randomUUID(),name:"Plan quote",qty:1,price_cents:price.total_cents}],deposit:options.deposit}).deposit_cents;
     price.deposit_cents=deposit; price.balance_after_deposit_cents=price.total_cents-deposit;

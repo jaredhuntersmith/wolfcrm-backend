@@ -113,6 +113,23 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       return (await db.query('INSERT INTO service_plan_tiers(tier_id,version,company_id,configuration,created_by) VALUES($1,$2,$3,$4::jsonb,$5) RETURNING *', [tierID, (prior?.version || 0) + 1, req.companyId, JSON.stringify(configuration), req.userId])).rows[0];
     }));
   }
+  async function currentMemberships(db,row) {
+    const rows=(await db.query(`SELECT e.* FROM agreement_plan_enrollments e JOIN service_plans p ON p.id=e.service_plan_id
+      WHERE e.company_id=$1 AND e.contact_id=$2 AND e.canceled_at IS NULL AND p.status IN ('active','paused','past_due')
+      ORDER BY e.activated_at DESC,e.id`,[row.company_id,row.contact_id])).rows;
+    return rows;
+  }
+  async function withReplacement(db,row,offer) {
+    const existing=(await currentMemberships(db,row)).filter(enrollment=>enrollment.snapshot.future_visit.line_items.some(line=>offer.future_visit.line_items.some(candidate=>candidate.service_id===line.service_id)));
+    if(existing.length>1) return {...offer,switch_unavailable:'Multiple memberships cover these services. Ask the business to reconcile them before switching.'};
+    if(!existing.length)return offer;
+    const current=existing[0];
+    if(current.tier_id===offer.tier_id) return null;
+    const replacement={enrollment_id:current.id,plan_name:current.snapshot.configuration.name,cancellation_notice_days:current.snapshot.configuration.cancellation_notice_days || 0};
+    const financial_text=offer.financial_text+`\n\nThis replaces your ${replacement.plan_name} membership after the new agreement and payment requirements are completed and the current plan’s ${replacement.cancellation_notice_days}-day cancellation notice has elapsed. The current plan remains active until then. Existing appointments and amounts owed remain recorded; unused prepaid benefits and any policy credits require the business’s review. No automatic refund or duplicate renewal is created.`;
+    const result={...offer,replaces:replacement,financial_text};delete result.offer_hash;
+    return {...result,offer_hash:quoteContentHash(result)};
+  }
   async function offers(db, row) {
     if (!row.snapshot.offer_service_plans || !row.snapshot.pricing || row.snapshot.kind === 'plan' || row.revoked_at || ['declined', 'superseded'].includes(row.decision)) return [];
     const state = await service.state(db, row);
@@ -125,7 +142,8 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     const timezone = (await db.query('SELECT timezone FROM companies WHERE id=$1', [row.company_id])).rows[0]?.timezone || 'America/New_York';
     let today;
     try { today = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now()); } catch { today = now().toISOString().slice(0, 10); }
-    return (await tiers(db, row.company_id)).filter((tier) => supportedBillingModes.includes(tier.configuration.billing.mode)).map((tier) => buildPlanOffer({ agreement: row, tier, eligible_service_ids: catalog.map((item) => item.id), payments_cents: payments.paid_cents, today, serviced,prior_adjustment_cents:payments.adjustment_cents||0,initial_visit_already_counted:previouslyCounted })).filter(Boolean);
+    const offered=(await tiers(db, row.company_id)).filter((tier) => supportedBillingModes.includes(tier.configuration.billing.mode)).map((tier) => buildPlanOffer({ agreement: row, tier, eligible_service_ids: catalog.map((item) => item.id), payments_cents: payments.paid_cents, today, serviced,prior_adjustment_cents:payments.adjustment_cents||0,initial_visit_already_counted:previouslyCounted })).filter(Boolean);
+    return (await Promise.all(offered.map(offer=>withReplacement(db,row,offer)))).filter(Boolean);
   }
   async function load(db, row, enrollmentID, lock = false) {
     const result = (await db.query(`SELECT * FROM agreement_plan_enrollments WHERE id=$1 AND company_id=$2 AND (base_agreement_id=$3 OR plan_agreement_id=$3) ${lock ? 'FOR UPDATE' : ''}`, [id(enrollmentID), row.company_id, row.id])).rows[0];
@@ -152,9 +170,11 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`payment:${row.company_id}:${key(row)}`]);
       const priorRequest = (await db.query('SELECT * FROM agreement_plan_enrollments WHERE company_id=$1 AND request_id=$2', [row.company_id, requestID])).rows[0];
       if (priorRequest) { if (priorRequest.request_hash !== requestHash || priorRequest.base_agreement_id !== row.id) fail('plan_request_conflict', 'This enrollment request was already used for different terms.'); return detail(db, priorRequest); }
-      const existing = (await db.query('SELECT * FROM agreement_plan_enrollments WHERE company_id=$1 AND collection_key=$2 AND canceled_at IS NULL', [row.company_id, key(row)])).rows[0];
+      await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`plan-contact:${row.company_id}:${row.contact_id}`]);
+      const existing = (await db.query('SELECT * FROM agreement_plan_enrollments WHERE company_id=$1 AND contact_id=$2 AND service_plan_id IS NULL AND canceled_at IS NULL', [row.company_id, row.contact_id])).rows[0];
       if (existing) { if (existing.offer_hash !== raw.offer_hash) fail('plan_enrollment_exists', 'Resume or cancel the existing enrollment before choosing another tier.'); return detail(db, existing); }
       const offer = (await offers(db, row)).find((entry) => entry.tier_id === raw.tier_id && entry.tier_version === raw.tier_version);
+      if (offer?.switch_unavailable) fail('plan_switch_review_required',offer.switch_unavailable);
       if (!offer || offer.offer_hash !== raw.offer_hash) fail('plan_offer_changed', 'The eligible services, tier, payment balance or offer date changed. Review the current offer before signing.');
       const enrollmentID = randomUUID(), planAgreementID = randomUUID();
       const number = String((await db.query('INSERT INTO agreement_number_sequences(company_id,last_number) VALUES($1,1) ON CONFLICT(company_id) DO UPDATE SET last_number=agreement_number_sequences.last_number+1 RETURNING last_number', [row.company_id])).rows[0].last_number);
@@ -184,7 +204,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
         const cover = await generateQuoteAgreementPDF({ ...snapshot, title: 'Plan Terms & Conditions', agreement_text: '', documents: [], consent_text: '' }, { customer_url: service.customerURL(agreement) });
         await service.storeArtifact(db, agreement.id, 'terms', termsAsset ? termsAsset.normalized_bytes : cover);
       }
-      const enrollment = (await db.query(`INSERT INTO agreement_plan_enrollments(id,company_id,contact_id,base_agreement_id,plan_agreement_id,tier_id,tier_version,collection_key,request_id,request_hash,offer_hash,snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb) RETURNING *`, [enrollmentID, row.company_id, row.contact_id, row.id, planAgreementID, offer.tier_id, offer.tier_version, key(row), requestID, requestHash, offer.offer_hash, JSON.stringify(offer)])).rows[0];
+      const enrollment = (await db.query(`INSERT INTO agreement_plan_enrollments(id,company_id,contact_id,base_agreement_id,plan_agreement_id,tier_id,tier_version,collection_key,request_id,request_hash,offer_hash,snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb) RETURNING *`, [enrollmentID, row.company_id, row.contact_id, row.id, planAgreementID, offer.tier_id, offer.tier_version, offer.replaces ? `switch:${offer.replaces.enrollment_id}:${row.id}` : key(row), requestID, requestHash, offer.offer_hash, JSON.stringify(offer)])).rows[0];
       await service.event(db, row.id, 'plan_enrollment_started', { payload: { enrollment_id: enrollmentID, plan_agreement_id: planAgreementID } });
       await service.event(db, agreement.id, 'link_created', { payload: { enrollment_id: enrollmentID, base_agreement_id: row.id } });
       return detail(db, enrollment);
@@ -195,9 +215,11 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     if (!preliminary) fail('plan_enrollment_unavailable', 'This enrollment is unavailable.', 404);
     if(preliminary.cancel_requested_at)return detail(pool,preliminary);
     if (service.reconcilePlanBilling) await service.reconcilePlanBilling(preliminary.id);
+    if (service.preparePlanReplacement) await service.preparePlanReplacement(preliminary);
     let activated;
     const result = await txn(pool, async (db) => {
-      await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`payment:${preliminary.company_id}:${preliminary.collection_key}`]);
+      const source=(await db.query('SELECT * FROM quote_agreements WHERE id=$1',[preliminary.base_agreement_id])).rows[0];
+      await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`payment:${preliminary.company_id}:${key(source)}`]);
       const enrollment = (await db.query('SELECT * FROM agreement_plan_enrollments WHERE id=$1 FOR UPDATE', [preliminary.id])).rows[0];
       if (enrollment.service_plan_id || enrollment.canceled_at || enrollment.cancel_requested_at) return detail(db, enrollment);
       const planAgreement = (await db.query('SELECT * FROM quote_agreements WHERE id=$1', [enrollment.plan_agreement_id])).rows[0];
@@ -207,8 +229,10 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       if (planState.signing === 'submitted') {
         state = 'setup_pending';
         const prerequisite = service.planActivationPrerequisites ? await service.planActivationPrerequisites(db, enrollment) : { ready: config.billing.mode === 'manual_per_visit' && config.billing.enrollment_fee_cents === 0 };
-        if (prerequisite.ready) {
-          const activeAttempt = (await db.query(`SELECT id FROM agreement_payment_attempts WHERE company_id=$1 AND collection_key=$2 AND state IN ('creating','open','processing','review') LIMIT 1`, [enrollment.company_id, enrollment.collection_key])).rows[0];
+        const priorPlan=offer.replaces ? (await db.query('SELECT canceled_at FROM agreement_plan_enrollments WHERE id=$1 AND company_id=$2',[offer.replaces.enrollment_id,enrollment.company_id])).rows[0] : null;
+        if (offer.replaces && !priorPlan?.canceled_at) state='replacement_pending';
+        if (prerequisite.ready && (!offer.replaces || priorPlan?.canceled_at)) {
+          const activeAttempt = (await db.query(`SELECT id FROM agreement_payment_attempts WHERE company_id=$1 AND collection_key=$2 AND state IN ('creating','open','processing','review') LIMIT 1`, [enrollment.company_id, key(base)])).rows[0];
           if (offer.current_adjustment_cents > 0 && activeAttempt) state = 'payment_conflict';
           else {
             const baseState = await service.state(db, base);
@@ -223,7 +247,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
                 config.billing.interval.count, config.service_interval.unit, config.service_interval.count, offer.next_service_date, offer.future_visit.line_items.map((line) => `${line.qty} × ${line.name}: ${line.description}`).join('\n'), 'Signed plan enrollment; see linked agreement for the preserved terms.', enrollment.id, JSON.stringify(offer), config.billing.mode, offer.future_visit_count, enrollment.connected_account_id, enrollment.stripe_customer_id])).rows[0];
               const count = offer.future_visit_count === null ? 1 : offer.future_visit_count;
               for (let visit = 0; visit < count; visit++) await db.query('INSERT INTO agreement_plan_visits(id,enrollment_id,service_plan_id,sequence,due_date) VALUES($1,$2,$3,$4,$5)', [randomUUID(), enrollment.id, membershipID, visit + 1, advancePlanDate(offer.next_service_date, config.service_interval, visit)]);
-              if (offer.current_adjustment_cents > 0 && !offer.price_in_quote) await db.query(`INSERT INTO agreement_quote_adjustments(id,company_id,collection_key,base_agreement_id,enrollment_id,discount_cents,original_total_cents,adjusted_total_cents,signed_agreement_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [randomUUID(), enrollment.company_id, enrollment.collection_key, base.id, enrollment.id, offer.current_adjustment_cents, offer.original_total_cents, offer.current_total_cents, planAgreement.id]);
+              if (offer.current_adjustment_cents > 0 && !offer.price_in_quote) await db.query(`INSERT INTO agreement_quote_adjustments(id,company_id,collection_key,base_agreement_id,enrollment_id,discount_cents,original_total_cents,adjusted_total_cents,signed_agreement_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [randomUUID(), enrollment.company_id, key(base), base.id, enrollment.id, offer.current_adjustment_cents, offer.original_total_cents, offer.current_total_cents, planAgreement.id]);
               await db.query(`INSERT INTO service_plan_events(user_id,company_id,created_by_user_id,service_plan_id,contact_id,event_type,notes) VALUES($1,$2,$3,$4,$5,'created','Activated from a separately signed plan enrollment')`, [owner,enrollment.company_id,base.created_by,membershipID,enrollment.contact_id]);
               await db.query(`UPDATE agreement_plan_enrollments SET service_plan_id=$2,state='active',activated_at=now(),updated_at=now() WHERE id=$1`, [enrollment.id,membershipID]);
               await db.query('UPDATE payment_records SET service_plan_id=$2 WHERE enrollment_id=$1',[enrollment.id,membershipID]);
@@ -336,13 +360,13 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     const due=enrollment.service_plan_id?(await db.query(`SELECT v.id,v.due_date FROM agreement_plan_visits v JOIN service_plans p ON p.id=v.service_plan_id WHERE v.enrollment_id=$1 AND v.state IN ('due','scheduled') AND p.status='active' AND (v.job_id IS NULL OR NOT EXISTS(SELECT 1 FROM schedule_events WHERE id=v.job_id)) ORDER BY v.due_date,v.sequence LIMIT 1`,[enrollment.id])).rows[0]:null;
     return {plan_setup_pending:!enrollment.service_plan_id?enrollment.signed_at:null,plan_setup_pending_occurrence:enrollment.id,plan_service_due:due?.due_date,plan_service_due_occurrence:due?.id};
   }
-  return { tiers, saveTier, offers, load, summary, detail, createEnrollment, reconcileEnrollment, paymentAdjustmentSummary, supportedBillingModes, linkVisit, deferVisit,markServiced, processMemberships, followupContext };
+  return { tiers, saveTier, offers, currentMemberships, withReplacement, load, summary, detail, createEnrollment, reconcileEnrollment, paymentAdjustmentSummary, supportedBillingModes, linkVisit, deferVisit,markServiced, processMemberships, followupContext };
 }
 
 export async function installAgreementPlans({ app, pool, service, authRequired, requireCapability, onPlanActivated, startWorker = true, ...options }) {
   await installAgreementPlanSchema(pool);
   const plans = createAgreementPlans({ pool, service, onPlanActivated, ...options });
-  installPlanQuotePublication(service, plans.supportedBillingModes);
+  installPlanQuotePublication(service, plans.supportedBillingModes, plans);
   service.plansReady = true; service.planSummary = plans.summary; service.paymentAdjustmentSummary = plans.paymentAdjustmentSummary;
   service.planFollowupContext = plans.followupContext;
   const wrap = (fn) => async (req,res) => { res.set({ 'Cache-Control':'private, no-store','Referrer-Policy':'no-referrer' }); try { await fn(req,res); } catch(error) { if(error instanceof QuoteContractError) return res.status(error.status).json({error:error.code,message:error.message}); console.error('[plans] operation failed',{code:error.code||'internal'}); res.status(500).json({error:'plan_operation_failed',message:'The plan could not be updated. Your existing agreement remains saved.'}); } };
@@ -365,7 +389,7 @@ export async function installAgreementPlans({ app, pool, service, authRequired, 
   app.get('/api/service-plan-enrollments/:id' ,...staff('payments.view'),wrap(async(req,res)=>{const enrollment=(await pool.query('SELECT * FROM agreement_plan_enrollments WHERE id=$1 AND company_id=$2',[id(req.params.id),req.companyId])).rows[0];if(!enrollment)fail('plan_enrollment_unavailable','This enrollment is unavailable.',404);res.json(await plans.detail(pool,enrollment));}));
   app.post('/api/service-plan-enrollments/:id/visits/:visitId/schedule',...staff('schedule.edit'),wrap(async(req,res)=>res.json(await plans.linkVisit(req,req.params.id,req.params.visitId,req.body))));
   app.post('/api/service-plan-enrollments/:id/visits/:visitId/defer',...staff('schedule.edit'),wrap(async(req,res)=>res.json(await plans.deferVisit(req,req.params.id,req.params.visitId,req.body))));
-  app.get('/api/public/agreements/:token/plan-offers',wrap(async(req,res)=>{const {row,role}=await service.loadPublic(pool,req.params.token);res.json({offers:role==='customer'?await plans.offers(pool,row):[],enrollment:await plans.summary(pool,row,{publicRole:role})});}));
+  app.get('/api/public/agreements/:token/plan-offers',wrap(async(req,res)=>{const {row,role}=await service.loadPublic(pool,req.params.token);res.json({offers:role==='customer'?await plans.offers(pool,row):[],enrollment:await plans.summary(pool,row,{publicRole:role}),current_memberships:role==='customer' ? await Promise.all((await plans.currentMemberships(pool,row)).map(item=>plans.detail(pool,item))) : []});}));
   app.post('/api/public/agreements/:token/enrollments',publicWrite,wrap(async(req,res)=>res.status(201).json(await plans.createEnrollment(req.params.token,req.body))));
   app.get('/api/public/agreements/:token/enrollments/:id',wrap(async(req,res)=>{const {row,role}=await service.loadPublic(pool,req.params.token);res.json(await plans.detail(pool,await plans.load(pool,row,req.params.id),{publicRole:role}));}));
   app.post('/api/public/agreements/:token/enrollments/:id/reconcile',publicWrite,wrap(async(req,res)=>{const {row,role}=await service.loadPublic(pool,req.params.token);if(role!=='customer')fail('plan_primary_customer_required','The primary customer completes enrollment.',403);await plans.load(pool,row,req.params.id);await service.rate(pool,`plan-reconcile:${req.params.id}`,60,3600);res.json(await plans.reconcileEnrollment(req.params.id));}));
