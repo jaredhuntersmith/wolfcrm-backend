@@ -15,10 +15,11 @@ export async function removeQuote(pool, req, id) {
     const row = (await db.query(`SELECT * FROM quotes WHERE id=$1 AND ${scope} FOR NO KEY UPDATE`, args)).rows[0];
     if (!row) { await db.query('COMMIT'); return null; }
     if (!row.deleted_at) {
-      const agreements = (await db.query('SELECT id FROM quote_agreements WHERE quote_id=$1 ORDER BY id FOR UPDATE', [id])).rows;
+      const agreements = (await db.query('SELECT id,link_root_id FROM quote_agreements WHERE quote_id=$1 ORDER BY id FOR UPDATE', [id])).rows;
+      const familyRetained = (await db.query('SELECT EXISTS(SELECT 1 FROM agreement_signatures s JOIN quote_agreements a ON a.id=s.agreement_id WHERE a.quote_id=$1) OR EXISTS(SELECT 1 FROM payment_records WHERE quote_id=$1) AS active', [id])).rows[0].active;
       for (const agreement of agreements) {
         const retained = (await db.query('SELECT EXISTS(SELECT 1 FROM agreement_signatures WHERE agreement_id=$1) OR EXISTS(SELECT 1 FROM payment_records WHERE agreement_id=$1) AS active', [agreement.id])).rows[0].active;
-        if (!retained) await db.query('UPDATE quote_agreements SET revoked_at=COALESCE(revoked_at,now()),token_generation=token_generation+1,updated_at=now() WHERE id=$1', [agreement.id]);
+        if (!retained && !(familyRetained && agreement.id === agreement.link_root_id)) await db.query('UPDATE quote_agreements SET revoked_at=COALESCE(revoked_at,now()),token_generation=token_generation+1,updated_at=now() WHERE id=$1', [agreement.id]);
         await db.query("INSERT INTO agreement_events(id,agreement_id,type,actor_type,actor_id,payload) VALUES($1,$2,'quote_removed',$3,$4,$5::jsonb)", [randomUUID(),agreement.id,req.userId ? "staff" : "automation",req.userId,JSON.stringify({quote_id:id,customer_access_retained:retained})]);
       }
       await db.query('UPDATE quotes SET deleted_at=now(),updated_at=now() WHERE id=$1', [id]);

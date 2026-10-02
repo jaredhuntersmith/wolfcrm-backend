@@ -158,7 +158,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     const anchor = (await db.query('SELECT * FROM quote_agreements WHERE id=$1', [id])).rows[0];
     if (!anchor || anchor.revoked_at || anchor.token_generation !== Number(generation) || !anchor.snapshot.required_signers.includes(role) || !equal(token, tokenFor(id, Number(generation), role))) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
     const row = anchor.quote_id
-      ? (await db.query(`SELECT * FROM quote_agreements WHERE quote_id=$1 AND company_id=$2 ORDER BY revision DESC LIMIT 1 ${lock ? "FOR UPDATE" : ""}`, [anchor.quote_id, anchor.company_id])).rows[0]
+      ? (await db.query(`SELECT * FROM quote_agreements WHERE quote_id=$1 AND company_id=$2 AND revoked_at IS NULL ORDER BY revision DESC LIMIT 1 ${lock ? "FOR UPDATE" : ""}`, [anchor.quote_id, anchor.company_id])).rows[0]
       : lock ? (await db.query('SELECT * FROM quote_agreements WHERE id=$1 FOR UPDATE', [anchor.id])).rows[0] : anchor;
     if (!row || row.revoked_at || row.token_generation !== Number(generation) || !row.snapshot.required_signers.includes(role)) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
     return { row, role };
@@ -675,12 +675,21 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
   app.post("/api/agreements/:id/countersign", ...staff("quotes.edit"), wrap(async (req, res) => res.json(await service.sign(req.params.id, req.body, { ip: req.ip, user_agent: req.get("user-agent") || "" }, req))));
   app.post("/api/agreements/:id/link", ...staff("quotes.edit"), wrap(async (req, res) => {
     const result = await transaction(pool, async (db) => {
-      let row = await service.loadStaff(db, req, req.params.id, true);
+      let row = await service.loadStaff(db, req, req.params.id);
+      if (row.quote_id) {
+        await db.query('SELECT id FROM quotes WHERE id=$1 FOR NO KEY UPDATE', [row.quote_id]);
+        await db.query('SELECT id FROM quote_agreements WHERE quote_id=$1 AND company_id=$2 ORDER BY id FOR UPDATE', [row.quote_id, row.company_id]);
+        row = await service.loadStaff(db, req, req.params.id);
+      } else row = await service.loadStaff(db, req, req.params.id, true);
       if (!["copied", "regenerate", "revoke"].includes(req.body.action)) problem("agreement_link_action_invalid", "Choose a supported link action.");
       const requestId = uuid(req.body.request_id), hash = quoteContentHash({ action: req.body.action });
       const existing = (await db.query(`SELECT * FROM agreement_events WHERE agreement_id=$1 AND request_id=$2`, [row.id, requestId])).rows[0];
       if (existing) { if (existing.request_hash !== hash) problem("agreement_request_conflict", "This request ID was already used.", 409); return service.detail(db, row, { staff: true }); }
-      if (req.body.action !== "copied") row = (await db.query(`UPDATE quote_agreements SET token_generation=token_generation+1,revoked_at=CASE WHEN $2='revoke' THEN now() ELSE NULL END,updated_at=now() WHERE id=$1 RETURNING *`, [row.id, req.body.action])).rows[0];
+      if (req.body.action !== "copied") {
+        const generation = row.quote_id ? Number((await db.query('SELECT max(token_generation) AS generation FROM quote_agreements WHERE quote_id=$1 AND company_id=$2', [row.quote_id,row.company_id])).rows[0].generation)+1 : row.token_generation+1;
+        await db.query(`UPDATE quote_agreements SET token_generation=$3,revoked_at=CASE WHEN $2='revoke' THEN now() ELSE NULL END,updated_at=now() WHERE id=$1 OR (quote_id=$4 AND company_id=$5)`, [row.id,req.body.action,generation,row.quote_id,row.company_id]);
+        row = await service.loadStaff(db,req,row.id);
+      }
       await service.event(db, row.id, `link_${req.body.action}`, { request_id: requestId, request_hash: hash, actor_type: "staff", actor_id: req.userId });
       return service.detail(db, row, { staff: true });
     });

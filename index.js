@@ -549,6 +549,7 @@ app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" 
 // remain before the JSON parser so a later handler can verify the exact body.
 app.use("/api/focus/webhooks/meta", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/api/agreements/assets", express.json({ limit: "14mb" }));
+app.use("/api/quotes/:id/publish", express.json({ limit: "16mb" }));
 
 app.use(express.json({
   limit: "2mb",

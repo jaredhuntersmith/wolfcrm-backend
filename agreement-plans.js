@@ -169,7 +169,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       const snapshot = { kind: 'plan', title: config.name, number, revision: 1, issued_at: now().toISOString(), expires_at: expiresAt,
         business: {...row.snapshot.business,name:merge.business_name,logo_data_url:content.branding.show_logo?row.snapshot.business.logo_data_url||'':''}, customer: { name: privateContact.name, address: privateContact.address, billing_address:merge.billing_address, phone: content.show_customer_phone ? privateContact.phone : null, email: content.show_customer_email ? privateContact.email : null },
         pricing: null, allow_customer_booking: false, offer_service_plans: false, customer_notes_enabled: false, duration_minutes: null,
-        ...content, show_agreement: true, agreement_text: `${offer.financial_text}\n\n${content.show_agreement ? resolveAgreementText(content.agreement_text, merge) : ""}`, terms_text: content.show_terms ? resolveAgreementText(content.terms_text, merge) : "", consent_text: resolveAgreementText(content.consent_text, merge),
+        ...content, show_agreement: true, agreement_text: `${offer.financial_text}\n\n${content.show_agreement && content.agreement_mode === "text" ? resolveAgreementText(content.agreement_text, merge) : ""}`, terms_text: "", consent_text: resolveAgreementText(content.consent_text, merge),
         documents: await service.validateDocuments(db, row.company_id, content, merge),
         terms_document: termsAsset ? { asset_id: termsAsset.id, name: termsAsset.name, sha256: termsAsset.normalized_sha256 } : null,
         plan_enrollment_id: enrollmentID, base_agreement_id: row.id, financial_terms: offer,
@@ -178,7 +178,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       await service.storeArtifact(db, agreement.id, 'quote', await generateQuoteAgreementPDF(snapshot, { customer_url: service.customerURL(agreement) }));
       if (snapshot.terms_text || termsAsset) {
         const cover = await generateQuoteAgreementPDF({ ...snapshot, title: 'Plan Terms & Conditions', agreement_text: '', documents: [], consent_text: '' }, { customer_url: service.customerURL(agreement) });
-        await service.storeArtifact(db, agreement.id, 'terms', termsAsset ? await combineAgreementPDFs([cover, termsAsset.normalized_bytes]) : cover);
+        await service.storeArtifact(db, agreement.id, 'terms', termsAsset ? termsAsset.normalized_bytes : cover);
       }
       const enrollment = (await db.query(`INSERT INTO agreement_plan_enrollments(id,company_id,contact_id,base_agreement_id,plan_agreement_id,tier_id,tier_version,collection_key,request_id,request_hash,offer_hash,snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb) RETURNING *`, [enrollmentID, row.company_id, row.contact_id, row.id, planAgreementID, offer.tier_id, offer.tier_version, key(row), requestID, requestHash, offer.offer_hash, JSON.stringify(offer)])).rows[0];
       await service.event(db, row.id, 'plan_enrollment_started', { payload: { enrollment_id: enrollmentID, plan_agreement_id: planAgreementID } });
