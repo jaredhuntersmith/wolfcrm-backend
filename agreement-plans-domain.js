@@ -5,7 +5,7 @@ const fail = (code, message) => { throw new QuoteContractError(code, message); }
 const id = (value) => { if (typeof value !== 'string' || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value)) fail('plan_service_invalid', 'Choose saved services from this company.'); return value.toLowerCase(); };
 const amount = (value) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value / 100);
 const boolean = (raw, key, fallback = false) => { if (raw[key] !== undefined && typeof raw[key] !== 'boolean') fail('plan_tier_invalid', `${key} must be true or false.`); return raw[key] ?? fallback; };
-export const PLAN_BILLING_MODES = ['manual_per_visit', 'automatic_per_visit', 'calendar_installments', 'prepaid'];
+export const PLAN_BILLING_MODES = ['manual_per_visit', 'automatic_per_visit', 'calendar_installments', 'calendar_recurring', 'prepaid'];
 export function normalizePlanInterval(raw = { unit: 'month', count: 3 }) {
   if (!raw || !['day', 'week', 'month', 'year'].includes(raw.unit)) fail('plan_interval_invalid', 'Choose a day, week, month or year interval.');
   return { unit: raw.unit, count: quoteInteger(raw.count, 'Interval count', raw.unit === 'day' ? 3650 : 120, 1) };
@@ -23,6 +23,8 @@ export function normalizePlanTier(raw) {
   const billing = raw.billing ?? { mode: 'manual_per_visit' };
   if (!PLAN_BILLING_MODES.includes(billing.mode)) fail('plan_billing_invalid', 'Choose a supported billing mode.');
   if (term.kind !== 'finite' && ['calendar_installments', 'prepaid'].includes(billing.mode)) fail('plan_finite_term_required', 'Installments and prepaid packages need an explicit included visit count.');
+  if (billing.mode === 'calendar_recurring' && term.kind !== 'ongoing') fail('plan_ongoing_required', 'Recurring calendar billing requires an ongoing plan. Use installments for a finite package.');
+  if (billing.mode === 'calendar_recurring' && billing.calendar_requires_completed_service && JSON.stringify(normalizePlanInterval(billing.interval)) !== JSON.stringify(normalizePlanInterval(raw.service_interval))) fail('plan_calendar_cadence_mismatch', 'For calendar charges held until job completion, use the same billing and service frequency. Each charge covers one completed visit.');
   const content = normalizeAgreementContent(raw.agreement || {});
   if (!content.consent_text.trim() || (!(content.show_agreement && content.agreement_mode === "text" && content.agreement_text.trim()) && !(content.show_agreement && content.agreement_mode === "pdf" && content.documents.length))) fail('plan_agreement_required', 'Configure plan agreement text or a PDF and explicit signing consent.');
   const policy = quoteText(raw.cancellation_policy, 'Cancellation and renewal terms', 10000).trim();
@@ -35,7 +37,7 @@ export function normalizePlanTier(raw) {
     discount: normalizeDeposit(raw.discount ?? { type: 'none', value: 0 }), discount_first_visit: boolean(raw, 'discount_first_visit'), current_visit_counts: boolean(raw, 'current_visit_counts'),
     service_interval: normalizePlanInterval(raw.service_interval),
     term: { kind: term.kind, visit_count: term.kind === 'finite' ? quoteInteger(term.visit_count, 'Included visits', 1000, 1) : null },
-    billing: { mode: billing.mode, interval: normalizePlanInterval(billing.interval ?? { unit: 'month', count: 1 }), installment_count: billing.mode === 'calendar_installments' ? quoteInteger(billing.installment_count, 'Installment count', 1200, 1) : 1,
+    billing: { mode: billing.mode, save_payment_method: boolean(billing, 'save_payment_method'), calendar_requires_completed_service: boolean(billing, 'calendar_requires_completed_service'), first_charge_date: billing.first_charge_date ? planDate(billing.first_charge_date).toISOString().slice(0,10) : null, interval: normalizePlanInterval(billing.interval ?? { unit: 'month', count: 1 }), installment_count: billing.mode === 'calendar_installments' ? quoteInteger(billing.installment_count, 'Installment count', 1200, 1) : 1,
       first_charge_delay_days: quoteInteger(billing.first_charge_delay_days ?? 0, 'First charge delay', 3650), enrollment_fee_cents: quoteInteger(billing.enrollment_fee_cents ?? 0, 'Enrollment fee'),
       collect_on: (() => { if (billing.collect_on !== undefined && !['scheduled','completed'].includes(billing.collect_on)) fail('plan_collection_timing_invalid', 'Collect when a visit is scheduled or completed.'); return billing.collect_on || 'completed'; })() },
     start_delay_days: quoteInteger(raw.start_delay_days ?? 0, 'Plan start delay', 3650), first_service_delay_days: raw.first_service_delay_days == null ? null : quoteInteger(raw.first_service_delay_days, 'First future service delay', 3650, 1),
@@ -79,7 +81,8 @@ export function buildPlanOffer({ agreement, tier, eligible_service_ids, payments
   calculation.credit_due_cents=Math.max(0,payments_cents-calculation.current_total_cents);
   const effectiveDate = advancePlanDate(today, { unit: 'day', count: 1 }, config.start_delay_days);
   const nextService = config.first_service_delay_days === null ? advancePlanDate(effectiveDate, config.service_interval) : advancePlanDate(effectiveDate, { unit: 'day', count: 1 }, config.first_service_delay_days);
-  const firstCharge = advancePlanDate(effectiveDate, { unit: 'day', count: 1 }, config.billing.first_charge_delay_days);
+  let firstCharge = config.billing.first_charge_date || advancePlanDate(effectiveDate, { unit: 'day', count: 1 }, config.billing.first_charge_delay_days);
+  if (config.billing.first_charge_date && firstCharge < effectiveDate) { let occurrence=0; const anchor=firstCharge; do { firstCharge=advancePlanDate(anchor, config.billing.interval, ++occurrence); } while(firstCharge < effectiveDate && occurrence < 3650); if(firstCharge < effectiveDate) fail('plan_charge_date_invalid','Choose a more recent first billing date.'); }
   const countedCurrent = config.current_visit_counts && !initial_visit_already_counted && config.term.kind === 'finite' ? 1 : 0;
   const futureCount = config.term.kind === 'finite' ? config.term.visit_count - countedCurrent : null;
   // The initial visit remains on the initial job invoice. When it counts toward
@@ -91,6 +94,7 @@ export function buildPlanOffer({ agreement, tier, eligible_service_ids, payments
   const labels = {
     manual_per_visit: `Pay ${amount(calculation.future_visit.total_cents)} per future visit when ${config.billing.collect_on}, collected manually.`,
     automatic_per_visit: `Authorize ${amount(calculation.future_visit.total_cents)} per future visit when ${config.billing.collect_on}, charged to the authorized saved payment method.`,
+    calendar_recurring: `Authorize ${amount(calculation.future_visit.total_cents)} ${cadence(config.billing.interval)} starting ${firstCharge}, until canceled.${config.billing.calendar_requires_completed_service ? ' Each dated charge is held until its corresponding covered visit has been completed; one charge per visit.' : ' These calendar charges are independent of appointment completion.'}`,
     calendar_installments: `${billingSchedule.length} installments ${cadence(config.billing.interval)} starting ${firstCharge}: ${billingSchedule.map((entry) => amount(entry.amount_cents)).join(', ')}.`,
     prepaid: `Prepay ${amount(installments?.remaining_cents || 0)} on ${firstCharge} for ${futureCount} future visits.`,
   };
@@ -99,7 +103,7 @@ export function buildPlanOffer({ agreement, tier, eligible_service_ids, payments
     `Service ${cadence(config.service_interval)}. Effective ${effectiveDate}; first future service due ${nextService}. Appointments remain subject to confirmed Schedule availability.`,
     `Future visit price ${amount(calculation.future_visit.total_cents)} including configured tax. ${labels[config.billing.mode]}`,
     `The one-time quote discount of ${amount(calculation.existing_quote_discount_cents)} does not repeat on future visits. For the initial job, ${calculation.discount_stacking_policy==='quote_then_plan'?'the plan discount applies after the allocated quote discount on eligible services':'eligible services retain the better price from the quote promotion or plan discount'}. Promotions on noneligible work remain unchanged.`,
-    ['automatic_per_visit','calendar_installments'].includes(config.billing.mode) ? 'By separately signing this plan and completing payment-method setup, you authorize the business to save that payment method and debit the exact service-triggered charges or dated installments stated here. A card used only for the initial job is not treated as this authorization.' : 'This plan does not authorize automatic recurring card debits.',
+    ['automatic_per_visit','calendar_installments','calendar_recurring'].includes(config.billing.mode) ? 'By separately signing this plan and completing payment-method setup, you authorize the business to save that payment method and debit the exact service-triggered charges or dated installments stated here. A card used only for the initial job is not treated as this authorization.' : (config.billing.save_payment_method ? 'By signing and completing card setup, you authorize saving your card for this plan. This does not authorize automatic recurring debits; you confirm manual payments separately.' : 'This plan does not authorize automatic recurring card debits.'),
     `Initial job: original ${amount(calculation.original_total_cents)}; prior signed adjustments ${amount(priorAdjustment)}; additional conditional plan adjustment ${amount(calculation.current_adjustment_cents)}; adjusted ${amount(calculation.current_total_cents)}; payments credited ${amount(payments_cents)}; amount due ${amount(calculation.current_balance_cents)}; credit due ${amount(calculation.credit_due_cents)}.`,
     calculation.current_adjustment_cents ? 'This adjustment takes effect only after all required plan signatures, required payment-method setup and initial payment succeed. Until activation, the initial job retains its original balance. No refund is issued automatically.' : 'The initial job invoice and prior payment records remain unchanged.',
     initial_visit_already_counted ? 'The initial visit was already allocated to a prior signed plan and is not counted or credited again in this new term.' : config.current_visit_counts ? `The initial visit counts toward the term and remains billed on the original job. ${amount(priorAllocation)} of visit allocation is excluded from package billing to avoid charging it twice.` : 'The initial visit does not count toward future plan visits.',

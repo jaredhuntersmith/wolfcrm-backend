@@ -23,6 +23,8 @@ export function installPlanQuotePublication(service, supportedBillingModes) {
     price.deposit_cents=deposit; price.balance_after_deposit_cents=price.total_cents-deposit;
     // The discount is already in this quote, so activation must not apply it again.
     offer.price_in_quote = true;
+    offer.financial_text = offer.financial_text.replace('This adjustment takes effect only after all required plan signatures, required payment-method setup and initial payment succeed. Until activation, the initial job retains its original balance. No refund is issued automatically.', 'The plan discount is included in this quote. Card setup and activation are required before this job can be paid or booked. The discount is not applied a second time at activation.');
+    offer.offer_hash = quoteContentHash({...offer,offer_hash:undefined});
     const agreement = offer.configuration.agreement;
     return { offer, pricing:price, content:{...content, ...Object.fromEntries(["agreement_mode","require_page_signature","agreement_text","consent_text","documents","required_signers"].map(key=>[key,agreement[key]])), show_agreement:true} };
   };

@@ -305,6 +305,7 @@ export async function generateQuoteAgreementPDF(snapshot, { customer_url, signat
   }
   if (snapshot.public_notes) { paragraph("Notes", 14); paragraph(snapshot.public_notes); }
   if (snapshot.scope_exclusions) { paragraph("Not included / Scope exclusions", 14); paragraph(snapshot.scope_exclusions); }
+  if (snapshot.financial_text && snapshot.kind !== "plan") { paragraph("Service plan terms", 14); paragraph(snapshot.financial_text); }
   if (snapshot.agreement_text) { paragraph("Agreement", 14); paragraph(snapshot.agreement_text); }
   if (snapshot.terms_text) { paragraph("Terms & Conditions", 14); paragraph(snapshot.terms_text); }
   if (snapshot.documents?.length) {

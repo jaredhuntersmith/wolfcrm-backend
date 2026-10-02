@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { QuoteContractError, quoteContentHash } from "./quote-contract-domain.js";
+import { advancePlanDate } from "./agreement-plans-domain.js";
 import { stripePaymentMode } from "./agreement-payments.js";
 
 const fail = (code, message, status = 409) => { throw new QuoteContractError(code, message, status); };
 const objectID = value => typeof value === "string" ? value : value?.id || null;
 const uuid = value => { if (typeof value !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value)) fail("plan_request_invalid", "Use a valid plan request ID.", 400); return value.toLowerCase(); };
-const automatic = enrollment => ["automatic_per_visit", "calendar_installments"].includes(enrollment.snapshot.configuration.billing.mode);
+const automatic = enrollment => ["automatic_per_visit", "calendar_installments", "calendar_recurring"].includes(enrollment.snapshot.configuration.billing.mode);
+const requiresCard = enrollment => automatic(enrollment) || enrollment.snapshot.configuration.billing.save_payment_method === true;
 const transaction = async (pool, work) => {
   const db = await pool.connect();
   try { await db.query("BEGIN"); const result = await work(db); await db.query("COMMIT"); return result; }
@@ -182,6 +184,15 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
       await lock(db, enrollment);
       const entries = ["calendar_installments", "prepaid"].includes(billing.mode) ? offer.billing_schedule.map(item => ({ ...item, kind: billing.mode, key: `installment:${item.sequence}` }))
         : billing.enrollment_fee_cents > 0 ? [{ sequence: 0, due_date: offer.effective_date, amount_cents: billing.enrollment_fee_cents, kind: "enrollment_fee", key: "enrollment_fee" }] : [];
+      if (billing.mode === "calendar_recurring") {
+        const last = (await db.query("SELECT COALESCE(max(sequence),0)::integer AS sequence, max(due_date)::text AS last_due FROM agreement_plan_billing_obligations WHERE enrollment_id=$1 AND kind='calendar_recurring'",[enrollment.id])).rows[0];
+        const date=await today(enrollment,db);
+        for(let sequence=last.sequence+1;(!last.last_due || last.last_due<=date) && sequence<=Math.min(last.sequence+90,3650);sequence++) {
+          const due=advancePlanDate(offer.first_charge_date,billing.interval,sequence-1);
+          entries.push({sequence,due_date:due,amount_cents:offer.future_visit.total_cents,kind:"calendar_recurring",key:`calendar:${sequence}`});
+          if(due>date) break;
+        }
+      }
       if (entries.some(item => item.amount_cents > 0 && item.amount_cents < 50)) fail("plan_amount_below_minimum", "Online plan charges must be at least $0.50, or exactly zero. Update the tier before offering it.");
       for (const item of entries) await db.query("INSERT INTO agreement_plan_billing_obligations(id,enrollment_id,obligation_key,kind,sequence,due_date,amount_cents) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(enrollment_id,obligation_key) DO NOTHING", [randomUUID(), enrollment.id, item.key, item.kind, item.sequence, item.due_date, item.amount_cents]);
       if (enrollment.service_plan_id && ["automatic_per_visit", "manual_per_visit"].includes(billing.mode)) {
@@ -285,15 +296,16 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
   }
   async function prerequisites(db, enrollment) {
     const billing = enrollment.snapshot.configuration.billing;
-    if (billing.mode === "manual_per_visit" && billing.enrollment_fee_cents === 0) return { ready: true };
+    if (billing.mode === "manual_per_visit" && !requiresCard(enrollment) && billing.enrollment_fee_cents === 0) return { ready: true };
     if (!enrollment.connected_account_id || enrollment.stripe_livemode !== stripePaymentMode(env)) return { ready: false };
-    if (automatic(enrollment) && !enrollment.stripe_payment_method_id) return { ready: false };
+    if (requiresCard(enrollment) && !enrollment.stripe_payment_method_id) return { ready: false };
     const problems = (await db.query("SELECT 1 FROM agreement_plan_provider_commands WHERE enrollment_id=$1 AND state='review' LIMIT 1", [enrollment.id])).rowCount;
     if (problems) return { ready: false };
     const date = await today(enrollment, db);
     const obligations = (await db.query("SELECT *,due_date::text AS due_date FROM agreement_plan_billing_obligations WHERE enrollment_id=$1 ORDER BY sequence", [enrollment.id])).rows;
     if (["calendar_installments", "prepaid"].includes(billing.mode) && !obligations.length) return { ready: false };
     if (!automatic(enrollment) && billing.mode === "prepaid") return { ready: obligations.every(item => item.state === "succeeded") };
+    if (billing.mode === "calendar_recurring" && billing.calendar_requires_completed_service) return {ready: obligations.filter(item=>item.kind === "enrollment_fee").every(item=>item.state === "succeeded")};
     return { ready: obligations.filter(item => item.kind === "enrollment_fee" || (item.sequence <= 1 && String(item.due_date).slice(0,10) <= date)).every(item => item.state === "succeeded") && (billing.enrollment_fee_cents === 0 || obligations.length > 0) };
   }
   async function reconcileEnrollmentCore(enrollmentID, { collectDue = true, retry = false } = {}) {
@@ -305,7 +317,7 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
     }
     try { await gate(enrollment); } catch (error) { if (error.code === "plan_signatures_required") return; throw error; }
     const billing = enrollment.snapshot.configuration.billing;
-    if (billing.mode === "manual_per_visit" && billing.enrollment_fee_cents === 0 && !enrollment.service_plan_id) return;
+    if (billing.mode === "manual_per_visit" && !requiresCard(enrollment) && billing.enrollment_fee_cents === 0 && !enrollment.service_plan_id) return;
     await ensureObligations(enrollment);
     if (!enrollment.connected_account_id || !enrollment.stripe_customer_id) return;
     for (const setup of (await pool.query("SELECT * FROM agreement_plan_setups WHERE enrollment_id=$1 AND state IN ('open','processing')", [enrollment.id])).rows) await reconcileSetup(enrollment, setup);
@@ -316,6 +328,12 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
     for (const obligation of obligations) reconciled.push(obligation.invoice_id ? await reconcileInvoice(enrollment, obligation) : obligation);
     const reviewRequired = reconciled.some(obligation => obligation.state === "review");
     for (const obligation of reconciled) {
+      if (obligation.kind === "calendar_recurring" && billing.calendar_requires_completed_service) {
+        const completed = (await pool.query("SELECT v.job_id FROM agreement_plan_visits v JOIN schedule_events j ON j.id=v.job_id AND j.company_id=$2 AND j.service_plan_id=v.service_plan_id WHERE v.enrollment_id=$1 AND v.sequence=$3 AND v.state='completed' AND j.finished_at IS NOT NULL",[enrollment.id,enrollment.company_id,obligation.sequence])).rows[0];
+        if(!completed) continue;
+        await pool.query("UPDATE agreement_plan_billing_obligations SET job_id=$2 WHERE id=$1 AND job_id IS NULL",[obligation.id,completed.job_id]);
+        obligation.job_id=completed.job_id;
+      }
       if (!reviewRequired && collectDue && (membership || obligation.sequence <= 1) && String(obligation.due_date).slice(0,10) <= date && ["scheduled", "creating", "open"].includes(obligation.state) && (!membership || ["active", "expired"].includes(membership.status)) && (!automatic(enrollment) || enrollment.stripe_payment_method_id)) await collect(enrollment, obligation, { retry });
     }
     if (enrollment.service_plan_id) {
@@ -356,13 +374,13 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
     if (raw.action !== undefined && !["continue", "update_card"].includes(raw.action)) fail("plan_billing_action_invalid", "Choose payment setup or update card.", 400);
     await service.rate(pool, `plan-billing:${enrollment.id}`, 30, 60); await gate(enrollment);
     const billing = enrollment.snapshot.configuration.billing;
-    if (billing.mode === "manual_per_visit" && billing.enrollment_fee_cents === 0 && raw.action !== "update_card") {
+    if (billing.mode === "manual_per_visit" && !requiresCard(enrollment) && billing.enrollment_fee_cents === 0 && raw.action !== "update_card") {
       await ensureObligations(enrollment);
       const due = (await pool.query("SELECT 1 FROM agreement_plan_billing_obligations WHERE enrollment_id=$1 AND due_date<=$2 AND state NOT IN ('succeeded','canceled') LIMIT 1",[enrollment.id,await today(enrollment)])).rowCount;
       if (!enrollment.service_plan_id || !due) { await plans.reconcileEnrollment(enrollment.id); return { status: "ready", url: null, billing: await billingSummary(enrollment.id) }; }
     }
     enrollment = await customer(await bindAccount(enrollment));
-    if (automatic(enrollment) && (!enrollment.stripe_payment_method_id || raw.action === "update_card")) {
+    if (requiresCard(enrollment) && (!enrollment.stripe_payment_method_id || raw.action === "update_card")) {
       const setup = await setupCard(enrollment, requestID, raw.action === "update_card");
       if (setup.status !== "succeeded") return { ...setup, billing: await billingSummary(enrollment.id) };
     } else if (raw.action === "update_card") fail("plan_card_not_required", "This plan does not authorize automatic card charges.");
@@ -531,7 +549,7 @@ export async function installAgreementPlanBilling({ app,pool,service,plans,getSt
   service.planActivationPrerequisites = adapter.planActivationPrerequisites;
   service.reconcilePlanBilling = adapter.reconcileEnrollment;
   service.planBillingFollowupContext=adapter.followupContext;
-  for (const mode of ["manual_per_visit","automatic_per_visit","calendar_installments","prepaid"]) if (!plans.supportedBillingModes.includes(mode)) plans.supportedBillingModes.push(mode);
+  for (const mode of ["manual_per_visit","automatic_per_visit","calendar_installments","calendar_recurring","prepaid"]) if (!plans.supportedBillingModes.includes(mode)) plans.supportedBillingModes.push(mode);
   app.locals.agreementPlanBilling = adapter;
   const route = action => async (req,res) => {
     res.set({"Cache-Control":"private, no-store","Referrer-Policy":"no-referrer"});

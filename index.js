@@ -6648,9 +6648,9 @@ app.delete("/api/company/employees/:id", authRequired, requireEmployer, async (r
     // Kill all their sessions / recovery tokens / device tokens.
     await client.query(`DELETE FROM sessions WHERE user_id = $1`, [targetId]);
     await client.query(`DELETE FROM password_reset_codes WHERE email IN (SELECT pre_delete_email FROM users WHERE id = $1)`, [targetId]);
-    await client.query(`DELETE FROM magic_tokens WHERE user_id = $1`, [targetId]).catch(() => {});
-    await client.query(`DELETE FROM device_tokens WHERE user_id = $1`, [targetId]).catch(() => {});
-    await client.query(`DELETE FROM employee_permissions WHERE user_id = $1`, [targetId]).catch(() => {});
+    await client.query(`DELETE FROM magic_tokens WHERE email IN (SELECT pre_delete_email FROM users WHERE id = $1)`, [targetId]);
+    await client.query(`DELETE FROM device_tokens WHERE user_id = $1`, [targetId]);
+    await client.query(`DELETE FROM employee_permissions WHERE user_id = $1`, [targetId]);
     await client.query("COMMIT");
     try {
       await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.deactivated", subjectType: "employee", subjectId: targetId, actorUserId: req.userId, source: "ios", payload: { employee_id: targetId, active: false } });
