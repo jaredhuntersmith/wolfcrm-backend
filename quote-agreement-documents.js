@@ -34,28 +34,47 @@ export function resolveAgreementText(text, values) {
 
 // Parse the real PDF structure, including object streams, rather than trusting
 // MIME/extension or a byte regex that compressed JavaScript could evade.
-export async function validateAndNormalizeAgreementPDF(bytes) {
+export async function validateAndNormalizeAgreementPDF(bytes, { allowSanitize = true } = {}) {
   if (!Buffer.isBuffer(bytes) || bytes.length < 8 || bytes.length > 10 * 1024 * 1024 || !bytes.subarray(0, 1024).includes(Buffer.from("%PDF-"))) fail("agreement_pdf_invalid", "Upload a valid PDF no larger than 10 MB.");
   let source;
   try { source = await PDFDocument.load(bytes, { updateMetadata: false, throwOnInvalidObject: true }); }
   catch { fail("agreement_pdf_unreadable", "This PDF is corrupt or encrypted. Export an unencrypted PDF and try again."); }
   if (source.isEncrypted) fail("agreement_pdf_encrypted", "Encrypted PDF contracts are not supported.");
   const forbidden = new Set(["JS", "JavaScript", "Launch", "EmbeddedFiles", "EF", "RichMedia", "XFA", "OpenAction", "AA"]);
-  const visited = new Set();
+  const visited = new Set(), removed = new Set();
   const inspect = (object) => {
     if (visited.has(object)) return;
     visited.add(object);
     if (object instanceof PDFDict) {
       for (const [key, value] of object.entries()) {
         const name = key.decodeText();
-        if (name === "ByteRange" || (name === "FT" && value.toString() === "/Sig")) fail("agreement_pdf_already_signed", "This PDF contains digital-signature fields or evidence. Preserve its original and upload an unsigned source for this signing workflow.");
-        if (forbidden.has(name)) fail("agreement_pdf_active_content", "Remove scripts, attachments, automatic actions and interactive media before uploading this PDF.");
+        if (name === "ByteRange" || (name === "FT" && value.toString() === "/Sig" && object.get(PDFName.of("V")))) fail("agreement_pdf_already_signed", "This PDF contains digital-signature fields or evidence. Preserve its original and upload an unsigned source for this signing workflow.");
+        if (forbidden.has(name)) {
+          if (!allowSanitize) fail("agreement_pdf_active_content", "The generated quote PDF must contain only its printable content.");
+          removed.add(name); object.delete(key); continue;
+        }
+        if (name === "S" && ["/JavaScript", "/Launch", "/SubmitForm", "/ImportData", "/RichMediaExecute", "/GoToR", "/GoToE"].includes(value.toString())) {
+          if (!allowSanitize) fail("agreement_pdf_active_content", "The generated quote PDF must contain only its printable content.");
+          removed.add("Action"); for (const [entry] of object.entries()) object.delete(entry); break;
+        }
         inspect(value);
       }
     } else if (object instanceof PDFArray) object.asArray().forEach(inspect);
     else if (object?.dict instanceof PDFDict) inspect(object.dict);
   };
   for (const [, object] of source.context.enumerateIndirectObjects()) inspect(object);
+  // Preserve existing visible form values before discarding interactive widgets.
+  // Original source bytes remain private evidence, while only passive pages are delivered.
+  if (source.catalog.has(PDFName.of("AcroForm"))) {
+    try {
+      const form = source.getForm();
+      for (const field of form.getFields()) {
+        if (field.constructor.name === "PDFSignature") form.removeField(field);
+      }
+      form.updateFieldAppearances(await attachFont(source));
+      form.flatten({ updateFieldAppearances: false });
+    } catch { fail("agreement_pdf_form_unreadable", "This PDF's existing form cannot be preserved. Export or print it to a regular PDF, then upload that copy."); }
+  }
   const sourcePages = source.getPages();
   if (!sourcePages.length || sourcePages.length > 50) fail("agreement_pdf_pages", "Contracts must contain 1–50 pages.");
   const normalized = await PDFDocument.create();
@@ -78,7 +97,7 @@ export async function validateAndNormalizeAgreementPDF(bytes) {
     pageSizes.push({ width, height });
   }
   const result = Buffer.from(await normalized.save());
-  return { source_sha256: sha256(bytes), normalized_sha256: sha256(result), normalized: result, pages: pageSizes };
+  return { source_sha256: sha256(bytes), normalized_sha256: sha256(result), normalized: result, pages: pageSizes, removed_features: [...removed] };
 }
 
 export function normalizeAgreementFields(raw, pages) {

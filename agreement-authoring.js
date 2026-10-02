@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { QuoteContractError, quoteContentHash } from './quote-contract-domain.js';
 
 const fail = (code, message, status = 400) => { throw new QuoteContractError(code, message, status); };

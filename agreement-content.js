@@ -23,15 +23,19 @@ export function normalizeAgreementContent(raw = {}) {
   if(branding.show_logo!=null&&typeof branding.show_logo!=="boolean")problem("agreement_branding_invalid","Logo visibility must be true or false.");
   const label=raw.estimate_label??"Quote";
   if(!["Estimate","Quote"].includes(label))problem("agreement_label_invalid","Choose Estimate or Quote.");
+  const agreementMode = raw.agreement_mode ?? (documents.length ? "pdf" : "text");
+  if (!["text", "pdf"].includes(agreementMode)) problem("agreement_mode_invalid", "Choose written text or PDF for the agreement.");
+  const requirePageSignature = raw.require_page_signature == null ? true : boolean("require_page_signature");
   return {
+    agreement_mode: agreementMode, require_page_signature: requirePageSignature,
     agreement_text: quoteText(raw.agreement_text, "Agreement text", 100000),
-    terms_text: quoteText(raw.terms_text, "Terms & Conditions", 100000),
+    terms_text: "", // Newly edited terms are an uploaded PDF; issued historical snapshots are untouched.
     terms_asset_id: raw.terms_asset_id ? uuid(raw.terms_asset_id) : null,
     consent_text: quoteText(raw.consent_text, "Electronic signing consent", 10000),
     confirmation_text:quoteText(raw.confirmation_text,"Confirmation message",5000),estimate_label:"Quote",
     show_agreement: raw.show_agreement == null ? true : boolean("show_agreement"),
     show_terms: raw.show_terms == null ? true : boolean("show_terms"),
-    quote_defaults: raw.quote_defaults == null ? null : normalizeQuoteTemplateDefaults(raw.quote_defaults),
+    quote_defaults: raw.quote_defaults == null ? null : normalizeQuoteTemplateDefaults({ ...raw.quote_defaults, balance_payment_timing: "after_signing" }),
     scope_exclusions:"",
     validity_days:raw.validity_days==null?null:quoteInteger(raw.validity_days,"Template validity",365,1),
     booking_preference:preference("booking_preference"),plan_offer_preference:preference("plan_offer_preference"),

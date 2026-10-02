@@ -130,15 +130,11 @@ export function createAgreementPayments({ pool, service, getStripe = service.get
     if (attempts.some((attempt) => attempt.state === "review")) review = true;
     const roles = (await db.query("SELECT role FROM agreement_signatures WHERE agreement_id=$1", [row.id])).rows.map((signature) => signature.role);
     const signed = row.snapshot.required_signers.every((role) => roles.includes(role));
-    let afterService = true;
-    if (row.snapshot.balance_payment_timing === "after_service") {
-      afterService = Boolean((await db.query(`SELECT count(*)>0 AND bool_and(finished_at IS NOT NULL) AS completed FROM schedule_events WHERE company_id=$1 AND quote_id=$2 AND contact_id=$3`, [row.company_id, row.quote_id, row.contact_id])).rows[0].completed);
-    }
     return { total_cents: total, original_total_cents: originalTotal, adjustment_cents: adjustment.discount_cents, adjustment_ids: adjustment.adjustment_ids, gross_paid_cents: gross, refunded_cents: refunds, paid_cents: paid,
       balance_cents: Math.max(0, total - paid), credit_cents: Math.max(0, paid - total), deposit_due_cents: Math.max(0, deposit - paid),
       payment_review_required: review, processing: attempts.some((attempt) => attempt.state === "processing"), receipts,
       active_checkout: attempts.find((attempt) => ["creating", "open", "processing"].includes(attempt.state)) || null,
-      can_pay_balance: signed && paid >= deposit && paid < total && !review && afterService && !row.revoked_at && !["declined", "superseded"].includes(row.decision) };
+      can_pay_balance: signed && paid < total && !review && !row.revoked_at && !["declined", "superseded"].includes(row.decision) };
   }
   async function reserve(row, { request_id, kind, transport, actor_id = null, expected_amount = null }, readiness) {
     if (!row.snapshot.pricing) fail("agreement_has_no_payment", "This standalone agreement has no payment obligation.");
@@ -157,7 +153,6 @@ export function createAgreementPayments({ pool, service, getStripe = service.get
       if (!row.snapshot.required_signers.every((role) => roles.includes(role))) fail("payment_signatures_required", "Complete all required signatures before payment.");
       if (row.revoked_at || ["declined", "superseded"].includes(row.decision)) fail("payment_agreement_unavailable", "This estimate is no longer available for payment. Contact the business.");
       if (summary.payment_review_required) fail("payment_adjustment_review_required", "A payment adjustment needs the business's review before another charge.");
-      if (kind === "balance" && summary.deposit_due_cents > 0) fail("payment_deposit_required", "Complete the required deposit before paying the remaining balance.");
       if (kind === "balance" && summary.balance_cents > 0 && !summary.can_pay_balance) fail("payment_balance_not_due", "The remaining balance is not yet available for payment.");
       const amount = kind === "deposit" ? Math.min(summary.deposit_due_cents, summary.balance_cents) : summary.balance_cents;
       if (amount === 0) return { state: "succeeded", amount_cents: 0, already_paid: true };
