@@ -370,6 +370,7 @@ export async function installAgreementPlans({ app, pool, service, authRequired, 
   installPlanQuotePublication(service, plans.supportedBillingModes, plans);
   service.plansReady = true; service.planSummary = plans.summary; service.paymentAdjustmentSummary = plans.paymentAdjustmentSummary;
   service.planFollowupContext = plans.followupContext;
+  service.currentPlanPresence = async (db,row) => (await plans.currentMemberships(db,row)).length > 0;
   const wrap = (fn) => async (req,res) => { res.set({ 'Cache-Control':'private, no-store','Referrer-Policy':'no-referrer' }); try { await fn(req,res); } catch(error) { if(error instanceof QuoteContractError) return res.status(error.status).json({error:error.code,message:error.message}); console.error('[plans] operation failed',{code:error.code||'internal'}); res.status(500).json({error:'plan_operation_failed',message:'The plan could not be updated. Your existing agreement remains saved.'}); } };
   const staff=(capability)=>[authRequired,requireCapability(capability),(req,res,next)=>req.companyId?next():res.status(403).json({error:'company_required'})];
   const publicWrite=(req,res,next)=>{if(!req.is('application/json'))return res.status(415).json({error:'json_required'});if(req.headers.origin&&req.headers.origin!==service.env.QUOTE_PUBLIC_BASE_URL?.replace(/\/$/,''))return res.status(403).json({error:'origin_not_allowed'});next();};

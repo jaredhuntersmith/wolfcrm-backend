@@ -8,6 +8,7 @@ import { installAgreementSystem } from '../quote-agreements.js';
 import { installAgreementPayments } from '../agreement-payments.js';
 import { installAgreementPlans } from '../agreement-plans.js';
 import { installAgreementArchive } from '../agreement-archive.js';
+import { installAgreementPlanBilling } from '../agreement-plan-billing.js';
 import { advancePlanDate } from '../agreement-plans-domain.js';
 
 test('tier offers, separate consent, conditional adjustments and existing memberships remain atomic', {timeout:120000}, async (t) => {
@@ -95,6 +96,12 @@ test('tier offers, separate consent, conditional adjustments and existing member
       const membership=(await request(`/api/service-plans/${after.plan.service_plan_id}`)).body;assert.ok(membership.id,JSON.stringify(membership));assert.equal(membership.price_cents,25500);
       assert.equal((await pool.query('SELECT count(*)::integer n FROM agreement_plan_visits WHERE enrollment_id=$1',[enrollment.id])).rows[0].n,4);
     });
+    await t.test('operations show one next visit, hide a scheduled membership, and dashboard uses service cadence',async()=>{
+      const current=(await request(`/api/agreements/${published.id}`)).body.plan;
+      const operations=await request('/api/service-plan-operations');assert.equal(operations.status,200,JSON.stringify(operations.body));assert.equal(operations.body.unscheduled.length,1);assert.equal(operations.body.unscheduled[0].service_plan_id,current.service_plan_id);
+      const dashboard=await request('/api/service-plans/dashboard');assert.equal(dashboard.body.active_count,1);assert.equal(dashboard.body.estimated_mrr_cents,8500);
+      assert.equal((await request('/api/service-plan-operations',{token:'plan-other'})).body.unscheduled.length,0);
+    });
     await t.test('actual linked completed jobs consume one entitlement and preserve next obligation',async()=>{
       const current=(await request(`/api/agreements/${published.id}`)).body.plan;
       const visit=current.visits[0],jobID=randomUUID();
@@ -103,6 +110,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
       assert.equal((await request(path,{method:'POST',token:'plan-other',body:{job_id:jobID}})).status,404);
       const linked=await request(path,{method:'POST',body:{job_id:jobID}});assert.equal(linked.status,200,JSON.stringify(linked.body));
       assert.equal(linked.body.visits[0].state,'scheduled');
+      assert.equal((await request('/api/service-plan-operations')).body.unscheduled.length,0);
       const membership=(await pool.query('SELECT * FROM service_plans WHERE id=$1',[current.service_plan_id])).rows[0];
       const body={request_id:randomUUID(),job_id:jobID};
       await assert.rejects(plans.markServiced({companyId:company,userId:owner},membership,body),/finish that job/);
@@ -110,6 +118,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
       await Promise.all([1,2,3].map(()=>plans.markServiced({companyId:company,userId:owner},membership,body)));
       const after=(await pool.query('SELECT * FROM service_plans WHERE id=$1',[membership.id])).rows[0];
       assert.equal(after.remaining_visits,3);assert.ok(after.next_service_date);
+      assert.equal((await request('/api/service-plan-operations')).body.unscheduled.length,1);
       assert.equal((await pool.query("SELECT count(*)::integer n FROM service_plan_events WHERE service_plan_id=$1 AND event_type='serviced'",[membership.id])).rows[0].n,1);
       assert.equal((await pool.query("SELECT count(*)::integer n FROM agreement_plan_visits WHERE enrollment_id=$1 AND state='completed'",[current.id])).rows[0].n,1);
       assert.equal((await request(path,{method:'POST',body:{job_id:jobID}})).status,409);
@@ -184,6 +193,21 @@ test('tier offers, separate consent, conditional adjustments and existing member
       const planView=(await request(`/api/public/agreements/${secondary}/enrollments/${enrollment.id}`,{token:null})).body;
       assert.ok(planView.plan_agreement_url);assert.notEqual(planView.plan_agreement_url,enrollment.plan_agreement_url);
       const roleLink=planView.plan_agreement_url.split('/').at(-1);assert.equal((await request(`/api/public/agreements/${roleLink}`,{token:null})).body.viewer_role,'customer_2');
+    });
+    await t.test('returning customer keeps current tier first and replacement activates only after old cancellation',async()=>{
+      await pool.query('UPDATE saved_services SET plan_eligible=true,archived_at=NULL WHERE id=$1',[windowID]);
+      const adapter=await installAgreementPlanBilling({app:backend.app,pool,service,plans,env,getStripe:()=>null,startWorker:false});
+      const newer=await request('/api/service-plan-tiers',{method:'POST',body:{configuration:{...config,name:'Monthly care',service_interval:{unit:'month',count:1},term:{kind:'ongoing'},discount:{type:'percent',value:2000}}}});assert.equal(newer.status,201);
+      const choices=(await request(`/api/public/agreements/${token}/plan-offers`,{token:null})).body;
+      assert.equal(choices.current_memberships.length,1);assert.ok(!choices.offers.some(choice=>choice.tier_id===tier.tier_id));
+      const replacement=choices.offers.find(choice=>choice.tier_id===newer.body.tier_id);assert.equal(replacement.replaces.enrollment_id,enrollment.id);
+      const selected=await request(`/api/public/agreements/${token}/enrollments`,{method:'POST',token:null,body:{request_id:randomUUID(),tier_id:replacement.tier_id,tier_version:replacement.tier_version,offer_hash:replacement.offer_hash}});assert.equal(selected.status,201,JSON.stringify(selected.body));
+      assert.equal((await pool.query('SELECT status FROM service_plans WHERE id=$1',[choices.current_memberships[0].service_plan_id])).rows[0].status,'active');
+      const terms=(await request(`/api/agreements/${selected.body.plan_agreement_id}`)).body;await sign(terms);
+      const ready=await request(`/api/public/agreements/${token}/enrollments/${selected.body.id}/reconcile`,{method:'POST',token:null,body:{}});assert.equal(ready.status,200,JSON.stringify(ready.body));assert.equal(ready.body.state,'active');
+      const live=(await pool.query("SELECT * FROM service_plans WHERE company_id=$1 AND status='active'",[company])).rows;assert.equal(live.length,1);assert.equal(live[0].plan_name,'Monthly care');
+      assert.ok((await pool.query('SELECT canceled_at FROM agreement_plan_enrollments WHERE id=$1',[enrollment.id])).rows[0].canceled_at);
+      adapter.stop();
     });
   } finally {if(server)await new Promise(resolve=>server.close(resolve));if(pool)await pool.end();postgres.stop();}
 });

@@ -202,6 +202,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     delete snapshot.addon_source;
     if (!staff) { delete snapshot.duration_minutes; snapshot.optional_addons = (snapshot.optional_addons || []).map(({ duration_minutes, ...line }) => line); }
     const result = { id: row.id, quote_id: row.quote_id, contact_id: row.contact_id, number: row.number, revision: row.revision, title: row.title, created_at: row.created_at, expires_at: row.expires_at, snapshot, packet_hash: row.packet_hash, state: await state(db, row), signatures, documents_ready: row.documents_ready };
+    if (service.currentPlanPresence && (staff || publicRole === "customer")) result.has_current_plan = await service.currentPlanPresence(db,row);
     if(staff){
       result.predecessor_id=row.predecessor_id||null;
       result.latest_activity=(await db.query('SELECT type,created_at FROM agreement_events WHERE agreement_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1',[row.id])).rows[0]||null;

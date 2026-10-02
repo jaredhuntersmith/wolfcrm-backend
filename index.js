@@ -18239,9 +18239,9 @@ app.get("/api/service-plans/dashboard", authRequired, requireCapability("payment
       `SELECT status, COUNT(*)::int AS n, COALESCE(SUM(price_cents),0)::bigint AS total_cents,
               billing_interval, billing_interval_count
          FROM service_plans
-        WHERE user_id = $1
+        WHERE (company_id = $2 OR (company_id IS NULL AND user_id = $1))
         GROUP BY status, billing_interval, billing_interval_count`,
-      [employerId]
+      [employerId,req.companyId]
     );
     let active = 0, pending = 0, pastDue = 0, canceled = 0, paused = 0, mrrCents = 0;
     for (const r of rows) {
@@ -18256,32 +18256,33 @@ app.get("/api/service-plans/dashboard", authRequired, requireCapability("payment
     const active_plans = await pool.query(
       `SELECT price_cents, status, billing_interval, billing_interval_count, service_interval, service_interval_count, billing_mode, plan_snapshot, remaining_visits
          FROM service_plans
-        WHERE user_id = $1 AND status = 'active'`,
-      [employerId]
+        WHERE (company_id = $2 OR (company_id IS NULL AND user_id = $1)) AND status = 'active'`,
+      [employerId,req.companyId]
     );
     for (const p of active_plans.rows) mrrCents += monthlyPlanRevenueCents(p);
     const { rows: upcoming } = await pool.query(
       `SELECT sp.*, c.name AS contact_name
          FROM service_plans sp
          LEFT JOIN contacts c ON c.id::text = sp.contact_id::text
-        WHERE sp.user_id = $1
+        WHERE (sp.company_id = $2 OR (sp.company_id IS NULL AND sp.user_id = $1))
           AND sp.status IN ('active','payment_pending','past_due')
           AND sp.next_service_date IS NOT NULL
           AND sp.next_service_date >= (CURRENT_DATE - INTERVAL '1 day')
         ORDER BY sp.next_service_date ASC
         LIMIT 25`,
-      [employerId]
+      [employerId,req.companyId]
     );
     const { rows: events } = await pool.query(
       `SELECT e.*, sp.plan_name, c.name AS contact_name
          FROM service_plan_events e
          LEFT JOIN service_plans sp ON sp.id = e.service_plan_id
          LEFT JOIN contacts c ON c.id::text = e.contact_id::text
-        WHERE e.user_id = $1
+        WHERE (e.company_id = $2 OR (e.company_id IS NULL AND e.user_id = $1))
         ORDER BY e.created_at DESC
         LIMIT 20`,
-      [employerId]
+      [employerId,req.companyId]
     );
+    if(req.companyId && app.locals.agreementPlans) pending += (await pool.query("SELECT count(*)::integer AS n FROM agreement_plan_enrollments WHERE company_id=$1 AND service_plan_id IS NULL AND canceled_at IS NULL",[req.companyId])).rows[0].n;
     res.json({
       active_count: active,
       pending_payment_count: pending,
