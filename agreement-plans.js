@@ -57,6 +57,7 @@ export async function installAgreementPlanSchema(pool) {
     ALTER TABLE agreement_plan_visits ADD COLUMN IF NOT EXISTS job_history JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE agreement_plan_visits ADD COLUMN IF NOT EXISTS schedule_offset INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE schedule_events ADD COLUMN IF NOT EXISTS service_plan_id UUID REFERENCES service_plans(id) ON DELETE RESTRICT;
+    CREATE INDEX IF NOT EXISTS schedule_events_active_plan_idx ON schedule_events(company_id,service_plan_id,start_at) WHERE service_plan_id IS NOT NULL AND finished_at IS NULL;
     CREATE TABLE IF NOT EXISTS agreement_plan_visit_actions (
       company_id UUID NOT NULL, request_id UUID NOT NULL, request_hash TEXT NOT NULL, result JSONB NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(company_id,request_id)
@@ -350,7 +351,18 @@ export async function installAgreementPlans({ app, pool, service, authRequired, 
   app.get('/api/service-plan-tiers',...staff('payments.view'),wrap(async(req,res)=>res.json({tiers:await plans.tiers(pool,req.companyId),supported_billing_modes:plans.supportedBillingModes})));
   app.post('/api/service-plan-tiers',...staff('settings.manage_company'),wrap(async(req,res)=>res.status(201).json(await plans.saveTier(req,req.body))));
   app.post('/api/service-plan-tiers/:id/archive',...staff('settings.manage_company'),wrap(async(req,res)=>{const result=await pool.query('UPDATE service_plan_tiers SET archived_at=now() WHERE tier_id=$1 AND company_id=$2 RETURNING tier_id',[id(req.params.id),req.companyId]);if(!result.rowCount)fail('plan_tier_unavailable','This tier is unavailable.',404);res.json({archived:true});}));
-  app.get('/api/service-plan-enrollments/:id',...staff('payments.view'),wrap(async(req,res)=>{const enrollment=(await pool.query('SELECT * FROM agreement_plan_enrollments WHERE id=$1 AND company_id=$2',[id(req.params.id),req.companyId])).rows[0];if(!enrollment)fail('plan_enrollment_unavailable','This enrollment is unavailable.',404);res.json(await plans.detail(pool,enrollment));}));
+  app.get('/api/service-plan-operations',...staff('payments.view'),requireCapability('schedule.view'),wrap(async(req,res)=>{
+    const rows=(await pool.query(`SELECT p.id AS service_plan_id,p.enrollment_id,p.contact_id,p.plan_name,c.name AS customer_name,
+      v.id AS visit_id,COALESCE(v.due_date,p.next_service_date)::text AS due_date
+      FROM service_plans p JOIN contacts c ON c.id=p.contact_id AND c.company_id=p.company_id
+      LEFT JOIN LATERAL (SELECT id,due_date FROM agreement_plan_visits WHERE service_plan_id=p.id AND state IN ('due','scheduled') ORDER BY due_date,sequence LIMIT 1) v ON true
+      WHERE p.company_id=$1 AND p.status='active' AND (p.remaining_visits IS NULL OR p.remaining_visits>0)
+      AND (p.enrollment_id IS NULL OR v.id IS NOT NULL)
+      AND NOT EXISTS(SELECT 1 FROM schedule_events j WHERE j.company_id=p.company_id AND j.service_plan_id=p.id AND j.finished_at IS NULL)
+      ORDER BY COALESCE(v.due_date,p.next_service_date) NULLS LAST,c.name,p.id`,[req.companyId])).rows;
+    res.json({unscheduled:rows});
+  }));
+  app.get('/api/service-plan-enrollments/:id' ,...staff('payments.view'),wrap(async(req,res)=>{const enrollment=(await pool.query('SELECT * FROM agreement_plan_enrollments WHERE id=$1 AND company_id=$2',[id(req.params.id),req.companyId])).rows[0];if(!enrollment)fail('plan_enrollment_unavailable','This enrollment is unavailable.',404);res.json(await plans.detail(pool,enrollment));}));
   app.post('/api/service-plan-enrollments/:id/visits/:visitId/schedule',...staff('schedule.edit'),wrap(async(req,res)=>res.json(await plans.linkVisit(req,req.params.id,req.params.visitId,req.body))));
   app.post('/api/service-plan-enrollments/:id/visits/:visitId/defer',...staff('schedule.edit'),wrap(async(req,res)=>res.json(await plans.deferVisit(req,req.params.id,req.params.visitId,req.body))));
   app.get('/api/public/agreements/:token/plan-offers',wrap(async(req,res)=>{const {row,role}=await service.loadPublic(pool,req.params.token);res.json({offers:role==='customer'?await plans.offers(pool,row):[],enrollment:await plans.summary(pool,row,{publicRole:role})});}));
