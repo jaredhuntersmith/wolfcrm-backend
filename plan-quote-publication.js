@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { QuoteContractError, quoteContentHash, calculateQuotePricing } from "./quote-contract-domain.js";
+import { QuoteContractError, quoteContentHash, calculateQuotePricing, calculatePlanOffer } from "./quote-contract-domain.js";
 import { buildPlanOffer } from "./agreement-plans-domain.js";
 
 const fail = (code, message) => { throw new QuoteContractError(code, message, 409); };
@@ -36,4 +36,17 @@ export function installPlanQuotePublication(service, supportedBillingModes) {
       VALUES($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)`, [enrollmentID,row.company_id,row.contact_id,row.id,offer.tier_id,offer.tier_version,`quote:${row.quote_id}`,row.request_id,quoteContentHash({agreement_id:row.id,offer_hash:offer.offer_hash}),offer.offer_hash,JSON.stringify(offer)]);
   };
   service.planQuoteReady = async (db,row) => !row.snapshot.plan_quote || Boolean((await db.query("SELECT 1 FROM agreement_plan_enrollments WHERE company_id=$1 AND plan_agreement_id=$2 AND service_plan_id IS NOT NULL AND activated_at IS NOT NULL",[row.company_id,row.id])).rowCount);
+}
+
+export async function priceQuoteForPlan(db, companyID, pricing, options) {
+  const tierID=options.template?.content?.plan_tier_id;
+  if(!tierID) return pricing;
+  const tier=(await db.query("SELECT configuration,archived_at FROM service_plan_tiers WHERE company_id=$1 AND tier_id=$2 ORDER BY version DESC LIMIT 1",[companyID,tierID])).rows[0];
+  if(!tier || tier.archived_at) fail("plan_tier_unavailable","Choose an available saved plan tier.");
+  const catalog=(await db.query("SELECT id FROM saved_services WHERE company_id=$1 AND plan_eligible AND archived_at IS NULL",[companyID])).rows;
+  const settings=(await db.query("SELECT discount_stacking_policy FROM quote_settings WHERE company_id=$1",[companyID])).rows[0];
+  const offer=calculatePlanOffer({line_items:pricing.line_items,quoted_pricing:pricing,tax_rate_basis_points:pricing.tax_rate_basis_points,tax_inclusive:pricing.tax_inclusive,eligible_service_ids:catalog.map(row=>row.id),tier:tier.configuration,discount_stacking_policy:settings?.discount_stacking_policy || "best_price"});
+  if(!offer) fail("plan_scope_required","Add a saved service eligible for this plan tier.");
+  const deposit=calculateQuotePricing({line_items:[{name:"Plan quote",qty:1,price_cents:offer.current_total_cents}],deposit:options.deposit}).deposit_cents;
+  return {...offer.current_pricing,deposit_cents:deposit,balance_after_deposit_cents:offer.current_total_cents-deposit};
 }

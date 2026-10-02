@@ -1,3 +1,4 @@
+import { priceQuoteForPlan } from "./plan-quote-publication.js";
 import { monthlyPlanRevenueCents } from "./service-plan-metrics.js";
 /* WolfCRM backend — email/password auth + user-scoped CRM data */
 /* WolfCRM backend auto-sync verification */
@@ -11761,8 +11762,8 @@ app.post("/api/quotes/pricing", authRequired, requireAnyCapability("quotes.creat
     validateQuoteAddonScope(line_items, quote_options);
     await assertQuoteReferences(pool, req, { line_items: [...line_items,...quote_options.optional_addons], existing_lines });
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
-    res.json(calculateQuotePricing({ line_items, deposit: quote_options.deposit, discount:quote_options.discount,tax_inclusive:settings.tax_inclusive??false,
-      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }));
+    res.json(await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items, deposit: quote_options.deposit, discount:quote_options.discount,tax_inclusive:settings.tax_inclusive??false,
+      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }),quote_options));
   } catch (error) {
     if (sendQuoteValidationError(res, error)) return;
     console.error("[quotes] pricing failed", { code: error?.code });
@@ -11779,8 +11780,8 @@ app.get("/api/quotes/:id/pricing", authRequired, requireCapability("quotes.view"
     validateQuoteAddonScope(quote.line_items, options);
     await assertQuoteReferences(pool, req, { line_items: [...quote.line_items,...options.optional_addons], existing_lines: [...quote.line_items,...options.optional_addons] });
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
-    res.json({ ...calculateQuotePricing({ line_items: quote.line_items, deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
-      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }), quote_updated_at: quote.updated_at });
+    res.json({ ...await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: quote.line_items, deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
+      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }),options), quote_updated_at: quote.updated_at });
   } catch (error) {
     if (sendQuoteValidationError(res, error)) return;
     console.error("[quotes] saved pricing failed", { code: error?.code });
@@ -11943,8 +11944,8 @@ app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async 
     items = normalizeQuoteLines(line_items ?? []);
     options = await resolveQuoteTemplateOptions(pool, req, req.body?.quote_options ?? {});
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
-    const pricing = calculateQuotePricing({ line_items: items, deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
-      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 });
+    const pricing = await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: items, deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
+      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }),options);
     total = pricing.subtotal_cents;
     validateQuoteAddonScope(items, options);
     await assertQuoteReferences(pool, req, { contact_id, line_items: [...items,...options.optional_addons] });
@@ -12004,8 +12005,8 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
     const options = req.body.quote_options === undefined ? null : await resolveQuoteTemplateOptions(pool, req, req.body.quote_options, { previous: previous.quote_options });
     const effectiveOptions = options || normalizeQuoteOptions(previous.quote_options || {});
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
-    const pricing = calculateQuotePricing({ line_items: items || previous.line_items, deposit: effectiveOptions.deposit, discount:effectiveOptions.discount,tax_inclusive:settings.tax_inclusive??false,
-      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 });
+    const pricing = await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: items || previous.line_items, deposit: effectiveOptions.deposit, discount:effectiveOptions.discount,tax_inclusive:settings.tax_inclusive??false,
+      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }),effectiveOptions);
     const total = items ? pricing.subtotal_cents : null;
     validateQuoteAddonScope(items || previous.line_items, effectiveOptions);
     await assertQuoteReferences(pool, req, { contact_id: previous.contact_id, line_items: [...(items || previous.line_items),...effectiveOptions.optional_addons], existing_lines: [...previous.line_items,...normalizeQuoteOptions(previous.quote_options || {}).optional_addons] });
