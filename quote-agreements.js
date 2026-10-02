@@ -304,7 +304,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       if (bookingEnabled && !service.bookingReady) problem("agreement_booking_not_ready", "Customer booking is not ready. Finish schedule integration before publishing with booking enabled.", 409);
       if (bookingEnabled) await service.validateBookingReadiness(db, req.companyId, { quote_id: quote.id, duration_minutes: options.duration_minutes, line_items: pricing.line_items });
       if (plansEnabled && !service.plansReady) problem("agreement_plans_not_ready", "Customer plan enrollment is not ready. Finish plan integration before enabling offers.", 409);
-      if (!quoteId && !content.agreement_text.trim() && !content.documents.length) problem("standalone_agreement_content_required", "Add agreement text or a contract PDF before publishing a standalone agreement.");
+      if (!quoteId && !(content.show_agreement && content.agreement_text.trim()) && !content.documents.length) problem("standalone_agreement_content_required", "Add agreement text or a contract PDF before publishing a standalone agreement.");
       if (!content.consent_text.trim()) problem("agreement_consent_required", "Configure the electronic signing consent wording in Quotes & Contracts.");
       if (!content.show_agreement) content.agreement_text = "";
       if (!content.show_terms) { content.terms_text = ""; content.terms_asset_id = null; }

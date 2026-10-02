@@ -24,7 +24,7 @@ export function normalizePlanTier(raw) {
   if (!PLAN_BILLING_MODES.includes(billing.mode)) fail('plan_billing_invalid', 'Choose a supported billing mode.');
   if (term.kind !== 'finite' && ['calendar_installments', 'prepaid'].includes(billing.mode)) fail('plan_finite_term_required', 'Installments and prepaid packages need an explicit included visit count.');
   const content = normalizeAgreementContent(raw.agreement || {});
-  if (!content.consent_text.trim() || (!content.agreement_text.trim() && !content.documents.length)) fail('plan_agreement_required', 'Configure plan agreement text or a PDF and explicit signing consent.');
+  if (!content.consent_text.trim() || (!(content.show_agreement && content.agreement_text.trim()) && !content.documents.length)) fail('plan_agreement_required', 'Configure plan agreement text or a PDF and explicit signing consent.');
   const policy = quoteText(raw.cancellation_policy, 'Cancellation and renewal terms', 10000).trim();
   if (!policy) fail('plan_policy_required', 'State cancellation, renewal and price-change terms before offering this tier.');
   return {

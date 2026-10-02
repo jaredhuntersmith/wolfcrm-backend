@@ -5,7 +5,8 @@ import {randomUUID} from "node:crypto";
 import {PDFDocument} from "pdf-lib";
 import {startLocalPostgres} from "./helpers/local-postgres.js";
 import {installAgreementSystem} from "../quote-agreements.js";
-import {normalizeQuoteOptions,validateQuoteAddonScope} from "../quote-contract-domain.js";
+import {normalizeQuoteOptions,validateQuoteAddonScope,quoteContentHash} from "../quote-contract-domain.js";
+import {generateQuoteAgreementPDF} from "../quote-agreement-documents.js";
 import {installScheduleBookingGuard} from "../schedule-booking-guard.js";
 
 test("optional choices use bounded explicit stable scope",()=>{
@@ -40,7 +41,21 @@ test("optional services produce immutable exact revisions before every signer",{
       const quote=randomUUID(),line={id:randomUUID(),service_id:savedService,name:"Windows",description:"Outside only",qty:2,price_cents:10000},addon={id:randomUUID(),service_id:savedService,name:"Screens",description:"Remove and wash\nRinse frames",qty:1.5,price_cents:2000,duration_minutes:30};
       const options=normalizeQuoteOptions({duration_minutes:90,optional_addons:noAddons?[]:[addon],allow_customer_booking:booking,deposit:{type:deposit?"percent":"none",value:deposit?2500:0},...(discount?{discount}:{})});
       await pool.query("INSERT INTO quotes(id,user_id,company_id,contact_id,line_items,total_cents,quote_options) VALUES($1,$2,$3,$4,$5::jsonb,20000,$6::jsonb)",[quote,user,company,contact,JSON.stringify([line]),JSON.stringify(options)]);
-      const published=await service.publish(req,quote,{request_id:randomUUID(),...(content?{content}:{})});return{quote,line,addon,published,token:tokenOf(published)};
+      let published=await service.publish(req,quote,{request_id:randomUUID(),...(content?{content}:{})});
+      if (!noAddons) {
+        // These are legacy issued packets: new publication intentionally removes
+        // optional choices. Seed the retired snapshot format directly to keep
+        // testing historical revision/financial/signature protections.
+        const snapshot=structuredClone(published.snapshot), money=c=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(c/100);
+        const template=(await pool.query('SELECT content FROM agreement_settings WHERE company_id=$1',[company])).rows[0].content;
+        const merge={customer_name:snapshot.customer.name,service_address:snapshot.customer.address,services:snapshot.pricing.line_items.map(li=>`${li.name}\n${li.description}`).join('\n\n'),total:money(snapshot.pricing.total_cents),deposit:money(snapshot.pricing.deposit_cents),balance:money(snapshot.pricing.balance_after_deposit_cents)};
+        snapshot.optional_addons=[addon];snapshot.addon_selection_finalized=false;snapshot.addon_source={base_line_items:snapshot.pricing.line_items,base_duration_minutes:90,pricing_inputs:{tax_rate_basis_points:snapshot.pricing.tax_rate_basis_points,tax_inclusive:snapshot.pricing.tax_inclusive,discount:options.discount,deposit:options.deposit},merge_values:merge,content:{...template,...content,documents:snapshot.documents.map(doc=>({asset_id:doc.asset_id,fields:doc.fields}))}};
+        await pool.query('UPDATE quote_agreements SET snapshot=$2::jsonb,packet_hash=$3 WHERE id=$1',[published.id,JSON.stringify(snapshot),quoteContentHash(snapshot)]);
+        await pool.query('DELETE FROM agreement_artifacts WHERE agreement_id=$1',[published.id]);
+        await service.storeArtifact(pool,published.id,'quote',await generateQuoteAgreementPDF(snapshot));
+        published=await service.detail(pool,(await pool.query('SELECT * FROM quote_agreements WHERE id=$1',[published.id])).rows[0],{staff:true});
+      }
+      return{quote,line,addon,published,token:tokenOf(published)};
     }
     const select=(item,ids=[item.addon.id],more={})=>service.selectAddons(item.token,{request_id:randomUUID(),packet_hash:item.published.packet_hash,selected_addon_ids:ids,...more});
     async function sign(item,role="customer"){
@@ -91,8 +106,8 @@ test("optional services produce immutable exact revisions before every signer",{
     await t.test("ownership and archival preserve existing options but reject new foreign or archived scope",async()=>{
       const item=await packet();await pool.query("UPDATE saved_services SET archived_at=now() WHERE id=$1",[savedService]);
       const update=await request(`/api/quotes/${item.quote}`,{quote_options:normalizeQuoteOptions({duration_minutes:90,optional_addons:[item.addon]})},"PUT");assert.equal(update.status,200,JSON.stringify(update.body));assert.equal((await select(item)).agreement.snapshot.pricing.total_cents,23000);
-      const added=await request(`/api/quotes/${item.quote}`,{quote_options:normalizeQuoteOptions({duration_minutes:90,optional_addons:[{...item.addon,id:randomUUID()}]})},"PUT");assert.equal(added.status,409);
-      const foreign=await request(`/api/quotes/${item.quote}`,{quote_options:normalizeQuoteOptions({duration_minutes:90,optional_addons:[{...item.addon,service_id:foreignService}]})},"PUT");assert.equal(foreign.status,404);
+      const added=await request(`/api/quotes/${item.quote}`,{quote_options:normalizeQuoteOptions({duration_minutes:90,optional_addons:[{...item.addon,id:randomUUID()}]})},"PUT");assert.equal(added.status,200);assert.deepEqual(added.body.quote_options.optional_addons,[]);
+      const foreign=await request(`/api/quotes/${item.quote}`,{quote_options:normalizeQuoteOptions({duration_minutes:90,optional_addons:[{...item.addon,service_id:foreignService}]})},"PUT");assert.equal(foreign.status,200);assert.deepEqual(foreign.body.quote_options.optional_addons,[]);
       await pool.query("UPDATE saved_services SET archived_at=NULL WHERE id=$1",[savedService]);
     });
     await t.test("decline remains available before optional services are finalized",async()=>{

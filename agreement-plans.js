@@ -162,20 +162,20 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
         quote_number: number, issue_date: now().toISOString(), expires_at: expiresAt, services: offer.future_visit.line_items.map((line) => `${line.name}: ${line.description}`).join('\n'),
         subtotal: money(offer.future_visit.subtotal_cents), tax: money(offer.future_visit.tax_cents), total: money(offer.current_total_cents), deposit: money(row.snapshot.pricing.deposit_cents), deposit_percentage: row.snapshot.deposit?.type === 'percent' ? `${row.snapshot.deposit.value / 100}%` : '', balance: money(offer.current_balance_cents),
         plan_name: config.name, service_frequency: `Every ${config.service_interval.count} ${config.service_interval.unit}`, contract_term: config.term.kind === 'finite' ? `${config.term.visit_count} visits` : 'Ongoing', plan_price: money(offer.future_visit.total_cents), billing_information: offer.financial_text };
-      const termsAsset = content.terms_asset_id ? (await db.query('SELECT * FROM agreement_assets WHERE id=$1 AND company_id=$2', [content.terms_asset_id, row.company_id])).rows[0] : null;
-      if (content.terms_asset_id && !termsAsset) fail('plan_terms_missing', 'The plan terms PDF is unavailable.');
+      const termsAsset = content.show_terms && content.terms_asset_id ? (await db.query('SELECT * FROM agreement_assets WHERE id=$1 AND company_id=$2', [content.terms_asset_id, row.company_id])).rows[0] : null;
+      if (content.show_terms && content.terms_asset_id && !termsAsset) fail('plan_terms_missing', 'The plan terms PDF is unavailable.');
       merge.business_name=content.branding.display_name||row.snapshot.business.name;
       const snapshot = { kind: 'plan', title: config.name, number, revision: 1, issued_at: now().toISOString(), expires_at: expiresAt,
         business: {...row.snapshot.business,name:merge.business_name,logo_data_url:content.branding.show_logo?row.snapshot.business.logo_data_url||'':''}, customer: { name: privateContact.name, address: privateContact.address, billing_address:merge.billing_address, phone: content.show_customer_phone ? privateContact.phone : null, email: content.show_customer_email ? privateContact.email : null },
         pricing: null, allow_customer_booking: false, offer_service_plans: false, customer_notes_enabled: false, duration_minutes: null,
-        ...content, agreement_text: `${offer.financial_text}\n\n${resolveAgreementText(content.agreement_text, merge)}`, terms_text: resolveAgreementText(content.terms_text, merge), consent_text: resolveAgreementText(content.consent_text, merge),
+        ...content, show_agreement: true, agreement_text: `${offer.financial_text}\n\n${content.show_agreement ? resolveAgreementText(content.agreement_text, merge) : ""}`, terms_text: content.show_terms ? resolveAgreementText(content.terms_text, merge) : "", consent_text: resolveAgreementText(content.consent_text, merge),
         documents: await service.validateDocuments(db, row.company_id, content, merge),
         terms_document: termsAsset ? { asset_id: termsAsset.id, name: termsAsset.name, sha256: termsAsset.normalized_sha256 } : null,
         plan_enrollment_id: enrollmentID, base_agreement_id: row.id, financial_terms: offer,
       };
       const agreement = (await db.query(`INSERT INTO quote_agreements(id,company_id,contact_id,created_by,number,revision,request_id,title,snapshot,packet_hash,expires_at) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8::jsonb,$9,$10) RETURNING *`, [planAgreementID, row.company_id, row.contact_id, row.created_by, number, randomUUID(), config.name, JSON.stringify(snapshot), quoteContentHash(snapshot), snapshot.expires_at])).rows[0];
       await service.storeArtifact(db, agreement.id, 'quote', await generateQuoteAgreementPDF(snapshot, { customer_url: service.customerURL(agreement) }));
-      if (content.terms_text || termsAsset) {
+      if (snapshot.terms_text || termsAsset) {
         const cover = await generateQuoteAgreementPDF({ ...snapshot, title: 'Plan Terms & Conditions', agreement_text: '', documents: [], consent_text: '' }, { customer_url: service.customerURL(agreement) });
         await service.storeArtifact(db, agreement.id, 'terms', termsAsset ? await combineAgreementPDFs([cover, termsAsset.normalized_bytes]) : cover);
       }
