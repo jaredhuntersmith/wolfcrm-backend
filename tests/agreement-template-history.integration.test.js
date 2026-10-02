@@ -1,3 +1,4 @@
+import { previewPublications } from "./helpers/publication-preview.js";
 import { drawnSignature } from "./helpers/signatures.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,6 +25,7 @@ test('template versions, frozen preferences, standalone revisions and private hi
     const env={NODE_ENV:'test',QUOTE_PUBLIC_BASE_URL:'http://localhost:3000',QUOTE_LINK_SECRET:'template-test-durable-link-secret-more-than32characters'};
     let settings={company_name:'Original business',valid_for_days:30,tax_enabled:false,company_logo_data_url:''};
     service=await installAgreementSystem({app:backend.app,pool,authRequired:backend.authRequired,requireCapability:backend.requireCapability,getQuoteSettings:async()=>settings,env,startWorker:false});
+    previewPublications(service);
     server=await new Promise(resolve=>{const listener=backend.app.listen(0,'127.0.0.1',()=>resolve(listener));});const base=`http://127.0.0.1:${server.address().port}`;
     const request=async(path,{method='GET',body,token='template-owner'}={})=>{const response=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})},body:body===undefined?undefined:JSON.stringify(body)});return {status:response.status,body:response.headers.get('content-type')?.includes('application/json')?await response.json():Buffer.from(await response.arrayBuffer())};};
     const content={agreement_text:'Agreed scope for {{customer_name}}',consent_text:'I agree to electronic signing.',validity_days:7,estimate_label:'Quote',confirmation_text:'Your signed record is available below.',scope_exclusions:'No interior work',branding:{display_name:'Exterior Division',accent_color:'#336699',show_logo:false},booking_preference:false,plan_offer_preference:false};

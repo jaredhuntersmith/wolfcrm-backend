@@ -33,6 +33,11 @@ test('template defaults, persisted overrides, visibility, drawing and removal wo
       const renamed=await saveTemplate({template_id:initial.template_id,expected_version:initial.version,name:'My Main Quote',content:initial.content});assert.equal(renamed.status,201);assert.equal(renamed.body.is_default,true);initial=renamed.body;
       assert.equal((await request(`/api/agreements/templates/${initial.template_id}/archive`,{method:'POST',body:{expected_version:initial.version}})).body.error,'agreement_default_template_required');
     });
+    await t.test('legacy company defaults seed independently of existing optional templates',async()=>{
+      await pool.query('UPDATE agreement_settings SET default_template_id=NULL,content=$2::jsonb WHERE company_id=$1',[otherCompany,JSON.stringify({agreement_text:'Legacy company default',consent_text:'Legacy consent'})]);
+      const rows=(await request('/api/agreements/templates',{token:'other'})).body;
+      assert.equal(rows.filter(row=>row.is_default).length,1);assert.equal(rows.find(row=>row.is_default).content.agreement_text,'Legacy company default');
+    });
     await t.test('template carries commercial/workflow settings and default selection enforces permissions/version',async()=>{
       custom=(await saveTemplate({name:'After Service',content:{...initial.content,agreement_text:'Visible agreement',terms_text:'Hidden terms',show_agreement:false,show_terms:false,quote_defaults:{...initial.content.quote_defaults,deposit:{type:'fixed',value:2500},discount:{type:'percent',value:1000},customer_notes_enabled:true,balance_payment_timing:'after_service'}}})).body;
       assert.equal((await request(`/api/agreements/templates/${custom.template_id}/default`,{method:'PUT',token:'worker',body:{expected_version:1}})).status,403);
@@ -47,12 +52,16 @@ test('template defaults, persisted overrides, visibility, drawing and removal wo
       assert.equal(saved.quote_options.template.name,'After Service');assert.equal(saved.quote_options.template.is_customized,true);assert.equal(saved.quote_options.duration_minutes,90);assert.equal(saved.quote_options.customer_notes_enabled,true);
       assert.deepEqual(saved.quote_options.optional_addons,[]);assert.equal(saved.quote_options.billing_address,'');assert.equal(saved.quote_options.public_notes,'');
       const source=(await request('/api/agreements/templates')).body.find(row=>row.template_id===custom.template_id);assert.equal(source.content.agreement_text,'Visible agreement');assert.equal(source.content.quote_defaults.deposit.value,2500);
+      const previewPricing=await request('/api/quotes/pricing',{method:'POST',body:{line_items:quoteBody.line_items,quote_options:{...saved.quote_options,deposit:{type:'fixed',value:9999},discount:{type:'none',value:0}}}});
+      assert.equal(previewPricing.status,200,JSON.stringify(previewPricing.body));assert.equal(previewPricing.body.total_cents,18000);assert.equal(previewPricing.body.deposit_cents,0);
       const foreign=(await request('/api/agreements/templates',{token:'other'})).body[0];
       assert.equal((await request(`/api/quotes/${saved.id}`,{method:'PUT',body:{quote_options:{template:{id:foreign.template_id,version:1,name:foreign.name,content:foreign.content}}}})).status,404);
       await saveTemplate({template_id:custom.template_id,expected_version:1,name:'Updated future quotes',content:{...custom.content,terms_text:'Future text'}});
       const reloaded=(await request('/api/quotes')).body.find(row=>row.id===saved.id);assert.deepEqual(reloaded.quote_options,saved.quote_options);
     });
     await t.test('publication uses saved override, omits hidden content, freezes exact preview, keeps customer notes',async()=>{
+      assert.equal((await request(`/api/quotes/${saved.id}/publish`,{method:'POST',body:{request_id:randomUUID()}})).body.error,'agreement_preview_required');
+      assert.equal((await request(`/api/quotes/${saved.id}/publish`,{method:'POST',body:{request_id:randomUUID(),expected_preview_hash:'stale'}})).body.error,'agreement_preview_changed');
       issued=await publish(saved);assert.equal(issued.snapshot.estimate_label,'Quote');assert.equal(issued.snapshot.agreement_text,'');assert.equal(issued.snapshot.terms_text,'');assert.equal(issued.snapshot.terms_document,null);assert.equal(issued.snapshot.customer_notes_enabled,true);assert.equal(issued.snapshot.pricing.deposit_cents,0);assert.equal(issued.snapshot.pricing.total_cents,18000);assert.equal(issued.snapshot.template.version,1);assert.equal(issued.snapshot.addon_selection_finalized,true);
       const token=issued.customer_url.split('/').at(-1);const session=(await request(`/api/public/agreements/${token}/session`,{token:null,method:'POST',body:{}})).body;
       const signBody={request_id:randomUUID(),packet_hash:issued.packet_hash,session_token:session.session_token,printed_name:'Customer',consent:true,signature:drawnSignature(),values:{}};

@@ -1,3 +1,4 @@
+import { previewPublications } from "./helpers/publication-preview.js";
 import { drawnSignature } from "./helpers/signatures.js";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -25,6 +26,7 @@ test("optional services produce immutable exact revisions before every signer",{
     const backend=await import("../index.js");pool=backend.pool;await backend.bootstrap();
     const {installGoogleSheetsSchema}=await import("../google-sheets.js");await installGoogleSheetsSchema(pool);
     const service=await installAgreementSystem({app:backend.app,pool,authRequired:backend.authRequired,requireCapability:backend.requireCapability,getQuoteSettings:backend.getQuoteSettings,env:{NODE_ENV:"test",QUOTE_LINK_SECRET:"test-optional-services-secret-at-least-32-characters",QUOTE_PUBLIC_BASE_URL:"http://localhost:3000"},startWorker:false});
+    previewPublications(service);
     await installScheduleBookingGuard(pool);
     const company=randomUUID(),otherCompany=randomUUID(),user=randomUUID(),contact=randomUUID(),savedService=randomUUID(),foreignService=randomUUID();
     await pool.query("INSERT INTO companies(id,name,join_code) VALUES($1,'Scope Company','ADDON'),($2,'Other','ADDONOTHER')",[company,otherCompany]);

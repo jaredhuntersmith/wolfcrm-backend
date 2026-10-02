@@ -97,3 +97,10 @@ test('unsupported document glyphs fail explicitly before losing name/signature c
   const fields=normalizeAgreementFields([definition({type:'text'})],[{width:612,height:792}]);
   await assert.rejects(populateAgreementPDF(bytes,fields,{signature:'Name 😀'}),error=>error.code==='agreement_font_unsupported');
 });
+
+test('new customer signature fields require drawings while historical typed evidence remains renderable', () => {
+  const typed = {type:'typed',text:'Customer'};
+  assert.equal(validateAgreementSignature(typed).type,'typed');
+  assert.throws(()=>validateAgreementSignature(typed,{requireDrawn:true}),error=>error.code==='signature_drawing_required');
+  assert.throws(()=>validateAgreementSubmission([definition()],{signature:typed},{role:'customer',printed_name:'Customer',submitted_at:'2026-10-02T00:00:00Z',require_drawn:true}),error=>error.code==='signature_drawing_required');
+});

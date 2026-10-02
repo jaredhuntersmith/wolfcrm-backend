@@ -1,3 +1,4 @@
+import { previewPublications } from "./helpers/publication-preview.js";
 import { drawnSignature } from "./helpers/signatures.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,6 +16,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
     const backend=await import('../index.js');pool=backend.pool;await backend.bootstrap();
     const env={NODE_ENV:'test',STRIPE_MODE:'test',QUOTE_PUBLIC_BASE_URL:'http://localhost:3000',QUOTE_LINK_SECRET:'test-only-long-cryptographic-link-key-never-production'};
     const service=await installAgreementSystem({app:backend.app,pool,authRequired:backend.authRequired,requireCapability:backend.requireCapability,getQuoteSettings:backend.getQuoteSettings,env,startWorker:false});
+    previewPublications(service);
     await installAgreementPayments({app:backend.app,pool,service,env,getStripe:()=>null,authRequired:backend.authRequired,requireCapability:backend.requireCapability,startWorker:false});
     const plans=await installAgreementPlans({app:backend.app,pool,service,authRequired:backend.authRequired,requireCapability:backend.requireCapability,startWorker:false});
     const company=randomUUID(),otherCompany=randomUUID(),owner=randomUUID(),otherOwner=randomUUID(),contact=randomUUID(),quote=randomUUID(),windowID=randomUUID(),pressureID=randomUUID();

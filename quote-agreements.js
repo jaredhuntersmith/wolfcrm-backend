@@ -347,6 +347,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         contact, settings, content, template: templateRef,
         documents: snapshot.documents.map(({ prefilled_values, ...document }) => document), terms_document: snapshot.terms_document,
       });
+      if (!preview && !raw.expected_preview_hash) problem("agreement_preview_required", "Prepare and review the exact preview before creating the customer link.", 409);
       if (raw.expected_preview_hash && raw.expected_preview_hash !== previewHash) problem("agreement_preview_changed", "The quote, customer, branding, template or pricing changed. Review a fresh preview before publishing.", 409);
       if (preview) {
         const safeSnapshot = structuredClone(snapshot);
@@ -598,7 +599,8 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
     await service.validateDocuments(pool, req.companyId, content);
     const row = await transaction(pool, async (db) => {
       await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, [`agreement-template:${id}`]);
-      const prior = (await db.query(`SELECT company_id,version FROM agreement_templates WHERE template_id=$1 ORDER BY version DESC LIMIT 1`, [id])).rows[0];
+      const prior = (await db.query(`SELECT company_id,version,archived_at FROM agreement_templates WHERE template_id=$1 ORDER BY version DESC LIMIT 1`, [id])).rows[0];
+      if (prior?.archived_at) problem("agreement_template_archived", "This template was archived. Save a new template instead.", 409);
       if (prior && (prior.company_id !== req.companyId || prior.version !== req.body.expected_version)) problem("agreement_template_changed", "Template unavailable or changed. Reload before saving.", 409);
       return (await db.query(`INSERT INTO agreement_templates(template_id,version,company_id,name,content,created_by) VALUES($1,$2,$3,$4,$5::jsonb,$6) RETURNING *`, [id, (prior?.version || 0) + 1, req.companyId, name, safeJSON(content), req.userId])).rows[0];
     });

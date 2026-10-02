@@ -1,3 +1,4 @@
+import { previewPublications } from "./helpers/publication-preview.js";
 import { drawnSignature } from "./helpers/signatures.js";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -27,6 +28,7 @@ test("agreement publication, signing and records are durable, immutable, authori
     await installAgreementSchema(pool); // Repeatable on existing production-shaped tables.
     const env = { NODE_ENV: "test", QUOTE_LINK_SECRET: "test-only-long-key-that-is-not-a-production-credential", QUOTE_PUBLIC_BASE_URL: "http://localhost:3000" };
     service = await installAgreementSystem({ app: backend.app, pool, authRequired: backend.authRequired, requireCapability: backend.requireCapability, getQuoteSettings: backend.getQuoteSettings, env, startWorker: false });
+    previewPublications(service);
     const company = randomUUID(), foreignCompany = randomUUID(), user = randomUUID(), foreignUser = randomUUID(), contact = randomUUID(), quote = randomUUID();
     await pool.query(`INSERT INTO companies(id,name,join_code) VALUES($1,'Test Services','AGREEMENT-TEST'),($2,'Other Business','AGREEMENT-OTHER')`, [company, foreignCompany]);
     await pool.query(`INSERT INTO users(id,email,role,company_id) VALUES($1,'agreements@example.invalid','employer',$3),($2,'other-agreements@example.invalid','employer',$4)`, [user, foreignUser, company, foreignCompany]);

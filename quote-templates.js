@@ -12,6 +12,7 @@ export async function quoteTemplateTransaction(pool, work) {
 }
 export function completeTemplateContent(raw = {}) {
   const content = normalizeAgreementContent(raw);
+  content.validity_days ??= 30;
   content.quote_defaults = normalizeQuoteTemplateDefaults(content.quote_defaults ?? {
     allow_customer_booking: content.booking_preference ?? false,
     offer_service_plans: content.plan_offer_preference ?? false,
@@ -33,7 +34,8 @@ export async function ensureDefaultQuoteTemplate(db, req) {
   }
   // Existing optional templates are not company defaults. Seed from the actual
   // legacy defaults rather than arbitrarily choosing the oldest template.
-  const content = completeTemplateContent(settings?.content || {});
+  const legacyPricing = (await db.query("SELECT valid_for_days FROM quote_settings WHERE company_id=$1", [req.companyId])).rows[0];
+  const content = completeTemplateContent({ ...settings?.content, validity_days: settings?.content?.validity_days ?? legacyPricing?.valid_for_days ?? 30 });
   if (!content.consent_text.trim()) content.consent_text = 'I agree to this quote and its displayed agreement and terms, and consent to signing electronically.';
   const template = (await db.query('INSERT INTO agreement_templates(template_id,version,company_id,name,content,created_by) VALUES($1,1,$2,$3,$4::jsonb,$5) RETURNING *', [randomUUID(), req.companyId, 'Default Quote', JSON.stringify(content), req.userId])).rows[0];
   await db.query('INSERT INTO agreement_settings(company_id,default_template_id) VALUES($1,$2) ON CONFLICT(company_id) DO UPDATE SET default_template_id=EXCLUDED.default_template_id,updated_at=now()', [req.companyId, template.template_id]);

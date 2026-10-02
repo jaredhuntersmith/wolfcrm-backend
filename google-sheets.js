@@ -411,7 +411,7 @@ export async function loadCompanyContactExportData(pool, companyId) {
         WHERE o.company_id = $1 AND o.contact_id = ANY($2::text[])`,
       [companyId, contactIds]
     ),
-    pool.query(`SELECT * FROM quotes WHERE company_id = $1 AND contact_id = ANY($2::text[]) ORDER BY created_at DESC`, [companyId, contactIds]),
+    pool.query(`SELECT * FROM quotes WHERE company_id = $1 AND deleted_at IS NULL AND contact_id = ANY($2::text[]) ORDER BY created_at DESC`, [companyId, contactIds]),
     pool.query(
       `SELECT se.*,
               COALESCE((SELECT array_agg(COALESCE(u.display_name, u.email) ORDER BY COALESCE(u.display_name, u.email)) FROM users u WHERE u.id::text IN (SELECT jsonb_array_elements_text(se.sales_user_ids))), ARRAY[]::text[]) AS sales_user_names,

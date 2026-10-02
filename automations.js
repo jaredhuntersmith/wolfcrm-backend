@@ -1,5 +1,7 @@
 import { randomUUID } from "crypto";
 import net from "net";
+import { removeQuote } from "./quote-removal.js";
+import { markGoogleSheetsContactDirty } from "./google-sheets.js";
 
 const AUTOMATION_LIMITS = {
   maxNodesPerRun: 5000,
@@ -1870,7 +1872,21 @@ export async function syncAutomationSchedulesForVoicemail(companyId, voicemail) 
 
 export async function syncAutomationSchedulesForQuote(companyId, quote) {
   if (!ctx?.pool || !companyId || !quote?.id) return;
-  await cancelScheduledForSubject(companyId, "quote", quote.id, ["quote.expired", "quote.followup_due"]);
+  const db = await ctx.pool.connect();
+  try {
+    await db.query("BEGIN");
+    // Use live state under the same row lock as removal. A delayed update must
+    // never recreate reminders from a pre-removal response object.
+    const current = (await db.query("SELECT * FROM quotes WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL FOR UPDATE", [quote.id, companyId])).rows[0];
+    if (current) await syncActiveQuoteSchedules(companyId, current, db);
+    else await cancelScheduledForSubject(companyId, "quote", quote.id, ["quote.expired", "quote.followup_due"], db);
+    await db.query("COMMIT");
+  } catch (error) { await db.query("ROLLBACK"); throw error; }
+  finally { db.release(); }
+}
+
+async function syncActiveQuoteSchedules(companyId, quote, db) {
+  await cancelScheduledForSubject(companyId, "quote", quote.id, ["quote.expired", "quote.followup_due"], db);
   const status = String(quote.status || "draft");
   if (["accepted", "declined", "converted", "deleted"].includes(status)) return;
   const expiresAt = quote.expires_at ? new Date(quote.expires_at) : null;
@@ -1884,9 +1900,9 @@ export async function syncAutomationSchedulesForQuote(companyId, quote) {
       scheduleKey: `quote.expired:${quote.id}:${expiresAt.toISOString()}`,
       sourceVersion: `${quote.updated_at || ""}:${status}:${expiresAt.toISOString()}`,
       payload: { quote_id: quote.id, contact_id: quote.contact_id || null, status, total_cents: quote.total_cents || 0, expires_at: expiresAt.toISOString() }
-    });
+    }, db);
   }
-  const triggers = (await ctx.pool.query(
+  const triggers = (await db.query(
     `SELECT n.id, n.config
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
@@ -1911,7 +1927,7 @@ export async function syncAutomationSchedulesForQuote(companyId, quote) {
       scheduleKey: `quote.followup_due:${trigger.id}:${quote.id}:${basisName}:${basis.toISOString()}:${amount}:${unit}`,
       sourceVersion: `${quote.updated_at || ""}:${status}`,
       payload: { trigger_node_id: trigger.id, quote_id: quote.id, contact_id: quote.contact_id || null, status, total_cents: quote.total_cents || 0, basis: basisName, amount, unit }
-    });
+    }, db);
   }
 }
 
@@ -2042,8 +2058,8 @@ export async function cancelAutomationSchedulesForSubject(companyId, subjectType
   );
 }
 
-async function enqueueScheduledAutomationEvent({ companyId, eventType, subjectType, subjectId, scheduledFor, scheduleKey, sourceVersion = null, payload = {} }) {
-  await ctx.pool.query(
+async function enqueueScheduledAutomationEvent({ companyId, eventType, subjectType, subjectId, scheduledFor, scheduleKey, sourceVersion = null, payload = {} }, db = ctx.pool) {
+  await db.query(
     `INSERT INTO automation_scheduled_events(company_id, event_type, subject_type, subject_id, scheduled_for, schedule_key, source_version, payload)
      VALUES($1,$2,$3,$4,$5::timestamptz,$6,$7,$8::jsonb)
      ON CONFLICT(company_id, schedule_key)
@@ -2052,8 +2068,8 @@ async function enqueueScheduledAutomationEvent({ companyId, eventType, subjectTy
   );
 }
 
-async function cancelScheduledForSubject(companyId, subjectType, subjectId, eventTypes) {
-  await ctx.pool.query(
+async function cancelScheduledForSubject(companyId, subjectType, subjectId, eventTypes, db = ctx.pool) {
+  await db.query(
     `UPDATE automation_scheduled_events
         SET status = 'canceled', updated_at = now()
       WHERE company_id = $1 AND subject_type = $2 AND subject_id = $3 AND event_type = ANY($4::text[]) AND status = 'scheduled'`,
@@ -2633,6 +2649,7 @@ async function bootstrapAutomationSchema() {
     CREATE INDEX IF NOT EXISTS time_clock_entries_review_idx ON time_clock_entries(company_id, needs_review) WHERE needs_review = true;
 
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'draft';
+    ALTER TABLE quotes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;
@@ -4873,7 +4890,7 @@ async function shouldFireScheduledAutomationEvent(row) {
     if (!vm || vm.is_read || vm.deleted_at) return false;
   }
   if (row.subject_type === "quote") {
-    const quote = (await ctx.pool.query(`SELECT status, expires_at, sent_at, updated_at FROM quotes WHERE id::text = $1 AND company_id = $2`, [row.subject_id, row.company_id])).rows[0];
+    const quote = (await ctx.pool.query(`SELECT status, expires_at, sent_at, updated_at FROM quotes WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL`, [row.subject_id, row.company_id])).rows[0];
     if (!quote || ["accepted", "declined", "converted", "deleted"].includes(String(quote.status || ""))) return false;
     if (row.event_type === "quote.expired" && (!quote.expires_at || new Date(quote.expires_at) > new Date())) return false;
   }
@@ -5030,7 +5047,7 @@ async function loadSubject(companyId, subjectType, subjectId) {
 }
 
 async function loadQuoteContext(companyId, quoteId) {
-  const quote = (await ctx.pool.query(`SELECT * FROM quotes WHERE id::text = $1 AND company_id = $2`, [quoteId, companyId])).rows[0];
+  const quote = (await ctx.pool.query(`SELECT * FROM quotes WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL`, [quoteId, companyId])).rows[0];
   if (!quote) return { exists: false };
   const items = Array.isArray(quote.line_items) ? quote.line_items : [];
   return { ...quote, exists: true, subtotal: quote.total_cents, total: quote.total_cents, subtotal_cents: quote.total_cents, line_item_count: items.length, is_expired: quote.expires_at ? new Date(quote.expires_at) <= new Date() : false, is_accepted: quote.status === "accepted", is_declined: quote.status === "declined", is_converted: quote.status === "converted" };
@@ -5260,7 +5277,7 @@ async function loadContactRelationshipFlags(companyId, contactId) {
   const [futureJob, completedJob, quote, unpaidPayment, activePlan, mapPin] = await Promise.all([
     ctx.pool.query(`SELECT 1 FROM schedule_events WHERE company_id = $1 AND contact_id = $2 AND start_at > now() LIMIT 1`, [companyId, contactId]),
     ctx.pool.query(`SELECT 1 FROM schedule_events WHERE company_id = $1 AND contact_id = $2 AND finished_at IS NOT NULL LIMIT 1`, [companyId, contactId]),
-    ctx.pool.query(`SELECT 1 FROM quotes WHERE company_id = $1 AND contact_id = $2 LIMIT 1`, [companyId, contactId]),
+    ctx.pool.query(`SELECT 1 FROM quotes WHERE company_id = $1 AND contact_id = $2 AND deleted_at IS NULL LIMIT 1`, [companyId, contactId]),
     ctx.pool.query(`SELECT 1 FROM payment_records WHERE company_id = $1 AND contact_id = $2 AND status NOT IN ('succeeded','paid') LIMIT 1`, [companyId, contactId]).catch(() => ({ rowCount: 0 })),
     ctx.pool.query(`SELECT 1 FROM service_plans WHERE company_id = $1 AND contact_id = $2 AND status = 'active' LIMIT 1`, [companyId, contactId]).catch(() => ({ rowCount: 0 })),
     ctx.pool.query(`SELECT 1 FROM map_pins mp JOIN users u ON u.id = mp.user_id WHERE u.company_id = $1 AND mp.contact_id = $2 LIMIT 1`, [companyId, contactId])
@@ -7345,10 +7362,11 @@ async function executeQuoteUpdate(run, node, config) {
             notes = COALESCE($6, notes),
             expires_at = COALESCE($7::timestamptz, expires_at),
             updated_at = now()
-      WHERE id::text = $1 AND company_id = $2
+      WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL
       RETURNING *`,
     [quote.id, run.company_id, config.title ? resolveTemplate(config.title, context) : null, items ? JSON.stringify(items) : null, total, config.notes ? resolveTemplate(config.notes, context) : null, expiresAt ? expiresAt.toISOString() : null]
   )).rows[0];
+  if (!row) throw new Error("quote_not_found");
   await emitQuoteChangeEvents(run, node, quote, row);
   await syncAutomationSchedulesForQuote(run.company_id, row);
   return { quote_id: row.id, total_cents: row.total_cents, status: row.status };
@@ -7357,10 +7375,14 @@ async function executeQuoteUpdate(run, node, config) {
 async function executeQuoteDelete(run, node, config) {
   if (config.confirm_delete !== true) throw new Error("delete_confirmation_required");
   const context = await buildRunContext(run);
-  const quote = await resolveQuote(run, context, config);
-  await ctx.pool.query(`DELETE FROM quotes WHERE id = $1 AND company_id = $2`, [quote.id, run.company_id]);
+  const quote = await resolveQuote(run, context, config, { includeDeleted: true });
+  const removed = await removeQuote(ctx.pool, { companyId: run.company_id, userId: run.manual_started_by_user_id || null }, quote.id);
+  if (!removed) throw new Error("quote_not_found");
   await cancelScheduledForSubject(run.company_id, "quote", quote.id, ["quote.expired", "quote.followup_due"]);
   await emitFinancialEvent(run, node, "quote.deleted", "quote", quote.id, quotePayload(quote));
+  if ((await ctx.pool.query("SELECT to_regclass('google_sheets_dirty_contacts') IS NOT NULL AS ready")).rows[0].ready) {
+    await markGoogleSheetsContactDirty(ctx.pool, run.company_id, quote.contact_id, "quote.deleted");
+  }
   return { quote_id: quote.id, deleted: true };
 }
 
@@ -7390,7 +7412,8 @@ async function executeQuoteReplaceLineItems(run, node, config) {
 
 async function updateQuoteItems(run, node, quote, items) {
   const total = computeQuoteTotalCents(items);
-  const row = (await ctx.pool.query(`UPDATE quotes SET line_items = $3::jsonb, total_cents = $4, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [quote.id, run.company_id, JSON.stringify(items), total])).rows[0];
+  const row = (await ctx.pool.query(`UPDATE quotes SET line_items = $3::jsonb, total_cents = $4, updated_at = now() WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL RETURNING *`, [quote.id, run.company_id, JSON.stringify(items), total])).rows[0];
+  if (!row) throw new Error("quote_not_found");
   await emitQuoteChangeEvents(run, node, quote, row);
   await syncAutomationSchedulesForQuote(run.company_id, row);
   return { quote_id: row.id, total_cents: row.total_cents, line_item_count: items.length };
@@ -7414,10 +7437,11 @@ async function setQuoteStatus(run, node, status, config) {
             accepted_at = CASE WHEN $3 = 'accepted' THEN COALESCE(accepted_at, now()) ELSE accepted_at END,
             declined_at = CASE WHEN $3 = 'declined' THEN COALESCE(declined_at, now()) ELSE declined_at END,
             updated_at = now()
-      WHERE id = $1 AND company_id = $2
+      WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL
       RETURNING *`,
     [quote.id, run.company_id, status]
   )).rows[0];
+  if (!row) throw new Error("quote_not_found");
   await emitQuoteChangeEvents(run, node, quote, row);
   await syncAutomationSchedulesForQuote(run.company_id, row);
   return { quote_id: row.id, status: row.status };
@@ -7428,7 +7452,8 @@ async function executeQuoteSetExpiration(run, node, config) {
   const quote = await resolveQuote(run, context, config);
   const expiresAt = resolveDateExpression(config.expires_at || config.until || "", context);
   if (!expiresAt) throw new Error("quote_expiration_required");
-  const row = (await ctx.pool.query(`UPDATE quotes SET expires_at = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [quote.id, run.company_id, expiresAt.toISOString()])).rows[0];
+  const row = (await ctx.pool.query(`UPDATE quotes SET expires_at = $3, updated_at = now() WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL RETURNING *`, [quote.id, run.company_id, expiresAt.toISOString()])).rows[0];
+  if (!row) throw new Error("quote_not_found");
   await emitQuoteChangeEvents(run, node, quote, row);
   await syncAutomationSchedulesForQuote(run.company_id, row);
   return { quote_id: row.id, expires_at: row.expires_at };
@@ -7443,8 +7468,7 @@ async function executeQuoteConvertToJob(run, node, config) {
     title: config.title || quote.title || "Quoted job",
     service_items: quote.line_items || [],
     price_cents: config.copy_total_to_price === false ? config.price_cents : quote.total_cents
-  });
-  await ctx.pool.query(`UPDATE quotes SET status = 'converted', converted_job_id = $3, updated_at = now() WHERE id = $1 AND company_id = $2`, [quote.id, run.company_id, job.job_id]);
+  }, "root", { sourceQuote: quote });
   await cancelScheduledForSubject(run.company_id, "quote", quote.id, ["quote.expired", "quote.followup_due"]);
   await emitFinancialEvent(run, node, "quote.converted_to_job", "quote", quote.id, { ...quotePayload(quote), job_id: job.job_id });
   await emitFinancialEvent(run, node, "quote.scheduled", "quote", quote.id, { ...quotePayload(quote), job_id: job.job_id });
@@ -7743,10 +7767,10 @@ function computeQuoteTotalCents(items) {
   return normalizeQuoteLineItems(items).reduce((sum, item) => sum + Math.round(item.qty * item.price_cents), 0);
 }
 
-async function resolveQuote(run, context, config) {
+async function resolveQuote(run, context, config, { includeDeleted = false } = {}) {
   const id = resolveTemplate(config.quote_id || context.quote?.id || (run.subject_type === "quote" ? run.subject_id : ""), context);
   if (!id) throw new Error("quote_required");
-  const row = (await ctx.pool.query(`SELECT * FROM quotes WHERE id::text = $1 AND company_id = $2`, [id, run.company_id])).rows[0];
+  const row = (await ctx.pool.query(`SELECT * FROM quotes WHERE id::text = $1 AND company_id = $2 ${includeDeleted ? "" : "AND deleted_at IS NULL"}`, [id, run.company_id])).rows[0];
   if (!row) throw new Error("quote_not_found");
   return row;
 }
@@ -8073,7 +8097,7 @@ async function executeMeasurementLinkContact(run, node, config) {
   return { measurement_id: measurement.id, contact_id: contactId };
 }
 
-async function executeJobCreate(run, node, config, scopeKey = "root") {
+async function executeJobCreate(run, node, config, scopeKey = "root", { sourceQuote = null } = {}) {
   const existingId = await getRunVariable(run.id, `idempotency:${node.id}:job_id`);
   if (existingId) {
     const existing = await loadSubject(run.company_id, "job", existingId);
@@ -8090,12 +8114,26 @@ async function executeJobCreate(run, node, config, scopeKey = "root") {
   const sales = await resolveCompanyUsers(run.company_id, config.sales_user_ids || [owner]);
   const workers = await resolveCompanyUsers(run.company_id, config.worker_user_ids || []);
   const serviceItems = normalizeServiceItems(resolveConfig(config.service_items || [], context));
-  const { rows } = await ctx.pool.query(
+  const insertJob = async db => db.query(
     `INSERT INTO schedule_events(id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids)
      VALUES($1,$2,$3,$2,$4,$5,$6,$7,$8,$9,'[]'::jsonb,$10::jsonb,$11::jsonb,$12,$13,$14::jsonb,$15::jsonb)
      RETURNING *`,
     [id, owner, run.company_id, title, start.toISOString(), end.toISOString(), config.color || "#3478F6", resolveTemplate(config.notes || "", context) || null, contactId, JSON.stringify(serviceItems.map((s) => s.name)), JSON.stringify(serviceItems), intOrNull(config.price_cents), intOrNull(config.material_cost_cents), JSON.stringify(sales), JSON.stringify(workers)]
   );
+  let rows;
+  if (sourceQuote) {
+    const db = await ctx.pool.connect();
+    try {
+      await db.query("BEGIN");
+      const active = (await db.query("SELECT updated_at FROM quotes WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL FOR UPDATE", [sourceQuote.id, run.company_id])).rows[0];
+      if (!active) throw new Error("quote_not_found");
+      if (new Date(active.updated_at).getTime() !== new Date(sourceQuote.updated_at).getTime()) throw new Error("quote_changed");
+      ({ rows } = await insertJob(db));
+      await db.query("UPDATE quotes SET status='converted',converted_job_id=$3,updated_at=now() WHERE id=$1 AND company_id=$2", [sourceQuote.id, run.company_id, id]);
+      await db.query("COMMIT");
+    } catch (error) { await db.query("ROLLBACK"); throw error; }
+    finally { db.release(); }
+  } else ({ rows } = await insertJob(ctx.pool));
   await setRunVariable(run.id, `idempotency:${node.id}:job_id`, id);
   await emitJobMutationEvents(run.company_id, null, rows[0], "automation", null, automationPayload(run, node, { job_id: id, contact_id: contactId }));
   await syncAutomationSchedulesForJob(run.company_id, rows[0]);
@@ -8348,13 +8386,13 @@ async function executeRouteGetStops(run, _node, config, scopeKey = "root") {
 
 async function executeQuotesSearch(run, _node, config, scopeKey = "root") {
   const context = await buildRunContext(run, { scopeKey });
-  const clauses = ["company_id = $1"];
+  const clauses = ["company_id = $1", "deleted_at IS NULL"];
   const params = [run.company_id];
   if (config.status) { params.push(resolveTemplate(config.status, context)); clauses.push(`status = $${params.length}`); }
   if (config.contact_id) { params.push(resolveTemplate(config.contact_id, context)); clauses.push(`contact_id::text = $${params.length}`); }
   if (config.min_total_cents != null) { params.push(Number(resolveTemplate(config.min_total_cents, context)) || 0); clauses.push(`total_cents >= $${params.length}`); }
   params.push(boundedLimit(config));
-  const rows = (await ctx.pool.query(`SELECT id, contact_id, title, status, subtotal_cents, total_cents, expires_at, created_at, updated_at FROM quotes WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC LIMIT $${params.length}`, params)).rows;
+  const rows = (await ctx.pool.query(`SELECT id, contact_id, title, status, total_cents AS subtotal_cents, total_cents, expires_at, created_at, updated_at FROM quotes WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC LIMIT $${params.length}`, params)).rows;
   return { quotes: rows, items: rows, count: rows.length };
 }
 
@@ -9162,6 +9200,9 @@ export const automationTestHooks = {
   cancelAutomationRun,
   ensureDraftVersion,
   loadRunDetail,
+  loadQuoteContext,
+  loadContactRelationshipFlags,
+  shouldFireScheduledAutomationEvent,
   loadVersionGraph,
   processAutomationEvents,
   processDueWaits,
