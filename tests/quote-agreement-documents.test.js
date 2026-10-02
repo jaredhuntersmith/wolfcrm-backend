@@ -140,3 +140,9 @@ test('new customer signature fields require drawings while historical typed evid
   assert.throws(()=>validateAgreementSignature(typed,{requireDrawn:true}),error=>error.code==='signature_drawing_required');
   assert.throws(()=>validateAgreementSubmission([definition()],{signature:typed},{role:'customer',printed_name:'Customer',submitted_at:'2026-10-02T00:00:00Z',require_drawn:true}),error=>error.code==='signature_drawing_required');
 });
+
+test("new packets separate legacy adjacent monetary merges without changing nonzero or labeled values", () => {
+  assert.equal(resolveAgreementText("Pay {{total}}{{tax}}{{deposit}}.", {total:"$475.00",tax:"$0.00",deposit:"$0.00"}), "Pay $475.00.");
+  assert.equal(resolveAgreementText("{{total}}{{deposit}}", {total:"$475.00",deposit:"$50.00"}), "$475.00 · $50.00");
+  assert.equal(resolveAgreementText("Total {{total}}; tax {{tax}}", {total:"$475.00",tax:"$0.00"}), "Total $475.00; tax $0.00");
+});

@@ -29,6 +29,11 @@ export function resolveAgreementText(text, values) {
     if (!(name in AGREEMENT_MERGE_FIELDS)) fail("agreement_merge_unknown", `The merge field ${name} is not supported.`);
     if (values[name] == null || values[name] === "") fail("agreement_merge_missing", `Enter ${AGREEMENT_MERGE_FIELDS[name]} before publishing.`);
     return String(values[name]);
+  }).replace(/(?:\$[\d,]+\.\d{2}){2,}/g, run => {
+    // Legacy insert buttons concatenated monetary tokens. Preserve every nonzero
+    // value, omit redundant zero-only suffixes, and freeze the readable new text.
+    const amounts = run.match(/\$[\d,]+\.\d{2}/g) || [];
+    return amounts.filter((amount, index) => index === 0 || Number(amount.replace(/[$,]/g, "")) !== 0).join(" · ");
   });
 }
 
