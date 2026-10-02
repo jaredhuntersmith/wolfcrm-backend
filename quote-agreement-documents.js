@@ -53,7 +53,9 @@ export async function validateAndNormalizeAgreementPDF(bytes, { allowSanitize = 
           if (!allowSanitize) fail("agreement_pdf_active_content", "The generated quote PDF must contain only its printable content.");
           removed.add(name); object.delete(key); continue;
         }
-        if (name === "S" && ["/JavaScript", "/Launch", "/SubmitForm", "/ImportData", "/RichMediaExecute", "/GoToR", "/GoToE"].includes(value.toString())) {
+        const uri = name === "S" && value.toString() === "/URI" ? object.lookup(PDFName.of("URI")) : null;
+        const unsafeURI = uri != null && (typeof uri.decodeText !== "function" || !/^(https?:|tel:|mailto:)/i.test(uri.decodeText()));
+        if (name === "S" && (["/JavaScript", "/Launch", "/SubmitForm", "/ImportData", "/RichMediaExecute", "/GoToR", "/GoToE", "/Rendition", "/Movie", "/Sound"].includes(value.toString()) || unsafeURI)) {
           if (!allowSanitize) fail("agreement_pdf_active_content", "The generated quote PDF must contain only its printable content.");
           removed.add("Action"); for (const [entry] of object.entries()) object.delete(entry); break;
         }

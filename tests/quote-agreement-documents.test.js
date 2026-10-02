@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PDFDocument, PDFName, PDFNull, degrees } from "pdf-lib";
+import { PDFDocument, PDFName, PDFNull, PDFString, degrees } from "pdf-lib";
 import { validateAndNormalizeAgreementPDF, normalizeAgreementFields, validateAgreementSignature, validateAgreementSubmission, populateAgreementPDF, generateQuoteAgreementPDF, resolveAgreementText, validateAgreementSignerText } from "../quote-agreement-documents.js";
 import { calculateQuotePricing } from "../quote-contract-domain.js";
 
@@ -71,6 +71,15 @@ test("unsigned signature widgets with null values are accepted as blank source f
   const cleaned = await validateAndNormalizeAgreementPDF(Buffer.from(await doc.save()));
   assert.equal((await PDFDocument.load(cleaned.normalized)).getForm().getFields().length, 0);
   assert.equal(cleaned.pages.length, 1);
+});
+
+test("non-web executable PDF links are removed from uploads and rejected in exact quote exports", async () => {
+  const doc=await sourcePDF();
+  const action=doc.context.obj({S:'URI',URI:PDFString.of('javascript:alert(1)')});
+  doc.getPage(0).node.set(PDFName.of('Annots'),doc.context.obj([doc.context.obj({Type:'Annot',Subtype:'Link',Rect:[0,0,100,30],A:action})]));
+  const bytes=Buffer.from(await doc.save());
+  assert.ok((await validateAndNormalizeAgreementPDF(bytes)).removed_features.includes('Action'));
+  await assert.rejects(validateAndNormalizeAgreementPDF(bytes,{allowSanitize:false}),/printable content/);
 });
 
 test("field definitions enforce page/bounds/role/type and prohibit rotation", () => {
