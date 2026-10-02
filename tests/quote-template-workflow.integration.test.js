@@ -45,7 +45,7 @@ test('template defaults, persisted overrides, visibility, drawing and removal wo
       assert.equal((await request(`/api/agreements/templates/${custom.template_id}/default`,{method:'PUT',token:'other',body:{expected_version:1}})).status,404);
       assert.equal((await request(`/api/agreements/templates/${custom.template_id}/default`,{method:'PUT',body:{expected_version:100}})).status,409);
       assert.equal((await request(`/api/agreements/templates/${custom.template_id}/default`,{method:'PUT',body:{expected_version:1}})).status,200);
-      const automatic=await makeQuote();assert.equal(automatic.quote_options.template.id,custom.template_id);assert.equal(automatic.quote_options.deposit.value,2500);assert.equal(automatic.quote_options.balance_payment_timing,'after_service');assert.equal(automatic.quote_options.template.is_customized,false);
+      const automatic=await makeQuote();assert.equal(automatic.quote_options.template.id,custom.template_id);assert.equal(automatic.quote_options.deposit.value,2500);assert.equal(automatic.quote_options.balance_payment_timing,'after_signing');assert.equal(automatic.quote_options.template.is_customized,false);
     });
     await t.test('quote overrides retain duration, are normalized and never rewrite selected template',async()=>{
       const content={...custom.content,quote_defaults:{...custom.content.quote_defaults,deposit:{type:'none',value:0}},agreement_text:'Quote-only wording'};

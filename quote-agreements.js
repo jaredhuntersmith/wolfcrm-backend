@@ -69,7 +69,8 @@ export async function installAgreementSchema(pool) {
     CREATE INDEX IF NOT EXISTS quote_agreements_quote_idx ON quote_agreements(quote_id,revision DESC);
     ALTER TABLE quote_agreements ADD COLUMN IF NOT EXISTS publication_request_hash TEXT;
     ALTER TABLE quote_agreements ADD COLUMN IF NOT EXISTS link_root_id UUID REFERENCES quote_agreements(id) ON DELETE RESTRICT;
-    UPDATE quote_agreements a SET link_root_id=COALESCE((SELECT first.id FROM quote_agreements first WHERE first.quote_id=a.quote_id AND first.company_id=a.company_id ORDER BY first.revision,first.created_at LIMIT 1),a.id) WHERE a.link_root_id IS NULL;
+    UPDATE quote_agreements SET link_root_id=id WHERE link_root_id IS NULL;
+    UPDATE quote_agreements a SET link_root_id=a.id FROM quote_agreements root WHERE a.link_root_id=root.id AND a.id<>root.id AND (a.token_generation<>root.token_generation OR root.revoked_at IS NOT NULL);
     CREATE INDEX IF NOT EXISTS quote_agreements_link_root_idx ON quote_agreements(link_root_id);
     CREATE TABLE IF NOT EXISTS agreement_signing_sessions (
       id UUID PRIMARY KEY, agreement_id UUID NOT NULL REFERENCES quote_agreements(id) ON DELETE RESTRICT,
@@ -156,11 +157,13 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     const [id, generation, role, mac, extra] = token.split(".");
     if (extra || !["customer", "customer_2"].includes(role) || !/^\d+$/.test(generation || "") || !mac || !/^[0-9a-f-]{36}$/i.test(id || "")) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
     const anchor = (await db.query('SELECT * FROM quote_agreements WHERE id=$1', [id])).rows[0];
-    if (!anchor || anchor.revoked_at || anchor.token_generation !== Number(generation) || !anchor.snapshot.required_signers.includes(role) || !equal(token, tokenFor(id, Number(generation), role))) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
-    const row = anchor.quote_id
+    if (!anchor || anchor.revoked_at || anchor.token_generation !== Number(generation) || !equal(token, tokenFor(id, Number(generation), role))) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
+    // Retired optional-choice packets retain their exact version for selection replay.
+    const followsRevisions = anchor.quote_id && !anchor.snapshot.optional_addons?.length;
+    const row = followsRevisions
       ? (await db.query(`SELECT * FROM quote_agreements WHERE quote_id=$1 AND company_id=$2 AND revoked_at IS NULL ORDER BY revision DESC LIMIT 1 ${lock ? "FOR UPDATE" : ""}`, [anchor.quote_id, anchor.company_id])).rows[0]
       : lock ? (await db.query('SELECT * FROM quote_agreements WHERE id=$1 FOR UPDATE', [anchor.id])).rows[0] : anchor;
-    if (!row || row.revoked_at || row.token_generation !== Number(generation) || !row.snapshot.required_signers.includes(role)) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
+    if (!row || row.revoked_at || !row.snapshot.required_signers.includes(role)) problem("agreement_link_invalid", "This link is unavailable. Contact the business.", 404);
     return { row, role };
   }
   async function event(db, agreementId, type, { request_id = null, request_hash = null, actor_type = "system", actor_id = null, payload = {} } = {}) {
@@ -296,7 +299,10 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       }
       const templateRef = { id: sourceTemplate.template_id, version: sourceTemplate.version };
       const contentSource = !raw.template_id && savedTemplate ? savedTemplate.content : sourceTemplate.content;
-      const content = normalizeAgreementContent({ ...contentSource, ...(raw.content || {}) });
+      const mergedContent = { ...contentSource, ...(raw.content || {}) };
+      // Older clients attach PDFs without knowing the text/PDF mode field.
+      if (raw.content?.documents && raw.content.agreement_mode == null) mergedContent.agreement_mode = raw.content.documents.length ? "pdf" : "text";
+      const content = normalizeAgreementContent(mergedContent);
       // Legacy drafts retain their explicitly saved commercial settings until a
       // template is deliberately chosen. New drafts already hold a frozen selection.
       const useTemplateDefaults = !!savedTemplate || !!raw.template_id || raw.content?.quote_defaults != null;
@@ -318,7 +324,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       if (bookingEnabled && !service.bookingReady) problem("agreement_booking_not_ready", "Customer booking is not ready. Finish schedule integration before publishing with booking enabled.", 409);
       if (bookingEnabled) await service.validateBookingReadiness(db, req.companyId, { quote_id: quote.id, duration_minutes: options.duration_minutes, line_items: pricing.line_items });
       if (plansEnabled && !service.plansReady) problem("agreement_plans_not_ready", "Customer plan enrollment is not ready. Finish plan integration before enabling offers.", 409);
-      if (!quoteId && !(content.show_agreement && content.agreement_text.trim()) && !content.documents.length) problem("standalone_agreement_content_required", "Add agreement text or a contract PDF before publishing a standalone agreement.");
+      if (!quoteId && !(content.show_agreement && (content.agreement_mode === "pdf" ? content.documents.length : content.agreement_text.trim()))) problem("standalone_agreement_content_required", "Add agreement text or a contract PDF before publishing a standalone agreement.");
       if (!content.consent_text.trim()) problem("agreement_consent_required", "Configure the electronic signing consent wording in Quotes & Contracts.");
       if (!content.show_agreement || content.agreement_mode === "pdf") content.agreement_text = "";
       if (!content.show_agreement || content.agreement_mode === "text") content.documents = [];
@@ -402,8 +408,8 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         return { quote_export_payload: exportPayload, snapshot: safeSnapshot, packet_hash: quoteContentHash(snapshot), preview_hash: previewHash, quote_updated_at: quote.updated_at, pdf_base64: pdf.toString("base64"), validation: { ready: true, number_is_preview: true } };
       }
       const row = (await db.query(`INSERT INTO quote_agreements(id,company_id,quote_id,contact_id,created_by,number,revision,predecessor_id,request_id,title,snapshot,packet_hash,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13) RETURNING *`, [id, req.companyId, quote.id, quote.contact_id, req.userId, number, snapshot.revision, predecessor?.id || null, requestId, snapshot.title, safeJSON(snapshot), quoteContentHash(snapshot), expires])).rows[0];
-      row.link_root_id = predecessor?.link_root_id || predecessor?.id || row.id;
-      row.token_generation = predecessor?.token_generation || 1;
+      row.link_root_id = quoteId ? predecessor?.link_root_id || predecessor?.id || row.id : row.id;
+      row.token_generation = quoteId ? predecessor?.token_generation || 1 : 1;
       await db.query(`UPDATE quote_agreements SET publication_request_hash=$2,link_root_id=$3,token_generation=$4 WHERE id=$1`, [id, publicationRequestHash, row.link_root_id, row.token_generation]);
       const pdf = suppliedQuotePDF || await generateQuoteAgreementPDF(snapshot, { customer_url: customerURL(row) });
       await storeArtifact(db, id, "quote", pdf);
@@ -411,7 +417,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         const cover = await generateQuoteAgreementPDF({ ...snapshot, title: "Terms & Conditions", pricing: null, agreement_text: "", public_notes: "", scope_exclusions: "", documents: [], consent_text: "" }, { customer_url: customerURL(row) });
         await storeArtifact(db, id, "terms", termsAsset ? termsAsset.normalized_bytes : cover);
       }
-      if (predecessor) await db.query(`UPDATE quote_agreements SET decision='superseded',updated_at=now() WHERE id=$1`, [predecessor.id]);
+      if (predecessor && (quoteId || !predecessor.signed_at)) await db.query(`UPDATE quote_agreements SET decision='superseded',updated_at=now() WHERE id=$1`, [predecessor.id]);
       await event(db, id, "link_created", { actor_type: "staff", actor_id: req.userId, payload: { revision: row.revision, predecessor_id: row.predecessor_id } });
       return detail(db, row, { staff: true });
     }, { rollback: preview });
@@ -725,7 +731,7 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
         const cached=(await pool.query('SELECT bytes FROM agreement_artifact_deliveries WHERE artifact_id=$1 AND role=$2 AND token_generation=$3',[output.id,role,row.token_generation])).rows[0];
         if(cached)bytes=cached.bytes;
         else{
-          bytes=await qualifyAgreementDocumentLinks(output.bytes,{agreement_id:row.id,customer_url:service.customerURL(row,role)});
+          bytes=await qualifyAgreementDocumentLinks(output.bytes,{agreement_id:row.id,link_root_id:row.link_root_id,customer_url:service.customerURL(row,role)});
           if(bytes!==output.bytes){
             await pool.query('INSERT INTO agreement_artifact_deliveries(artifact_id,role,token_generation,bytes,sha256,source_sha256) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',[output.id,role,row.token_generation,bytes,agreementBytesHash(bytes),output.sha256]);
             bytes=(await pool.query('SELECT bytes FROM agreement_artifact_deliveries WHERE artifact_id=$1 AND role=$2 AND token_generation=$3',[output.id,role,row.token_generation])).rows[0].bytes;

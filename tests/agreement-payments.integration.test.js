@@ -137,7 +137,7 @@ test("agreement payments enforce durable gates, idempotency and provider reconci
       assert.equal(new Set(results.map((result) => result.body.url)).size, 1);
       assert.equal(stripe.counts().sessions - before, 1);
       assert.equal(Number((await pool.query("SELECT count(*) AS count FROM payment_records WHERE agreement_id=$1", [item.row.id])).rows[0].count), 1);
-      assert.equal((await checkout(item, "balance")).body.error, "payment_deposit_required");
+      assert.equal((await checkout(item, "balance")).body.error, "payment_already_in_progress");
     });
     await t.test("processing and a browser-like success claim never count as paid", async () => {
       const attempt = await attemptFor(item.row);

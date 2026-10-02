@@ -74,7 +74,8 @@ test('replacement terms never repeat an existing current-job discount or initial
 
 test('hidden plan wording cannot satisfy required agreement but an attached contract can', () => {
   assert.throws(()=>normalizePlanTier({...config,agreement:{...config.agreement,show_agreement:false}}),error=>error.code==='plan_agreement_required');
-  const withPDF=normalizePlanTier({...config,agreement:{...config.agreement,show_agreement:false,documents:[{asset_id:randomUUID(),fields:[]}]}});
-  assert.equal(withPDF.agreement.show_agreement,false);
+  const withPDF=normalizePlanTier({...config,agreement:{...config.agreement,show_agreement:true,agreement_mode:'pdf',documents:[{asset_id:randomUUID(),fields:[]}]}});
+  assert.equal(withPDF.agreement.show_agreement,true);
+  assert.throws(()=>normalizePlanTier({...config,agreement:{...withPDF.agreement,show_agreement:false}}),error=>error.code==='plan_agreement_required');
   assert.equal(withPDF.agreement.agreement_text,'Quarterly service.');
 });

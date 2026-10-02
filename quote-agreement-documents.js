@@ -349,9 +349,10 @@ export async function combineAgreementPDFs(documents) {
 
 // A delivery copy may return only to its own recipient role. The stored source
 // artifact and all page content/signature streams remain untouched.
-export async function qualifyAgreementDocumentLinks(bytes, { agreement_id, customer_url }) {
+export async function qualifyAgreementDocumentLinks(bytes, { agreement_id, link_root_id, customer_url }) {
   const target = new URL(customer_url);
-  if (!target.pathname.startsWith(`/estimates/${agreement_id}.`)) fail('agreement_document_link_invalid', 'The document return link does not match its agreement.');
+  const isAgreementLink = url => [agreement_id, link_root_id].filter(Boolean).some(id => url.pathname.startsWith(`/estimates/${id}.`));
+  if (!isAgreementLink(target)) fail('agreement_document_link_invalid', 'The document return link does not match its agreement.');
   const pdf = await PDFDocument.load(bytes, { updateMetadata: false });
   let changed = false;
   for (const page of pdf.getPages()) {
@@ -364,7 +365,7 @@ export async function qualifyAgreementDocumentLinks(bytes, { agreement_id, custo
       const value=action.lookup(PDFName.of('URI'));
       if (typeof value?.decodeText!=='function') continue;
       let url;try{url=new URL(value.decodeText());}catch{continue;}
-      if (!url.pathname.startsWith(`/estimates/${agreement_id}.`)||url.href===target.href) continue;
+      if (!isAgreementLink(url)||url.href===target.href) continue;
       action.set(PDFName.of('URI'),PDFString.of(target.href));changed=true;
     }
   }

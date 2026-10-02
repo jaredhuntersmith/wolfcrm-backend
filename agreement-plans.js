@@ -102,6 +102,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`plan-tier:${tierID}`]);
       const prior = (await db.query('SELECT * FROM service_plan_tiers WHERE tier_id=$1 ORDER BY version DESC LIMIT 1', [tierID])).rows[0];
       if (prior && (prior.company_id !== req.companyId || prior.version !== raw.expected_version)) fail('plan_tier_changed', 'This tier changed or is unavailable. Reload before saving.');
+      if (prior?.archived_at) fail('plan_tier_archived', 'This tier was archived. Copy its settings into a new tier instead.', 409);
       if (configuration.service_ids) {
         const services = (await db.query('SELECT id FROM saved_services WHERE company_id=$1 AND id=ANY($2::uuid[]) AND archived_at IS NULL', [req.companyId, configuration.service_ids])).rows;
         if (services.length !== configuration.service_ids.length) fail('plan_service_unavailable', 'A selected service is archived or belongs to another company.');
