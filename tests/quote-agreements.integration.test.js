@@ -1,0 +1,303 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomUUID,createHash } from "node:crypto";
+import { mkdtempSync,rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+import pg from 'pg';
+import { PDFDocument, PDFName } from "pdf-lib";
+import { installAgreementNotifications } from "../agreement-notifications.js";
+import { startLocalPostgres } from "./helpers/local-postgres.js";
+import { installAgreementSystem, installAgreementSchema, normalizeAgreementContent,createAgreementService } from "../quote-agreements.js";
+
+test("templates cannot set deposits or unsupported roles", () => {
+  assert.throws(() => normalizeAgreementContent({ deposit: { type: "fixed", value: 10 } }), /individual quotes/);
+  assert.throws(() => normalizeAgreementContent({ required_signers: [] }), /required customer/);
+});
+
+test("agreement publication, signing and records are durable, immutable, authorized and idempotent", { timeout: 120000 }, async (t) => {
+  const postgres = startLocalPostgres();
+  postgres.configureEnvironment();
+  let pool, server, service;
+  try {
+    const backend = await import("../index.js");
+    pool = backend.pool;
+    await backend.bootstrap();
+    await installAgreementSchema(pool); // Repeatable on existing production-shaped tables.
+    const env = { NODE_ENV: "test", QUOTE_LINK_SECRET: "test-only-long-key-that-is-not-a-production-credential", QUOTE_PUBLIC_BASE_URL: "http://localhost:3000" };
+    service = await installAgreementSystem({ app: backend.app, pool, authRequired: backend.authRequired, requireCapability: backend.requireCapability, getQuoteSettings: backend.getQuoteSettings, env, startWorker: false });
+    const company = randomUUID(), foreignCompany = randomUUID(), user = randomUUID(), foreignUser = randomUUID(), contact = randomUUID(), quote = randomUUID();
+    await pool.query(`INSERT INTO companies(id,name,join_code) VALUES($1,'Test Services','AGREEMENT-TEST'),($2,'Other Business','AGREEMENT-OTHER')`, [company, foreignCompany]);
+    await pool.query(`INSERT INTO users(id,email,role,company_id) VALUES($1,'agreements@example.invalid','employer',$3),($2,'other-agreements@example.invalid','employer',$4)`, [user, foreignUser, company, foreignCompany]);
+    await pool.query(`INSERT INTO sessions(token,user_id) VALUES('agreement-owner',$1),('agreement-other',$2)`, [user, foreignUser]);
+    await pool.query(`INSERT INTO contacts(id,user_id,company_id,name,email,address) VALUES($1,$2,$3,'Original Customer','customer@example.invalid','123 Service Lane')`, [contact, user, company]);
+    await pool.query(`INSERT INTO quotes(id,user_id,company_id,contact_id,line_items,total_cents,notes,quote_options) VALUES($1,$2,$3,$4,$5::jsonb,30000,'PRIVATE QUOTE NOTE',$6::jsonb)`, [quote, user, company, contact, JSON.stringify([{ name: "Windows", qty: 2, price_cents: 15000, description: "Full outside glass\nScreens excluded" }]), JSON.stringify({ duration_minutes: 90, public_notes: "Customer-facing scope", deposit: { type: "none", value: 0 } })]);
+    server = await new Promise((resolve) => { const listener = backend.app.listen(0, "127.0.0.1", () => resolve(listener)); });
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const request = async (path, { method = "GET", body, token = "agreement-owner", origin } = {}) => {
+      const response = await fetch(base + path, { method, headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(origin ? { Origin: origin } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
+      const data = /application\/(pdf|zip)/.test(response.headers.get("content-type") || "") ? Buffer.from(await response.arrayBuffer()) : await response.json();
+      return { status: response.status, body: data };
+    };
+    let published, token, signingSession;
+    await t.test("defaults and templates require explicit consent; publication freezes exact safe content", async () => {
+      const blocked = await request(`/api/quotes/${quote}/publish`, { method: "POST", body: { request_id: randomUUID() } });
+      assert.equal(blocked.status, 400);
+      assert.equal(blocked.body.error, "agreement_consent_required");
+      assert.equal((await request("/api/agreements/settings", { method: "PUT", body: { expected_version: 0, content: { consent_text: "I agree to electronic signing of this estimate.", agreement_text: "Work for {{customer_name}} at {{service_address}}. Total {{total}}." } } })).status, 200);
+      const preview = await request(`/api/quotes/${quote}/preview`, { method: "POST", body: {} });
+      assert.equal(preview.status, 200, JSON.stringify(preview.body));
+      assert.match(preview.body.snapshot.agreement_text, /Original Customer/);
+      assert.ok(preview.body.pdf_base64);
+      assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM quote_agreements`)).rows[0].n, 0);
+      assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM agreement_number_sequences`)).rows[0].n, 0);
+      const requestID = randomUUID();
+      const first = await request(`/api/quotes/${quote}/publish`, { method: "POST", body: { request_id: requestID } });
+      assert.equal(first.status, 201, JSON.stringify(first.body));
+      published = first.body;
+      token = new URL(published.customer_url).pathname.split("/").at(-1);
+      assert.equal((await request(`/api/quotes/${quote}/publish`, { method: "POST", body: { request_id: requestID } })).body.id, published.id);
+      assert.equal(published.snapshot.pricing.total_cents, 30000);
+      assert.match(published.snapshot.agreement_text, /Original Customer/);
+      const publicResult = await request(`/api/public/agreements/${token}`, { token: null });
+      assert.equal(publicResult.status, 200);
+      assert.equal(publicResult.body.snapshot.customer.email, null);
+      assert.equal(publicResult.body.snapshot.duration_minutes, undefined);
+      assert.ok(!JSON.stringify(publicResult.body).includes("PRIVATE"));
+      assert.ok(!JSON.stringify(publicResult.body).includes("customer@example.invalid"));
+      await pool.query(`UPDATE contacts SET name='Changed Customer',address='Changed address' WHERE id=$1`, [contact]);
+      await pool.query(`UPDATE quotes SET line_items='[]'::jsonb,total_cents=0 WHERE id=$1`, [quote]);
+      const frozen = (await request(`/api/public/agreements/${token}`, { token: null })).body;
+      assert.equal(frozen.snapshot.customer.name, "Original Customer");
+      assert.equal(frozen.snapshot.pricing.total_cents, 30000);
+      assert.equal((await request(`/api/quotes/${quote}`, { method: "DELETE" })).status, 409);
+    });
+    await t.test("staff archive/evidence isolation and preview GET do not mutate events", async () => {
+      assert.equal((await request(`/api/agreements/${published.id}`, { token: "agreement-other" })).status, 404);
+      assert.equal((await request(`/api/agreements/${published.id}/evidence`, { token: "agreement-other" })).status, 404);
+      assert.equal((await request(`/api/agreements/${published.id}`, { token: null })).status, 401);
+      const exported=(await request(`/api/agreements/${published.id}/evidence`)).body;
+      assert.equal(exported.customer_url,undefined);
+      assert.equal(exported.signer_links,undefined);
+      assert.match(exported.observation_notice.source_ip,/proxy/);
+      const before = (await pool.query(`SELECT count(*)::integer AS n FROM agreement_events WHERE agreement_id=$1`, [published.id])).rows[0].n;
+      const metadata = (await request(`/api/public/agreements/${token}/metadata`, { token: null })).body;
+      assert.equal(metadata.title, "Estimate from Test Services");
+      assert.ok(!JSON.stringify(metadata).includes("Original Customer"));
+      await request(`/api/public/agreements/${token}`, { token: null });
+      assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM agreement_events WHERE agreement_id=$1`, [published.id])).rows[0].n, before);
+      const archive = await request(`/api/agreements?contact_id=${contact}`);
+      assert.equal(archive.body.total, 1);
+      assert.equal(archive.body.agreements[0].id, published.id);
+    });
+    await t.test("change requests retain full messages and dedupe exact delivery with linked exception", async () => {
+      const body = { request_id: randomUUID(), decision: "changes_requested", message: "Please add the rear windows.\nDo not change the driveway service." };
+      const path = `/api/public/agreements/${token}/decision`;
+      assert.equal((await request(path, { token: null, method: "POST", body })).status, 200);
+      assert.equal((await request(path, { token: null, method: "POST", body })).status, 200);
+      assert.equal((await request(path, { token: null, method: "POST", body: { ...body, message: "Different request" } })).status, 409);
+      const rows = (await pool.query(`SELECT payload FROM agreement_events WHERE agreement_id=$1 AND type='changes_requested'`, [published.id])).rows;
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].payload.message, body.message);
+      assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM business_exceptions WHERE company_id=$1 AND type='agreement_change_request'`, [company])).rows[0].n, 1);
+    });
+    await t.test("signing validates consent/signature/packet and atomically deduplicates concurrent submissions", async () => {
+      signingSession = (await request(`/api/public/agreements/${token}/session`, { token: null, method: "POST", body: {} })).body;
+      assert.equal(signingSession.verified, true);
+      const body = { request_id: randomUUID(), session_token: signingSession.session_token, packet_hash: published.packet_hash, printed_name: "Alex Customer", consent: true, signature: { type: "typed", text: "Alex Customer" }, values: {} };
+      const path = `/api/public/agreements/${token}/sign`;
+      assert.equal((await request(path, { token: null, method: "POST", body: { ...body, consent: false } })).status, 400);
+      assert.equal((await request(path, { token: null, method: "POST", body: { ...body, signature: { type: "typed", text: " " } } })).status, 400);
+      assert.equal((await request(path, { token: null, method: "POST", body: { ...body, packet_hash: "tampered" } })).status, 409);
+      const unsupported=await request(path,{token:null,method:'POST',body:{...body,printed_name:'Name 😀'}});
+      assert.equal(unsupported.status,400);assert.equal(unsupported.body.error,'agreement_font_unsupported');
+      assert.equal((await pool.query('SELECT count(*)::integer n FROM agreement_signatures WHERE agreement_id=$1',[published.id])).rows[0].n,0);
+      assert.equal((await request(path, { token: null, method: "POST", body, origin: "https://evil.example" })).status, 403);
+      const results = await Promise.all([1, 2, 3].map(() => request(path, { token: null, method: "POST", body })));
+      assert.ok(results.every((result) => result.status === 200));
+      assert.ok(results.every((result) => result.body.state.signing === "submitted"));
+      assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM agreement_signatures WHERE agreement_id=$1`, [published.id])).rows[0].n, 1);
+      assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM agreement_jobs WHERE agreement_id=$1`, [published.id])).rows[0].n, 1);
+      assert.equal((await request(`/api/public/agreements/${token}/decision`, { token: null, method: "POST", body: { request_id: randomUUID(), decision: "declined" } })).status, 409);
+    });
+    await t.test("durable artifact worker survives service recreation; public access excludes audit observations", async () => {
+      assert.equal((await request(`/api/public/agreements/${token}/documents/signed`, { token: null })).status, 409);
+      assert.equal(await service.processDocumentJobs(), 1);
+      assert.equal(await service.processDocumentJobs(), 0);
+      const signed = await request(`/api/public/agreements/${token}/documents/signed`, { token: null });
+      assert.equal(signed.status, 200);
+      assert.ok(signed.body.subarray(0, 10).toString().includes("%PDF"));
+      assert.equal((await request(`/api/public/agreements/${token}/documents/audit`, { token: null })).status, 403);
+      const evidence = (await request(`/api/agreements/${published.id}/evidence`)).body;
+      assert.equal(evidence.signatures[0].packet_hash, published.packet_hash);
+      assert.equal(evidence.signatures[0].verification_method, "link_only");
+      assert.equal(evidence.artifacts.length, 4);
+      await pool.query(`UPDATE quote_agreements SET expires_at='2020-01-01' WHERE id=$1`, [published.id]);
+      const reopened = (await request(`/api/public/agreements/${token}`, { token: null })).body;
+      assert.equal(reopened.state.signing, "submitted");
+      assert.notEqual(reopened.state.decision, "expired");
+    });
+    await t.test("standalone multi-signer packets preserve real PDFs, reject stale previews and gate final completion", async () => {
+      const pdf = await PDFDocument.create(); pdf.addPage([500, 700]).drawText("Contract source");
+      const asset = (await request("/api/agreements/assets", { method: "POST", body: { name: "Signed contract", base64: Buffer.from(await pdf.save()).toString("base64") } })).body;
+      const fields = [
+        { id: "primary", type: "signature", role: "customer", required: true, page: 0, x: 0.1, y: 0.25, width: 0.7, height: 0.15 },
+        { id: "secondary", type: "signature", role: "customer_2", required: true, page: 0, x: 0.1, y: 0.45, width: 0.7, height: 0.15 },
+        { id: "business", type: "signature", role: "business", required: true, page: 0, x: 0.1, y: 0.65, width: 0.7, height: 0.15 },
+      ];
+      const content = { agreement_text: "Work at {{service_address}}", consent_text: "I, {{customer_name}}, consent to electronic signing.", required_signers: ["customer", "customer_2", "business"], documents: [{ asset_id: asset.id, fields }], terms_asset_id: asset.id, quote_position: "last" };
+      const input = { contact_id: contact, title: "Standalone agreement", content };
+      const preview = await request("/api/agreements/preview", { method: "POST", body: input });
+      assert.equal(preview.status, 200, JSON.stringify(preview.body));
+      assert.ok((await PDFDocument.load(Buffer.from(preview.body.pdf_base64, "base64"))).getPageCount() >= 4);
+      assert.equal(preview.body.snapshot.pricing, null);
+      assert.match(preview.body.snapshot.consent_text, /Changed Customer/);
+      await pool.query("UPDATE contacts SET address='456 New Road' WHERE id=$1", [contact]);
+      assert.equal((await request("/api/agreements", { method: "POST", body: { ...input, request_id: randomUUID(), expected_preview_hash: preview.body.preview_hash } })).status, 409);
+      const fresh = (await request("/api/agreements/preview", { method: "POST", body: input })).body;
+      const requestId = randomUUID();
+      const issued = (await request("/api/agreements", { method: "POST", body: { ...input, request_id: requestId, expected_preview_hash: fresh.preview_hash } })).body;
+      assert.ok(issued.id, JSON.stringify(issued));
+      assert.equal((await request("/api/agreements", { method: "POST", body: { ...input, title: "Changed", request_id: requestId } })).status, 409);
+      for (const [role, field] of [["customer", "primary"], ["customer_2", "secondary"]]) {
+        const link = issued.signer_links.find((link) => link.role === role).url.split("/").at(-1);
+        const session = (await request(`/api/public/agreements/${link}/session`, { method: "POST", token: null, body: {} })).body;
+        const signature = { type: "typed", text: role === "customer" ? "Alex One" : "Alex Two" };
+        const signed = await request(`/api/public/agreements/${link}/sign`, { method: "POST", token: null, body: { request_id: randomUUID(), session_token: session.session_token, packet_hash: issued.packet_hash, printed_name: signature.text, consent: true, signature, values: { [field]: signature } } });
+        assert.equal(signed.status, 200, JSON.stringify(signed.body));
+        assert.equal(signed.body.state.signing, "required_signers_pending");
+        assert.equal(signed.body.state.base_workflow_complete, false);
+      }
+      assert.equal((await pool.query("SELECT count(*)::integer n FROM agreement_jobs WHERE agreement_id=$1", [issued.id])).rows[0].n, 0);
+      const signature = { type: "typed", text: "Business Signer" };
+      const result = await request(`/api/agreements/${issued.id}/countersign`, { method: "POST", body: { request_id: randomUUID(), packet_hash: issued.packet_hash, printed_name: signature.text, consent: true, signature, values: { business: signature } } });
+      assert.equal(result.status, 200, JSON.stringify(result.body));
+      assert.equal(result.body.state.signing, "submitted");
+      assert.equal(result.body.state.base_workflow_complete, true);
+      await service.processDocumentJobs();
+      const packet = await request(`/api/agreements/${issued.id}/documents/packet`);
+      assert.equal(packet.status, 200);
+      assert.ok((await PDFDocument.load(packet.body)).getPageCount() >= 4);
+      assert.equal((await request(`/api/agreements/assets/${asset.id}`, { token: "agreement-other" })).status, 404);
+      const archive=await request(`/api/agreements/${issued.id}/evidence-package`);
+      assert.equal(archive.status,200);assert.equal(archive.body.readUInt32LE(0),0x04034b50);
+      assert.ok(archive.body.includes(Buffer.from(`sources/${asset.id}-original.pdf`)));
+      assert.ok(archive.body.includes(Buffer.from('manifest.json')));
+      assert.equal((await request(`/api/agreements/${issued.id}/evidence-package`,{token:'agreement-other'})).status,404);
+      const secondaryURL=issued.signer_links.find(item=>item.role==='customer_2').url,secondaryToken=secondaryURL.split('/').at(-1);
+      for(const kind of ['quote','signed','packet']){
+        const original=(await pool.query('SELECT id,bytes,sha256 FROM agreement_artifacts WHERE agreement_id=$1 AND kind=$2',[issued.id,kind])).rows[0];
+        const delivered=await request(`/api/public/agreements/${secondaryToken}/documents/${kind}`,{token:null});assert.equal(delivered.status,200);
+        const pdf=await PDFDocument.load(delivered.body),urls=[];
+        for(const page of pdf.getPages()){const annotations=page.node.Annots();for(let n=0;annotations&&n<annotations.size();n++){const action=pdf.context.lookup(annotations.get(n)).lookup(PDFName.of('A'));const uri=action?.lookup(PDFName.of('URI'));if(uri?.decodeText)urls.push(uri.decodeText());}}
+        assert.ok(urls.includes(secondaryURL));assert.ok(!urls.includes(issued.customer_url));
+        assert.deepEqual((await request(`/api/public/agreements/${secondaryToken}/documents/${kind}`,{token:null})).body,delivered.body);
+        const retained=(await pool.query('SELECT bytes,sha256 FROM agreement_artifacts WHERE id=$1',[original.id])).rows[0];assert.deepEqual(retained, {bytes:original.bytes,sha256:original.sha256});
+        const delivery=(await pool.query("SELECT sha256,source_sha256 FROM agreement_artifact_deliveries WHERE artifact_id=$1 AND role='customer_2'",[original.id])).rows[0];assert.equal(delivery.source_sha256,original.sha256);assert.equal(delivery.sha256,createHash('sha256').update(delivered.body).digest('hex'));
+      }
+    });
+    await t.test("durable follow-ups dedupe concurrent workers, filter bots, resolve with history and survive delivery failure", async () => {
+      let automationCalls = 0;
+      const notifications = await installAgreementNotifications({ app: backend.app, pool, service, authRequired: backend.authRequired, requireCapability: backend.requireCapability, startWorker: false, emitAutomationEvent: async () => { automationCalls++; throw new Error("Offline"); } });
+      const rules = await request("/api/agreements/notification-rules", { method: "PUT", body: { expected_version: 0, rules: [{ key: "unopened", delay_minutes: 1 }] } });
+      assert.equal(rules.status, 200, JSON.stringify(rules.body));
+      assert.equal((await request("/api/agreements/notification-rules")).body.version, 1);
+      assert.equal((await request("/api/agreements/notification-rules", { method: "PUT", body: { expected_version: 0 } })).status, 409);
+      const issued = (await request("/api/agreements", { method: "POST", body: { contact_id: contact, title: "Follow-up", request_id: randomUUID(), content: { agreement_text: "Scope", consent_text: "I consent." } } })).body;
+      const link = issued.customer_url.split("/").at(-1);
+      await pool.query("UPDATE quote_agreements SET created_at=now()-interval '1 hour' WHERE id=$1", [issued.id]);
+      await Promise.all([notifications.evaluate(), notifications.evaluate()]);
+      let exceptions = (await pool.query("SELECT * FROM business_exceptions WHERE source_id=$1", [`${issued.id}:unopened`])).rows;
+      assert.equal(exceptions.length, 1); assert.equal(exceptions[0].status, "open");
+      await request(`/api/agreements/${issued.id}`);
+      assert.equal((await pool.query("SELECT status FROM business_exceptions WHERE id=$1", [exceptions[0].id])).rows[0].status, "open");
+      const bot = await fetch(base + `/api/public/agreements/${link}/observed-open`, { method: "POST", headers: { "content-type": "application/json", "user-agent": "facebookexternalhit preview" }, body: JSON.stringify({ request_id: randomUUID() }) });
+      assert.equal((await bot.json()).recorded, false);
+      const openRequest = { method: "POST", token: null, body: { request_id: randomUUID() } };
+      await request(`/api/public/agreements/${link}/observed-open`, openRequest);
+      await request(`/api/public/agreements/${link}/observed-open`, openRequest);
+      assert.equal((await pool.query("SELECT count(*)::integer n FROM agreement_events WHERE agreement_id=$1 AND type='observed_open'", [issued.id])).rows[0].n, 1);
+      await pool.query("UPDATE quote_agreements SET next_followup_at=now() WHERE id=$1", [issued.id]);
+      await notifications.evaluate(100, new Date(Date.now() + 1000));
+      exceptions = (await pool.query("SELECT * FROM business_exceptions WHERE source_id=$1", [`${issued.id}:unopened`])).rows;
+      assert.equal(exceptions[0].status, "resolved"); assert.ok(exceptions[0].resolved_at); assert.equal(exceptions[0].resolution_source, "automatic");
+      const change = await request(`/api/public/agreements/${link}/decision`, { method: "POST", token: null, body: { request_id: randomUUID(), decision: "changes_requested", message: "Please change the scope." } });
+      assert.equal(change.status, 200);
+      const event = (await pool.query("SELECT id FROM agreement_events WHERE agreement_id=$1 AND type='changes_requested'", [issued.id])).rows[0];
+      assert.equal((await request(`/api/agreements/${issued.id}/changes/${event.id}/resolve`, { method: "POST", body: {}, token: "agreement-other" })).status, 404);
+      await Promise.all([1, 2].map(() => request(`/api/agreements/${issued.id}/changes/${event.id}/resolve`, { method: "POST", body: {} })));
+      assert.equal((await pool.query("SELECT count(*)::integer n FROM agreement_events WHERE agreement_id=$1 AND type='change_request_addressed'", [issued.id])).rows[0].n, 1);
+      await notifications.deliverEvents();
+      assert.ok(automationCalls > 0);
+      const queued = (await pool.query("SELECT count(*)::integer n FROM agreement_notification_deliveries")).rows[0].n;
+      assert.ok(queued > 0);
+      await notifications.deliverEvents();
+      assert.equal((await pool.query("SELECT count(*)::integer n FROM agreement_notification_deliveries")).rows[0].n, queued);
+      assert.equal((await pool.query("SELECT count(*)::integer n FROM agreement_events WHERE automation_delivered_at IS NOT NULL")).rows[0].n, 0);
+      assert.ok((await pool.query("SELECT count(*)::integer n FROM lead_notifications WHERE company_id=$1", [company])).rows[0].n > 0);
+      const savedHook=service.planFollowupContext;
+      let occurrence='visit-one';
+      service.planFollowupContext=async(_db,row)=>row.id===issued.id?{plan_service_due:new Date(Date.now()-3600000),plan_service_due_occurrence:occurrence}:{};
+      const nextRules={expected_version:1,immediate_dashboard:false,immediate_push:false,events:[{key:'deposit_received',dashboard:false,push:true},{key:'plan_payment_failed',dashboard:true,push:false}],rules:[{key:'plan_service_due',delay_minutes:1,dashboard:false,push:true}]};
+      assert.equal((await request('/api/agreements/notification-rules',{method:'PUT',body:nextRules})).status,200);
+      const evaluateAgain=async()=>{await pool.query('UPDATE quote_agreements SET next_followup_at=now() WHERE id=$1',[issued.id]);const clock=new Date(Date.now()+1000);await Promise.all([notifications.evaluate(100,clock),notifications.evaluate(100,clock)]);};
+      await evaluateAgain();await evaluateAgain();
+      let occurrences=(await pool.query("SELECT payload->>'occurrence' AS occurrence FROM agreement_events WHERE agreement_id=$1 AND type='followup_plan_service_due' ORDER BY created_at",[issued.id])).rows;
+      assert.deepEqual(occurrences.map(item=>item.occurrence),[`${issued.id}:plan_service_due:visit-one`]);
+      occurrence='visit-two';await evaluateAgain();
+      occurrences=(await pool.query("SELECT payload->>'occurrence' AS occurrence FROM agreement_events WHERE agreement_id=$1 AND type='followup_plan_service_due' ORDER BY created_at",[issued.id])).rows;
+      assert.equal(occurrences.length,2);
+      assert.equal((await request('/api/agreements/notification-rules',{method:'PUT',body:{...nextRules,expected_version:2,rules:[{key:'plan_service_due',delay_minutes:1,dashboard:true,push:false}]}})).status,200);
+      await evaluateAgain();
+      assert.equal((await pool.query('SELECT status FROM business_exceptions WHERE source_id=$1',[`${issued.id}:plan_service_due:visit-two`])).rows[0].status,'open');
+      assert.equal((await request('/api/agreements/notification-rules',{method:'PUT',body:{...nextRules,expected_version:3}})).status,200);
+      await evaluateAgain();
+      assert.equal((await pool.query('SELECT status FROM business_exceptions WHERE source_id=$1',[`${issued.id}:plan_service_due:visit-two`])).rows[0].status,'resolved');
+      await service.event(pool,issued.id,'payment_succeeded',{payload:{kind:'deposit',test:'channel-override'}});
+      await service.event(pool,issued.id,'plan_payment_failed',{payload:{test:'channel-override'}});
+      await notifications.deliverEvents(1000);
+      const channels=(await pool.query("SELECT e.type,d.push_requested,d.notification_id FROM agreement_notification_deliveries d JOIN agreement_events e ON e.id=d.event_id WHERE e.agreement_id=$1 AND e.payload->>'test'='channel-override'",[issued.id])).rows;
+      assert.equal(channels.length,2);
+      assert.equal(channels.find(row=>row.type==='payment_succeeded').push_requested,true);
+      assert.equal(channels.find(row=>row.type==='payment_succeeded').notification_id,null);
+      assert.ok(channels.find(row=>row.type==='plan_payment_failed').notification_id);
+      assert.equal(channels.find(row=>row.type==='plan_payment_failed').push_requested,false);
+      service.planFollowupContext=savedHook;
+    });
+    await t.test("revocation/regeneration invalidates old links but preserves authorized evidence", async () => {
+      const action = { request_id: randomUUID(), action: "regenerate" };
+      const regenerated = await request(`/api/agreements/${published.id}/link`, { method: "POST", body: action });
+      assert.equal(regenerated.status, 200);
+      assert.notEqual(regenerated.body.customer_url, published.customer_url);
+      assert.equal((await request(`/api/public/agreements/${token}`, { token: null })).status, 404);
+      assert.equal((await request(`/api/agreements/${published.id}/link`, { method: "POST", body: action })).body.customer_url, regenerated.body.customer_url);
+      assert.equal((await request(`/api/agreements/${published.id}/evidence`)).status, 200);
+    });
+    await t.test('independent PostgreSQL dump and restore preserve exact evidence and payment links',async()=>{
+      const directory=mkdtempSync('/tmp/wolfcrm-agreement-backup-test-'),restored=startLocalPostgres();let target;
+      try{
+        const paymentID=randomUUID();await pool.query("INSERT INTO payment_records(id,user_id,company_id,contact_id,quote_id,agreement_id,payment_type,status,amount_cents,currency) VALUES($1,$2,$3,$4,$5,$6,'manual','succeeded',12300,'usd')",[paymentID,user,company,contact,quote,published.id]);
+        const file=join(directory,'fixture.dump');
+        const run=(command,args)=>{const result=spawnSync(command,args,{encoding:'utf8',timeout:30000});assert.equal(result.status,0,result.stderr||result.error?.message);};
+        run('pg_dump',['-h',postgres.config.host,'-U',postgres.config.user,'-d','postgres','-Fc','-f',file]);
+        run('pg_restore',['-h',restored.config.host,'-U',restored.config.user,'-d','postgres','--no-owner','--no-privileges',file]);
+        target=new pg.Pool(restored.config);
+        const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+        const artifacts=async(db)=>(await db.query('SELECT agreement_id,kind,bytes FROM agreement_artifacts ORDER BY agreement_id,kind')).rows.map(row=>({agreement_id:row.agreement_id,kind:row.kind,hash:hash(row.bytes)}));
+        assert.deepEqual(await artifacts(target),await artifacts(pool));
+        const assets=async(db)=>(await db.query('SELECT id,original_bytes,normalized_bytes FROM agreement_assets ORDER BY id')).rows.map(row=>({id:row.id,original:hash(row.original_bytes),normalized:hash(row.normalized_bytes)}));
+        assert.deepEqual(await assets(target),await assets(pool));
+        const record=(await target.query('SELECT * FROM payment_records WHERE id=$1',[paymentID])).rows[0];assert.equal(record.agreement_id,published.id);assert.equal(record.quote_id,quote);assert.equal(record.amount_cents,12300);
+        const newProcess=createAgreementService({pool:target,env,getQuoteSettings:backend.getQuoteSettings});
+        const row=(await target.query('SELECT * FROM quote_agreements WHERE id=$1',[published.id])).rows[0];
+        const detail=await newProcess.detail(target,row,{staff:true,includeActivity:true});assert.equal(detail.state.signing,'submitted');assert.ok(detail.signatures.length);assert.ok(detail.documents_ready);
+        assert.equal((await newProcess.loadPublic(target,newProcess.makeToken(row))).row.packet_hash,row.packet_hash);
+      }finally{if(target)await target.end();restored.stop();rmSync(directory,{recursive:true,force:true});}
+    });
+  } finally {
+    service?.stop();
+    if (server) await new Promise((resolve) => server.close(resolve));
+    if (pool) await pool.end();
+    postgres.stop();
+  }
+});

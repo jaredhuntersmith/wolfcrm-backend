@@ -1,4 +1,4 @@
-export const PERMISSION_CATALOG_VERSION = 4;
+export const PERMISSION_CATALOG_VERSION = 5;
 
 export const PERMISSION_GROUPS = Object.freeze([
   group("dashboard", "Dashboard", "Command center and daily business overview."),
@@ -7,6 +7,7 @@ export const PERMISSION_GROUPS = Object.freeze([
   group("schedule", "Schedule & Jobs", "Scheduling, job execution, completion, and workflow templates."),
   group("routes", "Routes", "View, build, edit, and administer field routes."),
   group("messaging", "Customer Messaging", "Customer conversations and message deletion."),
+  group("focus", "Focus (Private)", "Private native-only creator discovery, media library, and supported professional messaging."),
   group("communications", "Company Communication", "Internal channels, direct messages, and channel administration."),
   group("operations", "Operations", "Equipment, inventory, requests, measurements, maps, and mileage operations."),
   group("payments", "Payments", "Collect, view, manage, refund, or credit customer payments."),
@@ -61,6 +62,11 @@ export const PERMISSION_CAPABILITIES = Object.freeze([
   capability("messaging.customer.view", "messaging", "View customer messages", "Read customer SMS, iMessage, calls, and voicemail."),
   capability("messaging.customer.send", "messaging", "Message customers", "Send customer messages and place calls.", false, ["messaging.customer.view", "contacts.view"]),
   capability("messaging.customer.delete", "messaging", "Delete customer messages", "Delete conversations, messages, or voicemail.", true, ["messaging.customer.view"]),
+
+  capability("focus.view", "focus", "View Focus", "Use the private Focus feed, creator library, Likes, and diagnostics.", true),
+  capability("focus.manage", "focus", "Manage Focus", "Change Focus rules, discovery, budgets, connections, exports, and deletion controls.", true, ["focus.view"]),
+  capability("focus.messages.view", "focus", "View Focus messages", "Read supported private professional-account conversations inside Focus.", true, ["focus.view"]),
+  capability("focus.messages.send", "focus", "Send Focus messages", "Send eligible professional-account replies or supported shares from Focus.", true, ["focus.messages.view"]),
 
   capability("communications.view", "communications", "View company communication", "Read internal channels and direct messages."),
   capability("communications.send", "communications", "Send company messages", "Post to internal channels and direct messages.", false, ["communications.view"]),
@@ -134,7 +140,7 @@ const ALL_KEYS = Object.freeze(PERMISSION_CAPABILITIES.map((item) => item.key));
 const KNOWN_KEYS = new Set(ALL_KEYS);
 const CAPABILITY_BY_KEY = new Map(PERMISSION_CAPABILITIES.map((item) => [item.key, item]));
 
-const legacyEmployee = new Set(ALL_KEYS.filter((key) => !key.startsWith("finance.") && !key.startsWith("accounting.") && !key.startsWith("website.") && ![
+const legacyEmployee = new Set(ALL_KEYS.filter((key) => !key.startsWith("finance.") && !key.startsWith("accounting.") && !key.startsWith("website.") && !key.startsWith("focus.") && ![
   "dashboard.exceptions.view", "dashboard.exceptions.manage",
   "contacts.delete", "contacts.export", "sales.view_all", "sales.manage",
   "jobs.manage_templates", "routes.manage", "communications.manage",

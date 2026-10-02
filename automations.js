@@ -7617,6 +7617,7 @@ async function executeServicePlanCreate(run, node, config) {
 async function executeServicePlanUpdate(run, node, config) {
   const context = await buildRunContext(run);
   const plan = await resolveServicePlan(run, context, config);
+  if (plan.enrollment_id && ["plan_name", "price_cents", "billing_interval", "billing_interval_count", "service_interval", "service_interval_count", "first_service_date", "next_service_date", "included_services"].some(key => config[key] != null)) throw new Error("signed_plan_terms_require_new_agreement");
   const row = (await ctx.pool.query(
     `UPDATE service_plans
         SET plan_name = COALESCE($3, plan_name),
@@ -7645,6 +7646,12 @@ async function executeServicePlanResume(run, node, config) { return setServicePl
 
 async function setServicePlanStatus(run, node, config, status, eventOverride = null) {
   const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+  if (plan.enrollment_id) {
+    if (!ctx.changeEnrolledServicePlan) throw new Error("signed_plan_policy_service_unavailable");
+    const row = await ctx.changeEnrolledServicePlan(plan, status === "paused" ? "pause" : "resume");
+    await syncAutomationSchedulesForServicePlan(run.company_id, row);
+    return { service_plan_id: row.id, status: row.status };
+  }
   const row = (await ctx.pool.query(`UPDATE service_plans SET status = $3, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [plan.id, run.company_id, status])).rows[0];
   const eventType = eventOverride || (status === "active" ? "service_plan.activated" : status === "paused" ? "service_plan.paused" : "service_plan.updated");
   await emitFinancialEvent(run, node, eventType, "service_plan", row.id, servicePlanPayload(row));
@@ -7655,6 +7662,12 @@ async function setServicePlanStatus(run, node, config, status, eventOverride = n
 async function executeServicePlanCancel(run, node, config) {
   if (config.confirm_cancel !== true) throw new Error("service_plan_cancel_confirmation_required");
   const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+  if (plan.enrollment_id) {
+    if (!ctx.changeEnrolledServicePlan) throw new Error("signed_plan_policy_service_unavailable");
+    const row = await ctx.changeEnrolledServicePlan(plan, "cancel");
+    if (row.status === "canceled") await cancelScheduledForSubject(run.company_id, "service_plan", row.id, ["service_plan.service_upcoming", "service_plan.service_due", "service_plan.service_overdue"]);
+    return { service_plan_id: row.id, status: row.status };
+  }
   const stripe = ctx.getStripe ? ctx.getStripe() : null;
   if (stripe && plan.stripe_subscription_id && plan.stripe_connected_account_id) {
     await stripe.subscriptions.cancel(plan.stripe_subscription_id, {}, { stripeAccount: plan.stripe_connected_account_id, idempotencyKey: `auto_${run.id}_${node.id}_cancel_subscription` }).catch((e) => { throw new Error(`stripe_cancel_failed:${e?.message || "unknown"}`); });
@@ -7670,6 +7683,16 @@ async function executeServicePlanMarkServiced(run, node, config) {
   if (existing) return { service_event_id: existing, reused: true };
   const context = await buildRunContext(run);
   const plan = await resolveServicePlan(run, context, config);
+  if (plan.enrollment_id) {
+    if (!ctx.markEnrolledPlanServiced) throw new Error("signed_plan_visit_service_unavailable");
+    const jobID = resolveTemplate(config.job_id || context.job?.id || "", context);
+    if (!jobID) throw new Error("signed_plan_actual_job_required");
+    let requestID = await getRunVariable(run.id, `idempotency:${node.id}:enrolled_visit_request`);
+    if (!requestID) { requestID = randomUUID(); await setRunVariable(run.id, `idempotency:${node.id}:enrolled_visit_request`, requestID); }
+    const row = await ctx.markEnrolledPlanServiced(plan, { request_id: requestID, job_id: jobID });
+    await syncAutomationSchedulesForServicePlan(run.company_id, row);
+    return { service_plan_id: row.id, job_id: jobID, remaining_visits: row.remaining_visits };
+  }
   const completedDate = (resolveDateExpression(config.completed_date || "", context) || new Date()).toISOString().slice(0, 10);
   const next = addDaysISO(completedDate, serviceIntervalDays(plan.service_interval, plan.service_interval_count));
   const row = (await ctx.pool.query(`UPDATE service_plans SET last_service_date = $3::date, next_service_date = $4::date, updated_at = now() WHERE id = $1 AND company_id = $2 RETURNING *`, [plan.id, run.company_id, completedDate, next])).rows[0];
@@ -7688,6 +7711,7 @@ async function executeServicePlanSetNextServiceDate(run, node, config) { return 
 
 async function executeServicePlanCreateNextJob(run, node, config) {
   const plan = await resolveServicePlan(run, await buildRunContext(run), config);
+  if (plan.enrollment_id) throw new Error("signed_plan_visit_requires_confirmed_schedule_link");
   return executeJobCreate(run, node, { ...config, contact_id: plan.contact_id, title: config.title || plan.plan_name || "Service plan job", start_at: config.start_at || plan.next_service_date, price_cents: config.price_cents || plan.price_cents });
 }
 

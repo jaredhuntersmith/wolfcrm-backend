@@ -20,7 +20,7 @@ function testCatalogIsUniqueAndComplete() {
   assert.ok(PERMISSION_CAPABILITIES.every((item) => groupIds.has(item.group_id)));
   assert.ok(PERMISSION_CAPABILITIES.every((item) => item.depends_on.every((dependency) => keys.includes(dependency))));
   const payload = permissionCatalogPayload();
-  assert.equal(payload.version, 4);
+  assert.equal(payload.version, 5);
   assert.equal(Object.keys(payload.presets.find((item) => item.id === "admin").capabilities).length, keys.length);
 }
 
@@ -60,6 +60,18 @@ function testWebsiteBuilderPresetsStayLeastPrivilege() {
   assert.equal(office["website.publish"], false);
   assert.equal(sales["website.view"], false);
   assert.equal(legacy["website.view"], false);
+}
+
+function testFocusIsOwnerOrExplicitAdminOnly() {
+  const admin = resolveAccess({ role: "employee", preset: "admin" }).capabilities;
+  const technician = resolveAccess({ role: "employee", preset: "technician" }).capabilities;
+  const legacy = resolveAccess({ role: "employee", preset: "legacy_employee" }).capabilities;
+  assert.equal(admin["focus.view"], true);
+  assert.equal(admin["focus.manage"], true);
+  assert.equal(technician["focus.view"], false);
+  assert.equal(technician["focus.manage"], false);
+  assert.equal(legacy["focus.view"], false);
+  assert.equal(legacy["focus.messages.send"], false);
 }
 
 function testBusinessExceptionAccessIsLimitedToOperationalLeaders() {
@@ -223,6 +235,7 @@ const tests = [
   ["owner invariant", testOwnerAlwaysHasEveryCapability],
   ["technician preset", testTechnicianPresetIsOperationalButRestricted],
   ["website builder preset boundaries", testWebsiteBuilderPresetsStayLeastPrivilege],
+  ["focus least-privilege boundaries", testFocusIsOwnerOrExplicitAdminOnly],
   ["business exception access", testBusinessExceptionAccessIsLimitedToOperationalLeaders],
   ["override dependency expansion", testSparseOverrideAddsDependencies],
   ["explicit parent deny", testExplicitViewDenyCascadesToActions],

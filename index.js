@@ -31,6 +31,18 @@ import {
   syncAutomationSchedulesForTimeEntry
 } from "./automations.js";
 import { installFinanceSystem, loadProjection } from "./finance.js";
+import { normalizeQuoteLines, normalizeQuoteOptions, validateQuoteAddonScope, calculateQuotePricing, QuoteContractError } from "./quote-contract-domain.js";
+import { installServiceCatalogSchema, installServiceCatalogRoutes, assertQuoteReferences, ServiceCatalogError } from "./services-catalog.js";
+import { installAgreementSchema, installAgreementSystem } from "./quote-agreements.js";
+import { selectedQuoteScheduleScope } from "./quote-addons.js";
+import { installAgreementPlanCancellation } from "./agreement-plan-cancellation.js";
+import { installAgreementPayments } from "./agreement-payments.js";
+import { installAgreementBooking } from "./agreement-booking.js";
+import { installAgreementPlans } from "./agreement-plans.js";
+import { installAgreementArchive } from "./agreement-archive.js";
+import { installAgreementPlanBilling } from "./agreement-plan-billing.js";
+import { lockCompanySchedule, scheduleConflict } from "./schedule-booking-guard.js";
+import { installAgreementNotifications } from "./agreement-notifications.js";
 import { installPayStructureSystem } from "./pay-structures.js";
 import {
   isStripePaymentCollectionPaused,
@@ -180,6 +192,7 @@ import {
 } from "./operations-repairs.js";
 import { installWebsiteBuilderSystem } from "./website-builder.js";
 import { installRoutineGroupSystem } from "./routine-groups.js";
+import { installFocusSystem } from "./focus.js";
 import {
   LightingInputError,
   assertLightingAssetKey,
@@ -238,7 +251,7 @@ function getApnProvider(environment = null) {
   return apnProviderInstances.get(cacheKey);
 }
 
-async function sendApnsPush(deviceTokens, { title, body, contactId, payload = {}, badge = null, threadId = null }) {
+async function sendApnsPush(deviceTokens, { title, body, contactId, payload = {}, badge = null, threadId = null, collapseId = null }) {
   const bundleId = process.env.APNS_BUNDLE_ID;
   if (!bundleId) {
     return { sent: 0, failed: 0, skipped: true, reason: "not_configured" };
@@ -253,6 +266,7 @@ async function sendApnsPush(deviceTokens, { title, body, contactId, payload = {}
   note.expiry = Math.floor(Date.now() / 1000) + 3600;
   if (Number.isInteger(badge) && badge >= 0) note.badge = badge;
   if (threadId) note.threadId = threadId;
+  if (collapseId) note.collapseId = collapseId;
   note.payload = { ...payload };
   if (contactId) note.payload.contact_id = contactId;
   try {
@@ -340,6 +354,7 @@ async function deviceTokensForUsers(userIds) {
 }
 
 const DEFAULT_PUSH_CATEGORIES = {
+  agreements: true,
   cellular_sms: true,
   imessage: true,
   missed_call: true,
@@ -528,6 +543,10 @@ app.use(cors());
 // raw bytes aren't consumed. The handler is defined further down but the
 // raw-body middleware for that exact path lives here.
 app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }));
+// Focus receives only Meta-signed raw bytes on its webhook route. This must
+// remain before the JSON parser so a later handler can verify the exact body.
+app.use("/api/focus/webhooks/meta", express.raw({ type: "application/json", limit: "1mb" }));
+app.use("/api/agreements/assets", express.json({ limit: "14mb" }));
 
 app.use(express.json({
   limit: "2mb",
@@ -1288,6 +1307,8 @@ async function bootstrap() {
     ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS tax_enabled BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS tax_rate_basis_points INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS valid_for_days INTEGER NOT NULL DEFAULT 30;
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS tax_inclusive BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE quote_settings ADD COLUMN IF NOT EXISTS discount_stacking_policy TEXT NOT NULL DEFAULT 'best_price';
 
     -- APNs device tokens for real push notifications.
     CREATE TABLE IF NOT EXISTS device_tokens (
@@ -2664,6 +2685,8 @@ async function bootstrap() {
     END $$;
   `);
 
+  await installServiceCatalogSchema(pool);
+  await installAgreementSchema(pool);
   console.log(`[bootstrap] DB ready @ ${nowIso()}`);
 }
 
@@ -3057,6 +3080,10 @@ function sanitizeServicePlan(row, { employeeSafe = false } = {}) {
     id: row.id,
     contact_id: row.contact_id,
     plan_name: row.plan_name,
+    enrollment_id: row.enrollment_id || null,
+    billing_mode: row.billing_mode || null,
+    remaining_visits: row.remaining_visits ?? null,
+    plan_snapshot: row.plan_snapshot || null,
     status: row.status,
     price_cents: row.price_cents,
     currency: row.currency,
@@ -8185,7 +8212,7 @@ app.get("/api/contacts/:id/workspace", authRequired, requireCapability("contacts
         : Promise.resolve({ rows: [] }),
       quoteScope
         ? pool.query(
-            `SELECT id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
+            `SELECT id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
                FROM quotes q
               WHERE ${quoteScope.sql} AND q.contact_id = $${quoteScope.values.length + 1}
               ORDER BY q.updated_at DESC LIMIT 50`,
@@ -11705,18 +11732,57 @@ app.post("/webhooks/leads/:token", async (req, res) => {
 
 
 // ---------- QUOTES ----------
-// Line items are stored as JSON: [{ name: string, qty: number, price_cents: number }]
-// total_cents is the server-authoritative sum so listing/cards don't have to compute.
-function computeQuoteTotalCents(lineItems) {
-  if (!Array.isArray(lineItems)) return 0;
-  return lineItems.reduce((sum, li) => {
-    if (!li || typeof li !== "object") return sum;
-    const qty = Number(li.qty) || 0;
-    const price = Number(li.price_cents) || 0;
-    return sum + Math.max(0, Math.round(qty * price));
-  }, 0);
+installServiceCatalogRoutes({ app, pool, authRequired, requireCapability, requireAnyCapability });
+
+function sendQuoteValidationError(res, error) {
+  if (!(error instanceof QuoteContractError) && !(error instanceof ServiceCatalogError)) return false;
+  res.status(error.status || error.statusCode || 400).json({ error: error.code, message: error.message });
+  return true;
 }
 
+app.post("/api/quotes/pricing", authRequired, requireAnyCapability("quotes.create", "quotes.edit"), async (req, res) => {
+  try {
+    const line_items = normalizeQuoteLines(req.body?.line_items ?? []);
+    const quote_options = normalizeQuoteOptions(req.body?.quote_options ?? {});
+    let existing_lines = [];
+    if (req.body?.quote_id) {
+      const scope = quoteScopeSQL(req);
+      const existing = (await pool.query(`SELECT line_items,quote_options FROM quotes q WHERE ${scope.sql} AND id::text = $${scope.values.length + 1}`, [...scope.values, req.body.quote_id])).rows[0];
+      if (!existing) return res.status(404).json({ error: "not_found" });
+      existing_lines = [...existing.line_items, ...normalizeQuoteOptions(existing.quote_options || {}).optional_addons];
+    }
+    validateQuoteAddonScope(line_items, quote_options);
+    await assertQuoteReferences(pool, req, { line_items: [...line_items,...quote_options.optional_addons], existing_lines });
+    const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
+    res.json(calculateQuotePricing({ line_items, deposit: quote_options.deposit, discount:quote_options.discount,tax_inclusive:settings.tax_inclusive??false,
+      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }));
+  } catch (error) {
+    if (sendQuoteValidationError(res, error)) return;
+    console.error("[quotes] pricing failed", { code: error?.code });
+    res.status(500).json({ error: "quote_pricing_failed" });
+  }
+});
+
+app.get("/api/quotes/:id/pricing", authRequired, requireCapability("quotes.view"), async (req, res) => {
+  try {
+    const scope = quoteScopeSQL(req);
+    const quote = (await pool.query(`SELECT * FROM quotes q WHERE ${scope.sql} AND id = $${scope.values.length + 1}`, [...scope.values, req.params.id])).rows[0];
+    if (!quote) return res.status(404).json({ error: "not_found" });
+    const options = normalizeQuoteOptions(quote.quote_options || {});
+    validateQuoteAddonScope(quote.line_items, options);
+    await assertQuoteReferences(pool, req, { line_items: [...quote.line_items,...options.optional_addons], existing_lines: [...quote.line_items,...options.optional_addons] });
+    const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
+    res.json({ ...calculateQuotePricing({ line_items: quote.line_items, deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
+      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }), quote_updated_at: quote.updated_at });
+  } catch (error) {
+    if (sendQuoteValidationError(res, error)) return;
+    console.error("[quotes] saved pricing failed", { code: error?.code });
+    res.status(500).json({ error: "quote_pricing_failed" });
+  }
+});
+
+// Draft totals retain the original pre-tax semantics; exact public totals use
+// the shared quote calculation with company tax settings.
 function cleanQuoteString(value, maxLength = 1000) {
   return (value || "").toString().trim().slice(0, maxLength);
 }
@@ -11730,6 +11796,9 @@ function quoteSettingsPayload(row, company = {}) {
     notes: row?.notes || "This quote includes the services listed above.\nIf you have any questions or would like to move forward,\nwe're here to help!\n\nWe look forward to working with you.",
     tax_enabled: Boolean(row?.tax_enabled),
     tax_rate_basis_points: Number(row?.tax_rate_basis_points || 0),
+    tax_inclusive: Boolean(row?.tax_inclusive),
+    discount_stacking_policy: row?.discount_stacking_policy || "best_price",
+    updated_at: row?.updated_at ? new Date(row.updated_at).toISOString() : null,
     valid_for_days: Number(row?.valid_for_days || 30),
     company_name: company.name || "",
     company_logo_data_url: company.logo_data_url || "",
@@ -11769,13 +11838,17 @@ app.get("/api/quotes/settings", authRequired, requireCapability("quotes.view"), 
 app.patch("/api/quotes/settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
   try {
     if (!req.companyId) return res.status(400).json({ error: "company_required" });
-    const taxRate = Number(req.body?.tax_rate_basis_points || 0);
-    const validFor = Number(req.body?.valid_for_days || 30);
+    const current = await getQuoteSettings(pool,req.companyId);
+    const input = {...current,...req.body};
+    const taxRate = Number(input.tax_rate_basis_points ?? 0);
+    const validFor = Number(input.valid_for_days ?? 30);
+    if(typeof input.tax_enabled!=="boolean"||typeof input.tax_inclusive!=="boolean")return res.status(400).json({error:"quote_tax_invalid",message:"Specify tax enablement and inclusive treatment as true or false."});
+    if(!["best_price","quote_then_plan"].includes(input.discount_stacking_policy))return res.status(400).json({error:"quote_discount_policy_invalid"});
     if (!Number.isInteger(taxRate) || taxRate < 0 || taxRate > 5000) return res.status(400).json({ error: "quote_tax_rate_invalid" });
     if (!Number.isInteger(validFor) || validFor < 1 || validFor > 365) return res.status(400).json({ error: "quote_valid_for_invalid" });
     await pool.query(
-      `INSERT INTO quote_settings(company_id, tagline, phone, email, website, notes, tax_enabled, tax_rate_basis_points, valid_for_days)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `INSERT INTO quote_settings(company_id, tagline, phone, email, website, notes, tax_enabled, tax_rate_basis_points, valid_for_days,tax_inclusive,discount_stacking_policy)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        ON CONFLICT(company_id) DO UPDATE SET
          tagline = EXCLUDED.tagline,
          phone = EXCLUDED.phone,
@@ -11785,17 +11858,19 @@ app.patch("/api/quotes/settings", authRequired, requireCapability("settings.mana
          tax_enabled = EXCLUDED.tax_enabled,
          tax_rate_basis_points = EXCLUDED.tax_rate_basis_points,
          valid_for_days = EXCLUDED.valid_for_days,
+         tax_inclusive = EXCLUDED.tax_inclusive,
+         discount_stacking_policy = EXCLUDED.discount_stacking_policy,
          updated_at = now()`,
       [
         req.companyId,
-        cleanQuoteString(req.body?.tagline, 400) || null,
-        cleanQuoteString(req.body?.phone, 80) || null,
-        cleanQuoteString(req.body?.email, 160) || null,
-        cleanQuoteString(req.body?.website, 200) || null,
-        cleanQuoteString(req.body?.notes, 3000) || null,
-        Boolean(req.body?.tax_enabled),
+        cleanQuoteString(input.tagline, 400) || null,
+        cleanQuoteString(input.phone, 80) || null,
+        cleanQuoteString(input.email, 160) || null,
+        cleanQuoteString(input.website, 200) || null,
+        cleanQuoteString(input.notes, 3000) || null,
+        Boolean(input.tax_enabled),
         taxRate,
-        validFor
+        validFor,input.tax_inclusive,input.discount_stacking_policy
       ]
     );
     res.json(await getQuoteSettings(pool, req.companyId));
@@ -11812,7 +11887,7 @@ app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (re
     let rows;
     if (contactID) {
       rows = (await pool.query(
-        `SELECT id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
+        `SELECT id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
          FROM quotes q
          WHERE ${scope.sql} AND contact_id = $${scope.values.length + 1}
          ORDER BY updated_at DESC`,
@@ -11820,7 +11895,7 @@ app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (re
       )).rows;
     } else {
       rows = (await pool.query(
-        `SELECT id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
+        `SELECT id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
          FROM quotes q
          WHERE ${scope.sql}
          ORDER BY updated_at DESC
@@ -11855,18 +11930,25 @@ app.get("/api/quotes/totals", authRequired, requireCapability("quotes.view"), as
 app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async (req, res) => {
   const { contact_id, title, line_items, notes, status, expires_at } = req.body || {};
   if (!contact_id) return res.status(400).json({ error: "contact_id_required" });
-  const items = Array.isArray(line_items) ? line_items : [];
-  const total = computeQuoteTotalCents(items);
+  let items, options, total;
   const initialStatus = ["draft","sent","accepted","declined","expired","converted"].includes(status) ? status : "draft";
   try {
+    items = normalizeQuoteLines(line_items ?? []);
+    options = normalizeQuoteOptions(req.body?.quote_options ?? {});
+    const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
+    const pricing = calculateQuotePricing({ line_items: items, deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
+      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 });
+    total = pricing.subtotal_cents;
+    validateQuoteAddonScope(items, options);
+    await assertQuoteReferences(pool, req, { contact_id, line_items: [...items,...options.optional_addons] });
     const { rows } = await pool.query(
-      `INSERT INTO quotes (user_id, company_id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9,
+      `INSERT INTO quotes (user_id, company_id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $10::jsonb, $8, $9,
          CASE WHEN $8 = 'sent' THEN now() END,
          CASE WHEN $8 = 'accepted' THEN now() END,
          CASE WHEN $8 = 'declined' THEN now() END)
-       RETURNING id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
-      [req.userId, req.companyId || null, contact_id, title || null, JSON.stringify(items), total, notes || null, initialStatus, expires_at || null]
+       RETURNING id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
+      [req.userId, req.companyId || null, contact_id, title || null, JSON.stringify(items), total, notes || null, initialStatus, expires_at || null, JSON.stringify(options)]
     );
     if (req.companyId) {
       await emitAutomationEvent({
@@ -11897,6 +11979,7 @@ app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async 
     }
     res.status(201).json(rows[0]);
   } catch (e) {
+    if (sendQuoteValidationError(res, e)) return;
     console.error("[quotes] create failed:", e && e.message ? e.message : e);
     res.status(500).json({ error: "failed_create_quote" });
   }
@@ -11904,12 +11987,23 @@ app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async 
 
 app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async (req, res) => {
   const { title, line_items, notes, status, expires_at } = req.body || {};
-  const items = Array.isArray(line_items) ? line_items : null;
-  const total = items ? computeQuoteTotalCents(items) : null;
   try {
-    // Fixed placeholder numbering — $1 is the quote id, $2..$5 are the
-    // updatable fields, then scope filters follow at $6+ so they never
-    // collide with the id.
+    const scope = quoteScopeSQL(req);
+    const before = await pool.query(`SELECT * FROM quotes q WHERE ${scope.sql} AND id = $${scope.values.length + 1}`, [...scope.values, req.params.id]);
+    if (!before.rowCount) return res.status(404).json({ error: "not_found" });
+    const previous = before.rows[0];
+    const items = line_items === undefined ? null : normalizeQuoteLines(line_items);
+    if (req.body.quote_options !== undefined && (!req.body.quote_options || typeof req.body.quote_options !== "object" || Array.isArray(req.body.quote_options))) throw new QuoteContractError("quote_options_invalid","Quote options must be an object.");
+    const options = req.body.quote_options === undefined ? null : normalizeQuoteOptions({...previous.quote_options,...req.body.quote_options});
+    const effectiveOptions = options || normalizeQuoteOptions(previous.quote_options || {});
+    const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
+    const pricing = calculateQuotePricing({ line_items: items || previous.line_items, deposit: effectiveOptions.deposit, discount:effectiveOptions.discount,tax_inclusive:settings.tax_inclusive??false,
+      tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 });
+    const total = items ? pricing.subtotal_cents : null;
+    validateQuoteAddonScope(items || previous.line_items, effectiveOptions);
+    await assertQuoteReferences(pool, req, { contact_id: previous.contact_id, line_items: [...(items || previous.line_items),...effectiveOptions.optional_addons], existing_lines: [...previous.line_items,...normalizeQuoteOptions(previous.quote_options || {}).optional_addons] });
+    // Mutable fields precede tenant filters. The separate read above binds only
+    // its own parameters, avoiding PostgreSQL unknown-type gaps.
     const params = [
       req.params.id,
       title || null,
@@ -11917,7 +12011,8 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
       total,
       notes || null,
       ["draft","sent","accepted","declined","expired","converted"].includes(status) ? status : null,
-      expires_at || null
+      expires_at || null,
+      options ? JSON.stringify(options) : null
     ];
     let whereScope;
     if (req.companyId) {
@@ -11927,7 +12022,6 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
       params.push(req.userId);
       whereScope = `q.user_id = $${params.length}`;
     }
-    const before = await pool.query(`SELECT * FROM quotes q WHERE id = $1 AND ${whereScope}`, params);
     const { rows } = await pool.query(
       `UPDATE quotes q SET
          title = COALESCE($2, title),
@@ -11936,18 +12030,19 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
          notes = COALESCE($5, notes),
          status = COALESCE($6, status),
          expires_at = COALESCE($7::timestamptz, expires_at),
+         quote_options = COALESCE($8::jsonb, quote_options),
          sent_at = CASE WHEN $6 = 'sent' THEN COALESCE(sent_at, now()) ELSE sent_at END,
          accepted_at = CASE WHEN $6 = 'accepted' THEN COALESCE(accepted_at, now()) ELSE accepted_at END,
          declined_at = CASE WHEN $6 = 'declined' THEN COALESCE(declined_at, now()) ELSE declined_at END,
          updated_at = now()
        WHERE id = $1 AND ${whereScope}
-       RETURNING id, contact_id, title, line_items, total_cents, notes, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
+       RETURNING id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
       params
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
     if (req.companyId) {
       const prev = before.rows[0] || {};
-      const changed = ["title", "notes", "status", "total_cents", "expires_at"].filter((field) => JSON.stringify(prev[field] ?? null) !== JSON.stringify(rows[0][field] ?? null)).map((field) => ({ field, old_value: prev[field] ?? null, new_value: rows[0][field] ?? null }));
+      const changed = ["title", "notes", "status", "total_cents", "expires_at", "quote_options"].filter((field) => JSON.stringify(prev[field] ?? null) !== JSON.stringify(rows[0][field] ?? null)).map((field) => ({ field, old_value: prev[field] ?? null, new_value: rows[0][field] ?? null }));
       if (JSON.stringify(prev.line_items || []) !== JSON.stringify(rows[0].line_items || [])) changed.push({ field: "line_items", old_value: prev.line_items || [], new_value: rows[0].line_items || [] });
       if (changed.length) {
         const payload = { quote_id: rows[0].id, contact_id: rows[0].contact_id, status: rows[0].status, total_cents: rows[0].total_cents, line_item_count: Array.isArray(rows[0].line_items) ? rows[0].line_items.length : 0, changed_fields: changed };
@@ -11965,6 +12060,7 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
     }
     res.json(rows[0]);
   } catch (e) {
+    if (sendQuoteValidationError(res, e)) return;
     console.error("[quotes] update failed:", e && e.message ? e.message : e);
     res.status(500).json({ error: "failed_update_quote" });
   }
@@ -12005,6 +12101,7 @@ app.delete("/api/quotes/:id", authRequired, requireCapability("quotes.delete"), 
     }
     res.status(204).end();
   } catch (e) {
+    if (e?.code === "23503" && e?.constraint?.includes("quote_agreements")) return res.status(409).json({ error: "quote_has_agreements", message: "This quote has published agreements. Preserve its evidence; revoke its public link or issue a revision instead." });
     console.error("[quotes] delete failed:", e && e.message ? e.message : e);
     res.status(500).json({ error: "failed_delete_quote" });
   }
@@ -12014,7 +12111,67 @@ app.delete("/api/quotes/:id", authRequired, requireCapability("quotes.delete"), 
 // Stages are company-scoped when the user belongs to a company; otherwise they
 // fall back to the individual user. This is the SAME set of rows both the
 // Stages tab and the Integrations "auto-assign" picker read from.
-async function getDefaultPipelineID(req) {
+async function repairOrphanedPipelineAssignments(req) {
+  if (req.companyId) {
+    await pool.query(
+      `UPDATE stages s
+          SET pipeline_id = NULL,
+              updated_at = now()
+        WHERE (s.company_id = $1 OR (s.company_id IS NULL AND s.user_id = $2))
+          AND s.pipeline_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM pipelines p
+             WHERE p.id = s.pipeline_id
+               AND p.company_id = $1
+          )`,
+      [req.companyId, req.userId]
+    );
+    await pool.query(
+      `UPDATE opportunities o
+          SET pipeline_id = NULL,
+              updated_at = now()
+        WHERE (o.company_id = $1 OR (o.company_id IS NULL AND o.user_id = $2))
+          AND o.pipeline_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM pipelines p
+             WHERE p.id = o.pipeline_id
+               AND p.company_id = $1
+          )`,
+      [req.companyId, req.userId]
+    );
+  } else {
+    await pool.query(
+      `UPDATE stages s
+          SET pipeline_id = NULL,
+              updated_at = now()
+        WHERE s.user_id = $1
+          AND s.pipeline_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM pipelines p
+             WHERE p.id = s.pipeline_id
+               AND p.company_id IS NULL
+               AND p.user_id = $1
+          )`,
+      [req.userId]
+    );
+    await pool.query(
+      `UPDATE opportunities o
+          SET pipeline_id = NULL,
+              updated_at = now()
+        WHERE o.user_id = $1
+          AND o.pipeline_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM pipelines p
+             WHERE p.id = o.pipeline_id
+               AND p.company_id IS NULL
+               AND p.user_id = $1
+          )`,
+      [req.userId]
+    );
+  }
+}
+
+async function ensureDefaultPipeline(req) {
   const { rows } = req.companyId
     ? await pool.query(
         `SELECT id FROM pipelines WHERE company_id = $1 AND is_default = true ORDER BY order_idx ASC LIMIT 1`,
@@ -12024,7 +12181,49 @@ async function getDefaultPipelineID(req) {
         `SELECT id FROM pipelines WHERE company_id IS NULL AND user_id = $1 AND is_default = true ORDER BY order_idx ASC LIMIT 1`,
         [req.userId]
       );
-  return rows[0]?.id || null;
+  if (rows[0]?.id) {
+    await repairOrphanedPipelineAssignments(req);
+    return rows[0].id;
+  }
+
+  const id = randomUUID();
+  try {
+    if (req.companyId) {
+      await pool.query(
+        `INSERT INTO pipelines (id, user_id, company_id, name, order_idx, is_default)
+         VALUES ($1, $2, $3, 'Main Pipeline', 0, true)`,
+        [id, req.userId, req.companyId]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO pipelines (id, user_id, company_id, name, order_idx, is_default)
+         VALUES ($1, $2, NULL, 'Main Pipeline', 0, true)`,
+        [id, req.userId]
+      );
+    }
+    await repairOrphanedPipelineAssignments(req);
+    return id;
+  } catch (e) {
+    if (e && e.code !== "23505") throw e;
+  }
+
+  const retry = req.companyId
+    ? await pool.query(
+        `SELECT id FROM pipelines WHERE company_id = $1 AND is_default = true ORDER BY order_idx ASC LIMIT 1`,
+        [req.companyId]
+      )
+    : await pool.query(
+        `SELECT id FROM pipelines WHERE company_id IS NULL AND user_id = $1 AND is_default = true ORDER BY order_idx ASC LIMIT 1`,
+        [req.userId]
+      );
+  if (retry.rows[0]?.id) {
+    await repairOrphanedPipelineAssignments(req);
+  }
+  return retry.rows[0]?.id || null;
+}
+
+async function getDefaultPipelineID(req) {
+  return ensureDefaultPipeline(req);
 }
 
 async function resolvePipelineID(req, requestedPipelineID) {
@@ -12047,6 +12246,7 @@ async function isDefaultPipeline(req, pipelineID) {
 
 app.get("/api/pipelines", authRequired, requireCapability("pipeline.view"), async (req, res) => {
   try {
+    await ensureDefaultPipeline(req);
     const { rows } = req.companyId
       ? await pool.query(
           `SELECT id, name, order_idx, is_default FROM pipelines WHERE company_id = $1 ORDER BY order_idx ASC, created_at ASC`,
@@ -12417,7 +12617,7 @@ app.get("/api/schedule", authRequired, requireCapability("schedule.view"), async
       : { sql: `user_id = $1`, values: [req.userId] };
     const { rows } = await pool.query(
       `SELECT id, title, start_at AS start, end_at AS "end", color, notes,
-              contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
+              contact_id, quote_id, to_jsonb(schedule_events)->>'service_plan_id' AS service_plan_id, customer_note_entries, reminder_minutes, services, service_items, price_cents, material_cost_cents,
               company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
               weather_exposure
        FROM schedule_events WHERE ${where.sql} ORDER BY start_at ASC`,
@@ -12575,18 +12775,34 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
   if (!Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime()) || endDate <= startDate) {
     return res.status(400).json({ error: "invalid_schedule_interval", message: "Job end time must be after its start time." });
   }
+  const db = await pool.connect();
+  let committed = false;
   try {
-    const previous = await pool.query(
-      `SELECT * FROM schedule_events WHERE id = $1 AND (user_id = $2 OR company_id = $3)`,
+    await db.query("BEGIN");
+    if (req.companyId) await lockCompanySchedule(db, req.companyId);
+    const previous = await db.query(
+      `SELECT * FROM schedule_events WHERE id = $1 AND (($3::uuid IS NOT NULL AND company_id = $3) OR ($3::uuid IS NULL AND company_id IS NULL AND user_id = $2))`,
       [req.params.id, req.userId, req.companyId]
     );
     const requiredCapability = requiredScheduleWriteCapability(previous.rowCount > 0);
     if (!hasCapability(req, requiredCapability)) {
+      await db.query("ROLLBACK");
       return res.status(403).json({ error: "permission_denied", required_capability: requiredCapability });
     }
+    if (req.body.expected_updated_at && previous.rows[0] && new Date(req.body.expected_updated_at).getTime() !== new Date(previous.rows[0].updated_at).getTime()) {
+      await db.query("ROLLBACK");
+      return res.status(409).json({ error: "schedule_changed", message: "The appointment changed. Refresh before saving." });
+    }
     const activeMembers = req.companyId
-      ? await pool.query(`SELECT id FROM users WHERE company_id = $1 AND deleted_at IS NULL`, [req.companyId])
+      ? await db.query(`SELECT id FROM users WHERE company_id = $1 AND deleted_at IS NULL`, [req.companyId])
       : { rows: [{ id: req.userId }] };
+    if (contact_id && !(await db.query(`SELECT id FROM contacts WHERE id=$1 AND (${req.companyId ? "company_id=$2" : "user_id=$2"})`, [contact_id, req.companyId || req.userId])).rowCount) {
+      await db.query("ROLLBACK"); return res.status(404).json({ error: "contact_not_found" });
+    }
+    if (quote_id && !(await db.query(`SELECT id FROM quotes WHERE id=$1 AND (${req.companyId ? "company_id=$2" : "user_id=$2"}) AND ($3::text IS NULL OR contact_id=$3)`, [quote_id, req.companyId || req.userId, contact_id || null])).rowCount) {
+      await db.query("ROLLBACK"); return res.status(404).json({ error: "quote_not_found" });
+    }
+    const selectedScope = await selectedQuoteScheduleScope(db,{companyId:req.companyId,quoteId:quote_id,previous:previous.rows[0],start,end});
     const assignments = validateAssignments({
       salesIDs: Array.isArray(sales_user_ids) ? sales_user_ids : [req.userId],
       workerIDs: Array.isArray(worker_user_ids) ? worker_user_ids : [],
@@ -12601,7 +12817,7 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
     const weatherExposure = weather_exposure == null && previous.rowCount
       ? normalizeWeatherExposure(previous.rows[0].weather_exposure || "auto")
       : normalizeWeatherExposure(weather_exposure);
-    const r = await pool.query(
+    const r = await db.query(
       `INSERT INTO schedule_events
         (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, quote_id,
          reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
@@ -12629,18 +12845,18 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
              finished_by = EXCLUDED.finished_by,
              weather_exposure = EXCLUDED.weather_exposure,
              updated_at = now()
-       WHERE schedule_events.user_id = $2 OR schedule_events.company_id = $3
+       WHERE ($3::uuid IS NOT NULL AND schedule_events.company_id = $3) OR ($3::uuid IS NULL AND schedule_events.company_id IS NULL AND schedule_events.user_id = $2)
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
                  contact_id, quote_id, reminder_minutes, services, price_cents, material_cost_cents,
                  service_items, company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
                  weather_exposure`,
       [
         req.params.id, req.userId, req.companyId, title, start, end,
-        color || '#3478F6', notes || null, contact_id || null, quote_id || null,
+        color || '#3478F6', notes || null, selectedScope?.contact_id || contact_id || null, selectedScope?.quote_id || quote_id || null,
         JSON.stringify(reminder_minutes || []),
-        JSON.stringify(services || []),
-        JSON.stringify(Array.isArray(service_items) ? service_items : []),
-        Number.isFinite(Number(price_cents)) ? Number(price_cents) : null,
+        JSON.stringify(selectedScope?.services || services || []),
+        JSON.stringify(selectedScope?.service_items || (Array.isArray(service_items) ? service_items : [])),
+        selectedScope ? selectedScope.price_cents : Number.isFinite(Number(price_cents)) ? Number(price_cents) : null,
         Number.isFinite(Number(material_cost_cents)) ? Number(material_cost_cents) : null,
         JSON.stringify(salesIDs),
         JSON.stringify(workerIDs),
@@ -12651,6 +12867,18 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
         weatherExposure
       ]
     );
+    if (!r.rowCount) { await db.query("ROLLBACK"); return res.status(404).json({ error: "schedule_not_found" }); }
+    if (selectedScope) {
+      await db.query("UPDATE schedule_events SET agreement_id=$2 WHERE id=$1",[req.params.id,selectedScope.agreement_id]);
+      r.rows[0].agreement_id=selectedScope.agreement_id;
+    }
+    if (req.companyId && (selectedScope?.quote_id || quote_id) && (await db.query("SELECT to_regclass('agreement_events') IS NOT NULL AS present")).rows[0].present) {
+      const customerNotes=(await db.query(`SELECT e.id,e.created_at,e.actor_id AS signer_role,e.payload->>'message' AS message FROM agreement_events e JOIN quote_agreements a ON a.id=e.agreement_id WHERE a.company_id=$1 AND a.quote_id=$2 AND e.type='customer_note' ORDER BY e.created_at,e.id`,[req.companyId,selectedScope?.quote_id||quote_id])).rows;
+      await db.query("UPDATE schedule_events SET customer_note_entries=$2::jsonb WHERE id=$1",[req.params.id,JSON.stringify(customerNotes)]);
+      r.rows[0].customer_note_entries=customerNotes;
+    }
+    await db.query("COMMIT");
+    committed = true;
     const addedWorkers = workerIDs.filter((id) => !oldWorkerIDs.includes(id));
     await notifyMany(
       addedWorkers,
@@ -12692,6 +12920,11 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
     }
     res.json(r.rows[0]);
   } catch (e) {
+    if (!committed) await db.query("ROLLBACK").catch(() => {});
+    if (e instanceof QuoteContractError) return res.status(e.status).json({error:e.code,message:e.message});
+    if (e.code === "23514" && e.message === "signed_plan_job_scope_immutable") return res.status(409).json({error:"signed_plan_job_scope_immutable",message:"This appointment belongs to a signed membership. Keep its agreed services and quantities, or arrange a separate job."});
+    const conflict = scheduleConflict(e);
+    if (conflict) return res.status(conflict.status).json(conflict);
     if (e instanceof ScheduleTeamError) {
       return res.status(e.status).json({ error: e.code, message: e.message, details: e.details });
     }
@@ -12700,7 +12933,7 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
     }
     console.error(e);
     res.status(500).json({ error: "failed_upsert_schedule" });
-  }
+  } finally { db.release(); }
 });
 
 app.delete("/api/schedule/:id", authRequired, requireCapability("schedule.delete"), async (req, res) => {
@@ -12726,6 +12959,8 @@ app.delete("/api/schedule/:id", authRequired, requireCapability("schedule.delete
 
 // ---------- WEATHER-AWARE SCHEDULING ----------
 function sendWeatherError(res, error, fallbackCode = "weather_scheduling_failed") {
+  const conflict = scheduleConflict(error);
+  if (conflict) return res.status(conflict.status).json(conflict);
   if (error instanceof WeatherSchedulingError || error instanceof OnMyWayError) {
     return res.status(error.statusCode || 400).json({
       error: error.code,
@@ -13128,6 +13363,8 @@ app.post("/api/weather/reschedule", authRequired, requireCapability("schedule.ed
   try {
     const ids = normalizeWeatherJobIDs(req.body?.job_ids);
     await db.query("BEGIN");
+    await lockCompanySchedule(db, req.companyId);
+    if (app.locals.agreementBooking) await db.query("SET CONSTRAINTS schedule_resource_no_overlap, schedule_resource_legacy_guard DEFERRED");
     await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`weather-reschedule:${req.companyId}:${idempotencyKey}`]);
     const existing = (await db.query(
       `SELECT id FROM weather_reschedule_batches WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1`,
@@ -13260,6 +13497,8 @@ function startWeatherRiskWorkers() {
 
 // ---------- INTELLIGENT WORKER ASSIGNMENT ----------
 function sendAssignmentRecommendationError(res, error) {
+  const conflict = scheduleConflict(error);
+  if (conflict) return res.status(conflict.status).json(conflict);
   if (error instanceof AssignmentRecommendationError) {
     return res.status(error.statusCode || 400).json({
       error: error.code,
@@ -13580,6 +13819,7 @@ app.post(
     const db = await pool.connect();
     try {
       await db.query("BEGIN");
+      await lockCompanySchedule(db, req.companyId);
       await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`job-assignment:${req.companyId}:${idempotencyKey}`]);
       const existing = (await db.query(
         `SELECT * FROM job_assignment_recommendation_applications
@@ -18120,7 +18360,8 @@ app.post("/api/service-plans/:id/reconcile", authRequired, requireAnyCapability(
     if (req.role !== "employer" && plan.created_by_user_id !== req.userId) {
       return res.status(403).json({ error: "forbidden" });
     }
-    const updated = await reconcileServicePlanFromStripe(plan, {
+    if (plan.enrollment_id && app.locals.agreementPlanBilling) await app.locals.agreementPlanBilling.reconcileEnrollment(plan.enrollment_id);
+    const updated = plan.enrollment_id ? (await pool.query("SELECT * FROM service_plans WHERE id=$1",[plan.id])).rows[0] : await reconcileServicePlanFromStripe(plan, {
       source: "stripe.service_plan_client_reconcile",
       actorUserId: req.userId
     });
@@ -18298,6 +18539,10 @@ app.put("/api/service-plans/:id", authRequired, requireCapability("payments.mana
     );
     if (!owned.rows.length) return res.status(404).json({ error: "not_found" });
     const before = await pool.query(`SELECT * FROM service_plans WHERE id = $1 AND user_id = $2`, [req.params.id, employerId]);
+    if (before.rows[0]?.enrollment_id) {
+      const protectedFields = ["plan_name","price_cents","currency","billing_interval","billing_interval_count","service_interval","service_interval_count","first_service_date","next_service_date","included_services"];
+      if (protectedFields.some(key => b[key] !== undefined && String(b[key] ?? "") !== String(before.rows[0][key] ?? ""))) return res.status(409).json({ error: "signed_plan_terms_immutable", message: "A price, service scope or cadence change requires a new signed plan agreement." });
+    }
     const { rows } = await pool.query(
       `UPDATE service_plans
           SET plan_name = COALESCE($2, plan_name),
@@ -18366,6 +18611,7 @@ app.post("/api/service-plans/:id/start-connected-subscription", authRequired, re
     );
     const plan = rows[0];
     if (!plan) return res.status(404).json({ error: "not_found" });
+    if (plan.enrollment_id) return res.status(409).json({ error: "signed_plan_billing_required", message: "Use the signed enrollment billing flow for this membership.", enrollment_id: plan.enrollment_id });
     if (req.role !== "employer" && plan.created_by_user_id !== req.userId) {
       return res.status(403).json({ error: "forbidden" });
     }
@@ -18609,6 +18855,10 @@ app.post("/api/service-plans/:id/mark-serviced", authRequired, requireCapability
     );
     const plan = rows[0];
     if (!plan) return res.status(404).json({ error: "not_found" });
+    if (plan.enrollment_id) {
+      if (!app.locals.agreementPlans) return res.status(503).json({ error: "plan_system_unavailable" });
+      return res.json(sanitizeServicePlan(await app.locals.agreementPlans.markServiced(req, plan, req.body || {})));
+    }
     const completed = req.body && req.body.completed_date
       ? new Date(req.body.completed_date).toISOString().slice(0, 10)
       : new Date().toISOString().slice(0, 10);
@@ -18644,6 +18894,7 @@ app.post("/api/service-plans/:id/mark-serviced", authRequired, requireCapability
     }
     res.json(sanitizeServicePlan(updated.rows[0]));
   } catch (e) {
+    if (e instanceof QuoteContractError) return res.status(e.status).json({ error: e.code, message: e.message });
     console.error(e);
     res.status(500).json({ error: "mark_serviced_failed" });
   }
@@ -18658,6 +18909,10 @@ app.post("/api/service-plans/:id/pause", authRequired, requireCapability("paymen
     );
     const plan = planResult.rows[0];
     if (!plan) return res.status(404).json({ error: "not_found" });
+    if (plan.enrollment_id) {
+      if (!app.locals.agreementPlanBilling) return res.status(503).json({ error: "plan_billing_unavailable" });
+      return res.json(sanitizeServicePlan(await app.locals.agreementPlanBilling.changeMembership(req, plan, "pause", req.body || {})));
+    }
     let updatedPlan;
     if (plan.stripe_subscription_id) {
       const stripe = getStripe();
@@ -18712,6 +18967,7 @@ app.post("/api/service-plans/:id/pause", authRequired, requireCapability("paymen
     }
     res.json(sanitizeServicePlan(updatedPlan));
   } catch (e) {
+    if (e instanceof QuoteContractError) return res.status(e.status).json({ error: e.code, message: e.message });
     console.error("service plan pause failed:", { code: e?.code, type: e?.type, requestId: e?.requestId });
     res.status(502).json({ error: "pause_failed", message: "WolfCRM could not pause the service plan and Stripe collection." });
   }
@@ -18726,6 +18982,10 @@ app.post("/api/service-plans/:id/resume", authRequired, requireCapability("payme
     );
     const plan = planResult.rows[0];
     if (!plan) return res.status(404).json({ error: "not_found" });
+    if (plan.enrollment_id) {
+      if (!app.locals.agreementPlanBilling) return res.status(503).json({ error: "plan_billing_unavailable" });
+      return res.json(sanitizeServicePlan(await app.locals.agreementPlanBilling.changeMembership(req, plan, "resume", req.body || {})));
+    }
     let updatedPlan;
     if (plan.stripe_subscription_id) {
       const stripe = getStripe();
@@ -18791,6 +19051,7 @@ app.post("/api/service-plans/:id/resume", authRequired, requireCapability("payme
     }
     res.json(sanitizeServicePlan(updatedPlan));
   } catch (e) {
+    if (e instanceof QuoteContractError) return res.status(e.status).json({ error: e.code, message: e.message });
     console.error("service plan resume failed:", { code: e?.code, type: e?.type, requestId: e?.requestId });
     res.status(502).json({ error: "resume_failed", message: "WolfCRM could not resume the service plan and Stripe collection." });
   }
@@ -18805,6 +19066,10 @@ app.post("/api/service-plans/:id/cancel", authRequired, requireCapability("payme
     );
     const plan = rows[0];
     if (!plan) return res.status(404).json({ error: "not_found" });
+    if (plan.enrollment_id) {
+      if (!app.locals.agreementPlanBilling) return res.status(503).json({ error: "plan_billing_unavailable" });
+      return res.json(sanitizeServicePlan(await app.locals.agreementPlanBilling.changeMembership(req, plan, "cancel", req.body || {})));
+    }
     let updatedPlan;
     if (plan.stripe_subscription_id) {
       const stripe = getStripe();
@@ -18859,6 +19124,7 @@ app.post("/api/service-plans/:id/cancel", authRequired, requireCapability("payme
     }
     res.json(sanitizeServicePlan(updatedPlan));
   } catch (e) {
+    if (e instanceof QuoteContractError) return res.status(e.status).json({ error: e.code, message: e.message });
     console.error("service plan cancel failed:", { code: e?.code, type: e?.type, requestId: e?.requestId });
     res.status(502).json({ error: "cancel_failed", message: "WolfCRM could not cancel the service plan in Stripe." });
   }
@@ -18872,6 +19138,10 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, requireCapabil
   if (!canTakeContactPayment(req)) return res.status(403).json({ error: "forbidden" });
   const stripe = requireStripe(res); if (!stripe) return;
   try {
+    if (req.body?.agreement_id || req.body?.quote_id || req.body?.job_id) {
+      if (!app.locals.agreementPayments) return res.status(503).json({ error: "agreement_payment_not_ready" });
+      return res.json(await app.locals.agreementPayments.startStaffPayment(req));
+    }
     const employerId = await resolveEmployerUserId(req);
     const c = await pool.query(
       `SELECT * FROM contacts WHERE id = $1 AND user_id = $2`,
@@ -18970,7 +19240,8 @@ app.post("/api/contacts/:contactId/payments/start", authRequired, requireCapabil
       payment_record_id: record.rows[0].id
     });
   } catch (e) {
-    console.error("contact payment start:", e);
+    if (e instanceof QuoteContractError) return res.status(e.status).json({ error: e.code, message: e.message });
+    console.error("contact payment start:", { code: e?.code || "internal" });
     res.status(500).json({ error: "start_payment_failed", detail: e.message });
   }
 });
@@ -19070,7 +19341,7 @@ app.post("/api/payments/:id/client-result", authRequired, requireAnyCapability("
               client_result_at = now(),
               status = CASE
                 WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status
-                WHEN status = 'pending' THEN $3
+                WHEN status = 'pending' AND agreement_id IS NULL THEN $3
                 ELSE status
               END,
               updated_at = now()
@@ -19094,6 +19365,10 @@ app.post("/api/payments/:id/reconcile", authRequired, requireAnyCapability("paym
     if (!payment) return res.status(404).json({ error: "payment_not_found" });
     if (req.role !== "employer" && payment.created_by_user_id !== req.userId) {
       return res.status(403).json({ error: "forbidden" });
+    }
+    if (payment.agreement_id && app.locals.agreementPayments) {
+      const reconciled = await app.locals.agreementPayments.reconcilePayment(payment);
+      if (reconciled) return res.json(sanitizePaymentRecord(reconciled, { employeeSafe: req.role !== "employer" }));
     }
     if (!payment.stripe_payment_intent_id || !payment.stripe_connected_account_id) {
       return res.status(409).json({ error: "payment_not_reconcilable", message: "This payment has no Stripe PaymentIntent to reconcile." });
@@ -19196,7 +19471,7 @@ app.post("/stripe/webhook", async (req, res) => {
         `WITH candidate AS (
            SELECT id, refunded_amount_cents AS previous_refunded_amount_cents
              FROM payment_records
-            WHERE stripe_payment_intent_id = $1
+            WHERE agreement_id IS NULL AND stripe_payment_intent_id = $1
               AND stripe_connected_account_id IS NOT DISTINCT FROM $6
             FOR UPDATE
          ), updated AS (
@@ -19251,6 +19526,16 @@ app.post("/stripe/webhook", async (req, res) => {
       return refunded.rows;
     }
 
+    // Agreement-backed payments have stricter account/environment and provider
+    // reconciliation rules. Never let legacy callbacks mutate their ledger first.
+    if (app.locals.agreementPlanBilling && await app.locals.agreementPlanBilling.handleWebhook(event)) {
+      await completeStripeWebhookEvent(pool, event.id);
+      return res.json({ received: true });
+    }
+    if (app.locals.agreementPayments && await app.locals.agreementPayments.handleWebhook(event)) {
+      await completeStripeWebhookEvent(pool, event.id);
+      return res.json({ received: true });
+    }
     switch (event.type) {
       case "account.updated": {
         const acct = event.data.object;
@@ -19330,7 +19615,7 @@ app.post("/stripe/webhook", async (req, res) => {
               SET status = CASE WHEN status IN ('partially_refunded','refunded') THEN status ELSE 'succeeded' END,
                   paid_at = COALESCE(paid_at, $3),
                   updated_at = now()
-            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
+            WHERE agreement_id IS NULL AND stripe_invoice_id = $1 AND ($2::text IS NULL OR stripe_subscription_id IS NOT DISTINCT FROM $2)
               AND stripe_connected_account_id IS NOT DISTINCT FROM $4
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency, job_id, status`,
           [invoice.id, invoice.subscription || null, eventOccurredAt, connectedAccountId]
@@ -19383,7 +19668,7 @@ app.post("/stripe/webhook", async (req, res) => {
           `UPDATE payment_records
               SET status = CASE WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status ELSE 'failed' END,
                   updated_at = now()
-            WHERE (stripe_invoice_id = $1 OR stripe_subscription_id = $2)
+            WHERE agreement_id IS NULL AND stripe_invoice_id = $1 AND ($2::text IS NULL OR stripe_subscription_id IS NOT DISTINCT FROM $2)
               AND stripe_connected_account_id IS NOT DISTINCT FROM $3
               AND status NOT IN ('succeeded','paid','partially_refunded','refunded')
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
@@ -19435,7 +19720,7 @@ app.post("/stripe/webhook", async (req, res) => {
                   paid_at = COALESCE(paid_at, $2),
                   stripe_charge_id = COALESCE($3, stripe_charge_id),
                   updated_at = now()
-            WHERE stripe_payment_intent_id = $1
+            WHERE agreement_id IS NULL AND stripe_payment_intent_id = $1
               AND stripe_connected_account_id IS NOT DISTINCT FROM $4
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency, job_id, status`,
           [pi.id, eventOccurredAt, latestChargeId, connectedAccountId]
@@ -19461,7 +19746,7 @@ app.post("/stripe/webhook", async (req, res) => {
           `UPDATE payment_records
               SET status = CASE WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status ELSE 'failed' END,
                   updated_at = now()
-            WHERE stripe_payment_intent_id = $1
+            WHERE agreement_id IS NULL AND stripe_payment_intent_id = $1
               AND stripe_connected_account_id IS NOT DISTINCT FROM $2
               AND status NOT IN ('succeeded','paid','partially_refunded','refunded')
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
@@ -19518,7 +19803,7 @@ app.post("/stripe/webhook", async (req, res) => {
           `UPDATE payment_records
               SET status = CASE WHEN status IN ('succeeded','paid','partially_refunded','refunded') THEN status ELSE $2 END,
                   updated_at = now()
-            WHERE stripe_payment_intent_id = $1
+            WHERE agreement_id IS NULL AND stripe_payment_intent_id = $1
               AND stripe_connected_account_id IS NOT DISTINCT FROM $3
               AND status NOT IN ('succeeded','paid','partially_refunded','refunded')
             RETURNING id, company_id, contact_id, service_plan_id, amount_cents, currency`,
@@ -19546,7 +19831,7 @@ app.post("/stripe/webhook", async (req, res) => {
         const records = await pool.query(
           `SELECT id, company_id, contact_id, service_plan_id, amount_cents, currency
              FROM payment_records
-            WHERE (stripe_payment_intent_id = $1 OR stripe_invoice_id = $2)
+            WHERE agreement_id IS NULL AND (stripe_payment_intent_id = $1 OR stripe_invoice_id = $2)
               AND stripe_connected_account_id IS NOT DISTINCT FROM $3`,
           [dispute.payment_intent || null, dispute.invoice || null, connectedAccountId]
         );
@@ -19588,6 +19873,32 @@ async function startServer() {
   }
   serverStarted = true;
   await bootstrap();
+  app.locals.agreements = await installAgreementSystem({ app, pool, authRequired, requireCapability, getQuoteSettings, getStripe });
+  app.locals.agreementPayments = await installAgreementPayments({ app, pool, service: app.locals.agreements, getStripe, authRequired, requireCapability });
+  app.locals.agreementBooking = await installAgreementBooking({ app, pool, service: app.locals.agreements, authRequired, requireCapability,
+    onScheduleChange: async (change) => {
+      const job = change.job_snapshot;
+      if (change.operation === "booking_canceled") await cancelAutomationSchedulesForSubject(change.company_id, "job", change.job_id);
+      else await syncAutomationSchedulesForJob(change.company_id, job);
+      const types = change.operation === "booking_created" ? ["job.created", "job.scheduled"] : change.operation === "booking_canceled" ? ["job.deleted"] : ["job.updated", "job.rescheduled"];
+      for (const eventType of types) {
+        const eventID = await emitAutomationEvent({ companyId: change.company_id, eventType, subjectType: "job", subjectId: change.job_id, source: "agreement.booking", dedupeKey: `agreement-booking:${change.id}:${eventType}`, payload: { job_id: change.job_id, contact_id: job.contact_id, agreement_id: change.agreement_id, start: job.start_at, end: job.end_at, title: job.title } });
+        if (!eventID) throw new Error("booking_automation_delivery_pending");
+      }
+      if (job.contact_id) await markGoogleSheetsContactDirty(pool, change.company_id, job.contact_id, change.operation);
+    }
+  });
+  app.locals.agreementNotifications = await installAgreementNotifications({ app, pool, service: app.locals.agreements, authRequired, requireCapability, emitAutomationEvent, sendPushToUsers });
+  app.locals.agreementPlans = await installAgreementPlans({ app, pool, service: app.locals.agreements, authRequired, requireCapability,
+    onPlanActivated: async (plan) => {
+      await syncAutomationSchedulesForServicePlan(plan.company_id, plan);
+      const eventID = await emitAutomationEvent({ companyId: plan.company_id, eventType: "service_plan.created", subjectType: "service_plan", subjectId: plan.id, source: "agreement.plan", dedupeKey: `service_plan.created:${plan.id}`, payload: { service_plan_id: plan.id, contact_id: plan.contact_id, enrollment_id: plan.enrollment_id } });
+      if (!eventID) throw new Error("plan_automation_delivery_pending");
+    }
+  });
+  app.locals.agreementArchive = await installAgreementArchive({ pool, service: app.locals.agreements });
+  app.locals.agreementPlanBilling = await installAgreementPlanBilling({ app, pool, service: app.locals.agreements, plans: app.locals.agreementPlans, getStripe, authRequired, requireCapability });
+  app.locals.agreementPlanCancellation = await installAgreementPlanCancellation({app,pool,service:app.locals.agreements,plans:app.locals.agreementPlans,billing:app.locals.agreementPlanBilling,authRequired,requireCapability});
   await installAutomationSystem({
     app,
     pool,
@@ -19597,7 +19908,9 @@ async function startServer() {
     createTwilioClient,
     twilioPublicUrl,
     getStripe,
-    sendAutomatedIMessage
+    sendAutomatedIMessage,
+    changeEnrolledServicePlan: (plan, action) => app.locals.agreementPlanBilling.changeMembership({ companyId: plan.company_id, userId: plan.user_id }, plan, action, {}),
+    markEnrolledPlanServiced: (plan, body) => app.locals.agreementPlans.markServiced({ companyId: plan.company_id, userId: plan.user_id }, plan, body)
   });
   await installIMessageSystem({
     app,
@@ -19621,6 +19934,12 @@ async function startServer() {
     requireView: requireCapability("tasks.view"),
     requireManage: requireCapability("tasks.manage"),
     emitAutomationEvent
+  });
+  await installFocusSystem({
+    app,
+    pool,
+    authRequired,
+    requireCapability
   });
   await installWebsiteBuilderSystem({
     app,
@@ -19675,7 +19994,7 @@ async function startServer() {
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }
 
-export { app, bootstrap, pool, startServer };
+export { app, bootstrap, pool, startServer, authRequired, requireCapability, getQuoteSettings };
 
 if (process.env.WOLFCRM_SKIP_SERVER_START !== "true") {
   startServer().catch((err) => {
