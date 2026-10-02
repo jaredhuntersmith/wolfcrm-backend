@@ -292,7 +292,7 @@ export async function generateQuoteAgreementPDF(snapshot, { customer_url, signat
   if (snapshot.pricing) {
     const p = snapshot.pricing;
     paragraph(`Subtotal: ${money(p.subtotal_cents)}\nDiscount: ${money(p.discount_cents)}\nTax${p.tax_inclusive ? " (included)" : ""}: ${money(p.tax_cents)}\nTotal: ${money(p.total_cents)}\nDeposit due after signing: ${money(p.deposit_cents)}\nBalance after deposit: ${money(p.total_cents - p.deposit_cents)}`, 12);
-    paragraph(snapshot.balance_payment_timing==='after_service'?'Remaining balance collection opens after the quoted service is completed.':'Remaining balance may be paid after all required signing and deposit steps.');
+    paragraph('The full balance may be paid after all required signatures are complete, including before booking or service completion.');
     if(snapshot.balance_due_days_after_service!=null)paragraph(`Remaining balance is due ${snapshot.balance_due_days_after_service} days after completion of the quoted service.`);
     if(snapshot.optional_addons?.length){
       paragraph("Optional services",14);
