@@ -54,6 +54,42 @@ test('customer PDF workflow preserves drafts, exact exports, signer evidence and
       return post(`/api/public/agreements/${token}/sign`,{request_id:randomUUID(),packet_hash:packet.packet_hash,session_token:session.session_token,printed_name,consent:true,...(signature===null?{}:{signature}),values},null);
     };
 
+    await t.test('company name edits validate, persist, isolate tenants and preserve issued agreements',async()=>{
+      const packet=await publish(await makeQuote());
+      const before=(await pool.query('SELECT snapshot,packet_hash FROM quote_agreements WHERE id=$1',[packet.id])).rows[0];
+      const rename=(name,token='pdfowner')=>request('/api/company/name',{method:'PATCH',body:{name},token});
+      expectStatus(await rename('No auth',null),401);
+      expectStatus(await rename('Worker edit','pdfworker'),403);
+      for(const name of ['', '   ', 'A'.repeat(161), 'two\nlines', {name:'object'}]) expectStatus(await rename(name),400);
+      const saved=expectStatus(await rename('  Renamed Window Company  '),200);
+      assert.equal(saved.company.name,'Renamed Window Company');
+      assert.equal(expectStatus(await request('/api/company/settings'),200).company.name,'Renamed Window Company');
+      assert.equal((await pool.query('SELECT name FROM companies WHERE id=$1',[otherCompany])).rows[0].name,'Other');
+      assert.deepEqual((await pool.query('SELECT snapshot,packet_hash FROM quote_agreements WHERE id=$1',[packet.id])).rows[0],before);
+      const next=await publish(await makeQuote());assert.equal(next.snapshot.business.name,'Renamed Window Company');
+      expectStatus(await rename('PDF Company'),200);
+    });
+    await t.test('branded signed download appends completed PDFs and leaves archived signing evidence unchanged',async()=>{
+      const packet=await publish(await makeQuote(),pdfContent);
+      expectStatus(await request(`${publicPath(packet)}/documents/signed`,{token:null}),409);
+      expectStatus(await sign(packet,{signature:null,values:{initials:'PC',signature:drawnSignature()}}),200);
+      await service.processDocumentJobs(20);
+      const evidence=()=>pool.query("SELECT kind,sha256,bytes FROM agreement_artifacts WHERE agreement_id=$1 AND kind IN ('signed','audit','packet','contract-"+asset.id+"') ORDER BY kind",[packet.id]);
+      const before=(await evidence()).rows;
+      const branded=expectStatus(await request(`${publicPath(packet)}/documents/signed`,{token:null}),200);
+      const cover=await PDFDocument.load(branded);assert.equal(cover.getPageCount(),2);
+      // Emulate an existing signed agreement created before the presentation artifact existed.
+      await pool.query("DELETE FROM agreement_artifacts WHERE agreement_id=$1 AND kind='signed-presentation-v1'",[packet.id]);
+      await pool.query("UPDATE companies SET name='Changed after signing' WHERE id=$1",[company]);
+      const legacy=expectStatus(await request(`${publicPath(packet)}/documents/signed`,{token:null}),200);
+      assert.deepEqual(legacy,branded);
+      assert.deepEqual((await evidence()).rows,before);
+      const again=expectStatus(await request(`/api/agreements/${packet.id}/documents/signed`),200);assert.deepEqual(again,legacy);
+      expectStatus(await request(`/api/agreements/${packet.id}/documents/signed`,{token:'pdfother'}),404);
+      expectStatus(await request(`${publicPath(packet)}/documents/signed-presentation-v1`,{token:null}),404);
+      await pool.query("UPDATE companies SET name='PDF Company' WHERE id=$1",[company]);
+    });
+
     await t.test('durable incomplete drafts are scoped, versioned, replayable and cleared without losing CAS history',async()=>{
       const id=randomUUID(),path=`/api/agreements/editor-drafts/template/${id}`;
       assert.deepEqual(expectStatus(await request(path),200),{revision:0,base_version:null,payload:null});
