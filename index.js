@@ -18086,10 +18086,15 @@ app.get("/api/payments/connect/status", authRequired, requireEmployer, requireCa
         );
         return res.json({ settings: sanitizeBusinessSettings(updated.rows[0] || await ensureBusinessSettings(req.userId, req.companyId)) });
       } catch (err) {
-        console.error("stripe accounts.retrieve failed:", err.message);
+        return res.json({ settings: { ...sanitizeBusinessSettings(settings), stripe_charges_enabled: false,
+          stripe_payouts_enabled: false, stripe_connect_status: "action_required",
+          stripe_connection_error: "Stripe could not verify this account in the current payment environment. Refresh status or sign in to the correct account." } });
       }
     }
-    res.json({ settings: sanitizeBusinessSettings(settings) });
+    res.json({ settings: settings.stripe_account_id && !stripe
+      ? { ...sanitizeBusinessSettings(settings), stripe_charges_enabled: false, stripe_payouts_enabled: false,
+          stripe_connect_status: "action_required", stripe_connection_error: "Stripe is not configured on the server. Payment readiness cannot be verified." }
+      : sanitizeBusinessSettings(settings) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "connect_status_failed" });

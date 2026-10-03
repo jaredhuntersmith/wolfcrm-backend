@@ -41,6 +41,19 @@ test('actual API startup installs the complete quote workflow on an empty databa
     const receipt=await fetch(origin+'/api/agreements/00000000-0000-4000-8000-000000000001/payments/offline',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
     assert.equal(receipt.status,401);
     pool=new pg.Pool(config);
+    // Cached readiness must not be shown as verified after provider keys disappear/change.
+    const owner=(await pool.query("INSERT INTO users(email,role) VALUES('stripe-status-owner@example.invalid','employer') RETURNING id")).rows[0].id;
+    const company=(await pool.query("INSERT INTO companies(name,join_code) VALUES('Stripe status','STRIPESTAT') RETURNING id")).rows[0].id;
+    await pool.query('UPDATE users SET company_id=$2 WHERE id=$1',[owner,company]);
+    await pool.query("INSERT INTO sessions(token,user_id) VALUES('stripe-status-local',$1)",[owner]);
+    await pool.query("INSERT INTO business_settings(user_id,company_id,stripe_account_id,stripe_connect_status,stripe_charges_enabled) VALUES($1,$2,'acct_fixture','ready',true)",[owner,company]);
+    const statusResponse=await fetch(origin+'/api/payments/connect/status',{headers:{Authorization:'Bearer stripe-status-local'}});
+    assert.equal(statusResponse.status,200);
+    const paymentSettings=(await statusResponse.json()).settings;
+    assert.equal(paymentSettings.stripe_charges_enabled,false);
+    assert.equal(paymentSettings.stripe_connect_status,'action_required');
+    assert.match(paymentSettings.stripe_connection_error,/not configured/);
+
     for(const table of ['agreement_settings','agreement_assets','agreement_artifact_deliveries','agreement_archive_index','agreement_plan_enrollments','agreement_plan_cancellation_requests']){
       assert.equal((await pool.query('SELECT to_regclass($1)::text AS name',[table])).rows[0].name,table);
     }
