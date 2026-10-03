@@ -13,7 +13,11 @@ class PDFCanvas {
   textStyle(text) {
     const [,weight,size] = /^(\d+) ([\d.]+)px/.exec(this.font);
     let font=Number(weight)>=600?this.fonts.bold:this.fonts.regular;
-    try { font.encodeText(text); } catch { font=this.fonts.fallback; }
+    try { font.encodeText(text); } catch {
+      font=this.fonts.fallback;
+      const supported=this.fonts.supported;
+      if ([...text].some(character=>!supported.has(character.codePointAt(0)))) throw new Error('The agreement contains an unsupported character.');
+    }
     return {font,size:Number(size)};
   }
   color(value) {
@@ -46,6 +50,7 @@ export async function generateServiceAgreementPDF(snapshot, signatures=[]) {
   const pdf=await PDFDocument.create(); pdf.registerFontkit(fontkit);
   fallbackBytes ??= readFile(new URL('./assets/NotoSans.ttf',import.meta.url));
   const fonts={regular:await pdf.embedFont(StandardFonts.Helvetica),bold:await pdf.embedFont(StandardFonts.HelveticaBold),fallback:await pdf.embedFont(await fallbackBytes,{subset:true})};
+  fonts.supported = new Set(fonts.fallback.getCharacterSet());
   let logo=null;
   const data=snapshot.business.logo_data_url;
   if (data && data.length<=350000) {

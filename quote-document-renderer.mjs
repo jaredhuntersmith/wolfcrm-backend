@@ -225,6 +225,21 @@ function customerLines(contact) {
 function drawFirstPageHeader(context, document, logo) {
     const { contact, quote, settings } = document;
     const agreement = document.variant === "service-agreement";
+    if (!agreement) {
+        if (logo) context.drawImage(logo, 40, 42, 54, 54);
+        drawText(context, settings.company_name ?? "Company", 40, 118, {size:21,weight:700});
+        drawWrappedText(context, settings.tagline, 40, 151, 250, {size:11,lineHeight:16});
+        context.strokeStyle="#aeb7b0"; context.strokeRect(336.5,47.5,235,122);
+        drawText(context,"QUOTE",350,62,{size:20,weight:700}); drawRule(context,336,94,235);
+        drawText(context,"DATE",350,108,{color:"#758078",size:9}); drawText(context,quoteDate(quote.created_at),558,106,{size:10,align:"right"});
+        drawRule(context,336,132,235); drawText(context,"VALID FOR",350,145,{color:"#758078",size:9}); drawText(context,`${settings.valid_for_days} Days`,558,143,{size:10,align:"right"});
+        drawText(context,"QUOTE PREPARED FOR",40,218,{color:"#7d867f",size:10}); drawRule(context,40,237,232);
+        drawText(context,contact.name || "Customer",40,251,{size:11,weight:700}); customerLines(contact).slice(0,4).forEach((line,index)=>drawText(context,line,40,272+index*16,{size:10}));
+        drawText(context,"CONTACT US",336,218,{color:"#7d867f",size:10}); drawRule(context,336,237,235);
+        if(settings.company_address) drawWrappedText(context,settings.company_address,336,251,235,{size:10,lineHeight:15});
+        businessLines(settings).slice(0,3).forEach((line,index)=>drawText(context,line,336,283+index*16,{size:10}));
+        return;
+    }
     const top = agreement ? 66 : 47.5, labels = agreement ? 262 : 218, rule = labels + (agreement ? 20 : 19);
     if (logo) context.drawImage(logo, 40, agreement ? 48 : 42, agreement ? 48 : 54, agreement ? 48 : 54);
     drawWrappedText(context, settings.company_name ?? "Company", 40, agreement ? 134 : 118, 270, {size: agreement ? 22 : 21, weight: 700, lineHeight: 25});
@@ -371,18 +386,18 @@ export function drawServiceAgreement(createContext, document, signatures = []) {
         const signature = entry.signature?.type === "drawn" || entry.signature?.type === "typed" ? entry.signature : fieldSignature;
         setFont(context,10,700);
         const nameLines = wrappedLines(context, entry.printed_name || "Signer", 280);
-        const height = nameLines.length * 14 + (signature ? 100 : 20) + 32;
+        const height = nameLines.length * 14 + (signature ? 98 : 20) + 14;
         ensure(height);
         paragraph(entry.printed_name || "Signer", {size:10,weight:700});
-        paragraph(entry.role === "business" ? "Business signature" : entry.role === "additional_customer" ? "Additional customer signature" : "Customer signature", {size:9,color:"#6f7972"});
+        paragraph(entry.role === "business" ? "Business signature" : entry.role === "customer_2" ? "Additional customer signature" : "Customer signature", {size:9,color:"#6f7972"});
         if (signature?.type === "drawn") {
             context.strokeStyle = "#111111"; context.lineWidth = 1.3;
             for (const stroke of signature.strokes) {
                 context.beginPath();
-                stroke.forEach((point, index) => { const x=40+point[0]*270, y=cursor+point[1]*90; if(index) context.lineTo(x,y); else context.moveTo(x,y); });
+                stroke.forEach((point, index) => { const x=40+point[0]*240, y=cursor+point[1]*80; if(index) context.lineTo(x,y); else context.moveTo(x,y); });
                 context.stroke();
             }
-            cursor += 94;
+            cursor += 84;
         } else if (signature?.type === "typed") { paragraph(signature.text, {size:15}); cursor += 12; }
         paragraph(`Signed ${quoteDate(entry.submitted_at)}`, {size:9,color:"#6f7972"}); cursor += 16;
     }
