@@ -1,3 +1,4 @@
+import { generateServiceAgreementPDF, SIGNED_PRESENTATION_KIND } from "./service-agreement-export.js";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { QuoteContractError, calculateQuotePricing, normalizeQuoteOptions, validateQuoteAddonScope, quoteText, quoteInteger, quoteContentHash, deriveAgreementState } from "./quote-contract-domain.js";
 import { AGREEMENT_MERGE_FIELDS, resolveAgreementText, validateAndNormalizeAgreementPDF, normalizeAgreementFields, validateAgreementSignature, validateAgreementSubmission, generateQuoteAgreementPDF, populateAgreementPDF, agreementBytesHash, combineAgreementPDFs, qualifyAgreementDocumentLinks, validateAgreementSignerText } from "./quote-agreement-documents.js";
@@ -376,7 +377,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         kind: quoteId ? "quote" : "standalone",
         ...(suppliedQuotePDF ? { quote_pdf_sha256: agreementBytesHash(suppliedQuotePDF), quote_pdf_source: "client_export" } : {}),
         title: quote.title || "Quote", number, revision: (predecessor?.revision || 0) + 1, issued_at: issuedAt, expires_at: new Date(expires).toISOString(),
-        business: { name: values.business_name || "", address: settings.company_address || "", phone: settings.phone || settings.company_phone || "", email: settings.email || settings.company_email || "", logo_data_url: content.branding.show_logo ? settings.company_logo_data_url || "" : "" },
+        business: { name: values.business_name || "", website: settings.website || settings.company_website || "", address: settings.company_address || "", phone: settings.phone || settings.company_phone || "", email: settings.email || settings.company_email || "", logo_data_url: content.branding.show_logo ? settings.company_logo_data_url || "" : "" },
         customer: { name: contact.name || "", address: contact.address || "", billing_address:values.billing_address||"", phone: content.show_customer_phone ? contact.phone : null, email: content.show_customer_email ? contact.email : null },
         pricing: quoteId ? pricing : null, ...options, ...content, template: templateRef,
         ...(planQuote ? {plan_quote:planQuote.offer,financial_text:planQuote.offer.financial_text} : {}),
@@ -541,6 +542,25 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       return detail(db, { ...row, decision: raw.decision }, {publicRole:role});
     });
   }
+  async function signedPresentation(db, row, signatures, contracts) {
+    const cached = (await db.query('SELECT id,bytes,sha256 FROM agreement_artifacts WHERE agreement_id=$1 AND kind=$2', [row.id, SIGNED_PRESENTATION_KIND])).rows[0];
+    if (cached) return cached;
+    signatures ??= (await db.query('SELECT * FROM agreement_signatures WHERE agreement_id=$1 ORDER BY submitted_at,id', [row.id])).rows;
+    if (!row.snapshot.required_signers.every(role => signatures.some(entry => entry.role === role))) problem("agreement_signatures_pending", "Complete all required signatures before downloading the signed agreement.", 409);
+    if (!contracts) {
+      contracts = [];
+      for (const doc of row.snapshot.documents || []) {
+        const saved = (await db.query('SELECT bytes FROM agreement_artifacts WHERE agreement_id=$1 AND kind=$2', [row.id, `contract-${doc.asset_id}`])).rows[0];
+        if (!saved) problem("agreement_document_processing", "Your completed agreement PDF is still being prepared.", 409);
+        contracts.push(saved.bytes);
+      }
+    }
+    const cover = await generateServiceAgreementPDF(row.snapshot, signatures);
+    const bytes = contracts.length ? await combineAgreementPDFs([cover, ...contracts]) : cover;
+    await storeArtifact(db, row.id, SIGNED_PRESENTATION_KIND, bytes);
+    return (await db.query('SELECT id,bytes,sha256 FROM agreement_artifacts WHERE agreement_id=$1 AND kind=$2', [row.id, SIGNED_PRESENTATION_KIND])).rows[0];
+  }
+
   async function processDocumentJobs(limit = 5) {
     let processed = 0;
     for (let i = 0; i < limit; i++) {
@@ -565,6 +585,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
             await storeArtifact(db, row.id, `contract-${doc.asset_id}`, bytes, doc.asset_id);
             contracts.push(bytes);
           }
+          if (row.snapshot.pricing) await signedPresentation(db, row, signatures, contracts);
           const terms = (await db.query(`SELECT bytes FROM agreement_artifacts WHERE agreement_id=$1 AND kind='terms'`, [row.id])).rows[0];
           let packetCover = signed;
           if (row.snapshot.kind === "quote" && row.snapshot.quote_position === "excluded") {
@@ -589,7 +610,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     return processed;
   }
 
-  const service = { pool, env, secret, publicBase, makeToken, customerURL, loadStaff, loadPublic, event, rate, state, detail, validateDocuments, publish, storeArtifact, session, publicSession, sign, decision, processDocumentJobs, getStripe, paymentReady: false, bookingReady: false, plansReady: false };
+  const service = { pool, env, secret, publicBase, makeToken, customerURL, loadStaff, loadPublic, event, rate, state, detail, validateDocuments, publish, storeArtifact, session, publicSession, sign, decision, processDocumentJobs, signedPresentation, getStripe, paymentReady: false, bookingReady: false, plansReady: false };
   service.selectAddons = createQuoteAddonSelection({pool,service});
   return service;
 }
@@ -748,7 +769,9 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
     const assetId = kind.startsWith("contract-") ? kind.slice(9) : null;
     if (assetId && !row.snapshot.documents.some((doc) => doc.asset_id === assetId)) problem("agreement_document_missing", "This document is unavailable.", 404);
     if(publicAccess&&!['quote','terms','signed','scope-certificate','packet'].includes(kind)&&!assetId)problem('agreement_document_missing','This document is unavailable.',404);
-    const output = (await pool.query(`SELECT id,bytes,sha256 FROM agreement_artifacts WHERE agreement_id=$1 AND kind=$2`, [row.id, kind])).rows[0];
+    const output = kind === "signed" && row.snapshot.pricing && row.documents_ready
+      ? await service.signedPresentation(pool, row)
+      : (await pool.query(`SELECT id,bytes,sha256 FROM agreement_artifacts WHERE agreement_id=$1 AND kind=$2`, [row.id, kind])).rows[0];
     if (output) {
       let bytes=output.bytes;
       if(publicAccess && !(kind === "quote" && row.snapshot.quote_pdf_source === "client_export") && (role!=='customer'||row.token_generation!==1)){
@@ -762,7 +785,7 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
           }
         }
       }
-      return res.type("application/pdf").set("Content-Disposition", `inline; filename="quote-${row.number}-${kind}.pdf"`).send(bytes);
+      return res.type("application/pdf").set("Content-Disposition", `inline; filename="${kind === "signed" ? "service-agreement" : "quote"}-${row.number}-${kind}.pdf"`).send(bytes);
     }
     if (assetId) {
       const doc = row.snapshot.documents.find((item) => item.asset_id === assetId);
