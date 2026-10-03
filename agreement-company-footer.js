@@ -27,6 +27,11 @@ export async function companyFooter(db, companyId) {
       UNION ALL SELECT content->'customer_page'->'footer_links',2,created_at FROM current_templates WHERE archived_at IS NULL
       UNION ALL (SELECT snapshot->'customer_page'->'footer_links',3,created_at FROM quote_agreements WHERE company_id=$1 ORDER BY created_at DESC LIMIT 1)
     ) SELECT links FROM candidates ORDER BY priority,stamp DESC`, [companyId])).rows;
+  if ((await db.query("SELECT to_regclass('service_plan_tiers') AS table_name")).rows[0].table_name) {
+    sources.push(...(await db.query(`SELECT configuration->'agreement'->'customer_page'->'footer_links' AS links FROM (
+      SELECT DISTINCT ON(tier_id) * FROM service_plan_tiers WHERE company_id=$1 ORDER BY tier_id,version DESC
+    ) t WHERE archived_at IS NULL ORDER BY created_at DESC`, [companyId])).rows);
+  }
   const links = normalizeFooterLinks({});
   for (const source of sources) for (const key of Object.keys(links)) {
     if (links[key] || !source.links?.[key]) continue;
@@ -42,6 +47,7 @@ export function installCompanyFooterRoutes({ app, pool, staff, wrap }) {
     res.json(await companyFooter(pool, req.companyId));
   }));
   app.put('/api/agreements/footer', ...staff('settings.manage_company'), wrap(async (req, res) => {
+    if (!Object.hasOwn(req.body, 'links')) throw new QuoteContractError('footer_links_required', 'Enter company links, or leave their fields blank to remove them.', 400);
     const links = normalizeFooterLinks(req.body.links);
     if (!Number.isInteger(req.body.expected_version) || req.body.expected_version < 1)
       throw new QuoteContractError('footer_version_required', 'Reload the company links before saving.', 409);

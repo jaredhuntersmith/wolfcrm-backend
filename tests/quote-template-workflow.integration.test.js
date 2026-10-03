@@ -75,6 +75,30 @@ test('template defaults, persisted overrides, visibility, drawing and removal wo
       assert.equal((await sign(signBody)).status,200);assert.equal((await pool.query('SELECT count(*)::int n FROM agreement_signatures WHERE agreement_id=$1',[issued.id])).rows[0].n,1);
       assert.equal(validateAgreementSignature({type:'typed',text:'Historical signer'}).type,'typed');
     });
+    await t.test('company footer migrates once, updates all public pages and preserves signed evidence',async()=>{
+      const before=(await pool.query('SELECT packet_hash,snapshot FROM quote_agreements WHERE id=$1',[issued.id])).rows[0];
+      await pool.query('DELETE FROM company_agreement_footers WHERE company_id=$1',[company]);
+      await pool.query(`UPDATE agreement_templates SET content=jsonb_set(content,'{customer_page}', $3::jsonb) WHERE company_id=$1 AND template_id=$2 AND version=2`,[company,custom.template_id,JSON.stringify({footer_links:{website:'https://example.com/default',facebook:'javascript:invalid'}})]);
+      await pool.query(`UPDATE agreement_settings SET content=$2::jsonb WHERE company_id=$1`,[company,JSON.stringify({customer_page:{footer_links:{instagram:'https://instagram.com/company',website:'https://example.com/legacy'}}})]);
+      const reads=await Promise.all(Array.from({length:4},()=>request('/api/agreements/footer')));
+      for(const r of reads){assert.equal(r.status,200,JSON.stringify(r.body));assert.equal(r.body.version,1);assert.equal(r.body.links.website,'https://example.com/default');assert.equal(r.body.links.instagram,'https://instagram.com/company');assert.equal(r.body.links.facebook,'');}
+      const publicURL=`/api/public/agreements/${issued.customer_url.split('/').at(-1)}`;
+      assert.equal((await request(publicURL,{token:null})).body.footer_links.website,'https://example.com/default');
+      assert.equal((await request('/api/agreements/footer',{token:'other'})).body.links.website,'');
+      const put=(links,version=1,token='owner')=>request('/api/agreements/footer',{method:'PUT',token,body:{links,expected_version:version}});
+      assert.equal((await put({website:'https://example.com/no'},1,'worker')).status,403);
+      assert.equal((await put({website:'https://example.com/no'},1,null)).status,401);
+      for(const url of ['javascript:alert(1)','https://user:password@example.com','invalid'])assert.equal((await put({website:url})).status,400);
+      const writes=await Promise.all([put({website:'https://example.com/new'}),put({website:'https://example.com/new'})]);
+      assert.deepEqual(writes.map(r=>r.status).sort(),[200,409]);
+      assert.equal((await request(publicURL,{token:null})).body.footer_links.website,'https://example.com/new');
+      const clear=await put({},2);assert.equal(clear.status,200);assert.equal(clear.body.links.website,'');
+      const {installCompanyFooterSchema}=await import('../agreement-company-footer.js');await installCompanyFooterSchema(pool);
+      assert.equal((await request('/api/agreements/footer')).body.links.website,'');
+      assert.equal((await request(publicURL,{token:null})).body.footer_links.instagram,'');
+      assert.deepEqual((await pool.query('SELECT packet_hash,snapshot FROM quote_agreements WHERE id=$1',[issued.id])).rows[0],before);
+      await pool.query("UPDATE agreement_templates SET content=content #- '{customer_page,footer_links,facebook}' WHERE company_id=$1 AND template_id=$2 AND version=2",[company,custom.template_id]);
+    });
     await t.test('signed quote deletion hides active records but preserves signatures/customer access and is retry-safe',async()=>{
       const before=(await pool.query('SELECT packet_hash,snapshot FROM quote_agreements WHERE id=$1',[issued.id])).rows[0];
       assert.equal((await request(`/api/quotes/${saved.id}`,{method:'DELETE',token:'other'})).status,404);
