@@ -6499,6 +6499,25 @@ app.get("/api/company/settings", authRequired, requireEmployer, async (req, res)
   }
 });
 
+app.patch("/api/company/name", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
+  const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+  if (!name || [...name].length > 160 || /[\u0000-\u001f\u007f]/.test(name)) {
+    return res.status(400).json({ error: "invalid_company_name", message: "Enter a company name of 1–160 characters on one line." });
+  }
+  try {
+    const { rows } = await pool.query(
+      `UPDATE companies SET name=$2, updated_at=now() WHERE id=$1
+       RETURNING id, name, join_code, logo_data_url, website, address, phone, email,
+                 notify_all_members_on_jobs, on_my_way_message_template`, [req.companyId, name]
+    );
+    if (!rows.length) return res.status(404).json({ error: "company_not_found" });
+    res.json({ company: rows[0] });
+  } catch (error) {
+    console.error("[company/name] update failed", { code: error?.code });
+    res.status(500).json({ error: "company_name_update_failed", message: "Couldn't save the company name. Please try again." });
+  }
+});
+
 app.patch("/api/company/invoice-settings", authRequired, requireCapability("settings.manage_company"), async (req, res) => {
   try {
     const logo = (req.body.logo_data_url || "").toString();
