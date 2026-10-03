@@ -3,7 +3,7 @@ import fontkit from '@pdf-lib/fontkit';
 import { readFile } from 'node:fs/promises';
 import { drawServiceAgreement } from './quote-document-renderer.mjs';
 
-export const SIGNED_PRESENTATION_KIND = 'signed-presentation-v1';
+export const SIGNED_PRESENTATION_KIND = 'signed-presentation-v2';
 let fallbackBytes;
 
 // Canvas drawing operations shared with the browser export, rendered as vector

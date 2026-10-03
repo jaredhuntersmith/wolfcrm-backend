@@ -1,3 +1,4 @@
+import { SIGNED_PRESENTATION_KIND } from "../service-agreement-export.js";
 import { previewPublications } from "./helpers/publication-preview.js";
 import { drawnSignature } from "./helpers/signatures.js";
 import test from "node:test";
@@ -137,7 +138,7 @@ test("agreement publication, signing and records are durable, immutable, authori
       const evidence = (await request(`/api/agreements/${published.id}/evidence`)).body;
       assert.equal(evidence.signatures[0].packet_hash, published.packet_hash);
       assert.equal(evidence.signatures[0].verification_method, "link_only");
-      assert.equal(evidence.artifacts.length, 4);
+      assert.deepEqual(evidence.artifacts.map(item => item.kind).sort(), ["quote", "signed", "audit", "packet", SIGNED_PRESENTATION_KIND].sort());
       await pool.query(`UPDATE quote_agreements SET expires_at='2020-01-01' WHERE id=$1`, [published.id]);
       const reopened = (await request(`/api/public/agreements/${token}`, { token: null })).body;
       assert.equal(reopened.state.signing, "submitted");

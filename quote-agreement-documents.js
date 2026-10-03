@@ -345,12 +345,18 @@ export async function generateQuoteAgreementPDF(snapshot, { customer_url, signat
 
 export { sha256 as agreementBytesHash };
 
-export async function combineAgreementPDFs(documents) {
+export async function combineAgreementPDFs(documents, metadata = null) {
   const output = await PDFDocument.create();
   for (const bytes of documents) {
     const source = await PDFDocument.load(bytes);
     const pages = await output.copyPages(source, source.getPageIndices());
     pages.forEach((page) => output.addPage(page));
+  }
+  if (metadata) {
+    output.setTitle(metadata.title); output.setAuthor(metadata.author || ""); output.setCreator("WolfCRM");
+    if (metadata.issued_at && Number.isFinite(Date.parse(metadata.issued_at))) {
+      output.setCreationDate(new Date(metadata.issued_at)); output.setModificationDate(new Date(metadata.issued_at));
+    }
   }
   return Buffer.from(await output.save());
 }

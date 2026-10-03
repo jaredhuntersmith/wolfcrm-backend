@@ -79,14 +79,14 @@ test('customer PDF workflow preserves drafts, exact exports, signer evidence and
       const branded=expectStatus(await request(`${publicPath(packet)}/documents/signed`,{token:null}),200);
       const cover=await PDFDocument.load(branded);assert.equal(cover.getPageCount(),2);
       // Emulate an existing signed agreement created before the presentation artifact existed.
-      await pool.query("DELETE FROM agreement_artifacts WHERE agreement_id=$1 AND kind='signed-presentation-v1'",[packet.id]);
+      await pool.query("DELETE FROM agreement_artifacts WHERE agreement_id=$1 AND kind='signed-presentation-v2'",[packet.id]);
       await pool.query("UPDATE companies SET name='Changed after signing' WHERE id=$1",[company]);
       const legacy=expectStatus(await request(`${publicPath(packet)}/documents/signed`,{token:null}),200);
       assert.deepEqual(legacy,branded);
       assert.deepEqual((await evidence()).rows,before);
       const again=expectStatus(await request(`/api/agreements/${packet.id}/documents/signed`),200);assert.deepEqual(again,legacy);
       expectStatus(await request(`/api/agreements/${packet.id}/documents/signed`,{token:'pdfother'}),404);
-      expectStatus(await request(`${publicPath(packet)}/documents/signed-presentation-v1`,{token:null}),404);
+      expectStatus(await request(`${publicPath(packet)}/documents/signed-presentation-v2`,{token:null}),404);
       await pool.query("UPDATE companies SET name='PDF Company' WHERE id=$1",[company]);
     });
 

@@ -556,7 +556,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       }
     }
     const cover = await generateServiceAgreementPDF(row.snapshot, signatures);
-    const bytes = contracts.length ? await combineAgreementPDFs([cover, ...contracts]) : cover;
+    const bytes = contracts.length ? await combineAgreementPDFs([cover, ...contracts], {title:"Service Agreement", author:row.snapshot.business.name, issued_at:row.snapshot.issued_at}) : cover;
     await storeArtifact(db, row.id, SIGNED_PRESENTATION_KIND, bytes);
     return (await db.query('SELECT id,bytes,sha256 FROM agreement_artifacts WHERE agreement_id=$1 AND kind=$2', [row.id, SIGNED_PRESENTATION_KIND])).rows[0];
   }
