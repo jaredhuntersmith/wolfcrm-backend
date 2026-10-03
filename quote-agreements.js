@@ -1,3 +1,4 @@
+import { installCompanyFooterSchema, installCompanyFooterRoutes, companyFooter } from './agreement-company-footer.js';
 import { generateServiceAgreementPDF, SIGNED_PRESENTATION_KIND } from "./service-agreement-export.js";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { QuoteContractError, calculateQuotePricing, normalizeQuoteOptions, validateQuoteAddonScope, quoteText, quoteInteger, quoteContentHash, deriveAgreementState } from "./quote-contract-domain.js";
@@ -123,6 +124,7 @@ export async function installAgreementSchema(pool) {
     CREATE INDEX IF NOT EXISTS payment_records_agreement_idx ON payment_records(company_id,agreement_id);
   `);
   await installAgreementAuthoringSchema(pool);
+  await installCompanyFooterSchema(pool);
 }
 
 
@@ -203,6 +205,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
     delete snapshot.addon_source;
     if (!staff) { delete snapshot.duration_minutes; snapshot.optional_addons = (snapshot.optional_addons || []).map(({ duration_minutes, ...line }) => line); }
     const result = { id: row.id, quote_id: row.quote_id, contact_id: row.contact_id, number: row.number, revision: row.revision, title: row.title, created_at: row.created_at, expires_at: row.expires_at, snapshot, packet_hash: row.packet_hash, state: await state(db, row), signatures, documents_ready: row.documents_ready };
+    result.footer_links = (await companyFooter(db, row.company_id)).links;
     if (service.currentPlanPresence && (staff || publicRole === "customer")) result.has_current_plan = await service.currentPlanPresence(db,row);
     if(staff){
       result.predecessor_id=row.predecessor_id||null;
@@ -635,6 +638,7 @@ export async function installAgreementSystem({ app, pool, authRequired, requireC
   };
 
   installAgreementDraftRoutes({ app, pool, staff, wrap });
+  installCompanyFooterRoutes({ app, pool, staff, wrap });
 
   app.get("/api/agreements/settings", ...staff("quotes.view"), wrap(async (req, res) => {
     const row = (await pool.query(`SELECT * FROM agreement_settings WHERE company_id=$1`, [req.companyId])).rows[0];

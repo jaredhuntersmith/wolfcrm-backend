@@ -5,14 +5,19 @@ export function normalizeCustomerPage(raw = {}) {
   const fail=message=>{throw new QuoteContractError('customer_page_invalid',message,400);};
   if(!raw || typeof raw!=='object'||Array.isArray(raw))fail('Enter valid customer page settings.');
   const flag=(name,fallback)=>{if(raw[name]!=null&&typeof raw[name]!=='boolean')fail(`${name} must be on or off.`);return raw[name]??fallback;};
-  const links=raw.footer_links??{};
+  const footer_links=normalizeFooterLinks(raw.footer_links??{});
+  return {show_manage_booking:flag('show_manage_booking',true),allow_reschedule:flag('allow_reschedule',false),allow_cancel:flag('allow_cancel',false),plan_heading:quoteText(raw.plan_heading??planHeading,'Plan heading',160),plan_description:quoteText(raw.plan_description??planDescription,'Plan description',1200),footer_links};
+}
+
+export function normalizeFooterLinks(raw = {}) {
+  const fail=message=>{throw new QuoteContractError('customer_page_invalid',message,400);};
+  const links=raw;
   if(!links||typeof links!=='object'||Array.isArray(links))fail('Enter valid footer links.');
-  const footer_links=Object.fromEntries(['website','facebook','instagram','google_reviews'].map(name=>{
+  return Object.fromEntries(['website','facebook','instagram','google_reviews'].map(name=>{
     const text=quoteText(links[name],`${name} URL`,2000).trim();
     if(!text)return[name,''];
     let url;try{url=new URL(text);}catch{fail(`Enter a complete website URL for ${name}.`);}
     if(!['https:','http:'].includes(url.protocol)||!url.hostname||url.username||url.password)fail(`Use an http or https URL for ${name}.`);
     return[name,url.href];
   }));
-  return {show_manage_booking:flag('show_manage_booking',true),allow_reschedule:flag('allow_reschedule',false),allow_cancel:flag('allow_cancel',false),plan_heading:quoteText(raw.plan_heading??planHeading,'Plan heading',160),plan_description:quoteText(raw.plan_description??planDescription,'Plan description',1200),footer_links};
 }
