@@ -197,6 +197,7 @@ import {
 } from "./operations-repairs.js";
 import { installWebsiteBuilderSystem } from "./website-builder.js";
 import { installRoutineGroupSystem } from "./routine-groups.js";
+import { installMediaStorage } from "./media-storage/index.js";
 import { installFocusSystem } from "./focus.js";
 import {
   LightingInputError,
@@ -19888,6 +19889,7 @@ async function startServer() {
   }
   serverStarted = true;
   await bootstrap();
+  app.locals.mediaStorage = await installMediaStorage({ app, pool, authRequired });
   app.locals.agreements = await installAgreementSystem({ app, pool, authRequired, requireCapability, getQuoteSettings, getStripe });
   app.locals.agreementPayments = await installAgreementPayments({ app, pool, service: app.locals.agreements, getStripe, authRequired, requireCapability });
   app.locals.agreementBooking = await installAgreementBooking({ app, pool, service: app.locals.agreements, authRequired, requireCapability,
