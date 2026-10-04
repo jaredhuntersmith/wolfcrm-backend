@@ -26,6 +26,14 @@ export async function installStorageSchema(db) {
       version integer NOT NULL DEFAULT 1, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
       uploaded_at timestamptz, deleted_at timestamptz, cleanup_after timestamptz, checksum text
     );
+    ALTER TABLE stored_files ADD COLUMN IF NOT EXISTS thumbnail_id uuid;
+    CREATE TABLE IF NOT EXISTS storage_thumbnails (
+      id uuid PRIMARY KEY, file_id uuid NOT NULL REFERENCES stored_files(id), owner_user_id uuid NOT NULL REFERENCES users(id),
+      object_key text NOT NULL UNIQUE, byte_size bigint NOT NULL CHECK(byte_size BETWEEN 1 AND 524288),
+      mime_type text NOT NULL DEFAULT 'image/jpeg', cloud_status text NOT NULL DEFAULT 'pending', upload_id text,
+      created_at timestamptz NOT NULL DEFAULT now(), upload_expires_at timestamptz NOT NULL DEFAULT now()+interval '24 hours'
+    );
+    CREATE INDEX IF NOT EXISTS storage_thumbnails_file ON storage_thumbnails(file_id,cloud_status);
     CREATE INDEX IF NOT EXISTS stored_files_owner_state ON stored_files(owner_user_id,cloud_status,created_at DESC,id);
     CREATE INDEX IF NOT EXISTS stored_files_company_public ON stored_files(company_id,category,created_at DESC,id) WHERE visibility='company' AND cloud_status='active';
     CREATE INDEX IF NOT EXISTS stored_files_folder ON stored_files(owner_user_id,folder_id);

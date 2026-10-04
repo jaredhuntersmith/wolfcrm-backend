@@ -21,7 +21,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
   async function usage(actor) {
     await pool.query('INSERT INTO storage_accounts(user_id,quota_bytes) VALUES($1,$2) ON CONFLICT DO NOTHING',[actor.userId,defaultQuota]);
     const a=(await pool.query('SELECT * FROM storage_accounts WHERE user_id=$1',[actor.userId])).rows[0];
-    const rows=(await pool.query(`SELECT category,COALESCE(sum(byte_size) FILTER(WHERE cloud_status='active'),0)::text AS bytes,count(*) FILTER(WHERE cloud_status='active')::int AS file_count,COALESCE(sum(byte_size) FILTER(WHERE cloud_status IN ('pending','deleting')),0)::text AS reserved_bytes FROM stored_files WHERE owner_user_id=$1 AND cloud_status<>'deleted' GROUP BY category`,[actor.userId])).rows;
+    const rows=(await pool.query(`SELECT category,COALESCE(sum(byte_size) FILTER(WHERE cloud_status='active'),0)::text AS bytes,count(*) FILTER(WHERE cloud_status='active' AND original)::int AS file_count,COALESCE(sum(byte_size) FILTER(WHERE cloud_status IN ('pending','deleting')),0)::text AS reserved_bytes FROM (SELECT category,byte_size,cloud_status,true AS original FROM stored_files WHERE owner_user_id=$1 UNION ALL SELECT f.category,t.byte_size,t.cloud_status,false FROM storage_thumbnails t JOIN stored_files f ON f.id=t.file_id WHERE t.owner_user_id=$1) objects WHERE cloud_status<>'deleted' GROUP BY category`,[actor.userId])).rows;
     const categories=rows.map(r=>({...r,bytes:Number(r.bytes),reserved_bytes:Number(r.reserved_bytes)}));
     return {configured:!!bucket,quota_bytes:Number(a.quota_bytes)+Number(a.paid_allowance_bytes),used_bytes:categories.reduce((n,r)=>n+r.bytes,0),reserved_bytes:categories.reduce((n,r)=>n+r.reserved_bytes,0),file_count:categories.reduce((n,r)=>n+r.file_count,0),categories,plan_id:a.plan_id,max_file_bytes:maxSize};
   }
@@ -56,7 +56,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
         if(existing.cloud_status==='pending' && new Date(existing.upload_expires_at)<=new Date())fail(409,'upload_expired','This upload expired. Cancel it and upload again.');
         return {file:publicFile(existing,actor),part_size:PART_SIZE};
       }
-      const used=Number((await db.query("SELECT COALESCE(sum(byte_size),0)::text AS bytes FROM stored_files WHERE owner_user_id=$1 AND cloud_status<>'deleted'",[actor.userId])).rows[0].bytes);
+      const used=Number((await db.query("SELECT COALESCE(sum(byte_size),0)::text AS bytes FROM (SELECT byte_size FROM stored_files WHERE owner_user_id=$1 AND cloud_status<>'deleted' UNION ALL SELECT byte_size FROM storage_thumbnails WHERE owner_user_id=$1 AND cloud_status<>'deleted') objects",[actor.userId])).rows[0].bytes);
       if(used+input.byte_size>Number(a.quota_bytes)+Number(a.paid_allowance_bytes))fail(413,'storage_quota_exceeded','This file exceeds your available cloud storage.');
       const folderID=await folder(db,actor,body.folder_id),key=`storage/${actor.userId}/${input.id}/${randomUUID()}`;
       const row=(await db.query(`INSERT INTO stored_files(id,owner_user_id,uploaded_by_user_id,company_id,folder_id,display_name,original_filename,object_key,mime_type,type_identifier,extension,category,audio_subtype,byte_size,metadata_json,upload_expires_at) VALUES($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now()+interval '24 hours') RETURNING *`,[input.id,actor.userId,actor.companyId,folderID,input.display_name,input.original_filename,key,input.mime_type,input.type_identifier,input.extension,input.category,input.audio_subtype,input.byte_size,input.metadata_json])).rows[0];
@@ -138,6 +138,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
       if(row.cloud_status==='deleted'||row.cloud_status==='deleting')return;
       await db.query("UPDATE stored_files SET cloud_status='deleting',deleted_at=now(),updated_at=now(),cleanup_after=now(),version=version+1 WHERE id=$1",[row.id]);await audit(db,row,actor,'deleted');
     });
+    await pool.query("UPDATE storage_thumbnails SET cloud_status='deleting' WHERE file_id=$1 AND cloud_status<>'deleted'",[id]);
     await cleanup(id);return {ok:true};
   }
   async function cleanup(id=null) {
@@ -148,6 +149,8 @@ export function createStorageService({pool,bucket,env=process.env}) {
         try {await bucket.abort(row);await bucket.remove(row);await db.query("UPDATE stored_files SET cloud_status='deleted',upload_id=NULL,deleted_at=COALESCE(deleted_at,now()),updated_at=now() WHERE id=$1",[row.id]);}
         catch {await db.query("UPDATE stored_files SET cloud_status='deleting',cleanup_after=now()+interval '5 minutes' WHERE id=$1",[row.id]);}
       }
+      const thumbs=(await db.query(`SELECT t.* FROM storage_thumbnails t JOIN stored_files f ON f.id=t.file_id WHERE ($1::uuid IS NULL OR t.file_id=$1) AND (f.cloud_status IN ('deleting','deleted') OR t.cloud_status='deleting' OR (t.cloud_status='pending' AND t.upload_expires_at<now())) AND t.cloud_status<>'deleted' LIMIT 20 FOR UPDATE OF t SKIP LOCKED`,[id])).rows;
+      for(const thumb of thumbs) { try {await bucket.abort(thumb);await bucket.remove(thumb);await db.query("UPDATE storage_thumbnails SET cloud_status='deleted',upload_id=NULL WHERE id=$1",[thumb.id]);}catch{ /* Keep bytes charged until the next worker retry. */ } }
       await db.query("DELETE FROM storage_access_receipts WHERE created_at<now()-interval '7 days'");
     });
   }
@@ -174,9 +177,43 @@ export function createStorageService({pool,bucket,env=process.env}) {
     const rows=(await pool.query(`SELECT * FROM storage_activity WHERE ${where.join(' AND ')} ORDER BY created_at DESC,id DESC LIMIT 101`,params)).rows,last=rows[99];
     return {events:rows.slice(0,100).map(r=>({...r,byte_size:Number(r.byte_size)})),next_cursor:rows.length>100?Buffer.from(JSON.stringify({at:last.created_at,id:last.id})).toString('base64url'):null};
   }
+  async function thumbnailBegin(actor,id,body) {
+    cloud();const size=integer(body.byte_size,1,524288),requestID=uuid(body.id);
+    return transaction(async db=>{
+      const a=await account(db,actor.userId),row=await file(db,actor,id,true);owner(row,actor);
+      let thumb=(await db.query('SELECT * FROM storage_thumbnails WHERE id=$1',[requestID])).rows[0];
+      if(thumb) {if(thumb.file_id!==row.id||thumb.owner_user_id!==actor.userId||Number(thumb.byte_size)!==size)fail(409,'thumbnail_conflict','Thumbnail upload changed.');if(thumb.cloud_status!=='pending')fail(409,'thumbnail_finalized','Thumbnail already finalized.');}
+      else {
+        const used=Number((await db.query("SELECT COALESCE(sum(byte_size),0)::text AS bytes FROM (SELECT byte_size FROM stored_files WHERE owner_user_id=$1 AND cloud_status<>'deleted' UNION ALL SELECT byte_size FROM storage_thumbnails WHERE owner_user_id=$1 AND cloud_status<>'deleted') objects",[actor.userId])).rows[0].bytes);
+        if(used+size>Number(a.quota_bytes)+Number(a.paid_allowance_bytes))fail(413,'storage_quota_exceeded','No space available for artwork.');
+        thumb=(await db.query('INSERT INTO storage_thumbnails(id,file_id,owner_user_id,object_key,byte_size) VALUES($1,$2,$3,$4,$5) RETURNING *',[requestID,row.id,actor.userId,`storage/${actor.userId}/${row.id}/thumbnails/${requestID}`,size])).rows[0];
+      }
+      if(!thumb.upload_id){thumb.upload_id=await bucket.begin(thumb);await db.query('UPDATE storage_thumbnails SET upload_id=$2 WHERE id=$1',[thumb.id,thumb.upload_id]);}
+      return {url:await bucket.part(thumb,1,size),byte_size:size,part_number:1};
+    });
+  }
+  async function thumbnailComplete(actor,id,thumbnailID) {
+    cloud();return transaction(async db=>{
+      const row=await file(db,actor,id,true);owner(row,actor);
+      const thumb=(await db.query("SELECT * FROM storage_thumbnails WHERE id=$1 AND file_id=$2 AND cloud_status IN ('pending','active') FOR UPDATE",[uuid(thumbnailID),row.id])).rows[0];if(!thumb)fail(404,'thumbnail_not_found','Artwork upload not found.');
+      if(thumb.cloud_status==='active')return publicFile(row,actor);
+      let head=await bucket.head(thumb);
+      if(!head){const parts=await bucket.parts(thumb);if(parts.length!==1||Number(parts[0].Size)!==Number(thumb.byte_size))fail(409,'thumbnail_incomplete','Artwork upload is incomplete.');await bucket.complete(thumb,parts);head=await bucket.head(thumb);}
+      if(!head||Number(head.ContentLength)!==Number(thumb.byte_size)||head.Metadata?.['wolf-file-id']!==thumb.id)fail(409,'thumbnail_invalid','Artwork could not be verified.');
+      await db.query("UPDATE storage_thumbnails SET cloud_status='deleting' WHERE file_id=$1 AND cloud_status='active'",[row.id]);await db.query("UPDATE storage_thumbnails SET cloud_status='active',upload_id=NULL WHERE id=$1",[thumb.id]);
+      return publicFile((await db.query('UPDATE stored_files SET thumbnail_id=$2,version=version+1,updated_at=now() WHERE id=$1 RETURNING *',[row.id,thumb.id])).rows[0],actor);
+    });
+  }
+  async function thumbnailAccess(actor,id) {
+    cloud();return transaction(async db=>{
+      const row=await file(db,actor,id,true);
+      const thumb=(await db.query("SELECT * FROM storage_thumbnails WHERE id=$1 AND file_id=$2 AND cloud_status='active'",[row.thumbnail_id,row.id])).rows[0];if(!thumb)fail(404,'thumbnail_not_found','Preview is not available.');
+      return {url:await bucket.access({...thumb,original_filename:'preview.jpg'},false),expires_in:300};
+    });
+  }
   async function verify(actor,ids) {
     if(!Array.isArray(ids)||ids.length>200)fail(400,'invalid_ids','Verify up to 200 files at a time.');
     return {files:(await pool.query(`SELECT f.* FROM stored_files f WHERE ${readableSQL} AND f.cloud_status='active' AND f.id=ANY($3::uuid[])`,[actor.userId,actor.companyId,ids.map(uuid)])).rows.map(r=>publicFile(r,actor))};
   }
-  return {verify,usage,list,begin,part,complete,patch,access,acknowledge,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
+  return {thumbnailBegin,thumbnailComplete,thumbnailAccess,verify,usage,list,begin,part,complete,patch,access,acknowledge,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
 }
