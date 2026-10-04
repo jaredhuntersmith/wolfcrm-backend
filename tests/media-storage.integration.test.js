@@ -20,7 +20,7 @@ test('storage privacy and lifecycle against PostgreSQL', {timeout:120000}, async
   const service=await installMediaStorage({app,pool,authRequired:auth,bucket,env:{STORAGE_DEFAULT_QUOTA_BYTES:String(3*PART_SIZE)},startWorker:false});
   server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});const base=`http://127.0.0.1:${server.address().port}/api/storage`;
   const req=async(path,method='GET',body,actor='a')=>{const r=await fetch(base+path,{method,headers:{Authorization:actor,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,data:await r.json()};};
-  const upload=async(size=100,filename='Private.mp3')=>{const id=randomUUID();assert.equal((await req('/uploads','POST',{id,byte_size:size,original_filename:filename,mime_type:'audio/mpeg'})).status,200);for(let n=1;n<=Math.ceil(size/PART_SIZE);n++)assert.equal((await req(`/files/${id}/parts`,'POST',{part_number:n})).status,200);const r=await req(`/files/${id}/complete`,'POST',{});assert.equal(r.status,200,JSON.stringify(r));return r.data;};
+  const upload=async(size=100,filename='Private.mp3')=>{const id=randomUUID();assert.equal((await req('/uploads','POST',{id,byte_size:size,original_filename:filename,mime_type:'audio/mpeg'})).status,200);for(let n=1;n<=Math.max(1,Math.ceil(size/PART_SIZE));n++)assert.equal((await req(`/files/${id}/parts`,'POST',{part_number:n})).status,200);const r=await req(`/files/${id}/complete`,'POST',{});assert.equal(r.status,200,JSON.stringify(r));return r.data;};
   let f;
   await t.test('private direct access, browse, search, state, delete and logs deny employer/peers',async()=>{
    f=await upload();assert.equal(f.cloud_status,'active');assert.equal(f.object_key,undefined);
@@ -75,6 +75,11 @@ test('storage privacy and lifecycle against PostgreSQL', {timeout:120000}, async
   });
   await t.test('employer moderation hides immediately; failed delete stays charged until retry',async()=>{
    failDelete=true;assert.equal((await req(`/files/${f.id}`,'DELETE',undefined,'owner')).status,200);assert.equal((await req(`/files/${f.id}`)).status,404);assert.equal((await req('/usage')).data.reserved_bytes,125);assert.ok(objects.has(f.id));failDelete=false;await pool.query('UPDATE stored_files SET cleanup_after=now() WHERE id=$1',[f.id]);await service.cleanup();assert.equal((await req('/usage')).data.reserved_bytes,0);assert.ok(!objects.has(f.id));
+  });
+  await t.test('empty originals remain uploadable; audit search and folder replay remain scoped',async()=>{
+   const empty=await upload(0,'Empty.txt');assert.equal(empty.byte_size,0);assert.equal(empty.cloud_status,'active');
+   const id=randomUUID(),body={id,name:'Replay folder'};const one=(await req('/folders','POST',body)).data;const two=(await req('/folders','POST',body)).data;assert.equal(one.id,two.id);assert.equal((await req('/folders','POST',body,'b')).status,404);
+   assert.equal((await req('/activity?search=nonexistent','GET',undefined,'owner')).data.events.length,0);
   });
   await t.test('duplicate start/finalize charge once; no upload URLs after finalization; expired cleanup',async()=>{
    const id=randomUUID(),body={id,original_filename:'retry.zip',mime_type:'application/zip',byte_size:10};for(let i=0;i<2;i++)assert.equal((await req('/uploads','POST',body)).status,200);await req(`/files/${id}/parts`,'POST',{part_number:1});for(let i=0;i<2;i++)assert.equal((await req(`/files/${id}/complete`,'POST',{})).status,200);assert.equal((await req(`/files/${id}/parts`,'POST',{part_number:1})).status,404);

@@ -72,7 +72,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
     cloud(); return transaction(async db=>{
       const row=await file(db,actor,id,true,['pending']);owner(row,actor);
       if(new Date(row.upload_expires_at)<=new Date())fail(409,'upload_expired','Upload expired; cancel and retry.');
-      integer(number,1,Math.ceil(Number(row.byte_size)/PART_SIZE));
+      integer(number,1,Math.max(1,Math.ceil(Number(row.byte_size)/PART_SIZE)));
       if(!row.upload_id) { row.upload_id=await bucket.begin(row); await db.query('UPDATE stored_files SET upload_id=$2 WHERE id=$1',[row.id,row.upload_id]); }
       const size=Math.min(PART_SIZE,Number(row.byte_size)-(number-1)*PART_SIZE);
       return {url:await bucket.part(row,number,size),byte_size:size,part_number:number};
@@ -84,7 +84,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
       let head=await bucket.head(row);
       if(!head) {
         if(!row.upload_id)fail(409,'upload_incomplete','No uploaded parts found.');
-        const parts=await bucket.parts(row),expected=Math.ceil(Number(row.byte_size)/PART_SIZE);
+        const parts=await bucket.parts(row),expected=Math.max(1,Math.ceil(Number(row.byte_size)/PART_SIZE));
         if(parts.length!==expected||parts.some((p,i)=>p.PartNumber!==i+1||Number(p.Size)!==Math.min(PART_SIZE,Number(row.byte_size)-i*PART_SIZE)))fail(409,'upload_incomplete','Uploaded parts do not match the reserved file size. Retry the upload.');
         await bucket.complete(row,parts);head=await bucket.head(row);
       }
@@ -186,6 +186,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
     const add=v=>{params.push(v);return '$'+params.length;};
     if(q.user_id)where.push(`actor_user_id=${add(uuid(q.user_id))}`);
     if(q.file_id)where.push(`file_id=${add(uuid(q.file_id))}`);
+    if(q.search){const term='%'+String(q.search).slice(0,200).replace(/[\\%_]/g,'\\$&')+'%';const p=add(term);where.push(`(actor_name ILIKE ${p} OR file_name ILIKE ${p})`);}
     if(q.action)where.push(`event_type=${add(String(q.action).slice(0,50))}`);
     for(const [key,op] of [['from','>='],['to','<=']])if(q[key]){const d=new Date(q[key]);if(!Number.isFinite(d.getTime()))fail(400,'invalid_date','Invalid activity date.');where.push(`created_at${op}${add(d)}`);}
     if(q.before){let c;try{c=JSON.parse(Buffer.from(q.before,'base64url').toString());}catch{fail(400,'invalid_cursor','Invalid cursor.');}where.push(`(created_at,id)<(${add(c.at)}::timestamptz,${add(uuid(c.id))}::uuid)`);}
