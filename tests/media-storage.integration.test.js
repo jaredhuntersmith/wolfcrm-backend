@@ -52,8 +52,20 @@ test('storage privacy and lifecycle against PostgreSQL', {timeout:120000}, async
    const payload=()=>({id:randomUUID(),original_filename:'Large.mp4',byte_size:2*PART_SIZE,mime_type:'video/mp4'});const attempts=await Promise.all([req('/uploads','POST',payload()),req('/uploads','POST',payload())]);assert.deepEqual(attempts.map(r=>r.status).sort(),[200,413]);const id=attempts.find(r=>r.status===200).data.file.id;
    await req(`/files/${id}/parts`,'POST',{part_number:1});assert.equal((await req(`/files/${id}/complete`,'POST',{})).status,409);await req(`/files/${id}`,'DELETE');assert.equal((await req('/usage')).data.reserved_bytes,0);
   });
+  await t.test('thumbnail access inherits original privacy; quota includes derivative once; replacement cleans old bytes',async()=>{
+   const id=randomUUID();assert.equal((await req(`/files/${f.id}/thumbnail`,'POST',{id,byte_size:50},'b')).status,403);
+   assert.equal((await req(`/files/${f.id}/thumbnail`,'POST',{id,byte_size:50})).status,200);
+   f=(await req(`/files/${f.id}/thumbnail/complete`,'POST',{id})).data;assert.equal(f.thumbnail_id,id);assert.equal((await req('/usage')).data.used_bytes,250);
+   assert.equal((await req(`/files/${f.id}/thumbnail`,'GET',undefined,'b')).status,200);
+   f=(await req(`/files/${f.id}`,'PATCH',{expected_version:f.version,visibility:'private'})).data;
+   assert.equal((await req(`/files/${f.id}/thumbnail`,'GET',undefined,'owner')).status,404);
+   assert.equal((await req('/files/verify','POST',{ids:[f.id]},'b')).data.files.length,0);
+   const replacement=randomUUID();await req(`/files/${f.id}/thumbnail`,'POST',{id:replacement,byte_size:25});f=(await req(`/files/${f.id}/thumbnail/complete`,'POST',{id:replacement})).data;
+   assert.equal((await req('/usage')).data.reserved_bytes,50);await service.cleanup();assert.equal((await req('/usage')).data.used_bytes,225);assert.equal((await req('/usage')).data.reserved_bytes,0);assert.ok(!objects.has(id));
+   f=(await req(`/files/${f.id}`,'PATCH',{expected_version:f.version,visibility:'company'})).data;
+  });
   await t.test('employer moderation hides immediately; failed delete stays charged until retry',async()=>{
-   failDelete=true;assert.equal((await req(`/files/${f.id}`,'DELETE',undefined,'owner')).status,200);assert.equal((await req(`/files/${f.id}`)).status,404);assert.equal((await req('/usage')).data.reserved_bytes,100);assert.ok(objects.has(f.id));failDelete=false;await pool.query('UPDATE stored_files SET cleanup_after=now() WHERE id=$1',[f.id]);await service.cleanup();assert.equal((await req('/usage')).data.reserved_bytes,0);assert.ok(!objects.has(f.id));
+   failDelete=true;assert.equal((await req(`/files/${f.id}`,'DELETE',undefined,'owner')).status,200);assert.equal((await req(`/files/${f.id}`)).status,404);assert.equal((await req('/usage')).data.reserved_bytes,125);assert.ok(objects.has(f.id));failDelete=false;await pool.query('UPDATE stored_files SET cleanup_after=now() WHERE id=$1',[f.id]);await service.cleanup();assert.equal((await req('/usage')).data.reserved_bytes,0);assert.ok(!objects.has(f.id));
   });
   await t.test('duplicate start/finalize charge once; no upload URLs after finalization; expired cleanup',async()=>{
    const id=randomUUID(),body={id,original_filename:'retry.zip',mime_type:'application/zip',byte_size:10};for(let i=0;i<2;i++)assert.equal((await req('/uploads','POST',body)).status,200);await req(`/files/${id}/parts`,'POST',{part_number:1});for(let i=0;i<2;i++)assert.equal((await req(`/files/${id}/complete`,'POST',{})).status,200);assert.equal((await req(`/files/${id}/parts`,'POST',{part_number:1})).status,404);
