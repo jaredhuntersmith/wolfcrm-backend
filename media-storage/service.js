@@ -10,12 +10,16 @@ export function createStorageService({pool,bucket,env=process.env}) {
   function cloud() { if(!bucket) fail(503,'storage_not_configured','Cloud storage is not configured. Local files remain available.'); return bucket; }
   async function account(db,user) { await db.query('INSERT INTO storage_accounts(user_id,quota_bytes) VALUES($1,$2) ON CONFLICT DO NOTHING',[user,defaultQuota]); return (await db.query('SELECT * FROM storage_accounts WHERE user_id=$1 FOR UPDATE',[user])).rows[0]; }
   async function file(db,actor,id,lock=false,states=['active']) {
-    const row=(await db.query(`SELECT f.* FROM stored_files f WHERE ${readableSQL} AND f.id=$3 AND f.cloud_status=ANY($4::text[]) ${lock?'FOR UPDATE OF f':''}`,[actor.userId,actor.companyId,uuid(id),states])).rows[0];
+    const row=(await db.query(`SELECT f.*,owner.display_name AS owner_display_name,EXISTS(SELECT 1 FROM users active_owner WHERE active_owner.id=f.owner_user_id AND active_owner.company_id=f.company_id AND active_owner.deleted_at IS NULL) AS sharing_active FROM stored_files f JOIN users owner ON owner.id=f.owner_user_id WHERE ${readableSQL} AND f.id=$3 AND f.cloud_status=ANY($4::text[]) ${lock?'FOR UPDATE OF f':''}`,[actor.userId,actor.companyId,uuid(id),states])).rows[0];
     if(!row) fail(404,'file_not_found','This file is unavailable or access was removed.'); return row;
   }
   function owner(row,actor) { if(row.owner_user_id!==actor.userId) fail(403,'file_owner_required','Only the file owner can change this file.'); }
   async function folder(db,actor,id) { if(!id) return null; const row=(await db.query('SELECT * FROM storage_folders WHERE id=$1 AND owner_user_id=$2',[uuid(id),actor.userId])).rows[0]; if(!row) fail(404,'folder_not_found','Folder not found.'); return row.id; }
-  async function audit(db,row,actor,event,wasPublic=row.visibility==='company',snapshotName=row.display_name) {
+  async function effectivelyPublic(db,row) {
+    return row.visibility==='company' && !!(await db.query('SELECT 1 FROM users WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL',[row.owner_user_id,row.company_id])).rowCount;
+  }
+  async function audit(db,row,actor,event,wasPublic=null,snapshotName=row.display_name) {
+    if(wasPublic===null)wasPublic=await effectivelyPublic(db,row);
     await db.query(`INSERT INTO storage_activity(id,file_id,actor_user_id,actor_name,company_id,event_type,file_name,byte_size,was_public) SELECT $1,$2,$3,COALESCE(NULLIF(display_name,''),email),$4,$5,$6,$7,$8 FROM users WHERE id=$3`,[randomUUID(),row.id,actor.userId,row.company_id,event,snapshotName,row.byte_size,wasPublic]);
   }
   async function usage(actor) {
@@ -40,7 +44,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
     const sort=sorts[q.sort]||sorts[q.scope==='recent'?'recent':'added'],[column,direction]=sort;
     const fingerprint=createHash('sha256').update(JSON.stringify([q.scope,q.category,q.folder_id,q.search,sort])).digest('hex');
     if(q.cursor) { let c;try {c=JSON.parse(Buffer.from(String(q.cursor),'base64url').toString());}catch{fail(400,'invalid_cursor','Invalid page cursor.');}if(c.fingerprint!==fingerprint)fail(400,'invalid_cursor','Refresh the file list.'); where.push(`(${column},f.id) ${direction==='ASC'?'>':'<'} (${add(c.value)},${add(uuid(c.id))}::uuid)`); }
-    const result=await pool.query(`SELECT f.*,COALESCE(s.favorite,false) AS favorite,s.last_accessed_at,s.position_seconds,s.playback_rate,s.completed,${column} AS sort_value FROM stored_files f LEFT JOIN storage_file_state s ON s.file_id=f.id AND s.user_id=$1 LEFT JOIN storage_folders folder ON folder.id=f.folder_id WHERE ${where.join(' AND ')} ORDER BY ${column} ${direction},f.id ${direction} LIMIT ${add(limit+1)}`,params);
+    const result=await pool.query(`SELECT f.*,owner.display_name AS owner_display_name,EXISTS(SELECT 1 FROM users active_owner WHERE active_owner.id=f.owner_user_id AND active_owner.company_id=f.company_id AND active_owner.deleted_at IS NULL) AS sharing_active,COALESCE(s.favorite,false) AS favorite,s.last_accessed_at,s.position_seconds,s.playback_rate,s.completed,${column} AS sort_value FROM stored_files f JOIN users owner ON owner.id=f.owner_user_id LEFT JOIN storage_file_state s ON s.file_id=f.id AND s.user_id=$1 LEFT JOIN storage_folders folder ON folder.id=f.folder_id WHERE ${where.join(' AND ')} ORDER BY ${column} ${direction},f.id ${direction} LIMIT ${add(limit+1)}`,params);
     const more=result.rows.length>limit,rows=result.rows.slice(0,limit),last=rows.at(-1);
     return {files:rows.map(row=>{const {sort_value,...value}=row;return publicFile(value,actor);}),next_cursor:more?Buffer.from(JSON.stringify({fingerprint,value:last.sort_value,id:last.id})).toString('base64url'):null};
   }
@@ -93,12 +97,12 @@ export function createStorageService({pool,bucket,env=process.env}) {
     return transaction(async db=>{
       await account(db,actor.userId);const row=await file(db,actor,id,true);owner(row,actor);
       if(integer(body.expected_version,1,Number.MAX_SAFE_INTEGER)!==row.version)fail(409,'stale_file','This file changed. Refresh before saving.');
-      let event='metadata_updated',wasPublic=row.visibility==='company';
+      let event='metadata_updated',wasPublic=await effectivelyPublic(db,row);
       if(body.display_name!==undefined) {row.display_name=name(body.display_name);event='renamed';}
       if(body.folder_id!==undefined) {row.folder_id=await folder(db,actor,body.folder_id);event='moved';}
       if(body.metadata_json!==undefined)row.metadata_json=metadata(body.metadata_json);
       if(body.audio_subtype!==undefined) {if(!['music','audiobook'].includes(body.audio_subtype))fail(400,'invalid_subtype','Choose Music or Audiobook.');row.audio_subtype=body.audio_subtype;}
-      if(body.visibility!==undefined) {if(!['private','company'].includes(body.visibility))fail(400,'invalid_visibility','Invalid visibility.');if(body.visibility==='company'&&!actor.companyId)fail(409,'company_required','Join a company before sharing.');row.visibility=body.visibility;row.company_id=actor.companyId;event=row.visibility==='company'?'public_enabled':'public_disabled';wasPublic=wasPublic||row.visibility==='company';}
+      if(body.visibility!==undefined) {if(!['private','company'].includes(body.visibility))fail(400,'invalid_visibility','Invalid visibility.');if(body.visibility==='company'&&!actor.companyId)fail(409,'company_required','Join a company before sharing.');row.visibility=body.visibility;if(row.visibility==='company')row.company_id=actor.companyId;event=row.visibility==='company'?'public_enabled':'public_disabled';wasPublic=wasPublic||row.visibility==='company';}
       const saved=(await db.query(`UPDATE stored_files SET display_name=$2,folder_id=$3,metadata_json=$4,audio_subtype=$5,visibility=$6,company_id=$7,updated_at=now(),version=version+1 WHERE id=$1 RETURNING *`,[row.id,row.display_name,row.folder_id,row.metadata_json,row.audio_subtype,row.visibility,row.company_id])).rows[0];
       await audit(db,saved,actor,event,wasPublic);return publicFile(saved,actor);
     });
@@ -107,7 +111,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
     cloud();if(!['stream','preview','download'].includes(purpose))fail(400,'invalid_purpose','Choose stream, preview or download.');
     return transaction(async db=>{
       const row=await file(db,actor,id,true);const url=await bucket.access(row,purpose==='download');let receipt=null;
-      if(purpose==='download') {receipt=randomUUID();await db.query('INSERT INTO storage_access_receipts(id,file_id,user_id,company_id,was_public,file_name) VALUES($1,$2,$3,$4,$5,$6)',[receipt,row.id,actor.userId,row.company_id,row.visibility==='company',row.display_name]);}
+      if(purpose==='download') {receipt=randomUUID();await db.query('INSERT INTO storage_access_receipts(id,file_id,user_id,company_id,was_public,file_name) VALUES($1,$2,$3,$4,$5,$6)',[receipt,row.id,actor.userId,row.company_id,await effectivelyPublic(db,row),row.display_name]);}
       await db.query('INSERT INTO storage_file_state(user_id,file_id,last_accessed_at) VALUES($1,$2,now()) ON CONFLICT(user_id,file_id) DO UPDATE SET last_accessed_at=now()',[actor.userId,row.id]);
       return {url,receipt_id:receipt,expires_in:300};
     });
@@ -216,7 +220,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
   }
   async function verify(actor,ids) {
     if(!Array.isArray(ids)||ids.length>200)fail(400,'invalid_ids','Verify up to 200 files at a time.');
-    return {files:(await pool.query(`SELECT f.* FROM stored_files f WHERE ${readableSQL} AND f.cloud_status='active' AND f.id=ANY($3::uuid[])`,[actor.userId,actor.companyId,ids.map(uuid)])).rows.map(r=>publicFile(r,actor))};
+    return {files:(await pool.query(`SELECT f.*,owner.display_name AS owner_display_name,EXISTS(SELECT 1 FROM users active_owner WHERE active_owner.id=f.owner_user_id AND active_owner.company_id=f.company_id AND active_owner.deleted_at IS NULL) AS sharing_active FROM stored_files f JOIN users owner ON owner.id=f.owner_user_id WHERE ${readableSQL} AND f.cloud_status='active' AND f.id=ANY($3::uuid[])`,[actor.userId,actor.companyId,ids.map(uuid)])).rows.map(r=>publicFile(r,actor))};
   }
   return {thumbnailBegin,thumbnailComplete,thumbnailAccess,verify,usage,list,begin,part,complete,patch,access,acknowledge,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
 }
