@@ -158,7 +158,10 @@ export function createStorageService({pool,bucket,env=process.env}) {
   async function saveFolder(actor,id,body) {
     return transaction(async db=>{
       await account(db,actor.userId);const parent=await folder(db,actor,body.parent_folder_id);
-      if(!id)return (await db.query('INSERT INTO storage_folders(id,owner_user_id,parent_folder_id,name) VALUES($1,$2,$3,$4) RETURNING *',[randomUUID(),actor.userId,parent,name(body.name)])).rows[0];
+      if(!id) {
+        const saved=(await db.query('INSERT INTO storage_folders(id,owner_user_id,parent_folder_id,name) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET id=storage_folders.id WHERE storage_folders.owner_user_id=EXCLUDED.owner_user_id RETURNING *',[body.id?uuid(body.id):randomUUID(),actor.userId,parent,name(body.name)])).rows[0];
+        if(!saved)fail(404,'folder_not_found','Folder not found.');return saved;
+      }
       await folder(db,actor,id);const cycle=parent?(await db.query('WITH RECURSIVE ancestors AS (SELECT id,parent_folder_id FROM storage_folders WHERE id=$1 UNION ALL SELECT p.id,p.parent_folder_id FROM storage_folders p JOIN ancestors a ON p.id=a.parent_folder_id) SELECT 1 FROM ancestors WHERE id=$2',[parent,id])).rowCount:0;
       if(cycle)fail(409,'folder_cycle','A folder cannot be moved into itself or its descendants.');
       const saved=(await db.query('UPDATE storage_folders SET name=$3,parent_folder_id=$4,version=version+1,updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND version=$5 RETURNING *',[id,actor.userId,name(body.name),parent,integer(body.expected_version,1,1e9)])).rows[0];if(!saved)fail(409,'stale_folder','Folder changed. Refresh and retry.');return saved;
