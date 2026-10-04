@@ -20,19 +20,19 @@ function testCatalogIsUniqueAndComplete() {
   assert.ok(PERMISSION_CAPABILITIES.every((item) => groupIds.has(item.group_id)));
   assert.ok(PERMISSION_CAPABILITIES.every((item) => item.depends_on.every((dependency) => keys.includes(dependency))));
   const payload = permissionCatalogPayload();
-  assert.equal(payload.version, 5);
+  assert.equal(payload.version, 6);
   assert.equal(Object.keys(payload.presets.find((item) => item.id === "admin").capabilities).length, keys.length);
 }
 
 function testOwnerAlwaysHasEveryCapability() {
   const access = resolveAccess({
-    role: "employer",
+    role: "employer", isOwner: true,
     preset: "technician",
     overrides: { "contacts.view": false, "team.manage": false }
   });
   assert.equal(access.preset, "owner");
   assert.ok(Object.values(access.capabilities).every(Boolean));
-  assert.equal(hasCapability({ role: "employer" }, "team.manage"), true);
+  assert.equal(hasCapability({ role: "employer", isCompanyOwner: true }, "team.manage"), true);
 }
 
 function testTechnicianPresetIsOperationalButRestricted() {
@@ -260,3 +260,7 @@ for (const [name, test] of tests) {
 
 if (failures) process.exitCode = 1;
 else console.log(`Permission domain tests passed (${tests.length}).`);
+
+assert.equal(hasCapability({role:"employer"},"team.manage"),false);
+assert.equal(resolveAccess({role:"employer"}).preset,"technician");
+for(const key of ["communications.record","communications.transcribe","communications.ai","communications.screenshare"]) assert.equal(validateAccessUpdate({preset:"admin",overrides:{"communications.view":false}}).capabilities[key],false);

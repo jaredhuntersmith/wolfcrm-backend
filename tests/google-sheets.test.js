@@ -128,3 +128,11 @@ await testCredentialEncryptionRoundTrip();
 await testWebOAuthCallbackBoundary();
 
 console.log("google-sheets tests passed");
+
+// Preserve newer fallback support without regressing canonical separators/OAuth behavior.
+const fallback = makeContact({ stage_name: undefined, stageName: "Follow Up", notesText: "Retained note" });
+delete fallback.history;
+const result = buildContactExportRows([fallback], new Date("2026-10-04T00:00:00Z"));
+assert.equal(result.rows[0][result.schema.headers.indexOf("Notes")], "Retained note");
+assert.equal(result.rows[0][result.schema.headers.indexOf("Current Stage")], "Follow Up");
+assert.equal(result.rows[0][result.schema.headers.indexOf("Tags")], "residential; vip");

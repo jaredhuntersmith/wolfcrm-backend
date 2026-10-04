@@ -1,4 +1,4 @@
-export const PERMISSION_CATALOG_VERSION = 5;
+export const PERMISSION_CATALOG_VERSION = 6;
 
 export const PERMISSION_GROUPS = Object.freeze([
   group("dashboard", "Dashboard", "Command center and daily business overview."),
@@ -7,6 +7,9 @@ export const PERMISSION_GROUPS = Object.freeze([
   group("schedule", "Schedule & Jobs", "Scheduling, job execution, completion, and workflow templates."),
   group("routes", "Routes", "View, build, edit, and administer field routes."),
   group("messaging", "Customer Messaging", "Customer conversations and message deletion."),
+  group("storage", "Media/Storage", "Personal and authorized shared files, audio, and media."),
+  group("calls", "Customer Calls", "Existing customer phone calls and voicemail."),
+  group("plans", "Service Plans & Invoices", "Existing service plan and invoice workflows."),
   group("focus", "Focus (Private)", "Private native-only creator discovery, media library, and supported professional messaging."),
   group("communications", "Company Communication", "Internal channels, direct messages, and channel administration."),
   group("operations", "Operations", "Equipment, inventory, requests, measurements, maps, and mileage operations."),
@@ -59,9 +62,9 @@ export const PERMISSION_CAPABILITIES = Object.freeze([
   capability("routes.edit", "routes", "Edit routes", "Reorder, recalculate, and update routes.", false, ["routes.view"]),
   capability("routes.manage", "routes", "Manage routes", "Administer route assignments and destructive route actions.", true, ["routes.view", "routes.edit"]),
 
-  capability("messaging.customer.view", "messaging", "View customer messages", "Read customer SMS, iMessage, calls, and voicemail."),
-  capability("messaging.customer.send", "messaging", "Message customers", "Send customer messages and place calls.", false, ["messaging.customer.view", "contacts.view"]),
-  capability("messaging.customer.delete", "messaging", "Delete customer messages", "Delete conversations, messages, or voicemail.", true, ["messaging.customer.view"]),
+  capability("messaging.customer.view", "messaging", "View customer messages", "Read customer SMS and iMessage."),
+  capability("messaging.customer.send", "messaging", "Message customers", "Send customer SMS and iMessage.", false, ["messaging.customer.view", "contacts.view"]),
+  capability("messaging.customer.delete", "messaging", "Delete customer messages", "Delete customer conversations and messages.", true, ["messaging.customer.view"]),
 
   capability("focus.view", "focus", "View Focus", "Use the private Focus feed, creator library, Likes, and diagnostics.", true),
   capability("focus.manage", "focus", "Manage Focus", "Change Focus rules, discovery, budgets, connections, exports, and deletion controls.", true, ["focus.view"]),
@@ -132,6 +135,50 @@ export const PERMISSION_CAPABILITIES = Object.freeze([
   capability("settings.manage_company", "settings", "Manage company settings", "Change company-wide configuration.", true, ["settings.view"]),
   capability("exports.run", "settings", "Run exports", "Export company or customer information.", true),
 
+  capability("storage.view", "storage", "View library files", "View library files.", false, []),
+  capability("storage.upload", "storage", "Upload library files", "Upload library files.", false, ["storage.view"]),
+  capability("storage.edit", "storage", "Edit library files", "Edit library files.", false, ["storage.view"]),
+  capability("storage.delete", "storage", "Delete library files", "Delete library files.", false, ["storage.view"]),
+  capability("storage.share", "storage", "Share library files", "Share library files.", false, ["storage.view"]),
+  capability("storage.download", "storage", "Download library files", "Download library files.", false, ["storage.view"]),
+  capability("storage.manage", "storage", "Manage library files", "Manage library files.", true, ["storage.view"]),
+  capability("audio.view", "storage", "View audio", "View audio.", false, ["storage.view"]),
+  capability("audio.play", "storage", "Play audio", "Play audio.", false, ["audio.view"]),
+  capability("media.view", "storage", "View media", "View media.", false, ["storage.view"]),
+  capability("media.play", "storage", "Play media", "Play media.", false, ["media.view"]),
+  capability("customer.calls.view", "calls", "View customer calls", "View customer calls.", false, []),
+  capability("customer.calls.place", "calls", "Place customer calls", "Place customer calls.", false, ["customer.calls.view"]),
+  capability("customer.calls.delete", "calls", "Delete customer calls", "Delete customer calls.", true, ["customer.calls.view"]),
+  capability("quotes.export", "sales", "Export quotes", "Export quotes.", true, ["quotes.view"]),
+  capability("quotes.share", "sales", "Share quotes", "Share quotes.", false, ["quotes.view"]),
+  capability("service_plans.view", "plans", "View service plans", "View service plans.", false, []),
+  capability("service_plans.create", "plans", "Create service plans", "Create service plans.", false, ["service_plans.view"]),
+  capability("service_plans.edit", "plans", "Edit service plans", "Edit service plans.", false, ["service_plans.view"]),
+  capability("service_plans.delete", "plans", "Delete service plans", "Delete service plans.", true, ["service_plans.view"]),
+  capability("service_plans.approve", "plans", "Approve service plans", "Approve service plans.", true, ["service_plans.view"]),
+  capability("invoices.view", "plans", "View invoices", "View invoices.", false, []),
+  capability("invoices.create", "plans", "Create invoices", "Create invoices.", false, ["invoices.view"]),
+  capability("invoices.edit", "plans", "Edit invoices", "Edit invoices.", false, ["invoices.view"]),
+  capability("invoices.delete", "plans", "Delete invoices", "Delete invoices.", true, ["invoices.view"]),
+  capability("map.view", "operations", "View map", "View map.", false, ["operations.view"]),
+  capability("notifications.view", "dashboard", "View persistent notifications", "View persistent notifications.", false, []),
+  capability("notifications.share", "dashboard", "Share notifications", "Share notifications.", false, ["notifications.view", "communications.send"]),
+  capability("team.manage_access", "team", "Administer delegated employee access", "Administer delegated employee access.", true, []),
+  capability("communications.create", "communications", "Create Channels", "Create Channels.", false, ["communications.view"]),
+  capability("communications.share", "communications", "Share CRM items", "Share CRM items.", false, ["communications.view", "communications.send"]),
+  capability("communications.download", "communications", "Download attachments", "Download attachments.", false, ["communications.view"]),
+  capability("communications.moderate", "communications", "Moderate messages", "Moderate messages.", true, ["communications.view"]),
+  capability("communications.calls", "communications", "Join and start internal calls", "Join and start internal calls.", false, ["communications.view"]),
+  capability("communications.screenshare", "communications", "Share screen", "Share screen.", false, ["communications.view", "communications.calls"]),
+  capability("communications.record", "communications", "Record with consent", "Record with consent.", true, ["communications.view", "communications.calls"]),
+  capability("communications.transcribe", "communications", "Transcribe meetings", "Transcribe meetings.", true, ["communications.view", "communications.record"]),
+  capability("communications.ai", "communications", "Generate meeting output", "Generate meeting output.", true, ["communications.view", "communications.record"]),
+  capability("communications.notes", "communications", "Edit shared notes", "Edit shared notes.", false, ["communications.view"]),
+  capability("communications.tasks", "communications", "Create linked tasks", "Create linked tasks.", false, ["communications.view", "tasks.manage"]),
+  capability("communications.workflows", "communications", "Manage Comms workflows", "Manage Comms workflows.", true, ["communications.view"]),
+  capability("communications.guests", "communications", "Invite meeting guests", "Invite meeting guests.", true, ["communications.view", "communications.calls"]),
+  capability("communications.audit", "communications", "Read Comms audit", "Read Comms audit.", true, ["communications.view"]),
+
   capability("ai.use", "ai", "Use AI capabilities", "Use enabled WolfCRM AI assistants."),
   capability("ai.manage", "ai", "Manage AI", "Manage company AI policies, memory, and actions.", true, ["ai.use"])
 ]);
@@ -143,7 +190,7 @@ const CAPABILITY_BY_KEY = new Map(PERMISSION_CAPABILITIES.map((item) => [item.ke
 const legacyEmployee = new Set(ALL_KEYS.filter((key) => !key.startsWith("finance.") && !key.startsWith("accounting.") && !key.startsWith("website.") && !key.startsWith("focus.") && ![
   "dashboard.exceptions.view", "dashboard.exceptions.manage",
   "contacts.delete", "contacts.export", "sales.view_all", "sales.manage",
-  "jobs.manage_templates", "routes.manage", "communications.manage",
+  "jobs.manage_templates", "routes.manage", "communications.manage", "communications.moderate", "communications.record", "communications.transcribe", "communications.ai", "communications.workflows", "communications.guests", "communications.audit", "team.manage_access", "storage.manage", "service_plans.approve", "service_plans.delete", "invoices.delete",
   "operations.manage", "payments.manage", "payments.refund",
   "pay.view_all", "pay.manage", "time.view_all", "time.manage", "team.manage", "automations.view",
   "automations.manage", "automations.run", "integrations.manage",
@@ -233,8 +280,8 @@ export function validateAccessUpdate(raw) {
   return { preset: presetId, overrides: sparse, capabilities: effective };
 }
 
-export function resolveAccess({ role, preset: rawPreset, overrides, legacy = {} } = {}) {
-  if (role === "employer") {
+export function resolveAccess({ role, isOwner = false, isCompanyOwner = false, preset: rawPreset, overrides, legacy = {} } = {}) {
+  if (isOwner === true || isCompanyOwner === true) {
     return { preset: "owner", overrides: {}, capabilities: Object.fromEntries(ALL_KEYS.map((key) => [key, true])) };
   }
   const presetId = cleanPreset(rawPreset) || "technician";
@@ -251,7 +298,7 @@ export function resolveAccess({ role, preset: rawPreset, overrides, legacy = {} 
 
 export function hasCapability(context, key) {
   if (!KNOWN_KEYS.has(key)) return false;
-  if (context?.role === "employer") return true;
+  if (context?.isCompanyOwner === true || context?.isOwner === true) return true;
   return Boolean(context?.permissions?.capabilities?.[key] ?? context?.capabilities?.[key]);
 }
 
@@ -327,31 +374,45 @@ export function requiredFinanceCapability(method, path = "") {
   return isRead ? "finance.view" : "finance.manage";
 }
 
-function normalizeCapabilities(source, explicit = {}) {
-  const result = Object.fromEntries(ALL_KEYS.map((key) => [key, Boolean(source[key])]));
+export function normalizeCapabilities(source, explicit = {}) {
+  const denied = new Set(ALL_KEYS.filter(key => explicit[key] === false));
   let changed = true;
   while (changed) {
     changed = false;
     for (const item of PERMISSION_CAPABILITIES) {
-      if (!result[item.key]) continue;
-      for (const dependency of item.depends_on) {
-        if (explicit[dependency] === false) {
-          result[item.key] = false;
-          changed = true;
-          break;
-        }
-        if (!result[dependency]) {
-          result[dependency] = true;
-          changed = true;
-        }
+      if (!denied.has(item.key) && item.depends_on.some(key => denied.has(key))) {
+        denied.add(item.key); changed = true;
+      }
+    }
+  }
+  const result = Object.fromEntries(ALL_KEYS.map(key => [key, !denied.has(key) && Boolean(source[key])]));
+  changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of PERMISSION_CAPABILITIES) if (result[item.key]) {
+      for (const dependency of item.depends_on) if (!result[dependency]) {
+        result[dependency] = true; changed = true;
       }
     }
   }
   return result;
 }
 
+const DEFAULT_ADDITIONS = Object.freeze([
+  "storage.view", "storage.upload", "storage.edit", "storage.delete", "storage.share", "storage.download",
+  "audio.view", "audio.play", "media.view", "media.play", "notifications.view", "notifications.share",
+  "service_plans.view", "service_plans.create", "service_plans.edit", "invoices.view", "invoices.create", "invoices.edit",
+  "communications.create", "communications.share", "communications.download", "communications.calls", "communications.screenshare", "communications.notes", "communications.tasks"
+]);
+
 function effectivePresetCapabilities(id) {
-  const enabled = PRESET_KEYS[id] || PRESET_KEYS.technician;
+  const enabled = new Set(PRESET_KEYS[id] || PRESET_KEYS.technician);
+  for (const key of DEFAULT_ADDITIONS) enabled.add(key);
+  if (enabled.has("messaging.customer.view")) enabled.add("customer.calls.view");
+  if (enabled.has("messaging.customer.send")) enabled.add("customer.calls.place");
+  if (enabled.has("messaging.customer.delete")) enabled.add("customer.calls.delete");
+  if (enabled.has("operations.view")) enabled.add("map.view");
+  if (enabled.has("quotes.view")) { enabled.add("quotes.share"); enabled.add("quotes.export"); }
   return normalizeCapabilities(Object.fromEntries(ALL_KEYS.map((key) => [key, enabled.has(key)])));
 }
 

@@ -315,6 +315,22 @@ function formatActivity(activity) {
   ].filter(Boolean).join("\n")).join("\n\n");
 }
 
+const historyFallbackFields = {
+  Notes: "notesText",
+  "Scheduled Jobs": "scheduledJobsText",
+  "Completed Jobs": "completedJobsText",
+  Quotes: "quotesText",
+  "SMS Messages": "smsText",
+  Calls: "callsText",
+  "Activity Log": "activityText"
+};
+
+function exportHistoryValue(entry, key) {
+  const history = entry.history && typeof entry.history === "object" ? entry.history : {};
+  const fallbackField = historyFallbackFields[key];
+  return history[key] ?? (fallbackField ? entry[fallbackField] : "") ?? "";
+}
+
 export function buildContactExportSchema(contacts) {
   const standard = [
     "WolfCRM Contact ID",
@@ -344,7 +360,7 @@ export function buildContactExportSchema(contacts) {
   for (const c of contacts) {
     maxLead = Math.max(maxLead, leadInfoArray(c.contact).length);
     for (const key of historyKeys) {
-      maxChunks[key] = Math.max(maxChunks[key], splitLongValue(c.history[key] || "").length);
+      maxChunks[key] = Math.max(maxChunks[key], splitLongValue(exportHistoryValue(c, key)).length);
     }
   }
   const historyHeaders = [];
@@ -379,7 +395,7 @@ export function buildContactExportRows(contacts, syncDate = new Date(), syncDate
       addr.zip,
       c.job_type || "",
       tagsArray(c.tags).join("; "),
-      entry.stage_name || "",
+      entry.stage_name || entry.stageName || "",
       dateTime(c.created_at),
       dateTime(c.updated_at),
       dateTime(entry.last_activity_at),
@@ -387,7 +403,7 @@ export function buildContactExportRows(contacts, syncDate = new Date(), syncDate
     ];
     const history = [];
     for (const key of schema.historyKeys) {
-      const chunks = splitLongValue(entry.history[key] || "");
+      const chunks = splitLongValue(exportHistoryValue(entry, key));
       for (let i = 0; i < schema.maxChunks[key]; i += 1) history.push(chunks[i] || "");
     }
     const lead = schema.leadHeaders.map((_, i) => leadValues[i] || "");

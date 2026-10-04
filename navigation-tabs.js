@@ -1,4 +1,4 @@
-export const TAB_CATALOG_VERSION = 1;
+export const TAB_CATALOG_VERSION = 2;
 export const MAX_PRIMARY_TABS = 5;
 
 export const TAB_CATALOG = Object.freeze([
@@ -7,7 +7,8 @@ export const TAB_CATALOG = Object.freeze([
   tab("stages", "Stages", "chart.bar.doc.horizontal.fill", ["pipeline.view"]),
   tab("schedule", "Schedule", "calendar", ["schedule.view"]),
   tab("map", "Map", "map.fill", ["operations.view"]),
-  tab("messages", "Messages", "bubble.left.and.bubble.right.fill", ["messaging.customer.view", "communications.view"])
+  tab("company_comms", "Company Comms", "person.3.sequence.fill", ["communications.view"]),
+  tab("messages", "Messages", "bubble.left.and.bubble.right.fill", ["messaging.customer.view", "customer.calls.view"])
 ]);
 
 const TAB_IDS = Object.freeze(TAB_CATALOG.map((item) => item.id));
@@ -103,10 +104,23 @@ export function validateTabLayout(raw, { allowLocked = false } = {}) {
   return result;
 }
 
+// Deterministic compatibility migration. Existing selected destinations keep
+// their relative order; the previous fifth goes to More, never disappears.
+export function migrateCompanyCommsLayout(raw) {
+  if (!Array.isArray(raw?.order) || !Array.isArray(raw?.hidden) || raw.order.includes("company_comms")) return raw;
+  if (raw.order.some(id => !KNOWN_TAB_IDS.has(id))) return raw;
+  const oldOrder = [...raw.order, ...TAB_IDS.filter(id => id !== "company_comms" && !raw.order.includes(id))];
+  const visible = oldOrder.filter(id => !raw.hidden.includes(id));
+  const insertion = visible.length >= 5 ? oldOrder.indexOf(visible[4]) : oldOrder.length;
+  const order = [...oldOrder.slice(0,insertion), "company_comms", ...oldOrder.slice(insertion)];
+  const hidden = [...new Set([...raw.hidden,...visible.slice(4)])];
+  return {...raw, order, hidden};
+}
+
 export function sanitizePersistedTabLayout(raw, options = {}) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).length === 0) return null;
   try {
-    return validateTabLayout(raw, options);
+    return validateTabLayout(migrateCompanyCommsLayout(raw), options);
   } catch {
     return null;
   }
@@ -114,7 +128,8 @@ export function sanitizePersistedTabLayout(raw, options = {}) {
 
 export function defaultTabLayout({ role, preset } = {}) {
   const key = role === "employer" ? "owner" : (isKnownTabRolePreset(preset) ? preset : "technician");
-  const order = [...(DEFAULT_ORDER_BY_PRESET[key] || DEFAULT_ORDER_BY_PRESET.technician)];
+  const old = [...(DEFAULT_ORDER_BY_PRESET[key] || DEFAULT_ORDER_BY_PRESET.technician)];
+  const order = [...old.slice(0, 4), "company_comms", ...old.slice(4)];
   return { order, hidden: order.slice(MAX_PRIMARY_TABS), locked: false };
 }
 

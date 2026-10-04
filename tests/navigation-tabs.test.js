@@ -14,7 +14,7 @@ const allCapabilities = Object.fromEntries(TAB_CATALOG.flatMap((tab) => tab.any_
 
 test("tab catalog and built-in role defaults remain valid", () => {
   const catalog = tabCatalogPayload();
-  assert.equal(catalog.version, 1);
+  assert.equal(catalog.version, 2);
   assert.equal(catalog.max_primary_tabs, 5);
   assert.equal(new Set(catalog.tabs.map((tab) => tab.id)).size, catalog.tabs.length);
   for (const preset of ["admin", "manager", "sales", "technician", "office", "legacy_employee"]) {
@@ -32,7 +32,7 @@ test("layout validation rejects system IDs, duplicates, unknown fields, and too 
 
 test("partial orders append new catalog IDs and normalize hidden ordering", () => {
   const result = validateTabLayout({ order: ["messages", "dashboard"], hidden: ["map", "stages"] });
-  assert.deepEqual(result.order, ["messages", "dashboard", "contacts", "stages", "schedule", "map"]);
+  assert.deepEqual(result.order, ["messages", "dashboard", "contacts", "stages", "schedule", "map", "company_comms"]);
   assert.deepEqual(result.hidden, ["stages", "map"]);
 });
 
@@ -64,25 +64,25 @@ test("unlocked policy permits a valid user preference", () => {
   assert.deepEqual(response.effective.primary.slice(0, 2), ["messages", "contacts"]);
 });
 
-test("permissions filter primary and overflow with Messages OR semantics", () => {
+test("permissions separate customer Messages from Company Comms", () => {
   const response = resolveTabNavigation({
     role: "employee",
     preset: "technician",
     capabilities: { "schedule.view": true, "communications.view": true },
     userPreferences: { order: ["contacts", "messages", "schedule"], hidden: ["map"] }
   });
-  assert.deepEqual(response.effective.order, ["messages", "schedule"]);
-  assert.deepEqual(response.effective.primary, ["messages", "schedule"]);
+  assert.deepEqual(response.effective.order, ["schedule", "company_comms"]);
+  assert.deepEqual(response.effective.primary, ["schedule", "company_comms"]);
   assert.deepEqual(response.effective.overflow, []);
 });
 
 test("the direct tab cap moves remaining permitted destinations into overflow", () => {
   const response = resolveTabNavigation({
     role: "employer",
-    userPreferences: { order: TAB_CATALOG.map((tab) => tab.id), hidden: ["messages"] }
+    userPreferences: { order: TAB_CATALOG.map((tab) => tab.id), hidden: ["map", "messages"] }
   });
   assert.equal(response.effective.primary.length, MAX_PRIMARY_TABS);
-  assert.deepEqual(response.effective.overflow, ["messages"]);
+  assert.deepEqual(response.effective.overflow, ["map", "messages"]);
 });
 
 test("invalid persisted documents safely fall back to the built-in role layout", () => {
@@ -103,3 +103,11 @@ test("no permitted core destination leaves More as the safe fallback", () => {
   assert.deepEqual(response.effective.overflow, []);
 });
 
+
+ test("old preferences add Company Comms once and preserve all old destinations",()=>{
+ const old={order:["dashboard","contacts","stages","schedule","map","messages"],hidden:["messages"]};
+ const one=sanitizePersistedTabLayout(old);assert.deepEqual(one.order.slice(0,5),["dashboard","contacts","stages","schedule","company_comms"]);
+ assert.deepEqual(one.hidden,["map","messages"]);assert.deepEqual(sanitizePersistedTabLayout(one),one);
+ const noComms=resolveTabNavigation({role:"employee",preset:"technician",capabilities:{"messaging.customer.view":true},userPreferences:old});
+ assert.deepEqual(noComms.effective.order,["messages"]);
+ });

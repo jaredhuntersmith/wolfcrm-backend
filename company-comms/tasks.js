@@ -1,0 +1,61 @@
+import {randomUUID} from 'node:crypto';
+import {authorizeConversation,loadActor,requireCapability,conversationJoins,conversationAccessSQL,can,ids,id,text,fail,audit,publish} from './access.js';
+import {hydrateSources,sourceAccessSQL} from './sources.js';
+
+// Immutable readiness references retain every ancestor's revocation boundary without
+// recursively executing source SQL. References are bounded, deduplicated and server-owned.
+function dependenciesReadySQL(value,company){return `NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(${value}) dep(source_type text,source_id text) WHERE NOT(CASE dep.source_type WHEN 'recording_review' THEN comms_recording_task_ready(dep.source_id) WHEN 'asset' THEN EXISTS(SELECT 1 FROM stored_files dep_file WHERE dep_file.id::text=dep.source_id AND dep_file.company_id=${company} AND dep_file.cloud_status='active' AND dep_file.deleted_at IS NULL) WHEN 'task' THEN EXISTS(SELECT 1 FROM comms_task_links dep_task WHERE dep_task.task_id=dep.source_id AND dep_task.company_id=${company} AND dep_task.revoked_at IS NULL) ELSE false END))`;}
+function normalizeDependencies(input){const out=[...new Map((input||[]).map(ref=>{if(!['recording_review','asset','task'].includes(ref.source_type))fail(400,'invalid_task_dependency');const source_id=id(ref.source_id);return [ref.source_type+':'+source_id,{source_type:ref.source_type,source_id}];})).values()];if(out.length>100)fail(400,'task_dependency_limit','This source has too many dependencies to create another task.');return out;}
+// Only Comms-derived canonical tasks are additionally constrained. Existing tasks retain their established policy.
+export function taskAccessSQL(actor,alias='todo_tasks',user='$1',company='$2'){
+ const current=(sql)=>sql.replaceAll('$1','__comms_user__').replaceAll('$2',company).replaceAll('__comms_user__',user);
+ const allowed=Object.entries(actor.permissions?.capabilities||{}).filter(([,v])=>v).map(([k])=>"'"+k.replaceAll("'","''")+"'").join(',');
+ const refs=current(sourceAccessSQL(actor,'tr',false));
+ const rename=sql=>current(sql).replace(/\b(c|t|g|s|cp)\b/g,name=>'task_acl_'+name);
+ const linked=can(actor,'communications.view')?`EXISTS(SELECT 1 FROM comms_task_links cl JOIN conversations task_acl_c ON task_acl_c.id=cl.conversation_id ${rename(conversationJoins)} WHERE cl.task_id=${alias}.id AND cl.company_id=${company} AND cl.revoked_at IS NULL AND ${dependenciesReadySQL('cl.source_dependencies',company)} AND (cl.source_type<>'recording_review' OR comms_recording_task_ready(cl.source_id)) AND ${rename(conversationAccessSQL(actor))} AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements_text(cl.requirements) k WHERE NOT(k=ANY(ARRAY[${allowed}]::text[]))) AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(cl.source_refs) tr(source_type text,source_id text,context_type text,context_id text) WHERE NOT ${refs}))`:'false';
+ return `(NOT EXISTS(SELECT 1 FROM comms_task_links acl WHERE acl.task_id=${alias}.id) OR ${linked})`;
+}
+export async function validateTaskAudience(db,input,link,assignees){
+ const actor=await loadActor(db,input);if(!(await db.query(`SELECT ${dependenciesReadySQL('$1::jsonb','$2::uuid')} AS ready`,[JSON.stringify(link.source_dependencies||[]),actor.companyId])).rows[0].ready)fail(403,'task_source_unavailable');await authorizeConversation(db,actor,link.conversation_id);requireCapability(actor,'tasks.manage');requireCapability(actor,'communications.tasks');
+ for(const person of [...new Set([actor.userId,...ids(assignees,20)])]){
+  const target=await loadActor(db,{userId:person,companyId:actor.companyId});requireCapability(target,'tasks.view');await authorizeConversation(db,target,link.conversation_id);
+  for(const key of link.requirements||[])requireCapability(target,key);
+  const cards=await hydrateSources(db,target,link.source_refs||[]);if([...cards.values()].some(x=>!x.accessible||x.text==='Unavailable'))fail(403,'assignee_source_unavailable');
+ }
+ return actor;
+}
+export async function createTaskInTransaction(db,input,source,body){
+ const actor=await loadActor(db,input);requireCapability(actor,'communications.tasks');requireCapability(actor,'tasks.manage');
+ let link;
+ if(typeof source==='string'){
+  const row=(await db.query(`SELECT m.*,COALESCE(m.conversation_id,t.conversation_id) AS canonical_conversation_id FROM messages m LEFT JOIN comms_threads t ON t.legacy_channel_id=m.channel_id WHERE m.id=$1 AND m.company_id=$2 AND m.deleted_at IS NULL`,[id(source),actor.companyId])).rows[0];if(!row)fail(404,'message_unavailable');
+  await authorizeConversation(db,actor,row.canonical_conversation_id);const refs=(await db.query('SELECT source_type,source_id,context_type,context_id,provenance FROM comms_cards WHERE message_id=$1 ORDER BY sort_order',[source])).rows;
+  // Snapshot notification content can have additional provenance; carry it without copying the inbox row.
+  const requirements=new Set();const sourceRefs=[],dependencies=[];for(const ref of refs){if(ref.source_type==='notification'){for(const key of ref.provenance.requirements||[])requirements.add(key);sourceRefs.push(...ref.provenance.source_refs||[]);if(ref.provenance.conversation_id&&ref.provenance.conversation_id!==row.canonical_conversation_id)fail(409,'task_source_requires_original_conversation');}else if(ref.source_type==='task'){const parent=(await db.query('SELECT * FROM comms_task_links WHERE task_id=$1',[ref.source_id])).rows[0];if(parent){if(parent.revoked_at||parent.conversation_id!==row.canonical_conversation_id)fail(409,'task_source_requires_original_conversation');for(const key of parent.requirements||[])requirements.add(key);sourceRefs.push(...parent.source_refs||[]);dependencies.push({source_type:'task',source_id:parent.task_id},...parent.source_dependencies||[]);if(parent.source_type==='recording_review')dependencies.push({source_type:'recording_review',source_id:parent.source_id});}else sourceRefs.push(ref);}else sourceRefs.push(ref);}
+  const assetRows=(await db.query('SELECT f.id,f.category,cs.conversation_id,cs.capability FROM comms_asset_refs ar JOIN stored_files f ON f.id=ar.asset_id LEFT JOIN comms_asset_conversation_sources cs ON cs.asset_id=f.id WHERE ar.message_id=$1',[source])).rows;
+  for(const asset of assetRows){dependencies.push({source_type:'asset',source_id:asset.id});requirements.add('storage.view');if(asset.category==='audio')requirements.add('audio.view');if(['image','video'].includes(asset.category))requirements.add('media.view');if(asset.conversation_id){if(asset.conversation_id!==row.canonical_conversation_id)fail(409,'task_source_requires_original_conversation');requirements.add(asset.capability);}}
+  const assetSources=(await db.query('SELECT p.source_type,p.source_id,p.context_type,p.context_id FROM comms_asset_refs ar JOIN comms_asset_provenance p ON p.asset_id=ar.asset_id WHERE ar.message_id=$1',[source])).rows;sourceRefs.push(...assetSources);
+  link={conversation_id:row.canonical_conversation_id,source_type:'message',source_id:source,source_refs:sourceRefs,requirements:[...requirements],source_dependencies:normalizeDependencies(dependencies)};
+ }else{
+  if(!source||!['recording_review','workflow'].includes(source.source_type))fail(400,'invalid_task_source');link={conversation_id:id(source.conversation_id),source_type:source.source_type,source_id:id(source.source_id),source_refs:source.source_refs||[],requirements:source.requirements||[],source_dependencies:normalizeDependencies(source.source_dependencies||[])};if(source.source_type==='recording_review')link.source_dependencies=normalizeDependencies([...link.source_dependencies,{source_type:'recording_review',source_id:source.source_id}]);
+ }
+ if(typeof source==='object'&&source.asset_ids?.length){
+  const assetIds=ids(source.asset_ids,20),files=(await db.query('SELECT f.id,f.category,cs.conversation_id,cs.capability FROM stored_files f LEFT JOIN comms_asset_conversation_sources cs ON cs.asset_id=f.id WHERE f.id::text=ANY($1::text[]) AND f.company_id=$2',[assetIds,actor.companyId])).rows;
+  if(new Set(files.map(file=>file.id)).size!==assetIds.length)fail(403,'task_source_unavailable');
+  for(const file of files){link.source_dependencies.push({source_type:'asset',source_id:file.id});link.requirements.push('storage.view');if(file.category==='audio')link.requirements.push('audio.view');if(['image','video'].includes(file.category))link.requirements.push('media.view');if(file.conversation_id){if(file.conversation_id!==link.conversation_id)fail(409,'task_source_requires_original_conversation');link.requirements.push(file.capability);}}
+  link.source_refs.push(...(await db.query('SELECT source_type,source_id,context_type,context_id FROM comms_asset_provenance WHERE asset_id::text=ANY($1::text[])',[assetIds])).rows);
+ }
+ // Typed workflow inputs may also reference derived tasks. Expand immutable source
+ // refs while retaining every parent's readiness/deletion boundary; never drop it.
+ const pending=[...link.source_refs],expanded=[],dependencies=[...link.source_dependencies],requirements=new Set(link.requirements),seenTasks=new Set();
+ while(pending.length){if(pending.length+expanded.length>100)fail(400,'task_dependency_limit');const ref=pending.shift();if(ref.source_type!=='task'){expanded.push(ref);continue;}const parent=(await db.query('SELECT * FROM comms_task_links WHERE task_id=$1',[ref.source_id])).rows[0];if(!parent){expanded.push(ref);continue;}if(parent.revoked_at||parent.company_id!==actor.companyId||parent.conversation_id!==link.conversation_id)fail(409,'task_source_requires_original_conversation');if(seenTasks.has(parent.task_id))continue;seenTasks.add(parent.task_id);dependencies.push({source_type:'task',source_id:parent.task_id},...parent.source_dependencies||[]);if(parent.source_type==='recording_review')dependencies.push({source_type:'recording_review',source_id:parent.source_id});for(const capability of parent.requirements||[])requirements.add(capability);pending.push(...parent.source_refs||[]);}
+ link.source_refs=expanded;link.requirements=[...requirements];link.source_dependencies=normalizeDependencies(dependencies);
+ const key=id(body.client_key),assignees=ids(body.assignee_ids||[actor.userId],20);if(!assignees.length)fail(400,'task_assignee_required');await validateTaskAudience(db,actor,link,assignees);
+ await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['comms-task:'+actor.userId+':'+key]);
+ const prior=(await db.query('SELECT t.*,l.conversation_id,l.source_type,l.source_id FROM comms_task_links l JOIN todo_tasks t ON t.id=l.task_id WHERE l.company_id=$1 AND l.created_by=$2 AND l.client_key=$3',[actor.companyId,actor.userId,key])).rows[0];if(prior){if(prior.source_id!==link.source_id||prior.source_type!==link.source_type)fail(409,'idempotency_conflict');return {...prior,comms_protected:true};}
+ const due=body.due_date==null?null:new Date(body.due_date);if(due&&!Number.isFinite(due.getTime()))fail(400,'invalid_due_date');const taskId=randomUUID();
+ const task=(await db.query(`INSERT INTO todo_tasks(id,user_id,title,detail,creator_id,assignee_ids,due_date,priority,status) VALUES($1,$2,$3,$4,$2,$5,$6,$7,'open') RETURNING *`,[taskId,actor.userId,text(body.title,300),text(body.detail||'',10000,false),JSON.stringify(assignees),due,body.priority==='high'?'high':body.priority==='low'?'low':'normal'])).rows[0];
+ await db.query(`INSERT INTO comms_task_links(task_id,company_id,conversation_id,source_type,source_id,source_refs,requirements,created_by,client_key,source_dependencies) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,[taskId,actor.companyId,link.conversation_id,link.source_type,link.source_id,JSON.stringify(link.source_refs),JSON.stringify(link.requirements),actor.userId,key,JSON.stringify(link.source_dependencies)]);
+ await db.query(`INSERT INTO comms_automation_outbox(id,company_id,actor_id,event_type,subject_type,subject_id,payload) VALUES($1,$2,$3,'comms.task.created','task',$4,$5)`,[randomUUID(),actor.companyId,actor.userId,taskId,JSON.stringify({task_id:taskId,source:'company_comms',private_source:true})]);
+ await audit(db,actor,'task_created','task',taskId,{source_type:link.source_type,source_id:link.source_id});await publish(db,actor,link.conversation_id,'task.changed',taskId);return {...task,...link,comms_protected:true};
+}

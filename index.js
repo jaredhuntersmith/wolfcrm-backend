@@ -1,3 +1,10 @@
+import { apiRequestID, installAPIFallback } from "./api-errors.js";
+import {installJobHuddles,authorizeCommsCallConversation} from './company-comms/job-huddles.js';
+import {installCollaboration} from './company-comms/collaboration.js';
+import {takeRateLimit} from './company-comms/rate-limits.js';
+import {taskAccessSQL,validateTaskAudience} from './company-comms/tasks.js';
+import { installPermissionGovernanceSchema, installPermissionGovernanceRoutes, ownerIdentity } from "./permission-governance.js";
+import { enforceSensitiveRoute } from "./permission-routes.js";
 import { installStripeAccountManagementSchema, installStripeAccountManagement, stripeConnectionOptions } from "./stripe-account-management.js";
 import { priceQuoteForPlan } from "./plan-quote-publication.js";
 import { monthlyPlanRevenueCents } from "./service-plan-metrics.js";
@@ -198,6 +205,13 @@ import {
 import { installWebsiteBuilderSystem } from "./website-builder.js";
 import { installRoutineGroupSystem } from "./routine-groups.js";
 import { installMediaStorage } from "./media-storage/index.js";
+import { installCommsCompatibility } from "./company-comms/compatibility.js";
+import { installCommsAudit } from "./company-comms/audit.js";
+import { installCommsQuoteExports } from "./company-comms/quote-exports.js";
+import { installCompanyComms } from "./company-comms/index.js";
+import { installCommsCalls } from "./company-comms/calls/index.js";
+import { storagePredicate } from "./company-comms/assets.js";
+import { authorizeConversation, publish as publishComms, loadActor as loadCommsActor } from "./company-comms/access.js";
 import { installFocusSystem } from "./focus.js";
 import {
   LightingInputError,
@@ -208,6 +222,7 @@ import {
 
 const { Pool } = pkg;
 const app = express();
+app.use("/api", apiRequestID);
 const PORT = process.env.PORT || 8080;
 const googleRoutingService = createGoogleRoutingService();
 const googleWeatherService = createGoogleWeatherService();
@@ -409,6 +424,7 @@ async function pushEligibleUsers(userIds, category) {
 }
 
 async function sendPushToUsers(userIds, category, options) {
+  if (app.locals.comms && !options?.inboxDelivery) return app.locals.comms.notifications.fromPush(userIds, category, options);
   const eligible = await pushEligibleUsers(userIds, category);
   console.log("[push] event", { category, userCount: eligible.length });
   if (!eligible.length) return { skipped: true, reason: "preference_disabled" };
@@ -551,6 +567,7 @@ app.use(cors());
 app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }));
 // Focus receives only Meta-signed raw bytes on its webhook route. This must
 // remain before the JSON parser so a later handler can verify the exact body.
+app.use("/api/comms/livekit/webhook", express.raw({ type: ["application/webhook+json", "application/json"], limit: "1mb" }));
 app.use("/api/focus/webhooks/meta", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/api/agreements/assets", express.json({ limit: "14mb" }));
 app.use("/api/quotes/:id/publish", express.json({ limit: "16mb" }));
@@ -2693,6 +2710,7 @@ async function bootstrap() {
     END $$;
   `);
 
+  await installPermissionGovernanceSchema(pool);
   await installStripeAccountManagementSchema(pool);
   await installServiceCatalogSchema(pool);
   await installAgreementSchema(pool);
@@ -2707,9 +2725,10 @@ async function authRequired(req, res, next) {
     `UPDATE sessions s
        SET last_used_at = now()
        FROM users u
-       LEFT JOIN employee_permissions p ON p.user_id = u.id
+       LEFT JOIN companies c ON c.id=u.company_id
+       LEFT JOIN employee_permissions p ON p.user_id = u.id AND p.company_id=u.company_id
       WHERE s.token = $1 AND u.id = s.user_id AND u.deleted_at IS NULL
-      RETURNING s.user_id, u.email, u.role, u.company_id,
+      RETURNING s.user_id, u.email, u.role, u.company_id, c.owner_user_id, COALESCE(p.permission_revision,0) AS permission_revision,
                 COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts,
                 COALESCE(p.can_view_finance, u.role = 'employer') AS can_view_finance,
                 COALESCE(p.can_use_finance_ai, u.role = 'employer') AS can_use_finance_ai,
@@ -2738,10 +2757,14 @@ async function authRequired(req, res, next) {
   if (!rows.length) return res.status(401).json({ error: "unauthorized" });
   req.userId = rows[0].user_id;
   req.userEmail = rows[0].email;
-  req.role = rows[0].role;
+  req.isCompanyOwner = ownerIdentity(rows[0]);
+  req.ownerUserId = rows[0].owner_user_id;
+  req.permissionRevision = Number(rows[0].permission_revision);
+  req.role = req.isCompanyOwner ? "employer" : "employee";
   req.companyId = rows[0].company_id;
   const access = resolveAccess({
-    role: rows[0].role,
+    role: req.role,
+    isOwner: req.isCompanyOwner,
     preset: rows[0].permission_preset,
     overrides: rows[0].permission_overrides,
     legacy: rows[0]
@@ -2773,13 +2796,15 @@ async function authRequired(req, res, next) {
     overrides: access.overrides,
     capabilities: access.capabilities
   };
+  const effectiveLegacy = legacyColumnsForCapabilities(access.capabilities);
+  for (const [key,value] of Object.entries(effectiveLegacy)) req.permissions[key.replace(/_([a-z])/g,(_,letter)=>letter.toUpperCase())] = value;
   req.permissionPayload = employeePermissionPayload({ ...rows[0], access });
   req.sessionToken = token;
-  next();
+  if (enforceSensitiveRoute(req,res)) next();
 }
 
 function requireEmployer(req, res, next) {
-  if (req.role !== "employer") return res.status(403).json({ error: "employer_required" });
+  if (!req.isCompanyOwner) return res.status(403).json({ error: "employer_required" });
   next();
 }
 
@@ -3170,7 +3195,9 @@ function userPayload(user, permissions = null, company = null) {
   return {
     id: user.id,
     email: user.email,
-    role: user.role,
+    role: ownerIdentity(user) ? "employer" : "employee",
+    is_company_owner: ownerIdentity(user),
+    permission_revision: Number(user.permission_revision || 0),
     company_id: user.company_id,
     display_name: user.display_name,
     photo_url: user.photo_url,
@@ -3182,11 +3209,12 @@ function userPayload(user, permissions = null, company = null) {
 function employeePermissionPayload(row = {}) {
   const access = row.access || resolveAccess({
     role: row.role,
+    isOwner: ownerIdentity(row),
     preset: row.permission_preset,
     overrides: row.permission_overrides,
     legacy: row
   });
-  const legacy = row.role === "employer" ? legacyColumnsForCapabilities(access.capabilities) : row;
+  const legacy = legacyColumnsForCapabilities(access.capabilities);
   return {
     can_delete_contacts: !!legacy.can_delete_contacts,
     can_view_finance: !!legacy.can_view_finance,
@@ -3413,28 +3441,11 @@ function sendDashboardLayoutError(res, error, fallbackCode) {
 
 async function createNotification(userId, companyId, kind, title, body, data = {}) {
   if (!userId) return;
-  await pool.query(
-    `INSERT INTO notifications(id, user_id, company_id, kind, title, body, data)
-     VALUES($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-    [randomUUID(), userId, companyId || null, kind, title, body || null, JSON.stringify(data || {})]
-  );
+  if (app.locals.comms) return app.locals.comms.notifications.enqueue(pool, {userId,companyId,kind,title,body:body||'',data});
+  await pool.query(`INSERT INTO notifications(id,user_id,company_id,kind,title,body,data) VALUES($1,$2,$3,$4,$5,$6,$7)`, [randomUUID(),userId,companyId,kind,title,body||null,JSON.stringify(data)]);
 }
-
 async function notifyMany(userIds, companyId, kind, title, body, data = {}, skipUserId = null) {
-  const unique = [...new Set((userIds || []).filter(Boolean))].filter((id) => id !== skipUserId);
-  for (const userId of unique) {
-    await createNotification(userId, companyId, kind, title, body, data);
-  }
-  if (["internal_message", "channel_message", "job_assignment", "job_scheduled"].includes(kind)) {
-    await sendPushToUsers(unique, kind, {
-      title,
-      body,
-      payload: { type: kind, ...(data || {}) },
-      threadId: kind
-    }).catch((e) => {
-      console.error("[push] notifyMany APNs failed:", { category: kind, code: e?.code, message: e?.message });
-    });
-  }
+  for (const userId of [...new Set((userIds||[]).filter(Boolean))].filter(id=>id!==skipUserId)) await createNotification(userId,companyId,kind,title,body,data);
 }
 
 function parseAttachments(input) {
@@ -3531,6 +3542,7 @@ app.post("/auth/signup", async (req, res) => {
           [email, hashPassword(password), role, company.id]
         );
     const user = rows[0];
+    user.owner_user_id = role === "employer" ? user.id : company.owner_user_id;
 
     if (role === "employer") {
       await pool.query(`UPDATE companies SET owner_user_id = $1 WHERE id = $2`, [user.id, company.id]);
@@ -3578,7 +3590,7 @@ app.post("/auth/login", async (req, res) => {
     const email = normalizeEmail(req.body.email);
     const password = (req.body.password || "").toString();
     const { rows } = await pool.query(
-      `SELECT u.*, c.name AS company_name, c.join_code, to_jsonb(p) AS permission_record
+      `SELECT u.*, c.owner_user_id, c.name AS company_name, c.join_code, to_jsonb(p) AS permission_record
          FROM users u
          LEFT JOIN companies c ON c.id = u.company_id
          LEFT JOIN employee_permissions p ON p.user_id = u.id
@@ -3738,7 +3750,7 @@ app.get("/me", authRequired, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT u.id, u.email, u.role, u.company_id, u.created_at,
             u.display_name, u.photo_url,
-            c.name AS company_name, c.join_code,
+            c.owner_user_id, COALESCE(p.permission_revision,0) AS permission_revision, c.name AS company_name, c.join_code,
             COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts,
             COALESCE(p.can_view_finance, u.role = 'employer') AS can_view_finance,
             COALESCE(p.can_use_finance_ai, u.role = 'employer') AS can_use_finance_ai,
@@ -4180,7 +4192,7 @@ app.post("/api/phone/lines/attach-existing", authRequired, requireCapability("in
   }
 });
 
-app.get("/api/voice/token", authRequired, requireCapability("messaging.customer.send"), async (req, res) => {
+app.get("/api/voice/token", authRequired, requireCapability("customer.calls.place"), async (req, res) => {
   if (!req.userId || !req.companyId) {
     return res.status(400).json({ error: "company_required" });
   }
@@ -4237,7 +4249,7 @@ app.get("/api/voice/token", authRequired, requireCapability("messaging.customer.
   }
 });
 
-app.get("/api/voice/diagnostics", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/voice/diagnostics", authRequired, requireCapability("customer.calls.view"), async (req, res) => {
   const { configured, twimlAppSid, pushCredentialSid } = twilioVoiceConfig();
   const voiceIdentity = voiceIdentityForUserID(req.userId);
   try {
@@ -4995,7 +5007,7 @@ app.post("/webhooks/twilio/voice/status", async (req, res) => {
   }
 });
 
-app.get("/api/phone/calls", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/calls", authRequired, requireCapability("customer.calls.view"), async (req, res) => {
   if (!req.companyId) return res.json([]);
   const limit = Math.min(Math.max(parseInt(req.query.limit || "100", 10) || 100, 1), 200);
   try {
@@ -5048,7 +5060,7 @@ app.get("/api/phone/unread-count", authRequired, requireCapability("messaging.cu
   }
 });
 
-app.get("/api/phone/voicemails", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/voicemails", authRequired, requireCapability("customer.calls.view"), async (req, res) => {
   if (!req.companyId) return res.json([]);
   const limit = Math.min(Math.max(parseInt(req.query.limit || "100", 10) || 100, 1), 200);
   try {
@@ -5078,7 +5090,7 @@ app.get("/api/phone/voicemails", authRequired, requireCapability("messaging.cust
   }
 });
 
-app.post("/api/phone/voicemails/:id/read", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.post("/api/phone/voicemails/:id/read", authRequired, requireCapability("customer.calls.view"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
   try {
     const { rows } = await pool.query(
@@ -5119,7 +5131,7 @@ app.post("/api/phone/voicemails/:id/read", authRequired, requireCapability("mess
   }
 });
 
-app.delete("/api/phone/voicemails/:id", authRequired, requireCapability("messaging.customer.delete"), async (req, res) => {
+app.delete("/api/phone/voicemails/:id", authRequired, requireCapability("customer.calls.delete"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
   try {
     const { rows } = await pool.query(
@@ -5173,7 +5185,7 @@ app.delete("/api/phone/voicemails/:id", authRequired, requireCapability("messagi
   }
 });
 
-app.get("/api/phone/voicemails/:id/audio", authRequired, requireCapability("messaging.customer.view"), async (req, res) => {
+app.get("/api/phone/voicemails/:id/audio", authRequired, requireCapability("customer.calls.view"), async (req, res) => {
   if (!req.companyId) return res.status(404).json({ error: "voicemail_not_found" });
   try {
     const { rows } = await pool.query(
@@ -5799,7 +5811,7 @@ app.patch("/api/profile", authRequired, async (req, res) => {
         RETURNING id, email, role, company_id, display_name, photo_url`,
       [req.userId, displayName || null, photoUrl || null]
     );
-    res.json({ user: userPayload(rows[0], req.permissionPayload, null) });
+    res.json({ user: userPayload({...rows[0],owner_user_id:req.ownerUserId,permission_revision:req.permissionRevision}, req.permissionPayload, null) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "profile_update_failed" });
@@ -6640,6 +6652,7 @@ app.delete("/api/company/employees/:id", authRequired, requireEmployer, async (r
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('comms-permissions:' || $1,0))",[targetId]);
     // Verify target is an employee in this company and is not an employer.
     const check = await client.query(
       `SELECT id, role, deleted_at FROM users WHERE id = $1 AND company_id = $2 FOR UPDATE`,
@@ -6649,7 +6662,7 @@ app.delete("/api/company/employees/:id", authRequired, requireEmployer, async (r
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "employee_not_found" });
     }
-    if (check.rows[0].role === "employer") {
+    if (targetId === req.ownerUserId || check.rows[0].role === "employer") {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "cannot_delete_employer", message: "The employer/owner account cannot be removed." });
     }
@@ -6674,6 +6687,9 @@ app.delete("/api/company/employees/:id", authRequired, requireEmployer, async (r
     await client.query(`DELETE FROM password_reset_codes WHERE email IN (SELECT pre_delete_email FROM users WHERE id = $1)`, [targetId]);
     await client.query(`DELETE FROM magic_tokens WHERE email IN (SELECT pre_delete_email FROM users WHERE id = $1)`, [targetId]);
     await client.query(`DELETE FROM device_tokens WHERE user_id = $1`, [targetId]);
+    await client.query(`INSERT INTO permission_change_outbox(id,company_id,user_id,permission_revision,reason)
+      VALUES($1,$2,$3,(SELECT COALESCE(MAX(permission_revision),0)+1 FROM employee_permissions WHERE user_id=$3),'account_deactivated')`,[randomUUID(),req.companyId,targetId]);
+    await client.query(`DELETE FROM employee_access_delegations WHERE user_id=$1`,[targetId]);
     await client.query(`DELETE FROM employee_permissions WHERE user_id = $1`, [targetId]);
     await client.query("COMMIT");
     try {
@@ -6698,28 +6714,34 @@ app.delete("/api/company/employees/:id", authRequired, requireEmployer, async (r
 // regain access.
 app.post("/api/company/employees/:id/restore", authRequired, requireEmployer, async (req, res) => {
   const targetId = req.params.id;
+  if (targetId === req.ownerUserId) return res.status(403).json({error:"owner_protected"});
   if (!targetId) return res.status(400).json({ error: "bad_id" });
+  const client = await pool.connect();
   try {
-    const check = await pool.query(
-      `SELECT id, deleted_at, pre_delete_email FROM users WHERE id = $1 AND company_id = $2`,
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('comms-permissions:' || $1,0))",[targetId]);
+    const check = await client.query(
+      `SELECT id, deleted_at, pre_delete_email FROM users WHERE id = $1 AND company_id = $2 FOR UPDATE`,
       [targetId, req.companyId]
     );
-    if (!check.rowCount) return res.status(404).json({ error: "employee_not_found" });
+    if (!check.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "employee_not_found" }); }
     if (!check.rows[0].deleted_at) {
+      await client.query("ROLLBACK");
       return res.status(409).json({ error: "not_deleted", message: "This employee is already active." });
     }
     const originalEmail = check.rows[0].pre_delete_email;
     // Check the original email isn't now taken by someone else.
     if (originalEmail) {
-      const collision = await pool.query(
+      const collision = await client.query(
         `SELECT id FROM users WHERE email = $1 AND id <> $2 LIMIT 1`,
         [originalEmail, targetId]
       );
       if (collision.rowCount) {
+        await client.query("ROLLBACK");
         return res.status(409).json({ error: "email_taken", message: "The original email is already in use by another account. Update the employee's email after restoring." });
       }
     }
-    await pool.query(
+    await client.query(
       `UPDATE users SET
          email = COALESCE(pre_delete_email, email),
          pre_delete_email = NULL,
@@ -6728,6 +6750,11 @@ app.post("/api/company/employees/:id/restore", authRequired, requireEmployer, as
        WHERE id = $1`,
       [targetId]
     );
+    const restoredPermission = await client.query(`INSERT INTO employee_permissions(user_id,company_id,permission_preset,permission_revision)
+      VALUES($1,$2,'technician',(SELECT COALESCE(MAX(permission_revision),0)+1 FROM permission_change_outbox WHERE user_id=$1))
+      ON CONFLICT(user_id) DO UPDATE SET permission_preset='technician',permission_overrides='{}'::jsonb,permission_revision=employee_permissions.permission_revision+1 RETURNING permission_revision`,[targetId,req.companyId]);
+    await client.query(`INSERT INTO permission_change_outbox(id,company_id,user_id,permission_revision,reason) VALUES($1,$2,$3,$4,'account_restored')`,[randomUUID(),req.companyId,targetId,restoredPermission.rows[0].permission_revision]);
+    await client.query("COMMIT");
     try {
       await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.reactivated", subjectType: "employee", subjectId: targetId, actorUserId: req.userId, source: "ios", payload: { employee_id: targetId, active: true } });
     } catch (automationErr) {
@@ -6736,257 +6763,14 @@ app.post("/api/company/employees/:id/restore", authRequired, requireEmployer, as
     console.log("[employees] restored", { targetId, by: req.userId, company: req.companyId });
     res.json({ success: true });
   } catch (e) {
+    await client.query("ROLLBACK").catch(()=>{});
     console.error("[employees] restore failed:", e && e.message ? e.message : e);
     res.status(500).json({ error: "restore_failed", message: "Could not restore that employee." });
-  }
+  } finally { client.release(); }
 });
 
-app.put("/api/company/employees/:id/access", authRequired, requireEmployer, async (req, res) => {
-  let requestedAccess;
-  try {
-    requestedAccess = validateAccessUpdate(req.body);
-  } catch (error) {
-    return res.status(error.statusCode || 400).json({
-      error: error.code || "invalid_permission_document",
-      message: error.message,
-      details: error.details || undefined
-    });
-  }
-
-  const targetId = req.params.id;
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const employeeResult = await client.query(
-      `SELECT id, role, deleted_at
-         FROM users
-        WHERE id = $1 AND company_id = $2
-        FOR UPDATE`,
-      [targetId, req.companyId]
-    );
-    const employee = employeeResult.rows[0];
-    if (!employee || employee.role !== "employee") {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "employee_not_found" });
-    }
-    if (employee.deleted_at) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "employee_inactive", message: "Restore the employee before changing access." });
-    }
-
-    const existingResult = await client.query(
-      `SELECT * FROM employee_permissions WHERE user_id = $1 AND company_id = $2`,
-      [targetId, req.companyId]
-    );
-    const existing = existingResult.rows[0] || {};
-    const previousAccess = resolveAccess({
-      role: employee.role,
-      preset: existing.permission_preset,
-      overrides: existing.permission_overrides,
-      legacy: existing
-    });
-    const persisted = await persistEmployeeAccess(client, {
-      employeeUserId: targetId,
-      companyId: req.companyId,
-      access: requestedAccess
-    });
-    await client.query(
-      `INSERT INTO employee_permission_audit(
-         company_id, employee_user_id, changed_by_user_id,
-         previous_preset, previous_overrides, new_preset, new_overrides
-       ) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7::jsonb)`,
-      [
-        req.companyId,
-        targetId,
-        req.userId,
-        previousAccess.preset,
-        JSON.stringify(previousAccess.overrides),
-        requestedAccess.preset,
-        JSON.stringify(requestedAccess.overrides)
-      ]
-    );
-    await client.query("COMMIT");
-
-    try {
-      const changedCapabilities = Object.keys(requestedAccess.capabilities).filter(
-        (key) => requestedAccess.capabilities[key] !== previousAccess.capabilities[key]
-      );
-      await emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "employee.permission_changed",
-        subjectType: "employee",
-        subjectId: targetId,
-        actorUserId: req.userId,
-        source: "ios",
-        payload: {
-          employee_id: targetId,
-          previous_preset: previousAccess.preset,
-          new_preset: requestedAccess.preset,
-          changed_capabilities: changedCapabilities
-        }
-      });
-    } catch (automationError) {
-      console.warn("[automations] employee access hook failed", automationError?.message || automationError);
-    }
-
-    res.json({
-      id: targetId,
-      access: requestedAccess,
-      permissions: employeePermissionPayload({ ...persisted.row, role: "employee", access: requestedAccess })
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("[permissions] employee access update failed", error?.message || error);
-    res.status(500).json({ error: "permissions_update_failed" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/api/company/employees/:id/access-audit", authRequired, requireEmployer, async (req, res) => {
-  try {
-    const employee = await pool.query(
-      `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND role = 'employee'`,
-      [req.params.id, req.companyId]
-    );
-    if (!employee.rowCount) return res.status(404).json({ error: "employee_not_found" });
-    const { rows } = await pool.query(
-      `SELECT a.id,
-              a.employee_user_id,
-              a.changed_by_user_id,
-              actor.display_name AS changed_by_display_name,
-              actor.email AS changed_by_email,
-              a.previous_preset,
-              a.previous_overrides,
-              a.new_preset,
-              a.new_overrides,
-              a.created_at
-         FROM employee_permission_audit a
-         LEFT JOIN users actor ON actor.id = a.changed_by_user_id
-        WHERE a.company_id = $1 AND a.employee_user_id = $2
-        ORDER BY a.created_at DESC
-        LIMIT 100`,
-      [req.companyId, req.params.id]
-    );
-    res.json({ entries: rows });
-  } catch (error) {
-    console.error("[permissions] access audit load failed", error?.message || error);
-    res.status(500).json({ error: "permission_audit_failed" });
-  }
-});
-
-app.put("/api/company/employees/:id/permissions", authRequired, requireEmployer, async (req, res) => {
-  try {
-    const employee = await pool.query(
-      `SELECT u.id, to_jsonb(p) AS permission_record
-         FROM users u
-         LEFT JOIN employee_permissions p ON p.user_id = u.id
-        WHERE u.id = $1 AND u.company_id = $2 AND u.role = 'employee'`,
-      [req.params.id, req.companyId]
-    );
-    if (!employee.rowCount) return res.status(404).json({ error: "employee_not_found" });
-    const existing = employee.rows[0].permission_record || {};
-    const requestedBoolean = (key) => Object.hasOwn(req.body || {}, key) ? !!req.body[key] : !!existing[key];
-    const canDelete = requestedBoolean("can_delete_contacts");
-    const financePermissions = {
-      can_view_finance: requestedBoolean("can_view_finance"),
-      can_use_finance_ai: requestedBoolean("can_use_finance_ai"),
-      can_view_finance_transactions: requestedBoolean("can_view_finance_transactions"),
-      can_edit_finance_transactions: requestedBoolean("can_edit_finance_transactions"),
-      can_view_finance_accounts: requestedBoolean("can_view_finance_accounts"),
-      can_create_finance_accounts: requestedBoolean("can_create_finance_accounts"),
-      can_edit_finance_accounts: requestedBoolean("can_edit_finance_accounts"),
-      can_adjust_finance_account_balances: requestedBoolean("can_adjust_finance_account_balances"),
-      can_view_finance_receipts: requestedBoolean("can_view_finance_receipts"),
-      can_edit_finance_receipts: requestedBoolean("can_edit_finance_receipts"),
-      can_view_finance_planning: requestedBoolean("can_view_finance_planning"),
-      can_edit_finance_planning: requestedBoolean("can_edit_finance_planning"),
-      can_view_finance_budgets: requestedBoolean("can_view_finance_budgets"),
-      can_edit_finance_budgets: requestedBoolean("can_edit_finance_budgets"),
-      can_view_finance_goals: requestedBoolean("can_view_finance_goals"),
-      can_edit_finance_goals: requestedBoolean("can_edit_finance_goals"),
-      can_view_finance_debts: requestedBoolean("can_view_finance_debts"),
-      can_edit_finance_debts: requestedBoolean("can_edit_finance_debts"),
-      can_view_finance_settings: requestedBoolean("can_view_finance_settings"),
-      can_edit_finance_settings: requestedBoolean("can_edit_finance_settings"),
-      can_manage_company_finance_ai_memories: requestedBoolean("can_manage_company_finance_ai_memories")
-    };
-    const { rows } = await pool.query(
-      `INSERT INTO employee_permissions(
-         user_id, company_id, can_delete_contacts,
-         can_view_finance, can_use_finance_ai,
-         can_view_finance_transactions, can_edit_finance_transactions,
-         can_view_finance_accounts, can_create_finance_accounts, can_edit_finance_accounts, can_adjust_finance_account_balances,
-         can_view_finance_receipts, can_edit_finance_receipts,
-         can_view_finance_planning, can_edit_finance_planning,
-         can_view_finance_budgets, can_edit_finance_budgets,
-         can_view_finance_goals, can_edit_finance_goals,
-         can_view_finance_debts, can_edit_finance_debts,
-         can_view_finance_settings, can_edit_finance_settings,
-         can_manage_company_finance_ai_memories
-       )
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
-       ON CONFLICT(user_id) DO UPDATE
-         SET company_id = EXCLUDED.company_id,
-             can_delete_contacts = EXCLUDED.can_delete_contacts,
-             can_view_finance = EXCLUDED.can_view_finance,
-             can_use_finance_ai = EXCLUDED.can_use_finance_ai,
-             can_view_finance_transactions = EXCLUDED.can_view_finance_transactions,
-             can_edit_finance_transactions = EXCLUDED.can_edit_finance_transactions,
-             can_view_finance_accounts = EXCLUDED.can_view_finance_accounts,
-             can_create_finance_accounts = EXCLUDED.can_create_finance_accounts,
-             can_edit_finance_accounts = EXCLUDED.can_edit_finance_accounts,
-             can_adjust_finance_account_balances = EXCLUDED.can_adjust_finance_account_balances,
-             can_view_finance_receipts = EXCLUDED.can_view_finance_receipts,
-             can_edit_finance_receipts = EXCLUDED.can_edit_finance_receipts,
-             can_view_finance_planning = EXCLUDED.can_view_finance_planning,
-             can_edit_finance_planning = EXCLUDED.can_edit_finance_planning,
-             can_view_finance_budgets = EXCLUDED.can_view_finance_budgets,
-             can_edit_finance_budgets = EXCLUDED.can_edit_finance_budgets,
-             can_view_finance_goals = EXCLUDED.can_view_finance_goals,
-             can_edit_finance_goals = EXCLUDED.can_edit_finance_goals,
-             can_view_finance_debts = EXCLUDED.can_view_finance_debts,
-             can_edit_finance_debts = EXCLUDED.can_edit_finance_debts,
-             can_view_finance_settings = EXCLUDED.can_view_finance_settings,
-             can_edit_finance_settings = EXCLUDED.can_edit_finance_settings,
-             can_manage_company_finance_ai_memories = EXCLUDED.can_manage_company_finance_ai_memories,
-             updated_at = now()
-      RETURNING user_id AS id, can_delete_contacts,
-                can_view_finance, can_use_finance_ai,
-                can_view_finance_transactions, can_edit_finance_transactions,
-                can_view_finance_accounts, can_create_finance_accounts, can_edit_finance_accounts, can_adjust_finance_account_balances,
-                can_view_finance_receipts, can_edit_finance_receipts,
-                can_view_finance_planning, can_edit_finance_planning,
-                can_view_finance_budgets, can_edit_finance_budgets,
-                can_view_finance_goals, can_edit_finance_goals,
-                can_view_finance_debts, can_edit_finance_debts,
-                can_view_finance_settings, can_edit_finance_settings,
-                can_manage_company_finance_ai_memories`,
-      [
-        req.params.id, req.companyId, canDelete,
-        financePermissions.can_view_finance, financePermissions.can_use_finance_ai,
-        financePermissions.can_view_finance_transactions, financePermissions.can_edit_finance_transactions,
-        financePermissions.can_view_finance_accounts, financePermissions.can_create_finance_accounts, financePermissions.can_edit_finance_accounts, financePermissions.can_adjust_finance_account_balances,
-        financePermissions.can_view_finance_receipts, financePermissions.can_edit_finance_receipts,
-        financePermissions.can_view_finance_planning, financePermissions.can_edit_finance_planning,
-        financePermissions.can_view_finance_budgets, financePermissions.can_edit_finance_budgets,
-        financePermissions.can_view_finance_goals, financePermissions.can_edit_finance_goals,
-        financePermissions.can_view_finance_debts, financePermissions.can_edit_finance_debts,
-        financePermissions.can_view_finance_settings, financePermissions.can_edit_finance_settings,
-        financePermissions.can_manage_company_finance_ai_memories
-      ]
-    );
-    try {
-      await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.permission_changed", subjectType: "employee", subjectId: req.params.id, actorUserId: req.userId, source: "ios", payload: { employee_id: req.params.id, permission: "can_delete_contacts", new_value: canDelete } });
-    } catch (automationErr) {
-      console.warn("[automations] employee permission hook failed", automationErr?.message || automationErr);
-    }
-    res.json(rows[0]);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "permissions_update_failed" });
-  }
-});
+// Employee permission routes are installed by permission-governance.js.
+// Legacy /permissions shares the same owner boundary, transaction and audit.
 
 function weekRangeFromQuery(req) {
   const startRaw = (req.query.week_start || "").toString();
@@ -7018,452 +6802,19 @@ function canEmployeeChangeTimeEntry(start, now = new Date()) {
 // ---------- INTERNAL MESSAGING ----------
 app.get("/api/notifications", authRequired, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, kind, title, body, data, created_at, read_at
-         FROM notifications
-        WHERE user_id = $1
-        ORDER BY created_at DESC
-        LIMIT 100`,
-      [req.userId]
-    );
-    res.json(rows);
+    const result = await app.locals.comms.notifications.list(req, req.query);
+    res.json(result.notifications);
   } catch (e) { console.error(e); res.status(500).json({ error: "notifications_failed" }); }
 });
 
 app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
   try {
-    await pool.query(`UPDATE notifications SET read_at = now() WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    await app.locals.comms.notifications.change(req, {ids:[req.params.id],read:true});
     res.json({ ok: true });
   } catch (e) { console.error(e); res.status(500).json({ error: "notification_read_failed" }); }
 });
 
-app.post("/api/internal/media/upload-url", authRequired, requireCapability("communications.send"), async (req, res) => {
-  try {
-    const cfg = mediaBucketConfig();
-    const s3 = getMediaS3Client();
-    if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured" });
-
-    const kind = ["photo", "video", "file"].includes(req.body.kind) ? req.body.kind : "file";
-    const fileName = (req.body.file_name || "upload").toString().replace(/[^\w.\- ]+/g, "_").slice(0, 160);
-    const mimeType = (req.body.mime_type || "application/octet-stream").toString().slice(0, 120);
-    const byteSize = Number(req.body.byte_size || 0);
-    if (!Number.isFinite(byteSize) || byteSize <= 0) return res.status(400).json({ error: "invalid_file_size" });
-    if (byteSize > 200 * 1024 * 1024) return res.status(413).json({ error: "file_too_large" });
-
-    const scope = req.companyId || req.userId;
-    const objectKey = `companies/${scope}/messages/${new Date().toISOString().slice(0, 10)}/${randomUUID()}-${fileName}`;
-    const command = new PutObjectCommand({
-      Bucket: cfg.bucket,
-      Key: objectKey,
-      ContentType: mimeType
-    });
-    const upload_url = await getSignedUrl(s3, command, { expiresIn: 900 });
-    res.json({
-      object_key: objectKey,
-      upload_url,
-      kind,
-      file_name: fileName,
-      mime_type: mimeType,
-      byte_size: byteSize
-    });
-  } catch (e) { console.error(e); res.status(500).json({ error: "media_upload_url_failed" }); }
-});
-
-app.get("/api/internal/media/download-url", authRequired, requireCapability("communications.view"), async (req, res) => {
-  try {
-    const cfg = mediaBucketConfig();
-    const s3 = getMediaS3Client();
-    if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured" });
-
-    const objectKey = (req.query.object_key || "").toString();
-    const scope = req.companyId || req.userId;
-    if (!objectKey.startsWith(`companies/${scope}/messages/`)) {
-      return res.status(403).json({ error: "media_forbidden" });
-    }
-    const command = new GetObjectCommand({ Bucket: cfg.bucket, Key: objectKey });
-    const download_url = await getSignedUrl(s3, command, { expiresIn: 900 });
-    res.json({ download_url });
-  } catch (e) { console.error(e); res.status(500).json({ error: "media_download_url_failed" }); }
-});
-
-app.get("/api/internal/conversations", authRequired, requireCapability("communications.view"), async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT c.id, c.company_id, c.title, c.is_group, c.created_by, c.created_at, c.updated_at,
-              COALESCE((
-                SELECT json_agg(json_build_object(
-                  'id', u.id, 'email', u.email, 'role', u.role,
-                  'display_name', u.display_name, 'photo_url', u.photo_url
-                ) ORDER BY COALESCE(u.display_name, u.email))
-                FROM conversation_participants cp2
-                JOIN users u ON u.id = cp2.user_id
-                WHERE cp2.conversation_id = c.id
-              ), '[]'::json) AS participants,
-              lm.body AS latest_body,
-              lm.created_at AS latest_at,
-              (
-                SELECT COUNT(*)
-                  FROM messages m
-                 WHERE m.conversation_id = c.id
-                   AND m.sender_id <> $1
-                   AND m.deleted_at IS NULL
-                   AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01'::timestamptz)
-              )::int AS unread_count
-         FROM conversation_participants cp
-         JOIN conversations c ON c.id = cp.conversation_id
-         LEFT JOIN LATERAL (
-           SELECT body, created_at FROM messages
-            WHERE conversation_id = c.id
-            ORDER BY created_at DESC
-            LIMIT 1
-         ) lm ON true
-        WHERE cp.user_id = $1
-          AND c.deleted_at IS NULL
-        ORDER BY COALESCE(lm.created_at, c.updated_at) DESC`,
-      [req.userId]
-    );
-    res.json(rows);
-  } catch (e) { console.error(e); res.status(500).json({ error: "conversation_list_failed" }); }
-});
-
-app.post("/api/internal/conversations/private", authRequired, requireCapability("communications.send"), async (req, res) => {
-  const otherUserId = (req.body.user_id || "").toString();
-  if (!otherUserId || otherUserId === req.userId) return res.status(400).json({ error: "invalid_user" });
-  try {
-    const member = await pool.query(
-      req.companyId ? `SELECT id FROM users WHERE id = $1 AND company_id = $2` : `SELECT id FROM users WHERE id = $1`,
-      req.companyId ? [otherUserId, req.companyId] : [otherUserId]
-    );
-    if (!member.rows.length) return res.status(404).json({ error: "user_not_found" });
-    const existing = await pool.query(
-      `SELECT c.id
-         FROM conversations c
-         JOIN conversation_participants a ON a.conversation_id = c.id AND a.user_id = $1
-         JOIN conversation_participants b ON b.conversation_id = c.id AND b.user_id = $2
-        WHERE c.is_group = false
-          AND (SELECT COUNT(*) FROM conversation_participants cp WHERE cp.conversation_id = c.id) = 2
-        LIMIT 1`,
-      [req.userId, otherUserId]
-    );
-    if (existing.rows.length) return res.json({ id: existing.rows[0].id });
-    const id = project.id || randomUUID();
-    await pool.query(`INSERT INTO conversations(id, company_id, is_group, created_by) VALUES($1,$2,false,$3)`, [id, req.companyId || null, req.userId]);
-    await pool.query(
-      `INSERT INTO conversation_participants(id, conversation_id, user_id) VALUES($1,$2,$3),($4,$2,$5)`,
-      [randomUUID(), id, req.userId, randomUUID(), otherUserId]
-    );
-    if (req.companyId) {
-      emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "internal.conversation_created",
-        subjectType: "internal_conversation",
-        subjectId: id,
-        actorUserId: req.userId,
-        source: "ios",
-        dedupeKey: `internal.conversation_created:${id}`,
-        payload: { conversation_id: id, is_dm: true, recipient_user_ids: [otherUserId], sender_user_id: req.userId }
-      }).catch((e) => console.error("[internal/private] automation emission failed:", { code: e?.code, message: e?.message }));
-    }
-    res.status(201).json({ id });
-  } catch (e) { console.error(e); res.status(500).json({ error: "private_conversation_failed" }); }
-});
-
-app.post("/api/internal/conversations/group", authRequired, requireCapability("communications.send"), async (req, res) => {
-  const title = (req.body.title || "Group").toString().trim() || "Group";
-  const ids = [...new Set([req.userId, ...((Array.isArray(req.body.participant_ids) ? req.body.participant_ids : []).map(String))])];
-  if (ids.length < 2) return res.status(400).json({ error: "group_needs_members" });
-  try {
-    if (req.companyId) {
-      const valid = await pool.query(`SELECT id FROM users WHERE company_id = $1 AND id = ANY($2::uuid[])`, [req.companyId, ids]);
-      if (valid.rows.length !== ids.length) return res.status(400).json({ error: "invalid_participant" });
-    }
-    const id = randomUUID();
-    await pool.query(`INSERT INTO conversations(id, company_id, title, is_group, created_by) VALUES($1,$2,$3,true,$4)`, [id, req.companyId || null, title, req.userId]);
-    for (const userId of ids) {
-      await pool.query(`INSERT INTO conversation_participants(id, conversation_id, user_id) VALUES($1,$2,$3)`, [randomUUID(), id, userId]);
-    }
-    if (req.companyId) {
-      emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "internal.group_created",
-        subjectType: "internal_conversation",
-        subjectId: id,
-        actorUserId: req.userId,
-        source: "ios",
-        dedupeKey: `internal.group_created:${id}`,
-        payload: { conversation_id: id, title, recipient_user_ids: ids.filter((userId) => userId !== req.userId), sender_user_id: req.userId, is_group: true }
-      }).catch((e) => console.error("[internal/group] automation emission failed:", { code: e?.code, message: e?.message }));
-    }
-    res.status(201).json({ id });
-  } catch (e) { console.error(e); res.status(500).json({ error: "group_conversation_failed" }); }
-});
-
-app.get("/api/internal/conversations/:id/messages", authRequired, requireCapability("communications.view"), async (req, res) => {
-  try {
-    const member = await pool.query(`SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`, [req.params.id, req.userId]);
-    if (!member.rows.length) return res.status(403).json({ error: "not_participant" });
-    const { rows } = await pool.query(
-      `SELECT m.id, m.conversation_id, m.channel_id, m.sender_id, m.body, m.created_at, m.updated_at, m.deleted_at,
-              u.display_name AS sender_name, u.email AS sender_email, u.photo_url AS sender_photo_url
-         FROM messages m
-         JOIN users u ON u.id = m.sender_id
-        WHERE m.conversation_id = $1
-        ORDER BY m.created_at ASC
-        LIMIT 200`,
-      [req.params.id]
-    );
-    res.json(await messageRowsWithAttachments(rows));
-  } catch (e) { console.error(e); res.status(500).json({ error: "conversation_messages_failed" }); }
-});
-
-app.delete("/api/internal/conversations/:id", authRequired, requireCapability("communications.manage"), async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `UPDATE conversations
-          SET deleted_at = now(), updated_at = now()
-        WHERE id = $1
-          AND company_id = $2
-          AND deleted_at IS NULL
-        RETURNING id`,
-      [req.params.id, req.companyId]
-    );
-    if (!rows.length) return res.status(404).json({ error: "conversation_not_found" });
-    await pool.query(`UPDATE messages SET deleted_at = COALESCE(deleted_at, now()), body = '' WHERE conversation_id = $1 AND deleted_at IS NULL`, [req.params.id]);
-    res.status(204).end();
-  } catch (e) { console.error(e); res.status(500).json({ error: "delete_conversation_failed" }); }
-});
-
-app.post("/api/internal/conversations/:id/messages", authRequired, requireCapability("communications.send"), async (req, res) => {
-  const body = (req.body.body || "").toString();
-  const attachments = parseAttachments(req.body.attachments);
-  if (!body.trim() && !attachments.length) return res.status(400).json({ error: "empty_message" });
-  try {
-    const member = await pool.query(`SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`, [req.params.id, req.userId]);
-    if (!member.rows.length) return res.status(403).json({ error: "not_participant" });
-    const id = randomUUID();
-    const { rows } = await pool.query(
-      `INSERT INTO messages(id, conversation_id, sender_id, body) VALUES($1,$2,$3,$4)
-       RETURNING id, conversation_id, channel_id, sender_id, body, created_at, updated_at, deleted_at`,
-      [id, req.params.id, req.userId, body]
-    );
-    await attachRows(id, attachments);
-    await pool.query(`UPDATE conversations SET updated_at = now() WHERE id = $1`, [req.params.id]);
-    const recipients = await pool.query(`SELECT user_id FROM conversation_participants WHERE conversation_id = $1`, [req.params.id]);
-    const recipientIds = recipients.rows.map((r) => r.user_id).filter((userId) => userId !== req.userId);
-    if (req.companyId) {
-      const convo = await pool.query(`SELECT is_group FROM conversations WHERE id = $1 AND company_id = $2 LIMIT 1`, [req.params.id, req.companyId]);
-      const eventTypes = ["internal.message_sent", "internal.message_received", convo.rows[0]?.is_group ? "internal.group_message_received" : "internal.dm_received"];
-      if (attachments.length) eventTypes.push("internal.attachment_received");
-      for (const eventType of eventTypes) {
-        await emitAutomationEvent({
-          companyId: req.companyId,
-          eventType,
-          subjectType: "internal_message",
-          subjectId: id,
-          actorUserId: req.userId,
-          source: "ios",
-          dedupeKey: `${eventType}:${id}`,
-          payload: { message_id: id, conversation_id: req.params.id, sender_user_id: req.userId, recipient_user_ids: recipientIds, body, message_body: body, has_attachments: attachments.length > 0, attachment_count: attachments.length, conversation_type: convo.rows[0]?.is_group ? "group" : "dm" }
-        });
-      }
-    }
-    await notifyMany(recipients.rows.map((r) => r.user_id), req.companyId, "internal_message", "New message", body || "Attachment", { conversation_id: req.params.id, message_id: id }, req.userId);
-    res.status(201).json((await messageRowsWithAttachments(rows))[0]);
-  } catch (e) { console.error(e); res.status(500).json({ error: "send_conversation_message_failed" }); }
-});
-
-app.post("/api/internal/conversations/:id/read", authRequired, requireCapability("communications.view"), async (req, res) => {
-  try {
-    const result = await pool.query(`UPDATE conversation_participants SET last_read_at = now() WHERE conversation_id = $1 AND user_id = $2 RETURNING conversation_id`, [req.params.id, req.userId]);
-    if (result.rowCount && req.companyId) {
-      emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "internal.conversation_read",
-        subjectType: "internal_conversation",
-        subjectId: req.params.id,
-        actorUserId: req.userId,
-        source: "ios",
-        dedupeKey: `internal.conversation_read:${req.params.id}:${req.userId}:${Date.now()}`,
-        payload: { conversation_id: req.params.id, user_id: req.userId }
-      }).catch((e) => console.error("[internal/read] automation emission failed:", { code: e?.code, message: e?.message }));
-    }
-    res.json({ ok: true });
-  } catch (e) { console.error(e); res.status(500).json({ error: "mark_read_failed" }); }
-});
-
-app.get("/api/internal/channels", authRequired, requireCapability("communications.view"), async (req, res) => {
-  try {
-    const where = req.companyId ? `company_id = $1` : `created_by = $1`;
-    const { rows } = await pool.query(
-      `SELECT id, company_id, name, description, created_by, created_at, archived_at
-         FROM channels
-        WHERE ${where} AND archived_at IS NULL
-        ORDER BY lower(name) ASC`,
-      [req.companyId || req.userId]
-    );
-    res.json(rows);
-  } catch (e) { console.error(e); res.status(500).json({ error: "channels_failed" }); }
-});
-
-app.delete("/api/internal/channels/:id", authRequired, requireCapability("communications.manage"), async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `UPDATE channels
-          SET archived_at = now()
-        WHERE id = $1
-          AND company_id = $2
-          AND archived_at IS NULL
-        RETURNING id`,
-      [req.params.id, req.companyId]
-    );
-    if (!rows.length) return res.status(404).json({ error: "channel_not_found" });
-    await pool.query(`UPDATE messages SET deleted_at = COALESCE(deleted_at, now()), body = '' WHERE channel_id = $1 AND deleted_at IS NULL`, [req.params.id]);
-    emitAutomationEvent({
-      companyId: req.companyId,
-      eventType: "internal.channel_deleted",
-      subjectType: "channel",
-      subjectId: rows[0].id,
-      actorUserId: req.userId,
-      source: "ios",
-      dedupeKey: `internal.channel_deleted:${rows[0].id}`,
-      payload: { channel_id: rows[0].id }
-    }).catch((e) => console.error("[internal/channel/delete] automation emission failed:", { code: e?.code, message: e?.message }));
-    res.status(204).end();
-  } catch (e) { console.error(e); res.status(500).json({ error: "delete_channel_failed" }); }
-});
-
-app.post("/api/internal/channels", authRequired, requireCapability("communications.manage"), async (req, res) => {
-  const name = (req.body.name || "").toString().trim();
-  const description = (req.body.description || "").toString().trim();
-  if (!name) return res.status(400).json({ error: "missing_name" });
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO channels(id, company_id, name, description, created_by)
-       VALUES($1,$2,$3,$4,$5)
-       RETURNING id, company_id, name, description, created_by, created_at, archived_at`,
-      [randomUUID(), req.companyId || null, name, description || null, req.userId]
-    );
-    if (req.companyId) {
-      emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "internal.channel_created",
-        subjectType: "channel",
-        subjectId: rows[0].id,
-        actorUserId: req.userId,
-        source: "ios",
-        dedupeKey: `internal.channel_created:${rows[0].id}`,
-        payload: { channel_id: rows[0].id, name: rows[0].name, description: rows[0].description || null }
-      }).catch((e) => console.error("[internal/channel/create] automation emission failed:", { code: e?.code, message: e?.message }));
-    }
-    res.status(201).json(rows[0]);
-  } catch (e) { console.error(e); res.status(500).json({ error: "create_channel_failed" }); }
-});
-
-app.get("/api/internal/channels/:id/messages", authRequired, requireCapability("communications.view"), async (req, res) => {
-  try {
-    const channel = await pool.query(
-      req.companyId ? `SELECT id FROM channels WHERE id = $1 AND company_id = $2 AND archived_at IS NULL` : `SELECT id FROM channels WHERE id = $1 AND created_by = $2 AND archived_at IS NULL`,
-      req.companyId ? [req.params.id, req.companyId] : [req.params.id, req.userId]
-    );
-    if (!channel.rows.length) return res.status(404).json({ error: "channel_not_found" });
-    const { rows } = await pool.query(
-      `SELECT m.id, m.conversation_id, m.channel_id, m.sender_id, m.body, m.created_at, m.updated_at, m.deleted_at,
-              u.display_name AS sender_name, u.email AS sender_email, u.photo_url AS sender_photo_url
-         FROM messages m
-         JOIN users u ON u.id = m.sender_id
-        WHERE m.channel_id = $1
-        ORDER BY m.created_at ASC
-        LIMIT 200`,
-      [req.params.id]
-    );
-    res.json(await messageRowsWithAttachments(rows));
-  } catch (e) { console.error(e); res.status(500).json({ error: "channel_messages_failed" }); }
-});
-
-app.post("/api/internal/channels/:id/messages", authRequired, requireCapability("communications.send"), async (req, res) => {
-  const body = (req.body.body || "").toString();
-  const attachments = parseAttachments(req.body.attachments);
-  if (!body.trim() && !attachments.length) return res.status(400).json({ error: "empty_message" });
-  try {
-    const channel = await pool.query(
-      req.companyId ? `SELECT id, name FROM channels WHERE id = $1 AND company_id = $2 AND archived_at IS NULL` : `SELECT id, name FROM channels WHERE id = $1 AND created_by = $2 AND archived_at IS NULL`,
-      req.companyId ? [req.params.id, req.companyId] : [req.params.id, req.userId]
-    );
-    if (!channel.rows.length) return res.status(404).json({ error: "channel_not_found" });
-    const id = randomUUID();
-    const { rows } = await pool.query(
-      `INSERT INTO messages(id, channel_id, sender_id, body) VALUES($1,$2,$3,$4)
-       RETURNING id, conversation_id, channel_id, sender_id, body, created_at, updated_at, deleted_at`,
-      [id, req.params.id, req.userId, body]
-    );
-    await attachRows(id, attachments);
-    const recipients = await pool.query(
-      req.companyId ? `SELECT id FROM users WHERE company_id = $1` : `SELECT id FROM users WHERE id = $1`,
-      [req.companyId || req.userId]
-    );
-    if (req.companyId) {
-      const recipientIds = recipients.rows.map((r) => r.id).filter((userId) => userId !== req.userId);
-      const eventTypes = ["internal.message_sent", "internal.channel_message_received"];
-      if (attachments.length) eventTypes.push("internal.attachment_received");
-      for (const eventType of eventTypes) {
-        await emitAutomationEvent({
-          companyId: req.companyId,
-          eventType,
-          subjectType: "internal_message",
-          subjectId: id,
-          actorUserId: req.userId,
-          source: "ios",
-          dedupeKey: `${eventType}:${id}`,
-          payload: { message_id: id, channel_id: req.params.id, channel_name: channel.rows[0].name, sender_user_id: req.userId, recipient_user_ids: recipientIds, body, message_body: body, has_attachments: attachments.length > 0, attachment_count: attachments.length, conversation_type: "channel" }
-        });
-      }
-    }
-    await notifyMany(recipients.rows.map((r) => r.id), req.companyId, "channel_message", `#${channel.rows[0].name}`, body || "Attachment", { channel_id: req.params.id, message_id: id }, req.userId);
-    res.status(201).json((await messageRowsWithAttachments(rows))[0]);
-  } catch (e) { console.error(e); res.status(500).json({ error: "send_channel_message_failed" }); }
-});
-
-app.delete("/api/internal/messages/:id", authRequired, requireCapability("communications.manage"), async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `UPDATE messages m
-          SET deleted_at = now(), body = ''
-         FROM users sender
-         LEFT JOIN conversations c ON c.id = m.conversation_id
-         LEFT JOIN channels ch ON ch.id = m.channel_id
-        WHERE m.id = $1
-          AND sender.id = m.sender_id
-          AND m.deleted_at IS NULL
-          AND (
-            m.sender_id = $2
-            OR (
-              $3 = 'employer'
-              AND sender.company_id = $4
-              AND (
-                (c.id IS NOT NULL AND c.company_id = $4)
-                OR (ch.id IS NOT NULL AND ch.company_id = $4)
-              )
-            )
-          )
-        RETURNING m.id, m.conversation_id, m.channel_id`,
-      [req.params.id, req.userId, req.role, req.companyId]
-    );
-    if (!rows.length) return res.status(404).json({ error: "message_not_found" });
-    if (req.companyId) {
-      emitAutomationEvent({
-        companyId: req.companyId,
-        eventType: "internal.message_deleted",
-        subjectType: "internal_message",
-        subjectId: rows[0].id,
-        actorUserId: req.userId,
-        source: "ios",
-        dedupeKey: `internal.message_deleted:${rows[0].id}`,
-        payload: { message_id: rows[0].id, conversation_id: rows[0].conversation_id || null, channel_id: rows[0].channel_id || null }
-      }).catch((e) => console.error("[internal/message/delete] automation emission failed:", { code: e?.code, message: e?.message }));
-    }
-    res.status(204).end();
-  } catch (e) { console.error(e); res.status(500).json({ error: "delete_message_failed" }); }
-});
+installCommsCompatibility({app,pool,authRequired});
 
 // ---------- TIME CLOCK ----------
 app.get("/api/time-clock/settings", authRequired, requireCapability("time.view_self"), async (req, res) => {
@@ -9838,7 +9189,7 @@ async function loadSmartContactSMSBatch(queryable, companyId, batchId, replayed 
 app.post(
   "/api/smart-contact-lists/actions/sms/preview",
   authRequired,
-  requireAllCapabilities("communications.view", "messaging.customer.send"),
+  requireCapability("messaging.customer.send"),
   async (req, res) => {
     if (!req.companyId) return res.status(403).json({ error: "company_required" });
     try {
@@ -10875,26 +10226,15 @@ app.delete("/api/integrations/device-token", authRequired, async (req, res) => {
 // iOS polls this when the app becomes active and fires local notifications.
 app.get("/api/integrations/zapier/pending-notifications", authRequired, requireCapability("integrations.view"), async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, title, body, contact_id, created_at
-       FROM lead_notifications
-       WHERE user_id = $1 AND delivered_at IS NULL
-       ORDER BY created_at ASC
-       LIMIT 25`,
-      [req.userId]
-    );
-    if (rows.length) {
-      const ids = rows.map(r => r.id);
-      await pool.query(
-        `UPDATE lead_notifications SET delivered_at = now() WHERE id = ANY($1::uuid[])`,
-        [ids]
-      );
+    const rows=(await pool.query('SELECT id FROM lead_notifications WHERE user_id=$1 AND company_id=$2 AND delivered_at IS NULL ORDER BY created_at,id LIMIT 25',[req.userId,req.companyId])).rows;
+    const notifications=[];
+    for(const row of rows) {
+      try { const note=await app.locals.comms.notifications.get(req,'legacy-lead:'+row.id); if(note.accessible)notifications.push({id:row.id,title:'WolfCRM notification',body:'Open your notification inbox to read this update.',created_at:note.created_at}); }
+      catch(error) {if(![403,404].includes(error.status))throw error;}
     }
-    res.json({ notifications: rows });
-  } catch (e) {
-    console.error("[notifications] pending fetch failed:", e && e.message ? e.message : e);
-    res.status(500).json({ error: "failed_fetch_pending" });
-  }
+    if(rows.length)await pool.query('UPDATE lead_notifications SET delivered_at=now() WHERE id=ANY($1::uuid[]) AND user_id=$2',[rows.map(r=>r.id),req.userId]);
+    res.json({notifications});
+  } catch(e) { console.error('[notifications] pending fetch failed',{code:e.code||e.name});res.status(503).json({error:'notifications_unavailable'}); }
 });
 
 // One-shot backfill: re-processes every stored lead_import belonging to this
@@ -12627,7 +11967,8 @@ app.delete("/api/opportunities/:id", authRequired, requireCapability("pipeline.m
 });
 
 // ---------- SCHEDULE EVENTS ----------
-app.get("/api/schedule", authRequired, requireCapability("schedule.view"), async (req, res) => {
+app.get("/api/schedule", authRequired, requireAllCapabilities("schedule.view", "jobs.view"), async (req, res) => {
+  res.set("Cache-Control", "private, no-store");
   try {
     const where = req.companyId
       ? { sql: `company_id = $1`, values: [req.companyId] }
@@ -12644,7 +11985,8 @@ app.get("/api/schedule", authRequired, requireCapability("schedule.view"), async
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_schedule" }); }
 });
 
-app.get("/api/schedule/team", authRequired, requireCapability("schedule.view"), async (req, res) => {
+app.get("/api/schedule/team", authRequired, requireAllCapabilities("schedule.view", "jobs.view"), async (req, res) => {
+  res.set("Cache-Control", "private, no-store");
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const start = new Date(req.query.start || Date.now());
   const end = new Date(req.query.end || (start.getTime() + 7 * 86400000));
@@ -12715,7 +12057,7 @@ app.get("/api/schedule/team", authRequired, requireCapability("schedule.view"), 
   }
 });
 
-app.put("/api/schedule/team/:userId/availability", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
+app.put("/api/schedule/team/:userId/availability", authRequired, requireAllCapabilities("schedule.manage_team", "jobs.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   let availability;
   try {
@@ -12765,7 +12107,7 @@ app.put("/api/schedule/team/:userId/availability", authRequired, requireCapabili
   }
 });
 
-app.delete("/api/schedule/team/:userId/availability", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
+app.delete("/api/schedule/team/:userId/availability", authRequired, requireAllCapabilities("schedule.manage_team", "jobs.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const member = await pool.query(
@@ -12781,7 +12123,7 @@ app.delete("/api/schedule/team/:userId/availability", authRequired, requireCapab
   }
 });
 
-app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create", "schedule.edit"), async (req, res) => {
+app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requireAnyCapability("schedule.create", "schedule.edit"), async (req, res) => {
   const {
     title, start, end, color, notes, contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
     sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by, weather_exposure
@@ -12953,7 +12295,7 @@ app.put("/api/schedule/:id", authRequired, requireAnyCapability("schedule.create
   } finally { db.release(); }
 });
 
-app.delete("/api/schedule/:id", authRequired, requireCapability("schedule.delete"), async (req, res) => {
+app.delete("/api/schedule/:id", authRequired, requireAllCapabilities("schedule.delete", "jobs.view"), async (req, res) => {
   try {
     const before = req.companyId
       ? (await pool.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0]
@@ -13326,7 +12668,7 @@ app.put("/api/weather/settings", authRequired, requireCapability("schedule.manag
   }
 });
 
-app.get("/api/weather/risks", authRequired, requireCapability("schedule.view"), async (req, res) => {
+app.get("/api/weather/risks", authRequired, requireAllCapabilities("schedule.view", "jobs.view"), async (req, res) => {
   try {
     const report = await createWeatherRiskReport(req.companyId);
     await syncWeatherRiskObservations(req.companyId, report, { actorUserId: req.userId, source: "weather.ios_refresh" });
@@ -13336,7 +12678,7 @@ app.get("/api/weather/risks", authRequired, requireCapability("schedule.view"), 
   }
 });
 
-app.post("/api/weather/reschedule/preview", authRequired, requireCapability("schedule.edit"), async (req, res) => {
+app.post("/api/weather/reschedule/preview", authRequired, requireAllCapabilities("schedule.edit", "jobs.view"), async (req, res) => {
   try {
     const ids = normalizeWeatherJobIDs(req.body?.job_ids);
     const [company, jobs] = await Promise.all([
@@ -13363,7 +12705,7 @@ app.post("/api/weather/reschedule/preview", authRequired, requireCapability("sch
   }
 });
 
-app.post("/api/weather/reschedule", authRequired, requireCapability("schedule.edit"), async (req, res) => {
+app.post("/api/weather/reschedule", authRequired, requireAllCapabilities("schedule.edit", "jobs.view"), async (req, res) => {
   const idempotencyKey = String(req.body?.idempotency_key || "").trim().toLowerCase();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) {
     return res.status(400).json({ error: "weather_idempotency_key_required", message: "Reload the reschedule preview and try again." });
@@ -13741,7 +13083,7 @@ async function mapAssignmentWorkers(items, work, concurrency = 3) {
   return output;
 }
 
-app.get("/api/jobs/:id/assignment-recommendations", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
+app.get("/api/jobs/:id/assignment-recommendations", authRequired, requireAllCapabilities("schedule.manage_team", "jobs.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const context = await loadAssignmentRecommendationContext(req.companyId, req.params.id);
@@ -13815,7 +13157,7 @@ async function loadAssignmentApplicationEvent(queryable, companyId, jobId) {
 app.post(
   "/api/jobs/:id/assignment-recommendations/apply",
   authRequired,
-  requireAllCapabilities("schedule.manage_team", "schedule.edit"),
+  requireAllCapabilities("schedule.manage_team", "schedule.edit", "jobs.view"),
   async (req, res) => {
     if (!req.companyId) return res.status(403).json({ error: "company_required" });
     const idempotencyKey = String(req.body?.idempotency_key || "").trim().toLowerCase();
@@ -16708,6 +16050,7 @@ function filterDashboardDismissed(items, dismissals) {
 }
 
 app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.view"), async (req, res) => {
+  res.set("Cache-Control", "private, no-store");
   try {
     const requestId = dashboardRequestId(req);
     const now = new Date();
@@ -16721,7 +16064,11 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
     const upcomingEnd = parseDashboardDate(req.query.upcoming_end, new Date(todayStart.getTime() + 8 * 86400000));
     const jobsPastStart = parseDashboardDate(req.query.jobs_past_start, new Date(currentAt.getTime() - 120 * 86400000));
     const jobsUpcomingEnd = parseDashboardDate(req.query.jobs_upcoming_end, new Date(currentAt.getTime() + 30 * 86400000));
-    const employer = req.role === "employer";
+    const employer = req.isCompanyOwner;
+    const canJobs = hasCapability(req,"jobs.view") && hasCapability(req,"schedule.view");
+    const canTasks = hasCapability(req,"tasks.view");
+    const canContacts = hasCapability(req,"contacts.view");
+    const canReminders = canTasks && canContacts;
     const failedSources = [];
     const companyTimezoneSource = await dashboardSource(requestId, "company_timezone", () => req.companyId
       ? pool.query(`SELECT timezone FROM companies WHERE id = $1`, [req.companyId])
@@ -16739,12 +16086,12 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
           values: [req.companyId, req.userId, String(req.userId)]
         };
 
-    const jobsSource = await dashboardSource(requestId, "jobs", () => req.companyId ? pool.query(
-      `SELECT se.id, se.title, se.start_at AS start, se.end_at AS "end", se.contact_id,
+    const jobsSource = await dashboardSource(requestId, "jobs", () => canJobs && req.companyId ? pool.query(
+      `SELECT se.id, se.title, se.start_at AS start, se.end_at AS "end", CASE WHEN ${canContacts} THEN se.contact_id ELSE NULL END AS contact_id,
               se.services, se.service_items, se.price_cents, se.finished_at, se.updated_at,
               c.name AS contact_name, c.address AS contact_address
          FROM schedule_events se
-         LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id
+         LEFT JOIN contacts c ON c.id::text = se.contact_id AND c.company_id = se.company_id AND ${canContacts}
         WHERE ${jobScope.sql}
           AND se.start_at >= $${jobScope.values.length + 1}
           AND se.start_at < $${jobScope.values.length + 2}
@@ -16755,7 +16102,7 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
     if (jobsSource.failed) failedSources.push(jobsSource.source);
     const jobsResult = jobsSource.value;
 
-    const revenueSource = await dashboardSource(requestId, "metrics", () => employer && req.companyId ? pool.query(
+    const revenueSource = await dashboardSource(requestId, "metrics", () => canJobs && employer && req.companyId ? pool.query(
       `SELECT
           COALESCE(SUM(price_cents) FILTER (WHERE start_at >= $2 AND start_at < $3), 0)::int AS today,
           COALESCE(SUM(price_cents) FILTER (WHERE start_at >= $4 AND start_at < $5), 0)::int AS week,
@@ -16771,27 +16118,27 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
     const revenueResult = revenueSource.value;
 
     const [tasksSource, taskStatsSource, customerSource, customerStatsSource, routinesSource, doneSource, notificationsSource, dismissalsSource, equipmentRequestsSource, mileageApprovalsSource] = await Promise.all([
-      dashboardSource(requestId, "todos", () => pool.query(
+      dashboardSource(requestId, "todos", () => canTasks ? pool.query(
         `SELECT id, title, due_date, completed, updated_at, priority, assignee_ids
            FROM todo_tasks
           WHERE (user_id = $1 OR assignee_ids ? $1::text)
             AND completed = false
             AND due_date IS NOT NULL
-            AND due_date < $2
+            AND due_date < $2 AND ${taskAccessSQL(req,'todo_tasks','$1','$3')}
           ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, due_date ASC
           LIMIT 40`,
-        [req.userId, upcomingEnd.toISOString()]
-      ), { rows: [] }),
-      dashboardSource(requestId, "todo_stats", () => pool.query(
+        [req.userId, upcomingEnd.toISOString(),req.companyId]
+      ) : Promise.resolve({rows:[]}), { rows: [] }),
+      dashboardSource(requestId, "todo_stats", () => canTasks ? pool.query(
         `SELECT
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3)::int AS total_today,
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3 AND completed = true)::int AS completed_today
            FROM todo_tasks
           WHERE (user_id = $1 OR assignee_ids ? $1::text)
-            AND due_date IS NOT NULL`,
-        [req.userId, todayStart.toISOString(), todayEnd.toISOString()]
-      ), { rows: [{ total_today: 0, completed_today: 0 }] }),
-      dashboardSource(requestId, "customer_reminders", () => pool.query(
+            AND due_date IS NOT NULL AND ${taskAccessSQL(req,'todo_tasks','$1','$4')}`,
+        [req.userId, todayStart.toISOString(), todayEnd.toISOString(),req.companyId]
+      ) : Promise.resolve({rows:[{total_today:0,completed_today:0}]}), { rows: [{ total_today: 0, completed_today: 0 }] }),
+      dashboardSource(requestId, "customer_reminders", () => canReminders ? pool.query(
         `SELECT id, title, contact_id, contact_name, due_date, completed, updated_at
            FROM todo_customer_reminders
           WHERE user_id = $1
@@ -16801,8 +16148,8 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
           ORDER BY due_date ASC
           LIMIT 40`,
         [req.userId, upcomingEnd.toISOString()]
-      ), { rows: [] }),
-      dashboardSource(requestId, "customer_reminder_stats", () => pool.query(
+      ) : Promise.resolve({rows:[]}), { rows: [] }),
+      dashboardSource(requestId, "customer_reminder_stats", () => canReminders ? pool.query(
         `SELECT
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3)::int AS total_today,
             COUNT(*) FILTER (WHERE due_date >= $2 AND due_date < $3 AND completed = true)::int AS completed_today
@@ -16810,8 +16157,8 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
           WHERE user_id = $1
             AND due_date IS NOT NULL`,
         [req.userId, todayStart.toISOString(), todayEnd.toISOString()]
-      ), { rows: [{ total_today: 0, completed_today: 0 }] }),
-      dashboardSource(requestId, "routines", () => pool.query(
+      ) : Promise.resolve({rows:[{total_today:0,completed_today:0}]}), { rows: [{ total_today: 0, completed_today: 0 }] }),
+      dashboardSource(requestId, "routines", () => canTasks ? pool.query(
         `SELECT id, title, time, weekdays, updated_at
            FROM todo_routines
           WHERE user_id = $1
@@ -16819,22 +16166,16 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
           ORDER BY updated_at DESC
           LIMIT 80`,
         [req.userId]
-      ), { rows: [] }),
-      dashboardSource(requestId, "routine_done", () => pool.query(
+      ) : Promise.resolve({rows:[]}), { rows: [] }),
+      dashboardSource(requestId, "routine_done", () => canTasks ? pool.query(
         `SELECT routine_id, day_key
            FROM todo_routine_done
           WHERE user_id = $1`,
         [req.userId]
-      ), { rows: [] }),
-      dashboardSource(requestId, "notifications", () => pool.query(
-        `SELECT id, kind, title, body, data, created_at
-           FROM notifications
-          WHERE user_id = $1
-            AND read_at IS NULL
-          ORDER BY created_at DESC
-          LIMIT 12`,
-        [req.userId]
-      ), { rows: [] }),
+      ) : Promise.resolve({rows:[]}), { rows: [] }),
+      // Permanent Home inbox owns notification rendering; do not duplicate raw
+      // notification text or destination routing through command-center items.
+      dashboardSource(requestId, "notifications", () => Promise.resolve({rows:[]}), {rows:[]}),
       dashboardSource(requestId, "dismissals", () => pool.query(
         `SELECT item_type, source_id, fingerprint
            FROM dashboard_dismissals
@@ -16842,7 +16183,7 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
             AND (expires_at IS NULL OR expires_at > now())`,
         [req.userId]
       ), { rows: [] }),
-      dashboardSource(requestId, "equipment_requests", () => employer && req.companyId ? pool.query(
+      dashboardSource(requestId, "equipment_requests", () => employer && hasCapability(req,"operations.view") && req.companyId ? pool.query(
         `SELECT id, request_type, item_name, urgency, explanation, status, created_at
            FROM equipment_requests
           WHERE company_id = $1 AND status IN ('pending','under_review','approved','ordered','ready')
@@ -16850,7 +16191,7 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
           LIMIT 8`,
         [req.companyId]
       ) : Promise.resolve({ rows: [] }), { rows: [] }),
-      dashboardSource(requestId, "mileage_approvals", () => employer && req.companyId ? pool.query(
+      dashboardSource(requestId, "mileage_approvals", () => employer && hasCapability(req,"operations.view") && hasCapability(req,"pay.view_all") && req.companyId ? pool.query(
         `SELECT id, employee_id, service_date, reimbursement_cents, status, updated_at
            FROM mileage_daily_logs
           WHERE company_id = $1 AND status IN ('ready_for_review','submitted')
@@ -16992,29 +16333,7 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
       }
     }
 
-    for (const row of notificationsResult.rows) {
-      if (isInformationalJobNotification(row)) continue;
-      items.push({
-        id: `notification:${row.id}`,
-        type: "notification",
-        source_type: "notification",
-        source_id: String(row.id),
-        fingerprint: String(row.created_at || ""),
-        section: "attention",
-        priority: "normal",
-        title: row.title,
-        subtitle: row.body || "",
-        amount_cents: null,
-        due_at: row.created_at,
-        system_image: "bell.badge.fill",
-        tint: "orange",
-        completable: false,
-        dismissible: true,
-        destination: { type: row.kind === "voicemail" ? "message_thread" : "notification", id: String(row.id) }
-      });
-    }
-
-    if (employer && req.companyId) {
+    if (employer && hasCapability(req,"finance.planning.view") && req.companyId) {
       const financeSource = await dashboardSource(requestId, "finance_upcoming", async () => {
         const projection = await loadProjection(pool, req.companyId, 7);
         return projection;
@@ -17073,7 +16392,7 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
         revenue_week_cents: Number(revenue.week || 0),
         revenue_month_cents: Number(revenue.month || 0),
         jobs_missing_prices_today: Number(revenue.missing_today || 0),
-        revenue_visible: employer
+        revenue_visible: employer && canJobs
       },
       partial: failedSources.length > 0,
       failed_sources: failedSources,
@@ -17736,11 +17055,13 @@ app.get("/api/todo/tasks", authRequired, requireCapability("tasks.view"), async 
     const { rows } = await pool.query(
       `SELECT id, title, detail, creator_id, assignee_ids, due_date, priority, status,
               linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
-              reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex
+              reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex,
+              EXISTS(SELECT 1 FROM comms_task_links protected_link WHERE protected_link.task_id=todo_tasks.id) AS comms_protected
        FROM todo_tasks
-       WHERE user_id = $1
+       WHERE (user_id = $1
           OR ($2::uuid IS NOT NULL AND user_id = ANY($3::uuid[]))
-          OR (assignee_ids ? $1::text)
+          OR (assignee_ids ? $1::text))
+         AND ${taskAccessSQL(req,'todo_tasks','$1','$2')}
        ORDER BY due_date NULLS LAST, updated_at DESC`,
       [req.userId, req.companyId, companyUsers]
     );
@@ -17758,9 +17079,12 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
   const assignees = Array.isArray(assignee_ids) ? assignee_ids.filter((id) => typeof id === "string").slice(0, 20) : [];
   try {
     const previous = await pool.query(
-      `SELECT * FROM todo_tasks WHERE id = $1 AND (user_id = $2 OR ($3::uuid IS NOT NULL AND user_id IN (SELECT id FROM users WHERE company_id = $3)) OR assignee_ids ? $2::text)`,
+      `SELECT * FROM todo_tasks WHERE id = $1 AND (user_id = $2 OR ($3::uuid IS NOT NULL AND user_id IN (SELECT id FROM users WHERE company_id = $3)) OR assignee_ids ? $2::text) AND ${taskAccessSQL(req,'todo_tasks','$2','$3')}`,
       [req.params.id, req.userId, req.companyId]
     );
+    if (!previous.rows[0] && (await pool.query('SELECT 1 FROM todo_tasks WHERE id=$1',[req.params.id])).rowCount) return res.status(403).json({error:'task_access_denied'});
+    const commsLink = (await pool.query('SELECT * FROM comms_task_links WHERE task_id=$1',[req.params.id])).rows[0];
+    if (commsLink) await validateTaskAudience(pool,req,commsLink,assignees);
     const ownerUserId = previous.rows[0]?.user_id || creator_id || req.userId;
     const operationalLinks = normalizeTaskOperationalLinks(
       req.body || {},
@@ -17795,9 +17119,10 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
              completion_note_required = EXCLUDED.completion_note_required,
              color_hex = EXCLUDED.color_hex,
              updated_at = now()
-       WHERE todo_tasks.user_id = $2
+       WHERE (todo_tasks.user_id = $2
           OR ($23::uuid IS NOT NULL AND todo_tasks.user_id IN (SELECT id FROM users WHERE company_id = $23))
-          OR todo_tasks.assignee_ids ? $24::text
+          OR todo_tasks.assignee_ids ? $24::text)
+         AND ${taskAccessSQL(req,'todo_tasks','$24::uuid','$23')}
        RETURNING id, title, detail, creator_id, assignee_ids, due_date, priority, status,
                  linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
                  reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex`,
@@ -17812,7 +17137,10 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
         req.companyId, req.userId
       ]
     );
-    if (req.companyId) {
+    if (req.companyId && commsLink) {
+      const eventType = r.rows[0]?.completed ? 'comms.task.completed' : 'comms.task.updated';
+      await pool.query(`INSERT INTO comms_automation_outbox(id,company_id,actor_id,event_type,subject_type,subject_id,payload) VALUES($1,$2,$3,$4,'task',$5,$6)`,[randomUUID(),req.companyId,req.userId,eventType,req.params.id,JSON.stringify({task_id:req.params.id,private_source:true})]);
+    } else if (req.companyId) {
       const before = previous.rows[0] || null;
       const after = r.rows[0];
       if (!before) {
@@ -17830,11 +17158,12 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
       }
       await syncAutomationSchedulesForTask(req.companyId, after);
     }
-    res.json(r.rows[0]);
+    res.json(r.rows[0] ? {...r.rows[0],comms_protected:!!commsLink} : null);
   } catch (e) {
     if (e instanceof TodoOperationalLinkError) {
       return res.status(e.statusCode).json({ error: e.code, message: e.message });
     }
+    if (e.status) return res.status(e.status).json({error:e.code,message:e.message});
     console.error(e);
     res.status(500).json({ error: "failed_upsert_task" });
   }
@@ -17842,9 +17171,10 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
 
 app.delete("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), async (req, res) => {
   try {
-    const before = (await pool.query(`DELETE FROM todo_tasks WHERE id = $1 AND user_id = $2 RETURNING *`,
-      [req.params.id, req.userId])).rows[0];
-    if (before && req.companyId) {
+    const commsLink = (await pool.query('SELECT task_id FROM comms_task_links WHERE task_id=$1',[req.params.id])).rows[0];
+    const before = (await pool.query(`DELETE FROM todo_tasks WHERE id = $1 AND user_id = $2 AND ${taskAccessSQL(req,'todo_tasks','$2','$3')} RETURNING *`,
+      [req.params.id, req.userId, req.companyId])).rows[0];
+    if (before && req.companyId && !commsLink) {
       await emitAutomationEvent({ companyId: req.companyId, eventType: "task.deleted", subjectType: "task", subjectId: before.id, actorUserId: req.userId, source: "todo.api", dedupeKey: `task.deleted:${before.id}`, payload: { task_id: before.id, title: before.title } });
       await cancelAutomationSchedulesForSubject(req.companyId, "task", before.id);
     }
@@ -18033,9 +17363,9 @@ app.delete("/api/todo/customer-reminders/:id", authRequired, requireCapability("
 app.get("/api/todo/logs", authRequired, requireCapability("tasks.view"), async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, kind, ts AS timestamp, task_id, routine_id, contact_id, note
-       FROM todo_logs WHERE user_id = $1 ORDER BY ts DESC LIMIT 500`,
-      [req.userId]
+      `SELECT l.id,l.kind,l.ts AS timestamp,l.task_id,l.routine_id,l.contact_id,l.note,l.comms_protected
+       FROM todo_logs l WHERE l.user_id=$1 AND (NOT l.comms_protected OR EXISTS(SELECT 1 FROM todo_tasks t WHERE t.id=l.task_id AND ${taskAccessSQL(req,'t','$1','$2')})) ORDER BY l.ts DESC LIMIT 500`,
+      [req.userId,req.companyId]
     );
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_logs" }); }
@@ -18045,14 +17375,16 @@ app.put("/api/todo/logs/:id", authRequired, requireCapability("tasks.manage"), a
   const { kind, timestamp, task_id, routine_id, contact_id, note } = req.body || {};
   if (!kind) return res.status(400).json({ error: "kind_required" });
   try {
+    let protectedTask=false;
+    if(task_id){const task=(await pool.query(`SELECT EXISTS(SELECT 1 FROM comms_task_links cl WHERE cl.task_id=t.id) AS comms_protected FROM todo_tasks t JOIN users u ON u.id=t.user_id WHERE t.id=$3 AND (t.user_id=$1 OR (u.company_id=$2 AND $2::uuid IS NOT NULL) OR t.assignee_ids ? $1::text) AND ${taskAccessSQL(req,'t','$1','$2')}`,[req.userId,req.companyId,task_id])).rows[0];if(!task)return res.status(403).json({error:'task_access_denied'});protectedTask=task.comms_protected;}
     const r = await pool.query(
-      `INSERT INTO todo_logs (id, user_id, kind, ts, task_id, routine_id, contact_id, note)
-       VALUES ($1, $2, $3, COALESCE($4, now()), $5, $6, $7, $8)
+      `INSERT INTO todo_logs (id, user_id, kind, ts, task_id, routine_id, contact_id, note, comms_protected)
+       VALUES ($1, $2, $3, COALESCE($4, now()), $5, $6, $7, $8, $9)
        ON CONFLICT (id) DO NOTHING
-       RETURNING id, kind, ts AS timestamp, task_id, routine_id, contact_id, note`,
+       RETURNING id, kind, ts AS timestamp, task_id, routine_id, contact_id, note, comms_protected`,
       [
         req.params.id, req.userId, kind, timestamp || null,
-        task_id || null, routine_id || null, contact_id || null, note || null
+        task_id || null, routine_id || null, contact_id || null, note || null, protectedTask
       ]
     );
     res.json(r.rows[0] || { id: req.params.id });
@@ -19889,7 +19221,14 @@ async function startServer() {
   }
   serverStarted = true;
   await bootstrap();
-  app.locals.mediaStorage = await installMediaStorage({ app, pool, authRequired });
+  app.locals.permissionGovernance = installPermissionGovernanceRoutes({app,pool,authRequired});
+  app.locals.mediaStorage = await installMediaStorage({ app, pool, authRequired, accessPredicate: storagePredicate, onRequest:r=>takeRateLimit(pool,r), onAccess:(...args)=>app.locals.commsAudit?.record(...args) });
+  app.locals.comms = await installCompanyComms({app,pool,authRequired,sendPush:sendPushToUsers});
+  app.locals.commsCollaboration = installCollaboration({app,pool,authRequired,messages:app.locals.comms.messages,notifications:app.locals.comms.notifications,emitAutomationEvent});
+  app.locals.commsAudit = await installCommsAudit({app,pool,authRequired});
+  await installCommsQuoteExports({app,pool,authRequired,storage:app.locals.mediaStorage});
+  app.locals.commsJobHuddles = await installJobHuddles({app,pool,authRequired,messages:app.locals.comms.messages,calls:{get configured(){return app.locals.commsCalls?.configured===true;},create:(...args)=>app.locals.commsCalls.service.create(...args)}});
+  app.locals.commsCalls = await installCommsCalls({app,pool,authRequired,notifications:app.locals.comms.notifications,authorizeConversation:authorizeCommsCallConversation,publish:publishComms,resolveActor:req=>loadCommsActor(pool,req),getApnProvider});
   app.locals.agreements = await installAgreementSystem({ app, pool, authRequired, requireCapability, getQuoteSettings, getStripe });
   app.locals.agreementPayments = await installAgreementPayments({ app, pool, service: app.locals.agreements, getStripe, authRequired, requireCapability });
   app.locals.agreementBooking = await installAgreementBooking({ app, pool, service: app.locals.agreements, authRequired, requireCapability,
@@ -20008,6 +19347,7 @@ async function startServer() {
   });
   startGoogleSheetsWorkers(pool);
   startWeatherRiskWorkers();
+  installAPIFallback(app);
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }
 

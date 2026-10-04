@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "NODE_ENV=development nodemon index.js",
-    "test": "npm run test:permissions && npm run test:website-builder && npm run test:customer-message-compose && npm run test:contact-update-events && npm run test:contact-search && npm run test:contact-list-filters && npm run test:contact-export && npm run test:contact-import && npm run test:measurements && npm run test:navigation-tabs && npm run test:dashboard-layout && npm run test:schedule-team && npm run test:on-my-way && npm run test:weather && npm run test:assignment-recommendations && npm run test:smart-contact-lists && npm run test:business-exceptions && npm run test:sales-analytics && npm run test:routing && npm run test:finance && npm run test:google-sheets && npm run test:imessage && npm run test:quote-contracts && npm run test:stripe-account-management && npm run test:media-storage",
+    "test": "npm run test:permissions && npm run test:website-builder && npm run test:customer-message-compose && npm run test:contact-update-events && npm run test:contact-search && npm run test:contact-list-filters && npm run test:contact-export && npm run test:contact-import && npm run test:measurements && npm run test:navigation-tabs && npm run test:dashboard-layout && npm run test:schedule-team && npm run test:on-my-way && npm run test:weather && npm run test:assignment-recommendations && npm run test:smart-contact-lists && npm run test:business-exceptions && npm run test:sales-analytics && npm run test:routing && npm run test:finance && npm run test:google-sheets && npm run test:imessage && npm run test:quote-contracts && npm run test:stripe-account-management && npm run test:media-storage && npm run test:permission-routes && npm run test:permission-governance && npm run test:comms-core && npm run test:comms-calls && npm run test:comms-notifications && npm run test:comms-legacy && npm run test:comms-exports && npm run test:comms-audit && npm run test:comms-collaboration && npm run test:comms-upgrade && npm run test:comms-startup",
     "test:automation-core": "node tests/automation-core.integration.js",
     "test:automation": "npm run test:automation-core",
     "test:finance": "node tests/finance-projection.test.js && node tests/finance-planning.test.js && node tests/finance-plaid.test.js && node tests/finance-receipts.test.js && node tests/finance-accounting.test.js && node tests/finance-general-ledger.test.js && node tests/finance-bank-sources.test.js && node tests/finance-bank-transfers.test.js && node tests/finance-operational-accounting.test.js && node tests/finance-operational-journals.test.js && node tests/finance-operational-applications.test.js && node tests/finance-stripe-settlements.test.js && node tests/finance-statement-readiness.test.js && node tests/finance-cost-allocations.test.js && node tests/finance-mileage-allocations.test.js && node tests/pay-structures.test.js && node tests/finance-payroll-costs.test.js && node tests/finance-payroll-authority.test.js && node tests/finance-payroll-evaluation.test.js && node tests/finance-payroll-journals.test.js && node tests/finance-ai.test.js",
@@ -43,7 +43,18 @@
     "test:quote-addons:db": "node --test tests/quote-addons.integration.test.js",
     "test:quotes-contracts:all-db": "node --test tests/quote-catalog.integration.test.js tests/quote-agreements.integration.test.js tests/agreement-template-history.integration.test.js tests/agreement-payments.integration.test.js tests/agreement-booking.integration.test.js tests/agreement-plans.integration.test.js tests/agreement-plan-billing.integration.test.js tests/quote-addons.integration.test.js tests/quote-system-startup.integration.test.js tests/quote-template-workflow.integration.test.js tests/quote-removal-automation.integration.test.js tests/customer-pdf-workflow.integration.test.js",
     "test:stripe-account-management": "node --test tests/stripe-account-management.integration.test.js",
-    "test:media-storage": "node --test tests/media-storage.integration.test.js"
+    "test:media-storage": "node --test tests/media-storage.integration.test.js",
+    "test:permission-governance": "node --test tests/permission-governance.integration.test.js",
+    "test:permission-routes": "node --test tests/permission-routes.test.js",
+    "test:comms-core": "node --test tests/company-comms-core.integration.test.js tests/company-comms-readstate.integration.test.js tests/company-comms-mentions.integration.test.js",
+    "test:comms-calls": "node --test company-comms/calls/*.test.js",
+    "test:comms-notifications": "node --test tests/company-comms-notifications.integration.test.js",
+    "test:comms-legacy": "node --test tests/company-comms-legacy.integration.test.js",
+    "test:comms-exports": "node --test tests/company-comms-exports.integration.test.js",
+    "test:comms-audit": "node --test tests/company-comms-audit.integration.test.js",
+    "test:comms-collaboration": "node --test tests/company-comms-collaboration.integration.test.js tests/company-comms-workflows.integration.test.js",
+    "test:comms-upgrade": "node --test tests/company-comms-upgrade.integration.test.js tests/company-comms-job-huddles.integration.test.js",
+    "test:comms-startup": "node --test tests/company-comms-startup.integration.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",
@@ -52,6 +63,7 @@
     "@pdf-lib/fontkit": "1.1.1",
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "livekit-server-sdk": "2.19.1",
     "openai": "^7.4.0",
     "pdf-lib": "1.17.1",
     "pg": "^8.11.3",

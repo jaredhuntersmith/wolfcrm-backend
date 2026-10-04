@@ -26,7 +26,7 @@ export function fileInput(body, maxSize) {
 export const readableSQL = `(f.owner_user_id=$1 OR (f.visibility='company' AND f.company_id=$2 AND $2::uuid IS NOT NULL AND EXISTS(SELECT 1 FROM users owner WHERE owner.id=f.owner_user_id AND owner.company_id=f.company_id AND owner.deleted_at IS NULL)))`;
 export function canDelete(file, actor) { return file.owner_user_id===actor.userId || (actor.role==='employer' && file.visibility==='company' && actor.companyId && file.company_id===actor.companyId); }
 export function publicFile(file, actor) {
-  const {object_key,upload_id,upload_expires_at,cleanup_after,sharing_active,...safe}=file;
+  const {object_key,upload_id,upload_expires_at,cleanup_after,sharing_active,storage_provider,...safe}=file;
   if(sharing_active===false)safe.visibility='private';
   safe.byte_size=Number(file.byte_size); safe.can_edit=file.owner_user_id===actor.userId; safe.can_delete=Boolean(canDelete(file,actor));
   return safe;
