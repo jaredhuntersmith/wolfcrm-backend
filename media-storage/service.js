@@ -174,5 +174,9 @@ export function createStorageService({pool,bucket,env=process.env}) {
     const rows=(await pool.query(`SELECT * FROM storage_activity WHERE ${where.join(' AND ')} ORDER BY created_at DESC,id DESC LIMIT 101`,params)).rows,last=rows[99];
     return {events:rows.slice(0,100).map(r=>({...r,byte_size:Number(r.byte_size)})),next_cursor:rows.length>100?Buffer.from(JSON.stringify({at:last.created_at,id:last.id})).toString('base64url'):null};
   }
-  return {usage,list,begin,part,complete,patch,access,acknowledge,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
+  async function verify(actor,ids) {
+    if(!Array.isArray(ids)||ids.length>200)fail(400,'invalid_ids','Verify up to 200 files at a time.');
+    return {files:(await pool.query(`SELECT f.* FROM stored_files f WHERE ${readableSQL} AND f.cloud_status='active' AND f.id=ANY($3::uuid[])`,[actor.userId,actor.companyId,ids.map(uuid)])).rows.map(r=>publicFile(r,actor))};
+  }
+  return {verify,usage,list,begin,part,complete,patch,access,acknowledge,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
 }

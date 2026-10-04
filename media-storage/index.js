@@ -11,6 +11,7 @@ export async function installMediaStorage({app,pool,authRequired,bucket=createSt
   });
   route('get','/usage',r=>service.usage(r));
   route('get','/files',r=>service.list(r,r.query));
+  route('post','/files/verify',r=>service.verify(r,r.body.ids));
   route('post','/uploads',r=>service.begin(r,r.body));
   route('post','/files/:id/parts',r=>service.part(r,r.params.id,r.body.part_number));
   route('post','/files/:id/complete',r=>service.complete(r,r.params.id));
