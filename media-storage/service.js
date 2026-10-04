@@ -97,6 +97,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
     return transaction(async db=>{
       await account(db,actor.userId);const row=await file(db,actor,id,true);owner(row,actor);
       if(integer(body.expected_version,1,Number.MAX_SAFE_INTEGER)!==row.version)fail(409,'stale_file','This file changed. Refresh before saving.');
+      const previousName=row.display_name;
       let event='metadata_updated',wasPublic=await effectivelyPublic(db,row);
       if(body.display_name!==undefined) {row.display_name=name(body.display_name);event='renamed';}
       if(body.folder_id!==undefined) {row.folder_id=await folder(db,actor,body.folder_id);event='moved';}
@@ -104,7 +105,7 @@ export function createStorageService({pool,bucket,env=process.env}) {
       if(body.audio_subtype!==undefined) {if(!['music','audiobook'].includes(body.audio_subtype))fail(400,'invalid_subtype','Choose Music or Audiobook.');row.audio_subtype=body.audio_subtype;}
       if(body.visibility!==undefined) {if(!['private','company'].includes(body.visibility))fail(400,'invalid_visibility','Invalid visibility.');if(body.visibility==='company'&&!actor.companyId)fail(409,'company_required','Join a company before sharing.');row.visibility=body.visibility;if(row.visibility==='company')row.company_id=actor.companyId;event=row.visibility==='company'?'public_enabled':'public_disabled';wasPublic=wasPublic||row.visibility==='company';}
       const saved=(await db.query(`UPDATE stored_files SET display_name=$2,folder_id=$3,metadata_json=$4,audio_subtype=$5,visibility=$6,company_id=$7,updated_at=now(),version=version+1 WHERE id=$1 RETURNING *`,[row.id,row.display_name,row.folder_id,row.metadata_json,row.audio_subtype,row.visibility,row.company_id])).rows[0];
-      await audit(db,saved,actor,event,wasPublic);return publicFile(saved,actor);
+      await audit(db,saved,actor,event,wasPublic,saved.visibility==='private'?previousName:saved.display_name);return publicFile(saved,actor);
     });
   }
   async function access(actor,id,purpose) {

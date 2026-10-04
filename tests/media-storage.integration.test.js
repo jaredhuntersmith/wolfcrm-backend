@@ -88,6 +88,12 @@ test('storage privacy and lifecycle against PostgreSQL', {timeout:120000}, async
    let shared=await upload(1,'Moderated.txt');shared=(await req(`/files/${shared.id}`,'PATCH',{expected_version:shared.version,visibility:'company'})).data;await req(`/files/${shared.id}?everywhere=true`,'DELETE',undefined,'owner');
    assert.equal((await req('/files/verify','POST',{ids:[shared.id]})).data.deletions[0].delete_everywhere,false);
   });
+  await t.test('atomic make-private and rename never disclose the new private filename in shared audit',async()=>{
+   let file=await upload(2,'Previously public.txt');file=(await req(`/files/${file.id}`,'PATCH',{expected_version:file.version,visibility:'company'})).data;
+   const hidden='PRIVATE-RENAMED-'+randomUUID();await req(`/files/${file.id}`,'PATCH',{expected_version:file.version,visibility:'private',display_name:hidden});
+   assert.equal((await req('/activity?search='+hidden,'GET',undefined,'owner')).data.events.length,0);
+   const events=(await req('/activity?file_id='+file.id,'GET',undefined,'owner')).data.events;assert.equal(events.find(e=>e.event_type==='public_disabled').file_name,'Previously public.txt');
+  });
   await t.test('duplicate start/finalize charge once; no upload URLs after finalization; expired cleanup',async()=>{
    const id=randomUUID(),body={id,original_filename:'retry.zip',mime_type:'application/zip',byte_size:10};for(let i=0;i<2;i++)assert.equal((await req('/uploads','POST',body)).status,200);await req(`/files/${id}/parts`,'POST',{part_number:1});for(let i=0;i<2;i++)assert.equal((await req(`/files/${id}/complete`,'POST',{})).status,200);assert.equal((await req(`/files/${id}/parts`,'POST',{part_number:1})).status,404);
    const pending=randomUUID();await req('/uploads','POST',{...body,id:pending});await pool.query("UPDATE stored_files SET upload_expires_at=now()-interval '1 day' WHERE id=$1",[pending]);await service.cleanup();assert.equal((await req('/usage')).data.reserved_bytes,0);
