@@ -1,4 +1,4 @@
-import { S3Client, CreateMultipartUploadCommand, UploadPartCommand, ListPartsCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, HeadObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, ListMultipartUploadsCommand, CreateMultipartUploadCommand, UploadPartCommand, ListPartsCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, HeadObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 export const PART_SIZE = 16 * 1024 * 1024;
 export const ACCESS_SECONDS = 300;
@@ -10,7 +10,13 @@ export function createStorageBucket(env = process.env) {
   if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
   const client = new S3Client({ endpoint, region: env.STORAGE_REGION || env.MEDIA_REGION || env.AWS_DEFAULT_REGION || 'auto', forcePathStyle: true, credentials: { accessKeyId, secretAccessKey }, requestChecksumCalculation: 'WHEN_REQUIRED', responseChecksumValidation: 'WHEN_REQUIRED' });
   const args = file => ({ Bucket: bucket, Key: file.object_key });
+  let orphanMarker;
   return {
+    async abandonedUploads() {
+      const page=await client.send(new ListMultipartUploadsCommand({Bucket:bucket,Prefix:'storage/',MaxUploads:100,KeyMarker:orphanMarker?.key,UploadIdMarker:orphanMarker?.upload}));
+      orphanMarker=page.IsTruncated?{key:page.NextKeyMarker,upload:page.NextUploadIdMarker}:undefined;
+      return (page.Uploads||[]).filter(u=>new Date(u.Initiated).getTime()<Date.now()-24*60*60*1000).map(u=>({object_key:u.Key,upload_id:u.UploadId}));
+    },
     async begin(file) { return (await client.send(new CreateMultipartUploadCommand({ ...args(file), ContentType: file.mime_type, Metadata: { 'wolf-file-id': file.id, 'wolf-owner-id': file.owner_user_id } }))).UploadId; },
     async part(file, number, size) { return getSignedUrl(client, new UploadPartCommand({ ...args(file), UploadId: file.upload_id, PartNumber: number, ContentLength: size }), { expiresIn: 900 }); },
     async parts(file) {

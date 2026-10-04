@@ -52,6 +52,15 @@ test('storage privacy and lifecycle against PostgreSQL', {timeout:120000}, async
    const payload=()=>({id:randomUUID(),original_filename:'Large.mp4',byte_size:2*PART_SIZE,mime_type:'video/mp4'});const attempts=await Promise.all([req('/uploads','POST',payload()),req('/uploads','POST',payload())]);assert.deepEqual(attempts.map(r=>r.status).sort(),[200,413]);const id=attempts.find(r=>r.status===200).data.file.id;
    await req(`/files/${id}/parts`,'POST',{part_number:1});assert.equal((await req(`/files/${id}/complete`,'POST',{})).status,409);await req(`/files/${id}`,'DELETE');assert.equal((await req('/usage')).data.reserved_bytes,0);
   });
+  await t.test('company departure hides previous public sharing and never leaks subsequent private activity',async()=>{
+   const before=(await req('/activity','GET',undefined,'owner')).data.events.length;
+   const originalCompany=actors.a.companyId;actors.a.companyId=otherCompany;await pool.query('UPDATE users SET company_id=$2 WHERE id=$1',[actors.a.userId,otherCompany]);
+   assert.equal((await req(`/files/${f.id}`)).data.visibility,'private');
+   f=(await req(`/files/${f.id}`,'PATCH',{expected_version:f.version,display_name:'Private after departure'})).data;
+   const receipt=(await req(`/files/${f.id}/access`,'POST',{purpose:'download'})).data.receipt_id;await req(`/files/${f.id}/download-complete`,'POST',{receipt_id:receipt});
+   assert.equal((await req('/activity','GET',undefined,'owner')).data.events.length,before);assert.equal((await req('/activity','GET',undefined,'foreign')).data.events.length,0);
+   actors.a.companyId=originalCompany;await pool.query('UPDATE users SET company_id=$2 WHERE id=$1',[actors.a.userId,originalCompany]);
+  });
   await t.test('thumbnail access inherits original privacy; quota includes derivative once; replacement cleans old bytes',async()=>{
    const id=randomUUID();assert.equal((await req(`/files/${f.id}/thumbnail`,'POST',{id,byte_size:50},'b')).status,403);
    assert.equal((await req(`/files/${f.id}/thumbnail`,'POST',{id,byte_size:50})).status,200);

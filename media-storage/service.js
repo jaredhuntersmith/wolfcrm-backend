@@ -147,6 +147,14 @@ export function createStorageService({pool,bucket,env=process.env}) {
   }
   async function cleanup(id=null) {
     if(!bucket)return;
+    // Reconcile the provider/DB crash window between CreateMultipartUpload and
+    // committing its upload id. This prefix belongs only to this subsystem.
+    if(!id && bucket.abandonedUploads) {
+      for(const pending of await bucket.abandonedUploads()) {
+        const tracked=(await pool.query("SELECT 1 FROM stored_files WHERE object_key=$1 AND upload_id=$2 AND cloud_status='pending' AND upload_expires_at>now() UNION ALL SELECT 1 FROM storage_thumbnails WHERE object_key=$1 AND upload_id=$2 AND cloud_status='pending' AND upload_expires_at>now()",[pending.object_key,pending.upload_id])).rowCount;
+        if(!tracked)await bucket.abort(pending);
+      }
+    }
     return transaction(async db=>{
       const rows=(await db.query(`SELECT * FROM stored_files WHERE ($1::uuid IS NULL OR id=$1) AND ((cloud_status='deleting' AND cleanup_after<=now()) OR (cloud_status='pending' AND upload_expires_at<now())) ORDER BY updated_at LIMIT 20 FOR UPDATE SKIP LOCKED`,[id])).rows;
       for(const row of rows) {
