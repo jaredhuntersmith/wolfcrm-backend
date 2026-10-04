@@ -27,6 +27,7 @@ export async function installStorageSchema(db) {
       uploaded_at timestamptz, deleted_at timestamptz, cleanup_after timestamptz, checksum text
     );
     ALTER TABLE stored_files ADD COLUMN IF NOT EXISTS thumbnail_id uuid;
+    ALTER TABLE stored_files ADD COLUMN IF NOT EXISTS delete_everywhere boolean NOT NULL DEFAULT false;
     CREATE TABLE IF NOT EXISTS storage_thumbnails (
       id uuid PRIMARY KEY, file_id uuid NOT NULL REFERENCES stored_files(id), owner_user_id uuid NOT NULL REFERENCES users(id),
       object_key text NOT NULL UNIQUE, byte_size bigint NOT NULL CHECK(byte_size BETWEEN 1 AND 524288),

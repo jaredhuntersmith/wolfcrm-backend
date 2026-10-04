@@ -136,11 +136,11 @@ export function createStorageService({pool,bucket,env=process.env}) {
       return (await db.query(`UPDATE storage_file_state SET ${set.join(',')} WHERE user_id=$1 AND file_id=$2 RETURNING *`,params)).rows[0];
     });
   }
-  async function remove(actor,id) {
+  async function remove(actor,id,everywhere=false) {
     cloud();await transaction(async db=>{
       const row=await file(db,actor,id,true,['pending','active','deleting','deleted']);if(!canDelete(row,actor))fail(403,'delete_denied','Only the owner or company employer can delete this shared file.');
       if(row.cloud_status==='deleted'||row.cloud_status==='deleting')return;
-      await db.query("UPDATE stored_files SET cloud_status='deleting',deleted_at=now(),updated_at=now(),cleanup_after=now(),version=version+1 WHERE id=$1",[row.id]);await audit(db,row,actor,'deleted');
+      await db.query("UPDATE stored_files SET cloud_status='deleting',deleted_at=now(),updated_at=now(),cleanup_after=now(),version=version+1,delete_everywhere=$2 WHERE id=$1",[row.id,everywhere && row.owner_user_id===actor.userId]);await audit(db,row,actor,'deleted');
     });
     await pool.query("UPDATE storage_thumbnails SET cloud_status='deleting' WHERE file_id=$1 AND cloud_status<>'deleted'",[id]);
     await cleanup(id);return {ok:true};
@@ -229,7 +229,8 @@ export function createStorageService({pool,bucket,env=process.env}) {
   }
   async function verify(actor,ids) {
     if(!Array.isArray(ids)||ids.length>200)fail(400,'invalid_ids','Verify up to 200 files at a time.');
-    return {files:(await pool.query(`SELECT f.*,owner.display_name AS owner_display_name,EXISTS(SELECT 1 FROM users active_owner WHERE active_owner.id=f.owner_user_id AND active_owner.company_id=f.company_id AND active_owner.deleted_at IS NULL) AS sharing_active FROM stored_files f JOIN users owner ON owner.id=f.owner_user_id WHERE ${readableSQL} AND f.cloud_status='active' AND f.id=ANY($3::uuid[])`,[actor.userId,actor.companyId,ids.map(uuid)])).rows.map(r=>publicFile(r,actor))};
+    const deleted=(await pool.query("SELECT id,delete_everywhere FROM stored_files WHERE owner_user_id=$1 AND id=ANY($2::uuid[]) AND cloud_status IN ('deleting','deleted')",[actor.userId,ids.map(uuid)])).rows;
+    return {deletions:deleted,files:(await pool.query(`SELECT f.*,owner.display_name AS owner_display_name,EXISTS(SELECT 1 FROM users active_owner WHERE active_owner.id=f.owner_user_id AND active_owner.company_id=f.company_id AND active_owner.deleted_at IS NULL) AS sharing_active FROM stored_files f JOIN users owner ON owner.id=f.owner_user_id WHERE ${readableSQL} AND f.cloud_status='active' AND f.id=ANY($3::uuid[])`,[actor.userId,actor.companyId,ids.map(uuid)])).rows.map(r=>publicFile(r,actor))};
   }
   return {thumbnailBegin,thumbnailComplete,thumbnailAccess,verify,usage,list,begin,part,complete,patch,access,acknowledge,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
 }

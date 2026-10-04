@@ -81,6 +81,13 @@ test('storage privacy and lifecycle against PostgreSQL', {timeout:120000}, async
    const id=randomUUID(),body={id,name:'Replay folder'};const one=(await req('/folders','POST',body)).data;const two=(await req('/folders','POST',body)).data;assert.equal(one.id,two.id);assert.equal((await req('/folders','POST',body,'b')).status,404);
    assert.equal((await req('/activity?search=nonexistent','GET',undefined,'owner')).data.events.length,0);
   });
+  await t.test('delete-everywhere tombstones reach only the owner; moderation never erases owner offline copies',async()=>{
+   const owned=await upload(1,'Delete all.txt');await req(`/files/${owned.id}?everywhere=true`,'DELETE');
+   assert.equal((await req('/files/verify','POST',{ids:[owned.id]})).data.deletions[0].delete_everywhere,true);
+   assert.equal((await req('/files/verify','POST',{ids:[owned.id]},'owner')).data.deletions.length,0);
+   let shared=await upload(1,'Moderated.txt');shared=(await req(`/files/${shared.id}`,'PATCH',{expected_version:shared.version,visibility:'company'})).data;await req(`/files/${shared.id}?everywhere=true`,'DELETE',undefined,'owner');
+   assert.equal((await req('/files/verify','POST',{ids:[shared.id]})).data.deletions[0].delete_everywhere,false);
+  });
   await t.test('duplicate start/finalize charge once; no upload URLs after finalization; expired cleanup',async()=>{
    const id=randomUUID(),body={id,original_filename:'retry.zip',mime_type:'application/zip',byte_size:10};for(let i=0;i<2;i++)assert.equal((await req('/uploads','POST',body)).status,200);await req(`/files/${id}/parts`,'POST',{part_number:1});for(let i=0;i<2;i++)assert.equal((await req(`/files/${id}/complete`,'POST',{})).status,200);assert.equal((await req(`/files/${id}/parts`,'POST',{part_number:1})).status,404);
    const pending=randomUUID();await req('/uploads','POST',{...body,id:pending});await pool.query("UPDATE stored_files SET upload_expires_at=now()-interval '1 day' WHERE id=$1",[pending]);await service.cleanup();assert.equal((await req('/usage')).data.reserved_bytes,0);

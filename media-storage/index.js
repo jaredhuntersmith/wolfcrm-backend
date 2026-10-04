@@ -23,7 +23,7 @@ export async function installMediaStorage({app,pool,authRequired,bucket=createSt
   route('post','/files/:id/access',r=>service.access(r,r.params.id,r.body.purpose));
   route('post','/files/:id/download-complete',r=>service.acknowledge(r,r.params.id,r.body.receipt_id));
   route('put','/files/:id/state',r=>service.state(r,r.params.id,r.body));
-  route('delete','/files/:id',r=>service.remove(r,r.params.id));
+  route('delete','/files/:id',r=>service.remove(r,r.params.id,r.query.everywhere==='true'));
   route('get','/folders',r=>service.folders(r));
   route('post','/folders',r=>service.saveFolder(r,null,r.body));
   route('patch','/folders/:id',r=>service.saveFolder(r,r.params.id,r.body));
