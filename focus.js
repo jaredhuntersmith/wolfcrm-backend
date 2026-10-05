@@ -25,6 +25,8 @@ const FOCUS_DOC_VERSION = "2026-09-21";
 const JOB_LEASE_SECONDS = 120;
 const MAX_FEED_PAGE = 50;
 const META_PROVIDER = "meta_graph";
+export const FOCUS_META_DEFAULT_GRAPH_VERSION = "v26.0";
+export const FOCUS_META_DEFAULT_SCOPES = "instagram_basic,pages_show_list";
 
 export class FocusProviderError extends Error {
   constructor(code, { statusCode = 503, retryable = false, detail = null } = {}) {
@@ -449,12 +451,12 @@ class MetaGraphProvider {
   constructor({ env = process.env, fetchImpl = fetch }) { this.env = env; this.fetch = fetchImpl; }
   status() { return buildFocusCapabilityMatrix(this.env).capabilities.find((item) => item.id === "meta_business_discovery"); }
   configured() { return this.status().status !== "unconfigured"; }
-  version() { return this.env.FOCUS_META_GRAPH_VERSION || "v24.0"; }
+  version() { return this.env.FOCUS_META_GRAPH_VERSION || FOCUS_META_DEFAULT_GRAPH_VERSION; }
   redirectURI() { return this.env.FOCUS_META_REDIRECT_URI; }
   authURL(state) {
     if (!this.configured()) throw new FocusProviderError("meta_not_configured");
     const url = new URL(`https://www.facebook.com/${this.version()}/dialog/oauth`);
-    url.search = new URLSearchParams({ client_id: this.env.FOCUS_META_APP_ID, redirect_uri: this.redirectURI(), state, response_type: "code", scope: this.env.FOCUS_META_SCOPES || "instagram_basic,instagram_manage_messages,pages_show_list,pages_read_engagement" }).toString();
+    url.search = new URLSearchParams({ client_id: this.env.FOCUS_META_APP_ID, redirect_uri: this.redirectURI(), state, response_type: "code", scope: this.env.FOCUS_META_SCOPES || FOCUS_META_DEFAULT_SCOPES }).toString();
     return url.toString();
   }
   async exchangeCode(code) {
@@ -1262,7 +1264,10 @@ function timingSafeStringEquals(left, right) { const a = Buffer.from(String(left
 function verifyMetaWebhookSignature(raw, signature) { const secret = process.env.FOCUS_META_APP_SECRET; if (!secret || typeof signature !== "string" || !signature.startsWith("sha256=")) return false; const expected = createHmac("sha256", secret).update(raw).digest("hex"); return timingSafeStringEquals(signature.slice(7), expected); }
 function metaWebhookEventIDs(payload) { const entries = Array.isArray(payload?.entry) ? payload.entry : []; const ids = entries.flatMap((entry, entryIndex) => { const changes = Array.isArray(entry?.changes) ? entry.changes : []; const messages = Array.isArray(entry?.messaging) ? entry.messaging : []; const nested = [...changes, ...messages]; return nested.length ? nested.map((event, eventIndex) => String(event?.id || event?.message?.mid || event?.post_id || `${entry?.id || "entry"}:${entryIndex}:${eventIndex}`)) : [String(entry?.id || `entry:${entryIndex}`)]; }); return ids.length ? [...new Set(ids)] : [stableFingerprint(payload).slice(0, 64)]; }
 function hashSecret(value) { return createHash("sha256").update(value).digest("hex"); }
-function safeProviderJSON(response, code) { return response.json().catch(() => ({})).then((data) => { if (!response.ok || data.error) throw new FocusProviderError(data.error?.code ? `${code}:${data.error.code}` : code, { statusCode: response.status, retryable: response.status === 429 || response.status >= 500, detail: data.error?.message || null }); return data; }); }
+export function focusProviderFailureCode(code) {
+  return `${String(code).replace(/[^a-z0-9_]/g, "_").slice(0, 55)}_provider_rejected`;
+}
+function safeProviderJSON(response, code) { return response.json().catch(() => ({})).then((data) => { if (!response.ok || data.error) throw new FocusProviderError(data.error ? focusProviderFailureCode(code) : code, { statusCode: response.status, retryable: response.status === 429 || response.status >= 500 }); return data; }); }
 function extractBraveUsage(headers) { return Object.fromEntries(["x-request-id", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"].map((key) => [key, headers.get(key)]).filter(([, value]) => value !== null)); }
 function normalizeUsername(value) { const username = String(value || "").trim().replace(/^@/, "").toLowerCase(); if (!/^[a-z0-9._]{1,30}$/.test(username)) throw focusValidationError("invalid_instagram_username"); return username; }
 export function normalizeHashtag(value) { const hashtag = String(value || "").trim().replace(/^#/, "").toLowerCase(); if (!/^[\p{L}\p{N}_]{1,100}$/u.test(hashtag)) throw focusValidationError("invalid_instagram_hashtag"); return hashtag; }

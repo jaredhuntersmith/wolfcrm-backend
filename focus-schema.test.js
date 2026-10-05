@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fixtureProbeObservations, installFocusSchema, normalizeHashtag } from "./focus.js";
+import { FOCUS_META_DEFAULT_GRAPH_VERSION, FOCUS_META_DEFAULT_SCOPES, fixtureProbeObservations, focusProviderFailureCode, installFocusSchema, normalizeHashtag } from "./focus.js";
 
 test("Focus schema installer is additive and contains tenant-scoped persistence", async () => {
   const statements = [];
@@ -23,6 +23,13 @@ test("Meta hashtag discovery accepts a bounded tag and rejects a profile or URL"
   assert.equal(normalizeHashtag("#WindowWashing"), "windowwashing");
   assert.throws(() => normalizeHashtag("@creator"), { code: "invalid_instagram_hashtag" });
   assert.throws(() => normalizeHashtag("https://instagram.com/tag"), { code: "invalid_instagram_hashtag" });
+});
+
+test("Meta defaults follow the current Facebook Login contract and provider failures remain sanitized", () => {
+  assert.equal(FOCUS_META_DEFAULT_GRAPH_VERSION, "v26.0");
+  assert.equal(FOCUS_META_DEFAULT_SCOPES, "instagram_basic,pages_show_list");
+  assert.equal(focusProviderFailureCode("meta_oauth_exchange_failed"), "meta_oauth_exchange_failed_provider_rejected");
+  assert.match(focusProviderFailureCode("meta failure: 190"), /^[a-z0-9_]+$/);
 });
 
 test("Supply Probe fixture records every required measurement without claiming live evidence", () => {
