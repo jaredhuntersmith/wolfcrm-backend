@@ -21,7 +21,9 @@ import {
 
 const META_DOCS = "https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-facebook-login/business-discovery";
 const BRAVE_DOCS = "https://api-dashboard.search.brave.com/documentation/services/web-search";
-const FOCUS_DOC_VERSION = "2026-09-21";
+// Re-verified against current official Meta platform documentation on 2026-10-05.
+// This is an evidence date, not a claim that any provider capability is live.
+const FOCUS_DOC_VERSION = "2026-10-05";
 const JOB_LEASE_SECONDS = 120;
 const MAX_FEED_PAGE = 50;
 const META_PROVIDER = "meta_graph";
