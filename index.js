@@ -208,6 +208,7 @@ import { installMediaStorage } from "./media-storage/index.js";
 import { installCommsCompatibility } from "./company-comms/compatibility.js";
 import { installCommsAudit } from "./company-comms/audit.js";
 import { installCommsQuoteExports } from "./company-comms/quote-exports.js";
+import { installBrowser } from "./browser.js";
 import { installCompanyComms } from "./company-comms/index.js";
 import { installCommsCalls } from "./company-comms/calls/index.js";
 import { storagePredicate } from "./company-comms/assets.js";
@@ -19224,6 +19225,7 @@ async function startServer() {
   app.locals.permissionGovernance = installPermissionGovernanceRoutes({app,pool,authRequired});
   app.locals.mediaStorage = await installMediaStorage({ app, pool, authRequired, accessPredicate: storagePredicate, onRequest:r=>takeRateLimit(pool,r), onAccess:(...args)=>app.locals.commsAudit?.record(...args) });
   app.locals.comms = await installCompanyComms({app,pool,authRequired,sendPush:sendPushToUsers});
+  app.locals.browser = await installBrowser({app,pool,authRequired});
   app.locals.commsCollaboration = installCollaboration({app,pool,authRequired,messages:app.locals.comms.messages,notifications:app.locals.comms.notifications,emitAutomationEvent});
   app.locals.commsAudit = await installCommsAudit({app,pool,authRequired});
   await installCommsQuoteExports({app,pool,authRequired,storage:app.locals.mediaStorage});

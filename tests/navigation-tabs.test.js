@@ -14,7 +14,7 @@ const allCapabilities = Object.fromEntries(TAB_CATALOG.flatMap((tab) => tab.any_
 
 test("tab catalog and built-in role defaults remain valid", () => {
   const catalog = tabCatalogPayload();
-  assert.equal(catalog.version, 2);
+  assert.equal(catalog.version, 3);
   assert.equal(catalog.max_primary_tabs, 5);
   assert.equal(new Set(catalog.tabs.map((tab) => tab.id)).size, catalog.tabs.length);
   for (const preset of ["admin", "manager", "sales", "technician", "office", "legacy_employee"]) {
@@ -32,8 +32,8 @@ test("layout validation rejects system IDs, duplicates, unknown fields, and too 
 
 test("partial orders append new catalog IDs and normalize hidden ordering", () => {
   const result = validateTabLayout({ order: ["messages", "dashboard"], hidden: ["map", "stages"] });
-  assert.deepEqual(result.order, ["messages", "dashboard", "contacts", "stages", "schedule", "map", "company_comms"]);
-  assert.deepEqual(result.hidden, ["stages", "map"]);
+  assert.deepEqual(result.order, ["messages", "dashboard", "contacts", "stages", "schedule", "map", "company_comms", "browser"]);
+  assert.deepEqual(result.hidden, ["stages", "map", "browser"]);
 });
 
 test("individual locked policy takes precedence over role policy and user preference", () => {
@@ -79,10 +79,10 @@ test("permissions separate customer Messages from Company Comms", () => {
 test("the direct tab cap moves remaining permitted destinations into overflow", () => {
   const response = resolveTabNavigation({
     role: "employer",
-    userPreferences: { order: TAB_CATALOG.map((tab) => tab.id), hidden: ["map", "messages"] }
+    userPreferences: { order: TAB_CATALOG.map((tab) => tab.id), hidden: ["map", "messages", "browser"] }
   });
   assert.equal(response.effective.primary.length, MAX_PRIMARY_TABS);
-  assert.deepEqual(response.effective.overflow, ["map", "messages"]);
+  assert.deepEqual(response.effective.overflow, ["map", "browser", "messages"]);
 });
 
 test("invalid persisted documents safely fall back to the built-in role layout", () => {
@@ -107,7 +107,7 @@ test("no permitted core destination leaves More as the safe fallback", () => {
  test("old preferences add Company Comms once and preserve all old destinations",()=>{
  const old={order:["dashboard","contacts","stages","schedule","map","messages"],hidden:["messages"]};
  const one=sanitizePersistedTabLayout(old);assert.deepEqual(one.order.slice(0,5),["dashboard","contacts","stages","schedule","company_comms"]);
- assert.deepEqual(one.hidden,["map","messages"]);assert.deepEqual(sanitizePersistedTabLayout(one),one);
+ assert.deepEqual(one.hidden,["map","messages","browser"]);assert.deepEqual(sanitizePersistedTabLayout(one),one);
  const noComms=resolveTabNavigation({role:"employee",preset:"technician",capabilities:{"messaging.customer.view":true},userPreferences:old});
  assert.deepEqual(noComms.effective.order,["messages"]);
  });

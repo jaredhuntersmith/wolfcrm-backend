@@ -5,6 +5,7 @@ export const PERMISSION_GROUPS = Object.freeze([
   group("contacts", "Contacts & Customer Information", "Customer records, exports, and destructive contact actions."),
   group("sales", "Sales, Pipeline & Quotes", "Lead stages, opportunities, quotes, and sales reporting."),
   group("schedule", "Schedule & Jobs", "Scheduling, job execution, completion, and workflow templates."),
+  group("browser", "Browser", "Web browsing, website sharing and privacy controls."),
   group("routes", "Routes", "View, build, edit, and administer field routes."),
   group("messaging", "Customer Messaging", "Customer conversations and message deletion."),
   group("storage", "Media/Storage", "Personal and authorized shared files, audio, and media."),
@@ -25,6 +26,16 @@ export const PERMISSION_GROUPS = Object.freeze([
 ]);
 
 export const PERMISSION_CAPABILITIES = Object.freeze([
+  capability("browser.view", "browser", "Use Browser", "Browse websites in WolfCRM."),
+  capability("browser.download", "browser", "Download browser files", "Save explicitly selected webpage files and exports.", false, ["browser.view"]),
+  capability("browser.upload", "browser", "Upload to websites", "Select files or photos to upload to external websites.", false, ["browser.view"]),
+  capability("browser.crmShare", "browser", "Attach webpages to CRM", "Attach URL references and prepare tasks; record permissions also apply.", false, ["browser.view"]),
+  capability("browser.companyCommsShare", "browser", "Share webpage cards", "Share sanitized webpage URLs in authorized conversations.", false, ["browser.view"]),
+  capability("browser.ai", "browser", "Use Browser AI", "Submit explicitly previewed readable text to configured AI processing.", false, ["browser.view"]),
+  capability("browser.privateBrowsing", "browser", "Use Private browsing", "Browse in a temporary WebKit session.", false, ["browser.view"]),
+  capability("browser.clearData", "browser", "Clear browser data", "Remove own profile history and website data.", false, ["browser.view"]),
+  capability("browser.settings", "browser", "Change browser settings", "Change search engines and website preferences.", false, ["browser.view"]),
+
   capability("dashboard.view", "dashboard", "View dashboard", "See the command center and daily summaries."),
   capability("dashboard.exceptions.view", "dashboard", "View business exceptions", "See company-wide operational exceptions and affected records.", true, ["dashboard.view"]),
   capability("dashboard.exceptions.manage", "dashboard", "Manage business exceptions", "Snooze, dismiss, resolve, or reopen company-wide exceptions.", true, ["dashboard.exceptions.view"]),

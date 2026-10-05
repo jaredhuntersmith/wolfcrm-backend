@@ -1,4 +1,4 @@
-export const TAB_CATALOG_VERSION = 2;
+export const TAB_CATALOG_VERSION = 3;
 export const MAX_PRIMARY_TABS = 5;
 
 export const TAB_CATALOG = Object.freeze([
@@ -8,6 +8,7 @@ export const TAB_CATALOG = Object.freeze([
   tab("schedule", "Schedule", "calendar", ["schedule.view"]),
   tab("map", "Map", "map.fill", ["operations.view"]),
   tab("company_comms", "Company Comms", "person.3.sequence.fill", ["communications.view"]),
+  tab("browser", "Browser", "globe", ["browser.view"]),
   tab("messages", "Messages", "bubble.left.and.bubble.right.fill", ["messaging.customer.view", "customer.calls.view"])
 ]);
 
@@ -90,7 +91,7 @@ export function validateTabLayout(raw, { allowLocked = false } = {}) {
   }
 
   const order = completeOrder(raw.order);
-  const hidden = normalizedHidden(raw.hidden, order);
+  const hidden = normalizedHidden(raw.order.includes("browser") ? raw.hidden : [...raw.hidden, "browser"], order);
   const directCount = order.length - hidden.length;
   if (directCount < 1) {
     throw invalidLayout("At least one destination must remain in the tab bar.", { field: "hidden" });
@@ -109,7 +110,7 @@ export function validateTabLayout(raw, { allowLocked = false } = {}) {
 export function migrateCompanyCommsLayout(raw) {
   if (!Array.isArray(raw?.order) || !Array.isArray(raw?.hidden) || raw.order.includes("company_comms")) return raw;
   if (raw.order.some(id => !KNOWN_TAB_IDS.has(id))) return raw;
-  const oldOrder = [...raw.order, ...TAB_IDS.filter(id => id !== "company_comms" && !raw.order.includes(id))];
+  const oldOrder = [...raw.order, ...TAB_IDS.filter(id => id !== "browser" && id !== "company_comms" && !raw.order.includes(id))];
   const visible = oldOrder.filter(id => !raw.hidden.includes(id));
   const insertion = visible.length >= 5 ? oldOrder.indexOf(visible[4]) : oldOrder.length;
   const order = [...oldOrder.slice(0,insertion), "company_comms", ...oldOrder.slice(insertion)];
@@ -129,7 +130,7 @@ export function sanitizePersistedTabLayout(raw, options = {}) {
 export function defaultTabLayout({ role, preset } = {}) {
   const key = role === "employer" ? "owner" : (isKnownTabRolePreset(preset) ? preset : "technician");
   const old = [...(DEFAULT_ORDER_BY_PRESET[key] || DEFAULT_ORDER_BY_PRESET.technician)];
-  const order = [...old.slice(0, 4), "company_comms", ...old.slice(4)];
+  const order = [...old.slice(0, 4), "company_comms", ...old.slice(4), "browser"];
   return { order, hidden: order.slice(MAX_PRIMARY_TABS), locked: false };
 }
 

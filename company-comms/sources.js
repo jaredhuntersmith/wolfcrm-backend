@@ -1,10 +1,11 @@
+import {safeWebpage} from '../browser-contracts.js';
 import {taskAccessSQL} from './tasks.js';
 import {randomUUID} from 'node:crypto';
 import {can,loadActor,authorizeConversation,requireCapability,fail,id,text} from './access.js';
 export const NO_ACCESS=Object.freeze({accessible:false,text:'No Access'});
-export const SOURCE_CAPABILITIES=Object.freeze({contact:['contacts.view'],stage_entry:['contacts.view','pipeline.view'],job:['schedule.view','jobs.view'],quote:['quotes.view','contacts.view'],task:['tasks.view'],service_plan:['service_plans.view'],notification:['notifications.view']});
+export const SOURCE_CAPABILITIES=Object.freeze({webpage:[],contact:['contacts.view'],stage_entry:['contacts.view','pipeline.view'],job:['schedule.view','jobs.view'],quote:['quotes.view','contacts.view'],task:['tasks.view'],service_plan:['service_plans.view'],notification:['notifications.view']});
 export function sourceAllowed(actor,type,context=type){const keys=SOURCE_CAPABILITIES[type];return !!keys&&keys.every(k=>can(actor,k))&&(!['stages','stage_entry','pipeline'].includes(context)||can(actor,'pipeline.view'));}
-function descriptor(raw){const source_type=text(raw.source_type,40),source_id=id(raw.source_id),context_type=text(raw.context_type||source_type,40,false),context_id=raw.context_id==null?null:id(raw.context_id);if(!SOURCE_CAPABILITIES[source_type])fail(400,'unsupported_source');if(['stages','stage_entry','pipeline'].includes(context_type)&&source_type!=='stage_entry')fail(400,'stage_context_requires_stage_entry');return {source_type,source_id,context_type,context_id};}
+function descriptor(raw){if(raw?.source_type==='webpage'){const page=safeWebpage(raw);return {source_type:'webpage',source_id:page.url,context_type:'webpage',context_id:null,title:page.title};}const source_type=text(raw.source_type,40),source_id=id(raw.source_id),context_type=text(raw.context_type||source_type,40,false),context_id=raw.context_id==null?null:id(raw.context_id);if(!SOURCE_CAPABILITIES[source_type])fail(400,'unsupported_source');if(['stages','stage_entry','pipeline'].includes(context_type)&&source_type!=='stage_entry')fail(400,'stage_context_requires_stage_entry');return {source_type,source_id,context_type,context_id};}
 async function originalConversationAccessible(db,actor,conversationId){
  if(!conversationId)return true;
  try{await authorizeConversation(db,actor,conversationId);return true;}catch(error){if([403,404].includes(error.status))return false;throw error;}
@@ -13,6 +14,7 @@ export async function hydrateSources(db,actor,references){
  const output=new Map(),groups=new Map();
  for(const raw of references){const key=raw.id||JSON.stringify(raw),type=raw.source_type;if(!sourceAllowed(actor,type,raw.context_type)){output.set(key,NO_ACCESS);continue;}if(!groups.has(type))groups.set(type,[]);groups.get(type).push({...raw,key});}
  for(const [type,items] of groups){
+  if(type==='webpage'){for(const item of items){try{const page=safeWebpage({source_id:item.source_id,title:item.title||item.snapshot?.title});output.set(item.key,{accessible:true,interactive:true,source_type:'webpage',source_id:page.url,title:page.title,subtitle:page.domain,url:page.url});}catch{output.set(item.key,{accessible:true,interactive:false,text:'Unavailable'});}}continue;}
   const values=[items.map(x=>x.source_id),actor.companyId,actor.userId];let query;
   switch(type){
    case 'contact':query=`SELECT id::text,name AS title,address AS subtitle FROM contacts WHERE id::text=ANY($1::text[]) AND company_id=$2 AND deleted_at IS NULL`;break;
@@ -35,13 +37,13 @@ export async function hydrateSources(db,actor,references){
  return output;
 }
 export async function validateShares(db,actor,input){
- if(!Array.isArray(input)||input.length>10)fail(400,'invalid_cards');if(input.length)requireCapability(actor,'communications.share');for(const ref of input){if(ref.source_type==='notification')requireCapability(actor,'notifications.share');if(ref.source_type==='quote')requireCapability(actor,'quotes.share');}const descriptors=input.map(descriptor),mapped=descriptors.map((d,i)=>({...d,id:String(i)}));const hydrated=await hydrateSources(db,actor,mapped);
+ if(!Array.isArray(input)||input.length>10)fail(400,'invalid_cards');if(input.length)requireCapability(actor,'communications.share');for(const ref of input){if(ref.source_type==='webpage'){requireCapability(actor,'browser.view');requireCapability(actor,'browser.companyCommsShare');}if(ref.source_type==='notification')requireCapability(actor,'notifications.share');if(ref.source_type==='quote')requireCapability(actor,'quotes.share');}const descriptors=input.map(descriptor),mapped=descriptors.map((d,i)=>({...d,id:String(i)}));const hydrated=await hydrateSources(db,actor,mapped);
  const denied=mapped.filter(x=>!hydrated.get(x.id)?.accessible||hydrated.get(x.id)?.text==='Unavailable');if(denied.length)fail(403,'source_unavailable','One or more selected items are unavailable. Refresh your selection.');
  return descriptors;
 }
 export async function insertShares(db,actor,messageId,input){
  for(const [sortOrder,ref] of (await validateShares(db,actor,input)).entries()){
-  let snapshot=null,provenance={};
+  let snapshot=ref.source_type==='webpage'?{title:ref.title}:null,provenance={};
   if(ref.source_type==='notification'){
    const row=(await db.query('SELECT title,body,created_at,requirements,source_refs,conversation_id FROM notifications WHERE id=$1 AND user_id=$2',[ref.source_id,actor.userId])).rows[0];snapshot={title:row.title,body:row.body,original_at:row.created_at};provenance={requirements:row.requirements||[],source_refs:row.source_refs||[],conversation_id:row.conversation_id||null};
   }
@@ -76,6 +78,7 @@ export async function searchSources(db,actor,type,query){
 export function sourceAccessSQL(actor, alias='r', includeTaskProvenance=true) {
  const ref=`${alias}.source_id`,company='$2',user='$1';
  const conditions={
+  webpage:`true`,
   contact:`EXISTS(SELECT 1 FROM contacts x WHERE x.id::text=${ref} AND x.company_id=${company} AND x.deleted_at IS NULL)`,
   stage_entry:`EXISTS(SELECT 1 FROM opportunities x JOIN contacts cx ON cx.id::text=x.contact_id AND cx.company_id=x.company_id AND cx.deleted_at IS NULL WHERE x.id=${ref} AND x.company_id=${company})`,
   job:`EXISTS(SELECT 1 FROM schedule_events x WHERE x.id=${ref} AND x.company_id=${company} AND to_jsonb(x)->>'deleted_at' IS NULL)`,
