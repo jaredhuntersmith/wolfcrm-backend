@@ -1,10 +1,11 @@
+import {authorizePage,noteRoleSQL} from '../notes/access.js';
 import {safeWebpage} from '../browser-contracts.js';
 import {taskAccessSQL} from './tasks.js';
 import {randomUUID} from 'node:crypto';
 import {can,loadActor,authorizeConversation,requireCapability,fail,id,text} from './access.js';
 export const NO_ACCESS=Object.freeze({accessible:false,text:'No Access'});
-export const SOURCE_CAPABILITIES=Object.freeze({webpage:[],contact:['contacts.view'],stage_entry:['contacts.view','pipeline.view'],job:['schedule.view','jobs.view'],quote:['quotes.view','contacts.view'],task:['tasks.view'],service_plan:['service_plans.view'],notification:['notifications.view']});
-export function sourceAllowed(actor,type,context=type){const keys=SOURCE_CAPABILITIES[type];return !!keys&&keys.every(k=>can(actor,k))&&(!['stages','stage_entry','pipeline'].includes(context)||can(actor,'pipeline.view'));}
+export const SOURCE_CAPABILITIES=Object.freeze({note:['notes.view'],webpage:[],contact:['contacts.view'],stage_entry:['contacts.view','pipeline.view'],job:['schedule.view','jobs.view'],quote:['quotes.view','contacts.view'],task:['tasks.view'],service_plan:['service_plans.view'],notification:['notifications.view']});
+export function sourceAllowed(actor,type,context=type){const keys=SOURCE_CAPABILITIES[type];return (type!=='note'||actor.notesReady===true)&&!!keys&&keys.every(k=>can(actor,k))&&(!['stages','stage_entry','pipeline'].includes(context)||can(actor,'pipeline.view'));}
 function descriptor(raw){if(raw?.source_type==='webpage'){const page=safeWebpage(raw);return {source_type:'webpage',source_id:page.url,context_type:'webpage',context_id:null,title:page.title};}const source_type=text(raw.source_type,40),source_id=id(raw.source_id),context_type=text(raw.context_type||source_type,40,false),context_id=raw.context_id==null?null:id(raw.context_id);if(!SOURCE_CAPABILITIES[source_type])fail(400,'unsupported_source');if(['stages','stage_entry','pipeline'].includes(context_type)&&source_type!=='stage_entry')fail(400,'stage_context_requires_stage_entry');return {source_type,source_id,context_type,context_id};}
 async function originalConversationAccessible(db,actor,conversationId){
  if(!conversationId)return true;
@@ -14,6 +15,8 @@ export async function hydrateSources(db,actor,references){
  const output=new Map(),groups=new Map();
  for(const raw of references){const key=raw.id||JSON.stringify(raw),type=raw.source_type;if(!sourceAllowed(actor,type,raw.context_type)){output.set(key,NO_ACCESS);continue;}if(!groups.has(type))groups.set(type,[]);groups.get(type).push({...raw,key});}
  for(const [type,items] of groups){
+  if(type==='note'){for(const item of items){try{const {page}=await authorizePage(db,actor,item.source_id);output.set(item.key,{accessible:true,interactive:true,source_type:'note',source_id:page.id,title:page.title,subtitle:'Note',revision:page.revision});}catch(e){if(![403,404].includes(e.status))throw e;output.set(item.key,NO_ACCESS);}}continue;}
+
   if(type==='webpage'){for(const item of items){try{const page=safeWebpage({source_id:item.source_id,title:item.title||item.snapshot?.title});output.set(item.key,{accessible:true,interactive:true,source_type:'webpage',source_id:page.url,title:page.title,subtitle:page.domain,url:page.url});}catch{output.set(item.key,{accessible:true,interactive:false,text:'Unavailable'});}}continue;}
   const values=[items.map(x=>x.source_id),actor.companyId,actor.userId];let query;
   switch(type){
@@ -65,12 +68,15 @@ export async function messageCards(db,actor,messageIds){
 export async function searchSources(db,actor,type,query){
  actor=await loadActor(db,actor);if(!sourceAllowed(actor,type))return [];
  const term='%'+text(query||'',100,false).replace(/[\\%_]/g,'\\$&')+'%';let sql;
+ if(type==='note'){const rows=(await db.query(`SELECT n.id::text FROM comms_notes n WHERE n.company_id=$2 AND n.deleted_at IS NULL AND (${noteRoleSQL(actor)})>0 AND n.title ILIKE $3 ORDER BY n.updated_at DESC,n.id LIMIT 30`,[actor.userId,actor.companyId,term])).rows;return [...(await hydrateSources(db,actor,rows.map(r=>({source_type:'note',source_id:r.id})))).values()];}
  switch(type){case 'contact':sql=`SELECT id::text FROM contacts WHERE company_id=$1 AND deleted_at IS NULL AND name ILIKE $2`;break;
  case 'stage_entry':sql=`SELECT o.id FROM opportunities o JOIN contacts c ON c.id::text=o.contact_id AND c.company_id=o.company_id WHERE o.company_id=$1 AND c.deleted_at IS NULL AND c.name ILIKE $2`;break;
  case 'job':sql=`SELECT id FROM schedule_events WHERE company_id=$1 AND title ILIKE $2`;break;
  case 'quote':sql=`SELECT id::text FROM quotes WHERE company_id=$1 AND COALESCE(title,'Quote') ILIKE $2`;break;
+ case 'service_plan':sql=`SELECT id::text FROM service_plans WHERE company_id=$1 AND plan_name ILIKE $2`;break;
+ case 'task':sql=`SELECT t.id FROM todo_tasks t JOIN users u ON u.id=t.user_id WHERE u.company_id=$1 AND t.title ILIKE $2 AND (t.user_id=$3 OR t.creator_id=$3 OR t.assignee_ids ? $3::text) AND ${taskAccessSQL(actor,'t','$3','$1')}`;break;
  default:return [];}
- const rows=(await db.query(sql+' ORDER BY id LIMIT 30',[actor.companyId,term])).rows;return [...(await hydrateSources(db,actor,rows.map(r=>({...r,source_type:type,source_id:r.id,context_type:type})))).values()];
+ const rows=(await db.query(sql+' ORDER BY id LIMIT 30',type==='task'?[actor.companyId,term,actor.userId]:[actor.companyId,term])).rows;return [...(await hydrateSources(db,actor,rows.map(r=>({...r,source_type:type,source_id:r.id,context_type:type})))).values()];
 }
 
 // SQL predicates share the same source policy for inbox filtering and derived asset bytes.
@@ -86,6 +92,7 @@ export function sourceAccessSQL(actor, alias='r', includeTaskProvenance=true) {
   task:`EXISTS(SELECT 1 FROM todo_tasks x JOIN users ux ON ux.id=x.user_id WHERE x.id=${ref} AND ux.company_id=${company} AND (x.user_id=${user} OR x.creator_id=${user} OR x.assignee_ids ? ${user}::text) AND ${includeTaskProvenance?taskAccessSQL(actor,'x',user,company):'true'})`,
   service_plan:`EXISTS(SELECT 1 FROM service_plans x WHERE x.id::text=${ref} AND x.company_id=${company})`,
  };
+ if(actor.notesReady)conditions.note=`EXISTS(SELECT 1 FROM comms_notes note_source WHERE note_source.id::text=${ref} AND note_source.company_id=${company} AND note_source.deleted_at IS NULL AND (${noteRoleSQL(actor,'note_source')})>0)`;
  const clauses=Object.entries(conditions).filter(([type])=>sourceAllowed(actor,type)).map(([type,predicate])=>`(${alias}.source_type='${type}' AND ${predicate})`);
  const context=can(actor,'pipeline.view')?'true':`COALESCE(${alias}.context_type,'') NOT IN ('stages','stage_entry','pipeline')`;
  return `((${clauses.join(' OR ')||'false'}) AND ${context})`;

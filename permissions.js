@@ -5,6 +5,7 @@ export const PERMISSION_GROUPS = Object.freeze([
   group("contacts", "Contacts & Customer Information", "Customer records, exports, and destructive contact actions."),
   group("sales", "Sales, Pipeline & Quotes", "Lead stages, opportunities, quotes, and sales reporting."),
   group("schedule", "Schedule & Jobs", "Scheduling, job execution, completion, and workflow templates."),
+  group("notes", "Notes", "Private notes and shared company knowledge."),
   group("browser", "Browser", "Web browsing, website sharing and privacy controls."),
   group("routes", "Routes", "View, build, edit, and administer field routes."),
   group("messaging", "Customer Messaging", "Customer conversations and message deletion."),
@@ -26,6 +27,14 @@ export const PERMISSION_GROUPS = Object.freeze([
 ]);
 
 export const PERMISSION_CAPABILITIES = Object.freeze([
+  capability("notes.view", "notes", "Use Notes", "Read authorized private/shared/company pages.", false),
+  capability("notes.create", "notes", "Create Notes", "Create own pages and folders.", false, ["notes.view"]),
+  capability("notes.share", "notes", "Share Notes", "Manage authorized page membership; never grants private employer access.", false, ["notes.view"]),
+  capability("notes.company", "notes", "Publish company Notes", "Create and manage company knowledge pages.", false, ["notes.view"]),
+  capability("notes.databases", "notes", "Use Notes databases", "Create lightweight structured knowledge collections.", false, ["notes.view"]),
+  capability("notes.templates", "notes", "Manage Notes templates", "Create reusable company templates.", false, ["notes.view"]),
+  capability("notes.ai", "notes", "Use Notes AI", "Explicitly submit authorized excerpts to configured processing.", false, ["notes.view"]),
+  capability("notes.export", "notes", "Export Notes", "Export authorized note content.", false, ["notes.view"]),
   capability("browser.view", "browser", "Use Browser", "Browse websites in WolfCRM."),
   capability("browser.download", "browser", "Download browser files", "Save explicitly selected webpage files and exports.", false, ["browser.view"]),
   capability("browser.upload", "browser", "Upload to websites", "Select files or photos to upload to external websites.", false, ["browser.view"]),

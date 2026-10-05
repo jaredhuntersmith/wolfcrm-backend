@@ -1,0 +1,8 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {randomUUID} from 'node:crypto';
+import {createCommsFixture} from './helpers/comms-fixture.js';import {installNotesSchema} from '../notes/schema.js';import {createNotesWorkspace} from '../notes/pages.js';
+test('permanent deletion is owner-confirmed trash only, clears note history and preserves canonical files',{timeout:120000},async()=>{
+ const f=await createCommsFixture();try{await installNotesSchema(f.pool);const actor=await f.actor('owner'),notes=createNotesWorkspace({pool:f.pool}),asset=await f.asset('owner');let doc=await notes.create(actor,{id:randomUUID(),title:'Purge fixture'}),id=doc.page.id;
+ await assert.rejects(notes.purge(actor,id,{confirmed:true,expected_revision:doc.page.revision}),e=>e.status===409);doc=await notes.editBlocks(actor,id,{client_key:randomUUID(),operations:[{id:randomUUID(),type:'asset',expected_revision:0,position:1,payload:{asset_id:asset}}]});doc=await notes.metadata(actor,id,{expected_revision:doc.page.revision,trashed:true});await assert.rejects(notes.purge(actor,id,{expected_revision:doc.page.revision}),e=>e.status===409);await notes.purge(actor,id,{confirmed:true,expected_revision:doc.page.revision});await assert.rejects(notes.get(actor,id,{trash:'true'}),e=>e.status===404);
+ assert.equal((await notes.list(actor,{scope:'trash'})).pages.some(p=>p.id===id),false);assert.equal((await f.pool.query('SELECT 1 FROM stored_files WHERE id=$1',[asset])).rowCount,1);assert.equal((await f.pool.query('SELECT 1 FROM notes_versions WHERE page_id=$1',[id])).rowCount,0);assert.equal((await f.pool.query('SELECT body FROM comms_notes WHERE id=$1',[id])).rows[0].body,'');
+ }finally{await f.close();}
+});

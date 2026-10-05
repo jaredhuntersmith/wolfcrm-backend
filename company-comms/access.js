@@ -9,11 +9,11 @@ export function ids(value,max=100){if(!Array.isArray(value)||value.length>max)fa
 export function can(actor,key){return actor.permissions?.capabilities?.[key]===true;}
 export function requireCapability(actor,key){if(!can(actor,key))fail(403,'permission_denied','This action is not allowed.');}
 export async function loadActor(db, actor) {
- const row=(await db.query(`SELECT u.*,c.owner_user_id,row_to_json(p) AS permission_record FROM users u JOIN companies c ON c.id=u.company_id LEFT JOIN employee_permissions p ON p.user_id=u.id AND p.company_id=u.company_id WHERE u.id=$1 AND u.company_id=$2 AND u.deleted_at IS NULL`,[actor.userId,actor.companyId])).rows[0];
+ const row=(await db.query(`SELECT u.*,c.owner_user_id,row_to_json(p) AS permission_record,to_regclass('public.notes_members') IS NOT NULL AS notes_ready FROM users u JOIN companies c ON c.id=u.company_id LEFT JOIN employee_permissions p ON p.user_id=u.id AND p.company_id=u.company_id WHERE u.id=$1 AND u.company_id=$2 AND u.deleted_at IS NULL`,[actor.userId,actor.companyId])).rows[0];
  if(!row)fail(403,'account_unavailable');
  const owner=row.owner_user_id===row.id, p=row.permission_record||{};
  const access=resolveAccess({role:owner?'employer':'employee',isCompanyOwner:owner,userId:row.id,ownerUserId:row.owner_user_id,preset:p.permission_preset,overrides:p.permission_overrides,legacy:p});
- return {...actor,userId:row.id,companyId:row.company_id,role:owner?'employer':'employee',isCompanyOwner:owner,displayName:row.display_name||'Team member',permissions:{...p,capabilities:access.capabilities,preset:access.preset}};
+ return {...actor,userId:row.id,companyId:row.company_id,notesReady:row.notes_ready,role:owner?'employer':'employee',isCompanyOwner:owner,displayName:row.display_name||'Team member',permissions:{...p,capabilities:access.capabilities,preset:access.preset}};
 }
 // Parameters $1=current user, $2=current company. Apply before snippets, counts and joins.
 export const conversationJoins=`LEFT JOIN comms_threads t ON t.conversation_id=c.id LEFT JOIN comms_groups g ON g.id=t.group_id LEFT JOIN comms_sections s ON s.id=t.section_id LEFT JOIN conversation_participants cp ON cp.conversation_id=c.id AND cp.user_id=$1`;

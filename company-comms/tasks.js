@@ -1,3 +1,4 @@
+import {authorizePage,noteRoleSQL} from '../notes/access.js';
 import {randomUUID} from 'node:crypto';
 import {authorizeConversation,loadActor,requireCapability,conversationJoins,conversationAccessSQL,can,ids,id,text,fail,audit,publish} from './access.js';
 import {hydrateSources,sourceAccessSQL} from './sources.js';
@@ -13,10 +14,11 @@ export function taskAccessSQL(actor,alias='todo_tasks',user='$1',company='$2'){
  const refs=current(sourceAccessSQL(actor,'tr',false));
  const rename=sql=>current(sql).replace(/\b(c|t|g|s|cp)\b/g,name=>'task_acl_'+name);
  const linked=can(actor,'communications.view')?`EXISTS(SELECT 1 FROM comms_task_links cl JOIN conversations task_acl_c ON task_acl_c.id=cl.conversation_id ${rename(conversationJoins)} WHERE cl.task_id=${alias}.id AND cl.company_id=${company} AND cl.revoked_at IS NULL AND ${dependenciesReadySQL('cl.source_dependencies',company)} AND (cl.source_type<>'recording_review' OR comms_recording_task_ready(cl.source_id)) AND ${rename(conversationAccessSQL(actor))} AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements_text(cl.requirements) k WHERE NOT(k=ANY(ARRAY[${allowed}]::text[]))) AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(cl.source_refs) tr(source_type text,source_id text,context_type text,context_id text) WHERE NOT ${refs}))`:'false';
- return `(NOT EXISTS(SELECT 1 FROM comms_task_links acl WHERE acl.task_id=${alias}.id) OR ${linked})`;
+ const noteLinked=actor.notesReady&&can(actor,'notes.view')?`EXISTS(SELECT 1 FROM comms_task_links nl JOIN comms_notes note_task ON note_task.id::text=nl.source_id WHERE nl.task_id=${alias}.id AND nl.company_id=${company} AND nl.source_type='note' AND nl.revoked_at IS NULL AND note_task.deleted_at IS NULL AND (${current(noteRoleSQL(actor,'note_task'))})>0)`:'false';
+ return `(NOT EXISTS(SELECT 1 FROM comms_task_links acl WHERE acl.task_id=${alias}.id) OR ${linked} OR ${noteLinked})`;
 }
 export async function validateTaskAudience(db,input,link,assignees){
- const actor=await loadActor(db,input);if(!(await db.query(`SELECT ${dependenciesReadySQL('$1::jsonb','$2::uuid')} AS ready`,[JSON.stringify(link.source_dependencies||[]),actor.companyId])).rows[0].ready)fail(403,'task_source_unavailable');await authorizeConversation(db,actor,link.conversation_id);requireCapability(actor,'tasks.manage');requireCapability(actor,'communications.tasks');
+ const actor=await loadActor(db,input);if(link.source_type==='note'){requireCapability(actor,'tasks.manage');await authorizePage(db,actor,link.source_id);for(const person of [...new Set([actor.userId,...ids(assignees,20)])]){const target=await loadActor(db,{userId:person,companyId:actor.companyId});requireCapability(target,'tasks.view');await authorizePage(db,target,link.source_id);}return actor;}if(!(await db.query(`SELECT ${dependenciesReadySQL('$1::jsonb','$2::uuid')} AS ready`,[JSON.stringify(link.source_dependencies||[]),actor.companyId])).rows[0].ready)fail(403,'task_source_unavailable');await authorizeConversation(db,actor,link.conversation_id);requireCapability(actor,'tasks.manage');requireCapability(actor,'communications.tasks');
  for(const person of [...new Set([actor.userId,...ids(assignees,20)])]){
   const target=await loadActor(db,{userId:person,companyId:actor.companyId});requireCapability(target,'tasks.view');await authorizeConversation(db,target,link.conversation_id);
   for(const key of link.requirements||[])requireCapability(target,key);

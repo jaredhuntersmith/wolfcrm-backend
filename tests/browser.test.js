@@ -20,7 +20,7 @@ test('URL/AI boundaries reject credentials, schemes, oversized excerpts',()=>{
 });
 test('old five-slot layout remains selected with Browser in overflow',()=>{
  const order=['schedule','contacts','dashboard','stages','company_comms','messages','map'],raw={order,hidden:['messages','map']};
- const result=resolveTabNavigation({role:'employer',userPreferences:raw});assert.deepEqual(result.effective.primary,order.slice(0,5));assert.ok(result.effective.overflow.includes('browser'));assert.equal(result.source,'user');assert.deepEqual(validateTabLayout(raw).hidden,['messages','map','browser']);
+ const result=resolveTabNavigation({role:'employer',userPreferences:raw});assert.deepEqual(result.effective.primary,order.slice(0,5));assert.ok(result.effective.overflow.includes('browser'));assert.equal(result.source,'user');assert.deepEqual(validateTabLayout(raw).hidden,['messages','map','browser','notes']);
 });
 test('real HTTP browser auth, record isolation, idempotency and webpage cards',{timeout:120000},async()=>{
  const f=await createCommsFixture(),app=express();let server;

@@ -208,6 +208,7 @@ import { installMediaStorage } from "./media-storage/index.js";
 import { installCommsCompatibility } from "./company-comms/compatibility.js";
 import { installCommsAudit } from "./company-comms/audit.js";
 import { installCommsQuoteExports } from "./company-comms/quote-exports.js";
+import { installNotes } from "./notes/index.js";
 import { installBrowser } from "./browser.js";
 import { installCompanyComms } from "./company-comms/index.js";
 import { installCommsCalls } from "./company-comms/calls/index.js";
@@ -2763,6 +2764,7 @@ async function authRequired(req, res, next) {
   req.permissionRevision = Number(rows[0].permission_revision);
   req.role = req.isCompanyOwner ? "employer" : "employee";
   req.companyId = rows[0].company_id;
+  req.notesReady = !!app.locals.notes;
   const access = resolveAccess({
     role: req.role,
     isOwner: req.isCompanyOwner,
@@ -19226,6 +19228,7 @@ async function startServer() {
   app.locals.mediaStorage = await installMediaStorage({ app, pool, authRequired, accessPredicate: storagePredicate, onRequest:r=>takeRateLimit(pool,r), onAccess:(...args)=>app.locals.commsAudit?.record(...args) });
   app.locals.comms = await installCompanyComms({app,pool,authRequired,sendPush:sendPushToUsers});
   app.locals.browser = await installBrowser({app,pool,authRequired});
+  app.locals.notes = await installNotes({app,pool,authRequired,notifications:app.locals.comms.notifications,storage:app.locals.mediaStorage});
   app.locals.commsCollaboration = installCollaboration({app,pool,authRequired,messages:app.locals.comms.messages,notifications:app.locals.comms.notifications,emitAutomationEvent});
   app.locals.commsAudit = await installCommsAudit({app,pool,authRequired});
   await installCommsQuoteExports({app,pool,authRequired,storage:app.locals.mediaStorage});
