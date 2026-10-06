@@ -692,7 +692,8 @@ export async function installFocusSystem({ app, pool, authRequired, requireCapab
 
   app.get("/api/focus/status", authRequired, requireFocusView, async (req, res) => {
     const settings = await ensureSettings(pool, req);
-    res.json({ settings: publicSettings(settings), inventory: await inventoryStatus(pool, req, settings), capabilities: buildFocusCapabilityMatrix(), worker_enabled: process.env.FOCUS_WORKER_ENABLED === "true" });
+    const connection = await scopedConnection(pool, req, META_PROVIDER);
+    res.json({ settings: publicSettings(settings), inventory: await inventoryStatus(pool, req, settings), capabilities: buildFocusCapabilityMatrix(), connection: redactConnection(connection), worker_enabled: process.env.FOCUS_WORKER_ENABLED === "true" });
   });
 
   app.get("/api/focus/settings", authRequired, requireFocusView, async (req, res) => res.json(await ensureSettings(pool, req)));
@@ -743,7 +744,7 @@ export async function installFocusSystem({ app, pool, authRequired, requireCapab
       const encrypted = encryptFocusToken(token.token);
       if (!encrypted) throw new FocusProviderError("focus_token_encryption_key_missing");
       const initialSnapshot = { oauth: { callback: "completed", completed_at: new Date().toISOString() }, page: { id: account.page_id || null, name: account.page_name || null } };
-      await pool.query(`INSERT INTO focus_connections(user_id,company_id,provider,account_id,account_username,token_ciphertext,token_iv,token_tag,token_expires_at,capability_snapshot,status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'connected',now()) ON CONFLICT(user_id,provider) DO UPDATE SET company_id=EXCLUDED.company_id,account_id=EXCLUDED.account_id,account_username=EXCLUDED.account_username,token_ciphertext=EXCLUDED.token_ciphertext,token_iv=EXCLUDED.token_iv,token_tag=EXCLUDED.token_tag,token_expires_at=EXCLUDED.token_expires_at,capability_snapshot=EXCLUDED.capability_snapshot,status='connected',last_error_code=NULL,last_checked_at=now(),updated_at=now()`, [identity.user_id, identity.company_id, META_PROVIDER, account.id, account.username, encrypted.ciphertext, encrypted.iv, encrypted.tag, token.expires_in ? new Date(Date.now() + token.expires_in * 1000) : null, initialSnapshot]);
+      await pool.query(`INSERT INTO focus_connections(user_id,company_id,provider,account_id,account_username,token_ciphertext,token_iv,token_tag,token_expires_at,capability_snapshot,status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'verifying',now()) ON CONFLICT(user_id,provider) DO UPDATE SET company_id=EXCLUDED.company_id,account_id=EXCLUDED.account_id,account_username=EXCLUDED.account_username,token_ciphertext=EXCLUDED.token_ciphertext,token_iv=EXCLUDED.token_iv,token_tag=EXCLUDED.token_tag,token_expires_at=EXCLUDED.token_expires_at,capability_snapshot=EXCLUDED.capability_snapshot,status='verifying',last_error_code=NULL,last_checked_at=now(),updated_at=now()`, [identity.user_id, identity.company_id, META_PROVIDER, account.id, account.username, encrypted.ciphertext, encrypted.iv, encrypted.tag, token.expires_in ? new Date(Date.now() + token.expires_in * 1000) : null, initialSnapshot]);
       res.redirect(`${process.env.FOCUS_META_CALLBACK_SUCCESS_URL || "wolfcrm://focus-connection"}?status=connected`);
     } catch (error) {
       const failure = safeFocusErrorCode(error, "meta_oauth_callback_failed");
@@ -1013,7 +1014,7 @@ async function verifyMetaConnection(pool, req, meta) {
   if (!connection) throw new FocusProviderError("meta_connection_required", { statusCode: 409 });
   const accessToken = decryptFocusToken(connection);
   if (!accessToken) {
-    await pool.query(`UPDATE focus_connections SET status='failed',last_error_code='focus_token_unavailable',last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id]);
+    await pool.query(`UPDATE focus_connections SET status='expired',last_error_code='focus_token_unavailable',last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id]);
     throw new FocusProviderError("focus_token_unavailable", { statusCode: 409 });
   }
   try {
@@ -1023,7 +1024,7 @@ async function verifyMetaConnection(pool, req, meta) {
     return rows[0];
   } catch (error) {
     const failure = safeFocusErrorCode(error, "meta_connection_verification_failed");
-    await pool.query(`UPDATE focus_connections SET status=CASE WHEN $2='meta_token_invalid' THEN 'failed' ELSE status END,last_error_code=$2,last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id, failure]);
+    await pool.query(`UPDATE focus_connections SET status=CASE WHEN $2 IN ('meta_token_invalid','focus_token_unavailable') THEN 'expired' ELSE 'error' END,last_error_code=$2,last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id, failure]);
     throw error;
   }
 }
@@ -1049,7 +1050,7 @@ async function diagnostics(pool, req, settings) {
     scopedConnection(pool, req, META_PROVIDER)
   ]);
   const capabilityMatrix = buildFocusCapabilityMatrix();
-  return { inventory, candidate_states: content.rows, creators: creators.rows[0], jobs: jobs.rows, costs: costs.rows, capabilities: capabilityMatrix, meta_oauth: { ...capabilityMatrix.meta_oauth, last_provider_error: normalizedMetaOAuthProviderError(connection?.last_error_code), last_checked_at: connection?.last_checked_at || null }, fixture_notice: fixtureModeAllowed() ? "Fixtures can run only with explicit development/test flag." : null };
+  return { inventory, candidate_states: content.rows, creators: creators.rows[0], jobs: jobs.rows, costs: costs.rows, connection: redactConnection(connection), capabilities: capabilityMatrix, meta_oauth: { ...capabilityMatrix.meta_oauth, last_provider_error: normalizedMetaOAuthProviderError(connection?.last_error_code), last_checked_at: connection?.last_checked_at || null }, fixture_notice: fixtureModeAllowed() ? "Fixtures can run only with explicit development/test flag." : null };
 }
 
 async function leaseFocusFeed(pool, req, { mediaType, mode, settings, limit }) {
