@@ -24,6 +24,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
     await pool.query("INSERT INTO companies(id,name,join_code) VALUES($1,'Plans Test','PLAN-TEST'),($2,'Other Plans','PLAN-OTHER')",[company,otherCompany]);
     await pool.query("INSERT INTO users(id,email,role,company_id) VALUES($1,'planowner@example.invalid','employer',$3),($2,'planother@example.invalid','employer',$4)",[owner,otherOwner,company,otherCompany]);
     await pool.query('UPDATE companies SET owner_user_id=$2 WHERE id=$1',[company,owner]);
+    await pool.query('UPDATE companies SET owner_user_id=$2 WHERE id=$1',[otherCompany,otherOwner]);
     await pool.query("INSERT INTO sessions(token,user_id) VALUES('plan-owner',$1),('plan-other',$2)",[owner,otherOwner]);
     await pool.query("INSERT INTO contacts(id,user_id,company_id,name,email,address) VALUES($1,$2,$3,'Plan Customer','plans@example.invalid','123 Plan Lane')",[contact,owner,company]);
     await pool.query("INSERT INTO saved_services(id,company_id,name,default_price_cents,plan_eligible) VALUES($1,$3,'Windows',30000,true),($2,$3,'Pressure',40000,false)",[windowID,pressureID,company]);
@@ -37,7 +38,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
     const sign=async(agreement)=>{const link=agreement.customer_url.split('/').at(-1);const session=(await request(`/api/public/agreements/${link}/session`,{method:'POST',token:null,body:{}})).body;const result=await request(`/api/public/agreements/${link}/sign`,{method:'POST',token:null,body:{request_id:randomUUID(),session_token:session.session_token,packet_hash:agreement.packet_hash,printed_name:'Plan Customer',consent:true,signature:drawnSignature(),values:{}}});assert.equal(result.status,200,JSON.stringify(result.body));return result;};
     await t.test('tenant-owned tiers and eligibility use stable catalog references and version checks',async()=>{
       const saved=await request('/api/service-plan-tiers',{method:'POST',body:{configuration:config}});assert.equal(saved.status,201,JSON.stringify(saved.body));tier=saved.body;
-      assert.equal((await request('/api/service-plan-tiers',{token:'plan-other'})).body.tiers.length,0);
+      { const response=await request('/api/service-plan-tiers',{token:'plan-other'}); assert.equal(response.status,200,JSON.stringify(response.body)); assert.equal(response.body.tiers.length,0); }
       assert.equal((await request('/api/service-plan-tiers',{method:'POST',token:'plan-other',body:{tier_id:tier.tier_id,expected_version:1,configuration:config}})).status,409);
       assert.equal((await request('/api/service-plan-tiers',{method:'POST',body:{tier_id:tier.tier_id,expected_version:0,configuration:config}})).status,409);
       published=(await request(`/api/quotes/${quote}/publish`,{method:'POST',body:{request_id:randomUUID()}})).body;assert.ok(published.id,JSON.stringify(published));token=published.customer_url.split('/').at(-1);
@@ -146,7 +147,7 @@ test('tier offers, separate consent, conditional adjustments and existing member
       const deferred=await Promise.all([1,2,3].map(()=>request(path,{method:'POST',body})));
       assert.ok(deferred.every(result=>result.status===200),JSON.stringify(deferred));assert.ok(deferred.every(result=>result.body.remaining_visits===3));
       const dates=deferred[0].body.visits;
-      assert.equal(String(dates.find(item=>item.id===visit.id).due_date).slice(0,10),advancePlanDate(current.snapshot.next_service_date,config.service_interval,visit.sequence));
+      assert.equal(String(dates.find(item=>item.id===visit.id).due_date).slice(0,10),advancePlanDate(current.first_visit_date || current.snapshot.next_service_date,config.service_interval,visit.sequence));
       assert.equal((await pool.query('SELECT schedule_offset FROM agreement_plan_visits WHERE id=$1',[visit.id])).rows[0].schedule_offset,1);
       assert.equal((await pool.query('SELECT count(*)::int n FROM payment_records')).rows[0].n,beforePayments);
       assert.equal((await pool.query("SELECT count(*)::int n FROM agreement_events WHERE agreement_id=$1 AND type='plan_visit_deferred'",[published.id])).rows[0].n,1);

@@ -3129,8 +3129,8 @@ function sanitizeServicePlan(row, { employeeSafe = false } = {}) {
     billing_interval_count: row.billing_interval_count,
     service_interval: row.service_interval,
     service_interval_count: row.service_interval_count,
-    first_service_date: row.first_service_date,
-    next_service_date: row.next_service_date,
+    first_service_date: row.first_visit_date || (row.plan_snapshot?.schedule_model === "appointment_anchored_v1" ? null : row.first_service_date),
+    next_service_date: row.plan_snapshot?.schedule_model === "appointment_anchored_v1" && !row.first_visit_date ? null : row.next_service_date,
     last_service_date: row.last_service_date,
     included_services: row.included_services,
     notes: row.notes,
@@ -12241,6 +12241,7 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
     }
     await db.query("COMMIT");
     committed = true;
+    if (r.rows[0].finished_at) await app.locals.agreementPlans?.completeJob(req, req.params.id);
     const addedWorkers = workerIDs.filter((id) => !oldWorkerIDs.includes(id));
     await notifyMany(
       addedWorkers,
@@ -13917,6 +13918,7 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, requireCapability("job
     await syncAutomationSchedulesForJob(req.companyId, updated);
     await markGoogleSheetsContactDirty(pool, req.companyId, updated.contact_id, "job.completed");
     await client.query("COMMIT");
+    await app.locals.agreementPlans?.completeJob(req, req.params.id);
     res.json(updated);
   } catch (e) {
     await client.query("ROLLBACK");

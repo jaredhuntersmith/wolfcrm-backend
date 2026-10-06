@@ -178,9 +178,9 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
     setup = await reconcileSetup(enrollment, setup);
     return { status: setup.state, url: setup.state === "open" ? setup.url : null, kind: "setup" };
   }
-  async function ensureObligations(enrollment) {
+  async function ensureObligations(enrollment, existingDB = null) {
     const offer = enrollment.snapshot, billing = offer.configuration.billing;
-    await transaction(pool, async db => {
+    const reserve = async db => {
       await lock(db, enrollment);
       const entries = ["calendar_installments", "prepaid"].includes(billing.mode) ? offer.billing_schedule.map(item => ({ ...item, kind: billing.mode, key: `installment:${item.sequence}` }))
         : billing.enrollment_fee_cents > 0 ? [{ sequence: 0, due_date: offer.effective_date, amount_cents: billing.enrollment_fee_cents, kind: "enrollment_fee", key: "enrollment_fee" }] : [];
@@ -200,7 +200,8 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
           WHERE v.enrollment_id=$1 AND v.state<>'skipped' AND ($4='scheduled' OR (v.completed_at IS NOT NULL AND j.finished_at IS NOT NULL))`, [enrollment.id, enrollment.company_id, enrollment.contact_id, billing.collect_on])).rows;
         for (const visit of visits) await db.query("INSERT INTO agreement_plan_billing_obligations(id,enrollment_id,obligation_key,kind,sequence,due_date,amount_cents,job_id) VALUES($1,$2,$3,'visit',$4,$5,$6,$7) ON CONFLICT(enrollment_id,obligation_key) DO NOTHING", [randomUUID(), enrollment.id, `visit:${visit.id}`, visit.sequence, await today(enrollment, db), offer.future_visit.total_cents, visit.job_id]);
       }
-    });
+    };
+    if(existingDB) await reserve(existingDB); else await transaction(pool,reserve);
   }
   async function reservePayment(enrollment, obligation) {
     if (obligation.payment_record_id) return obligation;
@@ -238,9 +239,10 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
       await db.query(`UPDATE payment_records SET stripe_invoice_id=$2,stripe_payment_intent_id=COALESCE($3,stripe_payment_intent_id),stripe_charge_id=COALESCE($4,stripe_charge_id),status=CASE WHEN status IN ('succeeded','refunded','partially_refunded','disputed') AND $5 IN ('pending','failed','cancelled','processing') THEN status ELSE $5 END,
         refunded_amount_cents=GREATEST(refunded_amount_cents,$6),refund_amount_known=true,stripe_dispute_status=CASE WHEN $7 THEN COALESCE(stripe_dispute_status,'needs_review') ELSE stripe_dispute_status END,
         paid_at=CASE WHEN $8 THEN COALESCE(paid_at,now()) ELSE paid_at END,receipt_url=COALESCE($9,receipt_url),updated_at=now() WHERE id=$1`, [obligation.payment_record_id, invoice.id, objectID(intent), objectID(charge), status, refund, disputed, state === "succeeded", typeof charge === "object" ? charge?.receipt_url : null]);
-      const paymentStatus=state==='review'?'review':state==='succeeded'?'succeeded':intent?.status==='requires_action'?'requires_action':intent?.status==='requires_payment_method'&&old.attempted_at?'failed':state;
+      const actionRequired=intent?.status==='requires_action'||intent?.last_payment_error?.code==='authentication_required'||intent?.last_payment_error?.decline_code==='authentication_required';
+      const paymentStatus=state==='review'?'review':state==='succeeded'?'succeeded':actionRequired?'requires_action':intent?.status==='requires_payment_method'&&old.attempted_at?'failed':state;
       const attention=['review','requires_action','failed'].includes(paymentStatus);
-      const updated = (await db.query("UPDATE agreement_plan_billing_obligations SET state=$2,payment_intent_id=COALESCE($3,payment_intent_id),hosted_invoice_url=$4,invoice_pdf=$5,payment_status=$6,attention_since=CASE WHEN $7 THEN COALESCE(attention_since,now()) ELSE NULL END,next_reconcile_at=now()+interval '5 minutes',updated_at=now() WHERE id=$1 RETURNING *,due_date::text AS due_date", [obligation.id, state, objectID(intent), invoice.hosted_invoice_url || null, invoice.invoice_pdf || null,paymentStatus,attention])).rows[0];
+      const updated = (await db.query("UPDATE agreement_plan_billing_obligations SET state=$2,payment_intent_id=COALESCE($3,payment_intent_id),hosted_invoice_url=$4,invoice_pdf=$5,payment_status=$6,error_code=$8,attention_since=CASE WHEN $7 THEN COALESCE(attention_since,now()) ELSE NULL END,next_reconcile_at=now()+interval '5 minutes',updated_at=now() WHERE id=$1 RETURNING *,due_date::text AS due_date", [obligation.id, state, objectID(intent), invoice.hosted_invoice_url || null, invoice.invoice_pdf || null,paymentStatus,attention,attention ? (actionRequired ? 'authentication_required' : intent?.last_payment_error?.decline_code || intent?.last_payment_error?.code || paymentStatus) : null])).rows[0];
       if (state !== old.state || paymentStatus!==old.payment_status) await service.event(db, enrollment.base_agreement_id, state === "succeeded" ? "plan_payment_succeeded" : state === "review" ? "plan_payment_review_required" : attention ? "plan_payment_failed" : "plan_payment_updated", { payload: { enrollment_id: enrollment.id, obligation_id: obligation.id, payment_record_id: obligation.payment_record_id, amount_cents: obligation.amount_cents, state,payment_status:paymentStatus } });
       return updated;
     });
@@ -362,9 +364,13 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
   }
   async function billingSummary(enrollmentID) {
     const enrollment = await load(enrollmentID);
-    const obligations = (await pool.query("SELECT id,kind,sequence,due_date::text,amount_cents,state,payment_status,attention_since,hosted_invoice_url,invoice_pdf,payment_record_id FROM agreement_plan_billing_obligations WHERE enrollment_id=$1 ORDER BY sequence", [enrollment.id])).rows;
+    const obligations = (await pool.query("SELECT id,kind,sequence,due_date::text,amount_cents,state,payment_status,attention_since,hosted_invoice_url,invoice_pdf,payment_record_id,job_id,attempted_at,error_code,payment_intent_id FROM agreement_plan_billing_obligations WHERE enrollment_id=$1 ORDER BY sequence", [enrollment.id])).rows;
     const commandReview=(await pool.query("SELECT 1 FROM agreement_plan_provider_commands WHERE enrollment_id=$1 AND state='review' LIMIT 1",[enrollment.id])).rowCount>0;
-    return { enrollment_id: enrollment.id, card: enrollment.card_metadata || null, obligations, next_due_date: obligations.find(item => item.state === "scheduled")?.due_date || null, needs_review: commandReview || !!enrollment.billing_error_since || obligations.some(item => item.attention_since!=null) };
+    const visits = (await pool.query("SELECT id,sequence,due_date::text,job_id,state,completed_at FROM agreement_plan_visits WHERE enrollment_id=$1 ORDER BY sequence",[enrollment.id])).rows.map(visit=>{
+      const obligation=obligations.find(item=>item.kind==='visit'&&item.sequence===visit.sequence);
+      return {...visit,amount_cents:enrollment.snapshot.future_visit.total_cents,payment_status:obligation?.payment_status || obligation?.state || (visit.state==='completed'?'pending':'not_due'),obligation_id:obligation?.id || null};
+    });
+    return { visits, enrollment_id: enrollment.id, card: enrollment.card_metadata || null, obligations, next_due_date: obligations.find(item => item.state === "scheduled")?.due_date || null, needs_review: commandReview || !!enrollment.billing_error_since || obligations.some(item => item.attention_since!=null) };
   }
   async function begin(token, enrollmentID, raw = {}) {
     const { row,role } = await service.loadPublic(pool, token);
@@ -550,7 +556,7 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
     }
     return{ready:true};
   }
-  return { begin, reconcileEnrollment, prepareReplacement, planActivationPrerequisites: prerequisites, billingSummary, handleWebhook, processDue, reconcileInvoice, changeMembership, beginStaff, staffSummary,followupContext,preparePendingCancellation };
+  return { reserveCompletedPlanBilling: ensureObligations, begin, reconcileEnrollment, prepareReplacement, planActivationPrerequisites: prerequisites, billingSummary, handleWebhook, processDue, reconcileInvoice, changeMembership, beginStaff, staffSummary,followupContext,preparePendingCancellation };
 }
 
 export async function installAgreementPlanBilling({ app,pool,service,plans,getStripe=service.getStripe,env=service.env,authRequired,requireCapability,startWorker=true,now }) {
@@ -558,6 +564,7 @@ export async function installAgreementPlanBilling({ app,pool,service,plans,getSt
   const adapter = createAgreementPlanBilling({ pool,service,plans,getStripe,env,now });
   service.planActivationPrerequisites = adapter.planActivationPrerequisites;
   service.reconcilePlanBilling = adapter.reconcileEnrollment;
+  service.reserveCompletedPlanBilling = (db,enrollment) => adapter.reserveCompletedPlanBilling(enrollment,db);
   service.preparePlanReplacement = adapter.prepareReplacement;
   service.planBillingFollowupContext=adapter.followupContext;
   for (const mode of ["manual_per_visit","automatic_per_visit","calendar_installments","calendar_recurring","prepaid"]) if (!plans.supportedBillingModes.includes(mode)) plans.supportedBillingModes.push(mode);

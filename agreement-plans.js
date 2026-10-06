@@ -47,6 +47,7 @@ export async function installAgreementPlanSchema(pool) {
     ALTER TABLE service_plans ADD COLUMN IF NOT EXISTS plan_snapshot JSONB;
     ALTER TABLE service_plans ADD COLUMN IF NOT EXISTS billing_mode TEXT;
     ALTER TABLE service_plans ADD COLUMN IF NOT EXISTS remaining_visits INTEGER;
+    ALTER TABLE service_plans ADD COLUMN IF NOT EXISTS first_visit_date DATE;
     CREATE UNIQUE INDEX IF NOT EXISTS service_plans_enrollment_unique ON service_plans(enrollment_id) WHERE enrollment_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS agreement_plan_visits (
       id UUID PRIMARY KEY, enrollment_id UUID NOT NULL REFERENCES agreement_plan_enrollments(id) ON DELETE RESTRICT,
@@ -159,9 +160,9 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
   async function detail(db, enrollment,{publicRole='customer'}={}) {
     const agreement = (await db.query('SELECT * FROM quote_agreements WHERE id=$1', [enrollment.plan_agreement_id])).rows[0];
     const base = (await db.query('SELECT * FROM quote_agreements WHERE id=$1 AND company_id=$2', [enrollment.base_agreement_id, enrollment.company_id])).rows[0];
-    const membership=enrollment.service_plan_id?(await db.query('SELECT status,remaining_visits FROM service_plans WHERE id=$1 AND company_id=$2',[enrollment.service_plan_id,enrollment.company_id])).rows[0]:null;
+    const membership=enrollment.service_plan_id?(await db.query('SELECT status,remaining_visits,first_visit_date::text FROM service_plans WHERE id=$1 AND company_id=$2',[enrollment.service_plan_id,enrollment.company_id])).rows[0]:null;
     const visits = (await db.query('SELECT id,sequence,due_date,job_id,state,completed_at FROM agreement_plan_visits WHERE enrollment_id=$1 ORDER BY sequence', [enrollment.id])).rows;
-    return { return_url: base?.snapshot.required_signers.includes(publicRole) ? service.customerURL(base, publicRole) : null, id: enrollment.id, state: membership?.status || enrollment.state, enrollment_state:enrollment.state,cancellation_effective_at:enrollment.cancellation_effective_at||null, remaining_visits:membership?.remaining_visits??null, service_plan_id: enrollment.service_plan_id, plan_agreement_id: agreement.id, plan_agreement_url: agreement.snapshot.required_signers.includes(publicRole)?service.customerURL(agreement,publicRole):null, signed_state: await service.state(db, agreement), snapshot: enrollment.snapshot, card: enrollment.card_metadata || null, activated_at: enrollment.activated_at, visits };
+    return { awaiting_first_appointment: enrollment.snapshot.schedule_model === 'appointment_anchored_v1' && !membership?.first_visit_date, first_visit_date: membership?.first_visit_date || null, return_url: base?.snapshot.required_signers.includes(publicRole) ? service.customerURL(base, publicRole) : null, id: enrollment.id, state: membership?.status || enrollment.state, enrollment_state:enrollment.state,cancellation_effective_at:enrollment.cancellation_effective_at||null, remaining_visits:membership?.remaining_visits??null, service_plan_id: enrollment.service_plan_id, plan_agreement_id: agreement.id, plan_agreement_url: agreement.snapshot.required_signers.includes(publicRole)?service.customerURL(agreement,publicRole):null, signed_state: await service.state(db, agreement), snapshot: enrollment.snapshot, card: enrollment.card_metadata || null, activated_at: enrollment.activated_at, visits };
   }
   async function createEnrollment(token, raw) {
     const { row,role } = await service.loadPublic(pool, token);
@@ -272,6 +273,17 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     try { await onPlanActivated(plan); await pool.query('UPDATE agreement_plan_enrollments SET activation_dispatched_at=now() WHERE service_plan_id=$1', [plan.id]); }
     catch { /* Persisted null dispatch timestamp keeps scheduler recovery pending. */ }
   }
+  async function anchorFirstVisit(db, enrollment, plan, visit, job) {
+    if (visit.sequence !== 1 || !['automatic_per_visit','manual_per_visit'].includes(enrollment.snapshot.configuration.billing.mode)) return;
+    const date = (await db.query("SELECT ($1::timestamptz AT TIME ZONE COALESCE(timezone,'America/New_York'))::date::text AS day FROM companies WHERE id=$2", [job.start_at, enrollment.company_id])).rows[0].day;
+    const visits = (await db.query("SELECT * FROM agreement_plan_visits WHERE enrollment_id=$1 ORDER BY sequence FOR UPDATE", [enrollment.id])).rows;
+    for (const pending of visits) {
+      if (pending.state === 'completed' || (pending.job_id && pending.id !== visit.id)) continue;
+      const due = advancePlanDate(date, enrollment.snapshot.configuration.service_interval, pending.sequence - 1 + pending.schedule_offset);
+      await db.query('UPDATE agreement_plan_visits SET due_date=$2 WHERE id=$1', [pending.id, due]);
+    }
+    await db.query("UPDATE service_plans SET first_visit_date=$2,next_service_date=(SELECT min(due_date) FROM agreement_plan_visits WHERE enrollment_id=$3 AND state IN ('due','scheduled')),updated_at=now() WHERE id=$1", [plan.id, date, enrollment.id]);
+  }
   async function linkVisit(req, enrollmentID, visitID, raw) {
     return txn(pool, async (db) => {
       await lockCompanySchedule(db, req.companyId);
@@ -285,7 +297,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       const job = (await db.query('SELECT * FROM schedule_events WHERE id=$1 AND company_id=$2 AND contact_id=$3 FOR UPDATE', [String(raw.job_id),req.companyId,enrollment.contact_id])).rows[0];
       if (!job || job.quote_id || job.finished_at || (job.service_plan_id && job.service_plan_id !== plan.id)) fail('plan_job_unavailable','Choose an unfinished job for this customer that is not billed under an initial quote or another membership.');
       if(enrollment.cancellation_effective_at&&new Date(job.start_at)>=new Date(enrollment.cancellation_effective_at))fail('plan_cancellation_scheduled','This appointment falls after the membership cancellation takes effect.');
-      if (visit.job_id === job.id && visit.state === 'scheduled') return detail(db,enrollment);
+      if (visit.job_id === job.id && visit.state === 'scheduled') { await anchorFirstVisit(db,enrollment,plan,visit,job); return detail(db,enrollment); }
       const expected = enrollment.snapshot.future_visit.line_items;
       const scope = (lines) => lines.map((line) => ({service_id:line.service_id||null,qty:Number(line.qty??1)})).sort((a,b)=>String(a.service_id).localeCompare(String(b.service_id))||a.qty-b.qty);
       if (quoteContentHash(scope(job.service_items||[])) !== quoteContentHash(scope(expected))) fail('plan_job_scope_mismatch','The job must contain exactly the enrolled services and quantities. Keep unrelated one-time work on a separate job.');
@@ -293,6 +305,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       if ((await db.query('SELECT 1 FROM agreement_plan_visits WHERE job_id=$1 AND id<>$2',[job.id,visit.id])).rowCount) fail('plan_job_already_used','This job already covers another plan visit.');
       await db.query('UPDATE schedule_events SET service_plan_id=$2,updated_at=now() WHERE id=$1',[job.id,plan.id]);
       await db.query(`UPDATE agreement_plan_visits SET job_id=$2,state='scheduled',job_history=job_history||$3::jsonb WHERE id=$1`,[visit.id,job.id,JSON.stringify([{action:'scheduled',job_id:job.id,start_at:job.start_at,actor_id:req.userId,at:now().toISOString()}])]);
+      await anchorFirstVisit(db,enrollment,plan,visit,job);
       await service.event(db,enrollment.base_agreement_id,'plan_visit_scheduled',{actor_type:'staff',actor_id:req.userId,payload:{enrollment_id:enrollment.id,visit_id:visit.id,job_id:job.id}});
       return detail(db,enrollment);
     });
@@ -308,12 +321,13 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       if(replay){if(replay.request_hash!==requestHash)fail('plan_visit_request_conflict','This request belongs to another visit change.');return detail(db,enrollment);}
       const plan=(await db.query('SELECT * FROM service_plans WHERE id=$1 FOR UPDATE',[enrollment.service_plan_id])).rows[0];
       if(plan.status!=='active'||enrollment.canceled_at||enrollment.cancellation_effective_at)fail('plan_not_active','Review this membership before changing its service cadence.');
+      if(enrollment.snapshot.schedule_model==='appointment_anchored_v1'&&!plan.first_visit_date)fail('plan_first_appointment_required','Schedule the first covered visit before deferring its recurrence.');
       if(!enrollment.snapshot.configuration.allow_skip)fail('plan_skip_not_allowed','The signed membership does not allow skipping a service cycle.');
       const visits=(await db.query("SELECT * FROM agreement_plan_visits WHERE enrollment_id=$1 AND state IN ('due','scheduled') ORDER BY due_date,sequence FOR UPDATE",[enrollment.id])).rows;
       if(visits[0]?.id!==visitID)fail('plan_visit_unavailable','Choose the next uncompleted visit to defer the service cycle.');
       if(visits.some(visit=>visit.state==='scheduled'))fail('plan_appointments_exist','Reschedule or cancel existing plan appointments before deferring a service cycle.');
       for(const visit of visits){
-        const offset=visit.schedule_offset+1,date=advancePlanDate(enrollment.snapshot.next_service_date,enrollment.snapshot.configuration.service_interval,visit.sequence-1+offset);
+        const offset=visit.schedule_offset+1,date=advancePlanDate(plan.first_visit_date ? new Date(plan.first_visit_date).toISOString().slice(0,10) : enrollment.snapshot.next_service_date,enrollment.snapshot.configuration.service_interval,visit.sequence-1+offset);
         await db.query('UPDATE agreement_plan_visits SET due_date=$2,schedule_offset=$3,job_history=job_history||$4::jsonb WHERE id=$1',[visit.id,date,offset,JSON.stringify([{action:'cycle_deferred',from:visit.due_date,to:date,reason,actor_id:req.userId,at:now().toISOString()}])]);
       }
       await db.query('UPDATE service_plans SET next_service_date=(SELECT min(due_date) FROM agreement_plan_visits WHERE enrollment_id=$2 AND state=\'due\'),updated_at=now() WHERE id=$1',[plan.id,enrollment.id]);
@@ -325,7 +339,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
   }
   async function markServiced(req, suppliedPlan, raw) {
     const requestID=id(raw.request_id), jobID=String(raw.job_id||''), requestHash=quoteContentHash({plan_id:suppliedPlan.id,job_id:jobID});
-    return txn(pool, async(db)=>{
+    const result = await txn(pool, async(db)=>{
       const plan=(await db.query('SELECT * FROM service_plans WHERE id=$1 AND company_id=$2 FOR UPDATE',[suppliedPlan.id,req.companyId])).rows[0];
       if(!plan?.enrollment_id)fail('plan_membership_unavailable','This enrolled membership is unavailable.',404);
       const replay=(await db.query('SELECT * FROM agreement_plan_visit_actions WHERE company_id=$1 AND request_id=$2',[req.companyId,requestID])).rows[0];
@@ -336,15 +350,28 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       if(visit.state==='completed')return plan;
       if(!['active','past_due'].includes(plan.status))fail('plan_not_active','Review this membership before consuming another visit.');
       const enrollment=(await db.query('SELECT * FROM agreement_plan_enrollments WHERE id=$1',[plan.enrollment_id])).rows[0];
+      await anchorFirstVisit(db,enrollment,plan,visit,job);
+      const anchor=(await db.query('SELECT first_visit_date::text AS day FROM service_plans WHERE id=$1',[plan.id])).rows[0].day || enrollment.snapshot.next_service_date;
       await db.query(`UPDATE agreement_plan_visits SET state='completed',completed_at=$2,job_history=job_history||$3::jsonb WHERE id=$1`,[visit.id,job.finished_at,JSON.stringify([{action:'completed',job_id:job.id,actor_id:req.userId,at:now().toISOString()}])]);
-      if(plan.remaining_visits===null){const nextSequence=visit.sequence+1;await db.query('INSERT INTO agreement_plan_visits(id,enrollment_id,service_plan_id,sequence,due_date,schedule_offset) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(enrollment_id,sequence) DO NOTHING',[randomUUID(),enrollment.id,plan.id,nextSequence,advancePlanDate(enrollment.snapshot.next_service_date,enrollment.snapshot.configuration.service_interval,nextSequence-1+visit.schedule_offset),visit.schedule_offset]);}
+      if(plan.remaining_visits===null){const nextSequence=visit.sequence+1;await db.query('INSERT INTO agreement_plan_visits(id,enrollment_id,service_plan_id,sequence,due_date,schedule_offset) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(enrollment_id,sequence) DO NOTHING',[randomUUID(),enrollment.id,plan.id,nextSequence,advancePlanDate(anchor,enrollment.snapshot.configuration.service_interval,nextSequence-1+visit.schedule_offset),visit.schedule_offset]);}
       const next=(await db.query("SELECT min(due_date) AS due FROM agreement_plan_visits WHERE service_plan_id=$1 AND state<>'completed'",[plan.id])).rows[0].due;
-      const updated=(await db.query(`UPDATE service_plans SET remaining_visits=CASE WHEN remaining_visits IS NULL THEN NULL ELSE GREATEST(0,remaining_visits-1) END,last_service_date=$2::date,next_service_date=$3,status=CASE WHEN remaining_visits=1 THEN 'expired' ELSE status END,updated_at=now() WHERE id=$1 RETURNING *`,[plan.id,job.finished_at,next])).rows[0];
+      const updated=(await db.query(`UPDATE service_plans SET remaining_visits=CASE WHEN remaining_visits IS NULL THEN NULL ELSE GREATEST(0,remaining_visits-1) END,last_service_date=($2::timestamptz AT TIME ZONE (SELECT COALESCE(timezone,'America/New_York') FROM companies WHERE id=$4))::date,next_service_date=$3,status=CASE WHEN remaining_visits=1 THEN 'expired' ELSE status END,updated_at=now() WHERE id=$1 RETURNING *`,[plan.id,job.finished_at,next,req.companyId])).rows[0];
       await db.query(`INSERT INTO service_plan_events(user_id,company_id,created_by_user_id,service_plan_id,contact_id,event_type,completed_date,notes) VALUES($1,$2,$3,$4,$5,'serviced',$6::date,$7)`,[plan.user_id,req.companyId,req.userId,plan.id,plan.contact_id,job.finished_at,`Completed visit ${visit.sequence}; job ${job.id}`]);
+      if(service.reserveCompletedPlanBilling) await service.reserveCompletedPlanBilling(db,enrollment);
+      await db.query('UPDATE agreement_plan_enrollments SET next_reconcile_at=now() WHERE id=$1',[enrollment.id]);
       await service.event(db,enrollment.base_agreement_id,'plan_visit_completed',{actor_type:'staff',actor_id:req.userId,payload:{enrollment_id:enrollment.id,service_plan_id:plan.id,visit_id:visit.id,job_id:job.id}});
       await db.query('INSERT INTO agreement_plan_visit_actions(company_id,request_id,request_hash,result) VALUES($1,$2,$3,$4::jsonb)',[req.companyId,requestID,requestHash,JSON.stringify(updated)]);
       return updated;
     });
+    // Completion is durable even when Stripe is unavailable. The due worker
+    // retries the same reserved obligation and provider command.
+    try { await service.reconcilePlanBilling?.(suppliedPlan.enrollment_id); }
+    catch { console.error('[plan-billing] completed visit queued for reconciliation', {enrollment_id:suppliedPlan.enrollment_id}); }
+    return result;
+  }
+  async function completeJob(req, jobID) {
+    const plan=(await pool.query('SELECT p.* FROM service_plans p JOIN agreement_plan_visits v ON v.service_plan_id=p.id JOIN schedule_events j ON j.id=v.job_id WHERE v.job_id=$1 AND p.company_id=$2 AND j.finished_at IS NOT NULL',[jobID,req.companyId])).rows[0];
+    if(plan) return markServiced(req,plan,{request_id:randomUUID(),job_id:jobID});
   }
   async function processMemberships() {
     const pending=(await pool.query('SELECT p.* FROM service_plans p JOIN agreement_plan_enrollments e ON e.id=p.enrollment_id WHERE e.activation_dispatched_at IS NULL LIMIT 20')).rows;
@@ -362,7 +389,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     const due=enrollment.service_plan_id?(await db.query(`SELECT v.id,v.due_date FROM agreement_plan_visits v JOIN service_plans p ON p.id=v.service_plan_id WHERE v.enrollment_id=$1 AND v.state IN ('due','scheduled') AND p.status='active' AND (v.job_id IS NULL OR NOT EXISTS(SELECT 1 FROM schedule_events WHERE id=v.job_id)) ORDER BY v.due_date,v.sequence LIMIT 1`,[enrollment.id])).rows[0]:null;
     return {plan_setup_pending:!enrollment.service_plan_id?enrollment.signed_at:null,plan_setup_pending_occurrence:enrollment.id,plan_service_due:due?.due_date,plan_service_due_occurrence:due?.id};
   }
-  return { tiers, saveTier, offers, currentMemberships, withReplacement, load, summary, detail, createEnrollment, reconcileEnrollment, paymentAdjustmentSummary, supportedBillingModes, linkVisit, deferVisit,markServiced, processMemberships, followupContext };
+  return { tiers, saveTier, offers, currentMemberships, withReplacement, load, summary, detail, createEnrollment, reconcileEnrollment, paymentAdjustmentSummary, supportedBillingModes, linkVisit, deferVisit,markServiced, completeJob, processMemberships, followupContext };
 }
 
 export async function installAgreementPlans({ app, pool, service, authRequired, requireCapability, onPlanActivated, startWorker = true, ...options }) {

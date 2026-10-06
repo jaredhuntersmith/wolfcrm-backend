@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {randomUUID} from "node:crypto";
+import {installGoogleSheetsSchema} from "../google-sheets.js";
 import {installOperationalAccountingSchema} from "../finance-operational-accounting.js";
 import {startLocalPostgres} from "./helpers/local-postgres.js";
 import {installAgreementSchema,createAgreementService} from "../quote-agreements.js";
@@ -43,7 +44,7 @@ function providerDouble(){
 test("signed plan billing is durable, scoped and exact against PostgreSQL and fake provider boundary",{timeout:90000},async t=>{
   const postgres=startLocalPostgres();postgres.configureEnvironment();process.env.STRIPE_SECRET_KEY="sk_test_fixture_local_only";let pool,server;
   try{
-    const backend=await import("../index.js");pool=backend.pool;await backend.bootstrap();await installAgreementSchema(pool);await installOperationalAccountingSchema(pool);
+    const backend=await import("../index.js");pool=backend.pool;await backend.bootstrap();await installAgreementSchema(pool);await installOperationalAccountingSchema(pool);await installGoogleSheetsSchema(pool);
     const company=randomUUID(),owner=randomUUID(),contact=randomUUID(),serviceID=randomUUID();
     await pool.query("INSERT INTO companies(id,name,join_code,owner_user_id,timezone) VALUES($1,'Plan business','PLAN-BILL',$2,'America/New_York')",[company,owner]);
     await pool.query("INSERT INTO agreement_number_sequences(company_id,last_number) VALUES($1,10000)",[company]);
@@ -173,6 +174,30 @@ test("signed plan billing is durable, scoped and exact against PostgreSQL and fa
         if(mode==="manual_per_visit"){assert.equal(result.kind,"payment");assert.ok(result.url);assert.equal(stripe.counts().pays,before);stripe.settle(owed[0].invoice_id);}else assert.equal(owed[0].state,"succeeded");
         await plans.reconcileEnrollment(item.row.id);await begin(item);assert.equal((await pool.query("SELECT count(*)::int n FROM payment_records WHERE enrollment_id=$1",[item.row.id])).rows[0].n,1);
       }
+    });
+    await t.test("first appointment anchors recurrence and workflow completion immediately pays exactly once",async()=>{
+      const item=await enrollment({mode:"automatic_per_visit",term:"ongoing"});
+      await begin(item);await finishSetup(item);
+      const current=await stored(item),req={companyId:company,userId:owner};
+      let detail=await plans.detail(pool,current);
+      assert.equal(detail.awaiting_first_appointment,true);
+      assert.equal((await obligations(item)).length,0);
+      const visit=detail.visits[0],job=randomUUID(),start="2026-10-06T23:30:00-04:00";
+      await pool.query("INSERT INTO schedule_events(id,user_id,company_id,contact_id,title,start_at,end_at,service_items) VALUES($1,$2,$3,$4,'First covered appointment',$5,$5::timestamptz+interval '1 hour',$6::jsonb)",[job,owner,company,contact,start,JSON.stringify(current.snapshot.future_visit.line_items)]);
+      await plans.linkVisit(req,current.id,visit.id,{job_id:job});
+      detail=await plans.detail(pool,await stored(item));
+      assert.equal(detail.first_visit_date,"2026-10-06");assert.equal(detail.awaiting_first_appointment,false);
+      assert.equal(new Date(detail.visits[0].due_date).toISOString().slice(0,10),"2026-10-06");
+      const pays=stripe.counts().pays;
+      const complete=()=>fetch(base+`/api/jobs/${job}/workflow/complete`,{method:"POST",headers:{Authorization:"Bearer plan-billing-fixture","Content-Type":"application/json"},body:JSON.stringify({snapshot:[]})});
+      assert.equal((await complete()).status,200);
+      const owed=await obligations(item);assert.equal(owed.length,1);assert.equal(owed[0].state,"succeeded");assert.equal(stripe.counts().pays,pays+1);
+      assert.equal((await pool.query("SELECT next_service_date::text FROM service_plans WHERE id=$1",[current.service_plan_id])).rows[0].next_service_date,"2027-01-06");
+      await Promise.all([complete(),complete(),adapter.reconcileEnrollment(current.id)]);
+      await pool.query("UPDATE schedule_events SET finished_at=NULL WHERE id=$1",[job]);await complete();
+      assert.equal(stripe.counts().pays,pays+1);assert.equal((await obligations(item)).length,1);
+      const summary=await adapter.billingSummary(current.id);assert.equal(summary.visits[0].payment_status,"succeeded");assert.equal(summary.visits[1].payment_status,"not_due");
+      assert.equal((await stored(item)).snapshot.offer_hash,current.snapshot.offer_hash);
     });
     await t.test("unknown invoice item and payment outcomes retry exact commands without duplicating invoice items or charges",async()=>{
       const item=await enrollment({mode:"prepaid"});stripe.lose("item");await assert.rejects(begin(item));const due=(await obligations(item))[0];assert.ok(due.invoice_id);const again=await begin(item);assert.ok(again.url);assert.equal([...stripe.objects.items.values()].filter(i=>i.invoice===due.invoice_id).length,1);

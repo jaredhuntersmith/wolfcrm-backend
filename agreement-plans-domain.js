@@ -70,6 +70,7 @@ const cadence = (interval) => `every ${interval.count} ${interval.unit}${interva
 export function buildPlanOffer({ agreement, tier, eligible_service_ids, payments_cents = 0, today, serviced = false,prior_adjustment_cents=0,initial_visit_already_counted=false }) {
   const config = normalizePlanTier(tier.configuration);
   if (!config.visible || (serviced && !config.allow_after_service)) return null;
+  if (config.billing.mode === 'automatic_per_visit') config.billing.collect_on = 'completed';
   const pricing = agreement.snapshot.pricing;
   if (!pricing) return null;
   const calculation = calculatePlanOffer({ line_items: pricing.line_items, eligible_service_ids, tier: config, payments_cents, tax_rate_basis_points: pricing.tax_rate_basis_points, tax_inclusive: pricing.tax_inclusive,quoted_pricing:pricing,discount_stacking_policy:agreement.snapshot.discount_stacking_policy||'best_price' });
@@ -80,7 +81,8 @@ export function buildPlanOffer({ agreement, tier, eligible_service_ids, payments
   calculation.current_balance_cents=Math.max(0,calculation.current_total_cents-payments_cents);
   calculation.credit_due_cents=Math.max(0,payments_cents-calculation.current_total_cents);
   const effectiveDate = advancePlanDate(today, { unit: 'day', count: 1 }, config.start_delay_days);
-  const nextService = config.first_service_delay_days === null ? advancePlanDate(effectiveDate, config.service_interval) : advancePlanDate(effectiveDate, { unit: 'day', count: 1 }, config.first_service_delay_days);
+  const appointmentAnchored = ['automatic_per_visit', 'manual_per_visit'].includes(config.billing.mode);
+  const nextService = config.first_service_delay_days === null ? (appointmentAnchored ? effectiveDate : advancePlanDate(effectiveDate, config.service_interval)) : advancePlanDate(effectiveDate, { unit: 'day', count: 1 }, config.first_service_delay_days);
   let firstCharge = config.billing.first_charge_date || advancePlanDate(effectiveDate, { unit: 'day', count: 1 }, config.billing.first_charge_delay_days);
   if (config.billing.first_charge_date && firstCharge < effectiveDate) { let occurrence=0; const anchor=firstCharge; do { firstCharge=advancePlanDate(anchor, config.billing.interval, ++occurrence); } while(firstCharge < effectiveDate && occurrence < 3650); if(firstCharge < effectiveDate) fail('plan_charge_date_invalid','Choose a more recent first billing date.'); }
   const countedCurrent = config.current_visit_counts && !initial_visit_already_counted && config.term.kind === 'finite' ? 1 : 0;
@@ -93,14 +95,14 @@ export function buildPlanOffer({ agreement, tier, eligible_service_ids, payments
   const billingSchedule = ['calendar_installments', 'prepaid'].includes(config.billing.mode) ? installments.installments_cents.map((cents, index) => ({ sequence: index + 1, due_date: advancePlanDate(firstCharge, config.billing.interval, index), amount_cents: cents })) : [];
   const labels = {
     manual_per_visit: `Pay ${amount(calculation.future_visit.total_cents)} per future visit when ${config.billing.collect_on}, collected manually.`,
-    automatic_per_visit: `Authorize ${amount(calculation.future_visit.total_cents)} per future visit when ${config.billing.collect_on}, charged to the authorized saved payment method.`,
+    automatic_per_visit: `Authorize ${amount(calculation.future_visit.total_cents)} per covered visit when ${config.billing.collect_on}, automatically charged off-session to the authorized saved payment method.`,
     calendar_recurring: `Authorize ${amount(calculation.future_visit.total_cents)} ${cadence(config.billing.interval)} starting ${firstCharge}, until canceled.${config.billing.calendar_requires_completed_service ? ' Each dated charge is held until its corresponding covered visit has been completed; one charge per visit.' : ' These calendar charges are independent of appointment completion.'}`,
     calendar_installments: `${billingSchedule.length} installments ${cadence(config.billing.interval)} starting ${firstCharge}: ${billingSchedule.map((entry) => amount(entry.amount_cents)).join(', ')}.`,
     prepaid: `Prepay ${amount(installments?.remaining_cents || 0)} on ${firstCharge} for ${futureCount} future visits.`,
   };
   const financialText = [
     `Plan: ${config.name}.`, `Included future services: ${calculation.future_visit.line_items.map((line) => `${line.qty} × ${line.name}: ${line.description}`).join('; ')}.`,
-    `Service ${cadence(config.service_interval)}. Effective ${effectiveDate}; first future service due ${nextService}. Appointments remain subject to confirmed Schedule availability.`,
+    appointmentAnchored ? `Service ${cadence(config.service_interval)} between covered appointments. Effective ${effectiveDate}; Visit 1 is the first explicitly linked covered appointment. Until then it is unscheduled. Later visits are due from that appointment date, not from enrollment. Separately invoiced initial work remains separate.` : `Service ${cadence(config.service_interval)}. Effective ${effectiveDate}; first future service due ${nextService}. Appointments remain subject to confirmed Schedule availability.`,
     `Future visit price ${amount(calculation.future_visit.total_cents)} including configured tax. ${labels[config.billing.mode]}`,
     `The one-time quote discount of ${amount(calculation.existing_quote_discount_cents)} does not repeat on future visits. For the initial job, ${calculation.discount_stacking_policy==='quote_then_plan'?'the plan discount applies after the allocated quote discount on eligible services':'eligible services retain the better price from the quote promotion or plan discount'}. Promotions on noneligible work remain unchanged.`,
     ['automatic_per_visit','calendar_installments','calendar_recurring'].includes(config.billing.mode) ? 'By separately signing this plan and completing payment-method setup, you authorize the business to save that payment method and debit the exact service-triggered charges or dated installments stated here. A card used only for the initial job is not treated as this authorization.' : (config.billing.save_payment_method ? 'By signing and completing card setup, you authorize saving your card for this plan. This does not authorize automatic recurring debits; you confirm manual payments separately.' : 'This plan does not authorize automatic recurring card debits.'),
@@ -111,6 +113,6 @@ export function buildPlanOffer({ agreement, tier, eligible_service_ids, payments
     `Cancellation notice: ${config.cancellation_notice_days} days. ${config.cancellation_policy}`,
     `Pause ${config.allow_pause ? 'permitted under the policy' : 'requires a new agreed arrangement'}; skip ${config.allow_skip ? 'permits deferring all remaining unbooked visits by one service cycle without consuming an entitlement or changing billing dates; existing appointments must be handled separately' : 'not included'}. Price changes require a new signed agreement.`,
   ].join('\n\n');
-  const result = { tier_id: tier.tier_id, tier_version: tier.version, configuration: config, ...calculation,prior_adjustment_cents:priorAdjustment,initial_visit_already_counted, effective_date: effectiveDate, next_service_date: nextService, first_charge_date: firstCharge, future_visit_count: futureCount, installments, billing_schedule: billingSchedule, financial_text: financialText };
+  const result = { ...(appointmentAnchored ? { schedule_model: 'appointment_anchored_v1' } : {}), tier_id: tier.tier_id, tier_version: tier.version, configuration: config, ...calculation,prior_adjustment_cents:priorAdjustment,initial_visit_already_counted, effective_date: effectiveDate, next_service_date: nextService, first_charge_date: firstCharge, future_visit_count: futureCount, installments, billing_schedule: billingSchedule, financial_text: financialText };
   return { ...result, offer_hash: quoteContentHash({ agreement_id: agreement.id, packet_hash: agreement.packet_hash, ...result }) };
 }
