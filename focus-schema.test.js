@@ -106,3 +106,46 @@ test("Facebook Login for Business OAuth uses config_id, never conflicting scopes
     }
   }
 });
+
+test("OAuth callback persists a sanitized exchange failure after it consumes a valid state", async () => {
+  const original = Object.fromEntries([
+    "FOCUS_META_APP_ID", "FOCUS_META_APP_SECRET", "FOCUS_META_REDIRECT_URI", "FOCUS_TOKEN_ENCRYPTION_KEY", "FOCUS_META_LOGIN_CONFIG_ID"
+  ].map((key) => [key, process.env[key]]));
+  const originalFetch = globalThis.fetch;
+  Object.assign(process.env, {
+    FOCUS_META_APP_ID: "test-meta-app-id",
+    FOCUS_META_APP_SECRET: "test-meta-app-secret",
+    FOCUS_META_REDIRECT_URI: "https://example.test/api/focus/connections/meta/callback",
+    FOCUS_TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 9).toString("base64"),
+    FOCUS_META_LOGIN_CONFIG_ID: "test-business-login-configuration"
+  });
+  globalThis.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: { code: 100 } }) });
+
+  try {
+    const routes = new Map();
+    const register = (method) => (path, ...handlers) => routes.set(`${method} ${path}`, handlers);
+    const app = { get: register("GET"), post: register("POST"), put: register("PUT"), delete: register("DELETE") };
+    const queries = [];
+    const pool = {
+      query: async (statement, values) => {
+        queries.push({ statement, values });
+        if (statement.startsWith("DELETE FROM focus_oauth_states WHERE state_hash")) return { rows: [{ user_id: "user-id", company_id: "company-id" }] };
+        return { rows: [] };
+      }
+    };
+    const pass = (_req, _res, next) => next();
+    await installFocusSystem({ app, pool, authRequired: pass, requireCapability: () => pass });
+    const response = { redirect(url) { this.url = url; } };
+    await routes.get("GET /api/focus/connections/meta/callback")[0]({ query: { state: "state", code: "one-time-code" } }, response);
+    assert.match(response.url, /status=failed/);
+    assert.match(response.url, /reason=meta_oauth_exchange_failed_provider_rejected/);
+    const failure = queries.find((query) => query.statement.startsWith("INSERT INTO focus_connections(user_id,company_id,provider,status,last_error_code"));
+    assert.deepEqual(failure.values, ["user-id", "company-id", "meta_graph", "meta_oauth_exchange_failed_provider_rejected"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [key, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});

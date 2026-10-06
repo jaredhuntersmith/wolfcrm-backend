@@ -488,14 +488,123 @@ class MetaGraphProvider {
     if (!data.access_token) throw new FocusProviderError("meta_oauth_exchange_invalid");
     return { token: data.access_token, expires_in: Number(data.expires_in) || null };
   }
+  async graph(path, params, failureCode, timeout = 20_000) {
+    const url = new URL(`https://graph.facebook.com/${this.version()}${path}`);
+    url.search = new URLSearchParams(params).toString();
+    const response = await this.fetch(url, { signal: AbortSignal.timeout(timeout) });
+    return safeProviderJSON(response, failureCode);
+  }
+  async inspectToken(token) {
+    const data = await this.graph("/debug_token", {
+      input_token: token,
+      access_token: `${this.env.FOCUS_META_APP_ID}|${this.env.FOCUS_META_APP_SECRET}`
+    }, "meta_token_debug_failed");
+    const value = data.data || {};
+    return {
+      is_valid: value.is_valid === true,
+      expires_at: numericUnixDate(value.expires_at),
+      scopes: Array.isArray(value.scopes) ? value.scopes.filter((item) => typeof item === "string").sort() : [],
+      granular_scopes: Array.isArray(value.granular_scopes) ? value.granular_scopes.map((item) => String(item?.scope || "")).filter(Boolean).sort() : []
+    };
+  }
+  async verifyConnection(token, accountID, expectedUsername = null) {
+    const probes = {};
+    let tokenInfo = null;
+    try {
+      tokenInfo = await this.inspectToken(token);
+      probes.token_debug = { status: tokenInfo.is_valid ? "available" : "unavailable" };
+      if (!tokenInfo.is_valid) throw new FocusProviderError("meta_token_invalid", { statusCode: 401 });
+    } catch (error) {
+      if (error?.code === "meta_token_invalid") throw error;
+      probes.token_debug = providerProbeFailure(error);
+    }
+
+    await this.graph("/me", { fields: "id,name", access_token: token }, "meta_connected_identity_failed");
+    probes.connected_identity = { status: "available" };
+
+    const permissions = await this.graph("/me/permissions", { access_token: token }, "meta_permissions_read_failed");
+    const grantedPermissions = (permissions.data || [])
+      .filter((item) => item?.status === "granted" && typeof item.permission === "string")
+      .map((item) => item.permission)
+      .sort();
+
+    const pages = await this.graph("/me/accounts", {
+      fields: "id,name,instagram_business_account{id,username}",
+      access_token: token
+    }, "meta_page_list_failed");
+    const pageAccounts = (pages.data || [])
+      .filter((page) => page?.instagram_business_account?.id)
+      .map((page) => ({
+        page_id: String(page.id),
+        page_name: typeof page.name === "string" ? page.name.slice(0, 200) : null,
+        account_id: String(page.instagram_business_account.id),
+        account_username: typeof page.instagram_business_account.username === "string" ? page.instagram_business_account.username.toLowerCase() : null
+      }));
+    const linked = pageAccounts.find((item) => item.account_id === String(accountID)) || pageAccounts.find((item) => !expectedUsername || item.account_username === String(expectedUsername).toLowerCase());
+    if (!linked) throw new FocusProviderError("meta_linked_professional_account_not_found", { statusCode: 409, detail: "Meta returned no Page-linked Instagram Professional account for this connection." });
+    probes.page_list = { status: "available", linked_professional_accounts: pageAccounts.length };
+    probes.linked_professional_account = { status: "available", account_id_matches_connection: linked.account_id === String(accountID) };
+
+    const profile = await this.graph(`/${encodeURIComponent(linked.account_id)}`, {
+      fields: "id,username,account_type,followers_count,media_count",
+      access_token: token
+    }, "meta_basic_profile_read_failed");
+    if (!profile?.id || !profile?.username) throw new FocusProviderError("meta_professional_profile_incomplete", { statusCode: 409 });
+    probes.basic_profile = { status: "available", account_type: profile.account_type || null };
+
+    const mediaRead = await this.graph(`/${encodeURIComponent(linked.account_id)}/media`, {
+      fields: "id,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp",
+      limit: "1",
+      access_token: token
+    }, "meta_bounded_media_read_failed");
+    const media = Array.isArray(mediaRead.data) ? mediaRead.data : [];
+    const sample = media[0] || null;
+    probes.bounded_media = {
+      status: "available",
+      items_returned: media.length,
+      direct_media_fields_returned: sample ? {
+        media_type: sample.media_type || null,
+        media_product_type: sample.media_product_type || null,
+        media_url: typeof sample.media_url === "string" && sample.media_url.startsWith("https://"),
+        thumbnail_url: typeof sample.thumbnail_url === "string" && sample.thumbnail_url.startsWith("https://"),
+        permalink: typeof sample.permalink === "string"
+      } : null
+    };
+
+    const optional = async (name, request) => {
+      try { probes[name] = { status: "available", ...(await request()) }; }
+      catch (error) { probes[name] = providerProbeFailure(error); }
+    };
+    await optional("business_discovery", async () => {
+      const result = await this.businessDiscover({ connection: { accessToken: token, account_id: linked.account_id }, username: profile.username });
+      return { profile_returned: Boolean(result?.username) };
+    });
+    if (sample?.id) {
+      await optional("comments", async () => {
+        const result = await this.graph(`/${encodeURIComponent(sample.id)}/comments`, { fields: "id", limit: "1", access_token: token }, "meta_comments_probe_failed");
+        return { comments_returned: Array.isArray(result.data) ? result.data.length : 0 };
+      });
+    } else probes.comments = { status: "not_tested", reason: "no_media_available" };
+    await optional("professional_messaging", async () => {
+      const result = await this.graph(`/${encodeURIComponent(linked.account_id)}/conversations`, { fields: "id", limit: "1", access_token: token }, "meta_messaging_probe_failed");
+      return { conversations_returned: Array.isArray(result.data) ? result.data.length : 0 };
+    });
+
+    const permissionSet = new Set([...(tokenInfo?.scopes || []), ...(tokenInfo?.granular_scopes || []), ...grantedPermissions]);
+    return {
+      checked_at: new Date().toISOString(),
+      token: { valid: tokenInfo?.is_valid !== false, expires_at: tokenInfo?.expires_at || null, validation: tokenInfo ? "debug_token" : "connected_identity_read" },
+      granted_permissions: [...permissionSet].sort(),
+      page: { id: linked.page_id, name: linked.page_name },
+      account: { id: String(profile.id), username: String(profile.username).toLowerCase(), account_type: profile.account_type || null, followers_count: numericOrNull(profile.followers_count), media_count: numericOrNull(profile.media_count) },
+      capabilities: probes
+    };
+  }
   async resolveLinkedProfessionalAccount(token) {
-    const url = new URL(`https://graph.facebook.com/${this.version()}/me/accounts`);
-    url.search = new URLSearchParams({ fields: "id,name,instagram_business_account{id,username}", access_token: token }).toString();
-    const response = await this.fetch(url, { signal: AbortSignal.timeout(20_000) });
-    const data = await safeProviderJSON(response, "meta_linked_account_discovery_failed");
-    const candidates = (data.data || []).map((page) => page.instagram_business_account).filter((account) => account?.id);
+    const data = await this.graph("/me/accounts", { fields: "id,name,instagram_business_account{id,username}", access_token: token }, "meta_linked_account_discovery_failed");
+    const candidates = (data.data || []).filter((page) => page?.instagram_business_account?.id);
     if (candidates.length !== 1) throw new FocusProviderError(candidates.length ? "meta_linked_professional_account_selection_required" : "meta_linked_professional_account_not_found", { statusCode: 409, detail: "Connect exactly one eligible linked Instagram Professional account, or extend the account-selection UI before retrying." });
-    return { id: String(candidates[0].id), username: candidates[0].username || null };
+    return { id: String(candidates[0].instagram_business_account.id), username: candidates[0].instagram_business_account.username || null, page_id: String(candidates[0].id), page_name: candidates[0].name || null };
   }
   async businessDiscover({ connection, username }) {
     const token = connection?.accessToken;
@@ -616,29 +725,41 @@ export async function installFocusSystem({ app, pool, authRequired, requireCapab
     } catch (error) { sendFocusError(res, error); }
   });
   app.get("/api/focus/connections/meta/callback", async (req, res) => {
+    let identity = null;
     try {
       const state = typeof req.query.state === "string" ? req.query.state : "";
       const code = typeof req.query.code === "string" ? req.query.code : "";
       const providerFailure = metaOAuthCallbackFailure(req.query);
       if (providerFailure) {
-        const identity = state ? await consumeMetaOAuthState(pool, state) : null;
+        identity = state ? await consumeMetaOAuthState(pool, state) : null;
         if (identity) await recordMetaOAuthFailure(pool, identity, providerFailure);
         return res.redirect(`${process.env.FOCUS_META_CALLBACK_FAILURE_URL || "wolfcrm://focus-connection"}?status=failed&reason=${encodeURIComponent(providerFailure)}`);
       }
       if (!state || !code) throw new FocusProviderError("meta_oauth_callback_invalid", { statusCode: 400 });
-      const identity = await consumeMetaOAuthState(pool, state);
+      identity = await consumeMetaOAuthState(pool, state);
       if (!identity) throw new FocusProviderError("meta_oauth_state_invalid", { statusCode: 400 });
       const token = await meta.exchangeCode(code);
       const account = await meta.resolveLinkedProfessionalAccount(token.token);
       const encrypted = encryptFocusToken(token.token);
       if (!encrypted) throw new FocusProviderError("focus_token_encryption_key_missing");
-      await pool.query(`INSERT INTO focus_connections(user_id,company_id,provider,account_id,account_username,token_ciphertext,token_iv,token_tag,token_expires_at,status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'connected',now()) ON CONFLICT(user_id,provider) DO UPDATE SET company_id=EXCLUDED.company_id,account_id=EXCLUDED.account_id,account_username=EXCLUDED.account_username,token_ciphertext=EXCLUDED.token_ciphertext,token_iv=EXCLUDED.token_iv,token_tag=EXCLUDED.token_tag,token_expires_at=EXCLUDED.token_expires_at,status='connected',last_error_code=NULL,last_checked_at=now(),updated_at=now()`, [identity.user_id, identity.company_id, META_PROVIDER, account.id, account.username, encrypted.ciphertext, encrypted.iv, encrypted.tag, token.expires_in ? new Date(Date.now() + token.expires_in * 1000) : null]);
+      const initialSnapshot = { oauth: { callback: "completed", completed_at: new Date().toISOString() }, page: { id: account.page_id || null, name: account.page_name || null } };
+      await pool.query(`INSERT INTO focus_connections(user_id,company_id,provider,account_id,account_username,token_ciphertext,token_iv,token_tag,token_expires_at,capability_snapshot,status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'connected',now()) ON CONFLICT(user_id,provider) DO UPDATE SET company_id=EXCLUDED.company_id,account_id=EXCLUDED.account_id,account_username=EXCLUDED.account_username,token_ciphertext=EXCLUDED.token_ciphertext,token_iv=EXCLUDED.token_iv,token_tag=EXCLUDED.token_tag,token_expires_at=EXCLUDED.token_expires_at,capability_snapshot=EXCLUDED.capability_snapshot,status='connected',last_error_code=NULL,last_checked_at=now(),updated_at=now()`, [identity.user_id, identity.company_id, META_PROVIDER, account.id, account.username, encrypted.ciphertext, encrypted.iv, encrypted.tag, token.expires_in ? new Date(Date.now() + token.expires_in * 1000) : null, initialSnapshot]);
       res.redirect(`${process.env.FOCUS_META_CALLBACK_SUCCESS_URL || "wolfcrm://focus-connection"}?status=connected`);
     } catch (error) {
-      res.redirect(`${process.env.FOCUS_META_CALLBACK_FAILURE_URL || "wolfcrm://focus-connection"}?status=failed&reason=${encodeURIComponent(error.code || "oauth_failed")}`);
+      const failure = safeFocusErrorCode(error, "meta_oauth_callback_failed");
+      if (identity) {
+        try { await recordMetaOAuthFailure(pool, identity, failure); }
+        catch (recordError) { console.error("[focus][meta-oauth-callback]", safeFocusErrorCode(recordError, "meta_oauth_failure_record_failed")); }
+      }
+      console.error("[focus][meta-oauth-callback]", failure);
+      res.redirect(`${process.env.FOCUS_META_CALLBACK_FAILURE_URL || "wolfcrm://focus-connection"}?status=failed&reason=${encodeURIComponent(failure)}`);
     }
   });
   app.get("/api/focus/connections", authRequired, requireFocusView, async (req, res) => res.json((await listConnections(pool, req)).map(redactConnection)));
+  app.post("/api/focus/connections/meta/verify", authRequired, requireFocusManage, async (req, res) => {
+    try { res.json({ connection: redactConnection(await verifyMetaConnection(pool, req, meta)) }); }
+    catch (error) { sendFocusError(res, error); }
+  });
   app.delete("/api/focus/connections/:provider", authRequired, requireFocusManage, async (req, res) => {
     await pool.query(`DELETE FROM focus_connections WHERE user_id = $1 AND company_id IS NOT DISTINCT FROM $2 AND provider = $3`, [req.userId, req.companyId, req.params.provider]);
     res.json({ ok: true, local_disconnect: true });
@@ -868,7 +989,44 @@ async function updateSettings(pool, req, body) {
 function publicSettings(settings) { return { ...settings, config: normalizeFocusSettings(settings.config) }; }
 function publicCreator(row) { return { id: row.id, username: row.username, display_name: row.display_name, biography: row.biography, website: row.website, profile_picture_url: row.profile_picture_url, follower_count: row.follower_count === null ? null : Number(row.follower_count), following_count: row.following_count === null ? null : Number(row.following_count), media_count: row.media_count === null ? null : Number(row.media_count), account_type: row.account_type, profile_status: row.profile_status, follower_gate_status: row.follower_gate_status, follower_gate_exemption: row.follower_gate_exemption, native_compatibility: { reels_checked: row.observed_reels_checked, reels_playable: row.observed_reels_native_playable, posts_checked: row.observed_posts_checked, posts_displayable: row.observed_posts_native_displayable, rejection_breakdown: row.native_rejection_breakdown }, is_followed: row.is_followed === true, is_blocked: row.is_blocked === true, last_profile_refresh_at: row.last_profile_refresh_at, last_media_refresh_at: row.last_media_refresh_at }; }
 function publicContent(row) { return { id: row.id, creator_id: row.creator_id, creator_username: row.creator_username || null, provider_media_id: row.provider_media_id, permalink: row.permalink, media_type: row.media_type, caption: row.caption, hashtags: row.hashtags || [], published_at: row.published_at, thumbnail_url: row.thumbnail_url, native_state: row.native_state, native_rejection_reason: row.native_rejection_reason, access_state: row.access_state, dominant_topic: row.dominant_topic, media_url_expires_at: row.media_url_expires_at, liked_at: row.liked_at || null }; }
-function redactConnection(row) { return row ? { provider: row.provider, status: row.status, account_id: row.account_id, account_username: row.account_username, token_expires_at: row.token_expires_at, capability_snapshot: row.capability_snapshot, last_error_code: row.last_error_code, last_checked_at: row.last_checked_at } : { provider: META_PROVIDER, status: "disconnected" }; }
+function redactConnection(row) {
+  if (!row) return { provider: META_PROVIDER, status: "disconnected" };
+  const snapshot = row.capability_snapshot && typeof row.capability_snapshot === "object" ? row.capability_snapshot : {};
+  return {
+    provider: row.provider,
+    status: row.status,
+    account_id: row.account_id,
+    account_username: row.account_username,
+    page_name: snapshot.page?.name || null,
+    token_expires_at: row.token_expires_at,
+    token_valid: snapshot.token?.valid === true,
+    last_verified_at: snapshot.checked_at || null,
+    granted_permissions: Array.isArray(snapshot.granted_permissions) ? snapshot.granted_permissions : [],
+    capability_results: snapshot.capabilities && typeof snapshot.capabilities === "object" ? snapshot.capabilities : {},
+    last_error_code: row.last_error_code,
+    last_checked_at: row.last_checked_at
+  };
+}
+
+async function verifyMetaConnection(pool, req, meta) {
+  const connection = await scopedConnection(pool, req, META_PROVIDER);
+  if (!connection) throw new FocusProviderError("meta_connection_required", { statusCode: 409 });
+  const accessToken = decryptFocusToken(connection);
+  if (!accessToken) {
+    await pool.query(`UPDATE focus_connections SET status='failed',last_error_code='focus_token_unavailable',last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id]);
+    throw new FocusProviderError("focus_token_unavailable", { statusCode: 409 });
+  }
+  try {
+    const verification = await meta.verifyConnection(accessToken, connection.account_id, connection.account_username);
+    const snapshot = { ...(connection.capability_snapshot || {}), ...verification };
+    const { rows } = await pool.query(`UPDATE focus_connections SET account_id=$2,account_username=$3,token_expires_at=COALESCE($4,token_expires_at),capability_snapshot=$5,status='connected',last_error_code=NULL,last_checked_at=now(),updated_at=now() WHERE id=$1 RETURNING *`, [connection.id, verification.account.id, verification.account.username, verification.token.expires_at, snapshot]);
+    return rows[0];
+  } catch (error) {
+    const failure = safeFocusErrorCode(error, "meta_connection_verification_failed");
+    await pool.query(`UPDATE focus_connections SET status=CASE WHEN $2='meta_token_invalid' THEN 'failed' ELSE status END,last_error_code=$2,last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id, failure]);
+    throw error;
+  }
+}
 
 async function scopedConnection(pool, req, provider) { const { rows } = await pool.query(`SELECT * FROM focus_connections WHERE user_id=$1 AND company_id IS NOT DISTINCT FROM $2 AND provider=$3`, [req.userId, req.companyId, provider]); return rows[0] || null; }
 async function listConnections(pool, req) { const { rows } = await pool.query(`SELECT * FROM focus_connections WHERE user_id=$1 AND company_id IS NOT DISTINCT FROM $2 ORDER BY provider`, [req.userId, req.companyId]); return rows; }
@@ -1300,6 +1458,12 @@ function metaOAuthCallbackFailure(query = {}) {
   const safe = normalizedMetaOAuthProviderError(error || "provider_rejected") || "provider_rejected";
   return `meta_oauth_${safe}`.slice(0, 80);
 }
+function safeFocusErrorCode(error, fallback) {
+  const candidate = typeof error?.code === "string" ? error.code : fallback;
+  const normalized = String(candidate || fallback).toLowerCase().replace(/[^a-z0-9_]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "");
+  return (normalized || fallback).slice(0, 80);
+}
+function providerProbeFailure(error) { return { status: "unavailable", error: safeFocusErrorCode(error, "meta_provider_probe_failed") }; }
 async function consumeMetaOAuthState(pool, state) {
   const { rows } = await pool.query(`DELETE FROM focus_oauth_states WHERE state_hash = $1 AND provider = $2 AND expires_at > now() RETURNING user_id, company_id`, [hashSecret(state), META_PROVIDER]);
   return rows[0] || null;
@@ -1321,6 +1485,7 @@ export function normalizeHashtag(value) { const hashtag = String(value || "").tr
 function boundedText(value, max) { const text = typeof value === "string" ? value.trim() : ""; return text ? text.slice(0, max) : null; }
 function boundedLimit(value, fallback, max) { const number = Number(value); return Number.isSafeInteger(number) && number > 0 ? Math.min(number, max) : fallback; }
 function numericOrNull(value) { const number = Number(value); return Number.isSafeInteger(number) && number >= 0 ? number : null; }
+function numericUnixDate(value) { const seconds = Number(value); return Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000) : null; }
 function parseMetaDate(value) { const date = new Date(value); return Number.isFinite(date.valueOf()) ? date : null; }
 function extractHashtags(caption) { return [...String(caption || "").matchAll(/#([\p{L}\p{N}_]+)/gu)].map((match) => match[1].toLowerCase()).slice(0, 30); }
 function requestId(req, fallback) { const supplied = req.headers?.["idempotency-key"] || req.headers?.["x-idempotency-key"]; return typeof supplied === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(supplied) ? supplied : fallback; }
