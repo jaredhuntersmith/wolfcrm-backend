@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { FOCUS_META_DEFAULT_GRAPH_VERSION, FOCUS_META_DEFAULT_SCOPES, fixtureProbeObservations, focusProviderFailureCode, installFocusSchema, installFocusSystem, normalizeHashtag } from "./focus.js";
+import { FOCUS_META_DEFAULT_GRAPH_VERSION, FOCUS_META_DEFAULT_SCOPES, buildFocusCapabilityMatrix, fixtureProbeObservations, focusProviderFailureCode, installFocusSchema, installFocusSystem, normalizeHashtag } from "./focus.js";
 
 test("Focus schema installer is additive and contains tenant-scoped persistence", async () => {
   const statements = [];
@@ -30,6 +30,9 @@ test("Meta defaults follow the current Facebook Login contract and provider fail
   assert.equal(FOCUS_META_DEFAULT_SCOPES, "instagram_basic,pages_show_list");
   assert.equal(focusProviderFailureCode("meta_oauth_exchange_failed"), "meta_oauth_exchange_failed_provider_rejected");
   assert.match(focusProviderFailureCode("meta failure: 190"), /^[a-z0-9_]+$/);
+  const metaOAuth = buildFocusCapabilityMatrix({ FOCUS_META_APP_ID: "app", FOCUS_META_APP_SECRET: "secret", FOCUS_META_REDIRECT_URI: "https://example.test/callback", FOCUS_TOKEN_ENCRYPTION_KEY: "key" }).meta_oauth;
+  assert.equal(metaOAuth.setup_error, "meta_login_configuration_required");
+  assert.deepEqual(metaOAuth.authorization_parameters, ["client_id", "redirect_uri", "state", "response_type"]);
 });
 
 test("Supply Probe fixture records every required measurement without claiming live evidence", () => {
@@ -43,15 +46,17 @@ test("Supply Probe fixture records every required measurement without claiming l
   assert.ok(observations.every((item) => item.metric_value.fixture_only === true));
 });
 
-test("Meta OAuth start issues cleanup and state insertion as separate PostgreSQL queries", async () => {
+test("Facebook Login for Business OAuth uses config_id, never conflicting scopes, and preserves provider errors", async () => {
   const original = Object.fromEntries([
-    "FOCUS_META_APP_ID", "FOCUS_META_APP_SECRET", "FOCUS_META_REDIRECT_URI", "FOCUS_TOKEN_ENCRYPTION_KEY"
+    "FOCUS_META_APP_ID", "FOCUS_META_APP_SECRET", "FOCUS_META_REDIRECT_URI", "FOCUS_TOKEN_ENCRYPTION_KEY", "FOCUS_META_SCOPES", "FOCUS_META_LOGIN_CONFIG_ID"
   ].map((key) => [key, process.env[key]]));
   Object.assign(process.env, {
     FOCUS_META_APP_ID: "test-meta-app-id",
     FOCUS_META_APP_SECRET: "test-meta-app-secret",
     FOCUS_META_REDIRECT_URI: "https://example.test/api/focus/connections/meta/callback",
-    FOCUS_TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64")
+    FOCUS_TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
+    FOCUS_META_SCOPES: "instagram_basic,pages_show_list",
+    FOCUS_META_LOGIN_CONFIG_ID: "test-business-login-configuration"
   });
 
   try {
@@ -59,7 +64,13 @@ test("Meta OAuth start issues cleanup and state insertion as separate PostgreSQL
     const register = (method) => (path, ...handlers) => routes.set(`${method} ${path}`, handlers);
     const app = { get: register("GET"), post: register("POST"), put: register("PUT"), delete: register("DELETE") };
     const queries = [];
-    const pool = { query: async (statement, values) => { queries.push({ statement, values }); return { rows: [] }; } };
+    const pool = {
+      query: async (statement, values) => {
+        queries.push({ statement, values });
+        if (statement.startsWith("DELETE FROM focus_oauth_states WHERE state_hash")) return { rows: [{ user_id: "user-id", company_id: "company-id" }] };
+        return { rows: [] };
+      }
+    };
     const pass = (_req, _res, next) => next();
     await installFocusSystem({ app, pool, authRequired: pass, requireCapability: () => pass });
 
@@ -76,7 +87,18 @@ test("Meta OAuth start issues cleanup and state insertion as separate PostgreSQL
     assert.equal(stateQueries[0].values, undefined);
     assert.match(stateQueries[1].statement, /^INSERT INTO focus_oauth_states/);
     assert.equal(stateQueries[1].values.length, 4);
-    assert.match(res.payload.authorization_url, /^https:\/\/www\.facebook\.com\/v26\.0\/dialog\/oauth\?/);
+    const authorizationURL = new URL(res.payload.authorization_url);
+    assert.equal(authorizationURL.origin, "https://www.facebook.com");
+    assert.equal(authorizationURL.pathname, "/v26.0/dialog/oauth");
+    assert.equal(authorizationURL.searchParams.get("config_id"), "test-business-login-configuration");
+    assert.equal(authorizationURL.searchParams.has("scope"), false);
+
+    const callbackRes = { redirect(url) { this.url = url; } };
+    await routes.get("GET /api/focus/connections/meta/callback")[0]({ query: { state: authorizationURL.searchParams.get("state"), error: "invalid_scope", error_description: "Invalid Scopes: instagram_basic" } }, callbackRes);
+    assert.match(callbackRes.url, /status=failed/);
+    assert.match(callbackRes.url, /reason=meta_oauth_invalid_scope/);
+    const failure = queries.find((query) => query.statement.startsWith("INSERT INTO focus_connections(user_id,company_id,provider,status,last_error_code"));
+    assert.deepEqual(failure.values, ["user-id", "company-id", "meta_graph", "meta_oauth_invalid_scope"]);
   } finally {
     for (const [key, value] of Object.entries(original)) {
       if (value === undefined) delete process.env[key];
