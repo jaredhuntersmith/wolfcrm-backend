@@ -592,7 +592,8 @@ export async function installFocusSystem({ app, pool, authRequired, requireCapab
   app.get("/api/focus/connections/meta/start", authRequired, requireFocusManage, async (req, res) => {
     try {
       const state = randomBytes(32).toString("base64url");
-      await pool.query(`DELETE FROM focus_oauth_states WHERE expires_at < now(); INSERT INTO focus_oauth_states(state_hash,user_id,company_id,provider,expires_at) VALUES($1,$2,$3,$4,now() + interval '10 minutes')`, [hashSecret(state), req.userId, req.companyId, META_PROVIDER]);
+      await pool.query(`DELETE FROM focus_oauth_states WHERE expires_at < now()`);
+      await pool.query(`INSERT INTO focus_oauth_states(state_hash,user_id,company_id,provider,expires_at) VALUES($1,$2,$3,$4,now() + interval '10 minutes')`, [hashSecret(state), req.userId, req.companyId, META_PROVIDER]);
       res.json({ authorization_url: meta.authURL(state), callback_scheme: "wolfcrm://focus-connection", expires_in_seconds: 600 });
     } catch (error) { sendFocusError(res, error); }
   });

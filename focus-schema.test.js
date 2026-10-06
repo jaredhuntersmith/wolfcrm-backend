@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { FOCUS_META_DEFAULT_GRAPH_VERSION, FOCUS_META_DEFAULT_SCOPES, fixtureProbeObservations, focusProviderFailureCode, installFocusSchema, normalizeHashtag } from "./focus.js";
+import { FOCUS_META_DEFAULT_GRAPH_VERSION, FOCUS_META_DEFAULT_SCOPES, fixtureProbeObservations, focusProviderFailureCode, installFocusSchema, installFocusSystem, normalizeHashtag } from "./focus.js";
 
 test("Focus schema installer is additive and contains tenant-scoped persistence", async () => {
   const statements = [];
@@ -41,4 +41,46 @@ test("Supply Probe fixture records every required measurement without claiming l
     "fresh_content_yield", "eligible_posts", "candidate_supply_per_day", "ready_bank_sustainability"
   ]) assert.ok(keys.has(key), `missing ${key}`);
   assert.ok(observations.every((item) => item.metric_value.fixture_only === true));
+});
+
+test("Meta OAuth start issues cleanup and state insertion as separate PostgreSQL queries", async () => {
+  const original = Object.fromEntries([
+    "FOCUS_META_APP_ID", "FOCUS_META_APP_SECRET", "FOCUS_META_REDIRECT_URI", "FOCUS_TOKEN_ENCRYPTION_KEY"
+  ].map((key) => [key, process.env[key]]));
+  Object.assign(process.env, {
+    FOCUS_META_APP_ID: "test-meta-app-id",
+    FOCUS_META_APP_SECRET: "test-meta-app-secret",
+    FOCUS_META_REDIRECT_URI: "https://example.test/api/focus/connections/meta/callback",
+    FOCUS_TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64")
+  });
+
+  try {
+    const routes = new Map();
+    const register = (method) => (path, ...handlers) => routes.set(`${method} ${path}`, handlers);
+    const app = { get: register("GET"), post: register("POST"), put: register("PUT"), delete: register("DELETE") };
+    const queries = [];
+    const pool = { query: async (statement, values) => { queries.push({ statement, values }); return { rows: [] }; } };
+    const pass = (_req, _res, next) => next();
+    await installFocusSystem({ app, pool, authRequired: pass, requireCapability: () => pass });
+
+    const req = { userId: "user-id", companyId: "company-id" };
+    const res = { json(payload) { this.payload = payload; } };
+    for (const handler of routes.get("GET /api/focus/connections/meta/start")) {
+      const result = handler(req, res, (error) => { if (error) throw error; });
+      if (result?.then) await result;
+    }
+
+    const stateQueries = queries.slice(1);
+    assert.equal(stateQueries.length, 2);
+    assert.match(stateQueries[0].statement, /^DELETE FROM focus_oauth_states WHERE expires_at < now\(\)$/);
+    assert.equal(stateQueries[0].values, undefined);
+    assert.match(stateQueries[1].statement, /^INSERT INTO focus_oauth_states/);
+    assert.equal(stateQueries[1].values.length, 4);
+    assert.match(res.payload.authorization_url, /^https:\/\/www\.facebook\.com\/v26\.0\/dialog\/oauth\?/);
+  } finally {
+    for (const [key, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
