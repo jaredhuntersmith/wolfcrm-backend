@@ -12164,7 +12164,10 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
     if (quote_id && !(await db.query(`SELECT id FROM quotes WHERE id=$1 AND (deleted_at IS NULL OR id::text=$4) AND (${req.companyId ? "company_id=$2" : "user_id=$2"}) AND ($3::text IS NULL OR contact_id=$3)`, [quote_id, req.companyId || req.userId, contact_id || null, previous.rows[0]?.quote_id || null])).rowCount) {
       await db.query("ROLLBACK"); return res.status(404).json({ error: "quote_not_found" });
     }
-    const selectedScope = await selectedQuoteScheduleScope(db,{companyId:req.companyId,quoteId:quote_id,previous:previous.rows[0],start,end});
+    if(finished_at && !previous.rows[0]?.finished_at && !hasCapability(req,"jobs.complete")) {
+      await db.query("ROLLBACK"); return res.status(403).json({error:"permission_denied",required_capability:"jobs.complete"});
+    }
+    const selectedScope = await selectedQuoteScheduleScope(db,{companyId:req.companyId,quoteId:quote_id,previous:previous.rows[0],start,end,requestedServiceItems:service_items});
     const assignments = validateAssignments({
       salesIDs: Array.isArray(sales_user_ids) ? sales_user_ids : [req.userId],
       workerIDs: Array.isArray(worker_user_ids) ? worker_user_ids : [],
@@ -12239,6 +12242,8 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
       await db.query("UPDATE schedule_events SET customer_note_entries=$2::jsonb WHERE id=$1",[req.params.id,JSON.stringify(customerNotes)]);
       r.rows[0].customer_note_entries=customerNotes;
     }
+    const planJob=await app.locals.agreementPlans?.associateJob(db,req.companyId,req.params.id,{allowFinished:!!r.rows[0].finished_at});
+    if(planJob){r.rows[0].price_cents=planJob.amount_cents;r.rows[0].service_plan_id=(await db.query('SELECT service_plan_id FROM schedule_events WHERE id=$1',[req.params.id])).rows[0].service_plan_id;}
     await db.query("COMMIT");
     committed = true;
     if (r.rows[0].finished_at) await app.locals.agreementPlans?.completeJob(req, req.params.id);
@@ -12285,6 +12290,7 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
   } catch (e) {
     if (!committed) await db.query("ROLLBACK").catch(() => {});
     if (e instanceof QuoteContractError) return res.status(e.status).json({error:e.code,message:e.message});
+    if(e.code === "23514" && ["completed_plan_job_price_immutable","plan_job_customer_immutable"].includes(e.message)) return res.status(409).json({error:e.message,message:"This plan job already has a fixed customer or completed billing amount. Preserve it and create a new job for additional work."});
     if (e.code === "23514" && e.message === "signed_plan_job_scope_immutable") return res.status(409).json({error:"signed_plan_job_scope_immutable",message:"This appointment belongs to a signed membership. Keep its agreed services and quantities, or arrange a separate job."});
     const conflict = scheduleConflict(e);
     if (conflict) return res.status(conflict.status).json(conflict);
@@ -13892,8 +13898,10 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, requireCapability("job
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    await lockCompanySchedule(client,req.companyId);
     const job = (await client.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2 FOR UPDATE`, [req.params.id, req.companyId])).rows[0];
     if (!job) { await client.query("ROLLBACK"); return res.status(404).json({ error: "job_not_found" }); }
+    await app.locals.agreementPlans?.associateJob(client,req.companyId,req.params.id,{allowFinished:true});
     const now = new Date();
     await client.query(
       `INSERT INTO job_workflow_runs(id, company_id, job_id, status, started_at, started_by, completed_at, completed_by, override_reason, snapshot)
@@ -13909,7 +13917,7 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, requireCapability("job
               finished_at = COALESCE(finished_at, $3), finished_by = COALESCE(finished_by, $4), updated_at = now()
        WHERE id = $1 AND company_id = $2
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
-                 contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
+                 contact_id, service_plan_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
                  company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
                  weather_exposure`,
       [req.params.id, req.companyId, now, req.userId]
@@ -13922,6 +13930,7 @@ app.post("/api/jobs/:id/workflow/complete", authRequired, requireCapability("job
     res.json(updated);
   } catch (e) {
     await client.query("ROLLBACK");
+    if(e instanceof QuoteContractError) return res.status(e.status).json({error:e.code,message:e.message});
     console.error("[operations] workflow complete failed:", e);
     res.status(500).json({ error: "job_workflow_complete_failed" });
   } finally { client.release(); }

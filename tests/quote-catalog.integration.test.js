@@ -19,6 +19,7 @@ test("real PostgreSQL quote and service routes preserve ownership, history, opti
     const contactA = randomUUID(), contactB = randomUUID();
     await pool.query(`INSERT INTO companies(id,name,join_code) VALUES($1,'Test A','TEST-A'),($2,'Test B','TEST-B')`, [companyA, companyB]);
     await pool.query(`INSERT INTO users(id,email,role,company_id) VALUES($1,'a@example.invalid','employer',$4),($2,'b@example.invalid','employer',$5),($3,'worker@example.invalid','employee',$4)`, [ownerA, ownerB, worker, companyA, companyB]);
+    await pool.query('UPDATE companies SET owner_user_id=CASE WHEN id=$1 THEN $3::uuid ELSE $4::uuid END WHERE id IN ($1,$2)',[companyA,companyB,ownerA,ownerB]);
     await pool.query(`INSERT INTO employee_permissions(user_id,company_id,permission_preset) VALUES($1,$2,'technician')`, [worker, companyA]);
     await pool.query(`INSERT INTO sessions(token,user_id) VALUES('owner-a',$1),('owner-b',$2),('worker',$3)`, [ownerA, ownerB, worker]);
     await pool.query(`INSERT INTO contacts(id,user_id,company_id,name) VALUES($1,$3,$5,'Customer A'),($2,$4,$6,'Customer B')`, [contactA, contactB, ownerA, ownerB, companyA, companyB]);

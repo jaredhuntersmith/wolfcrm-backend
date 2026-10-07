@@ -19,6 +19,7 @@ test('template versions, frozen preferences, standalone revisions and private hi
     const company=randomUUID(),foreign=randomUUID(),owner=randomUUID(),other=randomUUID(),contact=randomUUID(),quote=randomUUID();
     await pool.query("INSERT INTO companies(id,name,join_code) VALUES($1,'Template Business','TPL-ONE'),($2,'Other','TPL-TWO')",[company,foreign]);
     await pool.query("INSERT INTO users(id,email,role,company_id) VALUES($1,'template@example.invalid','employer',$3),($2,'other-template@example.invalid','employer',$4)",[owner,other,company,foreign]);
+    await pool.query('UPDATE companies SET owner_user_id=CASE WHEN id=$1 THEN $3::uuid ELSE $4::uuid END WHERE id IN ($1,$2)',[company,foreign,owner,other]);
     await pool.query("INSERT INTO sessions(token,user_id) VALUES('template-owner',$1),('template-other',$2)",[owner,other]);
     await pool.query("INSERT INTO contacts(id,user_id,company_id,name,address,email) VALUES($1,$2,$3,'Original Customer','123 Service Street','customer@example.invalid')",[contact,owner,company]);
     await pool.query("INSERT INTO quotes(id,user_id,company_id,contact_id,title,line_items,total_cents,quote_options) VALUES($1,$2,$3,$4,'Exterior service',$5::jsonb,30000,$6::jsonb)",[quote,owner,company,contact,JSON.stringify([{id:randomUUID(),name:'Windows',qty:1,price_cents:30000,description:'All exterior glass'}]),JSON.stringify({duration_minutes:60,scope_exclusions:'No roof work',deposit:{type:'none',value:0}})]);

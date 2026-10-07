@@ -41,7 +41,7 @@
     "test:agreement-plans:db": "node --test tests/agreement-plans.integration.test.js",
     "test:agreement-plan-billing:db": "node --test tests/agreement-plan-billing.integration.test.js",
     "test:quote-addons:db": "node --test tests/quote-addons.integration.test.js",
-    "test:quotes-contracts:all-db": "node --test tests/quote-catalog.integration.test.js tests/quote-agreements.integration.test.js tests/agreement-template-history.integration.test.js tests/agreement-payments.integration.test.js tests/agreement-booking.integration.test.js tests/agreement-plans.integration.test.js tests/agreement-plan-billing.integration.test.js tests/quote-addons.integration.test.js tests/quote-system-startup.integration.test.js tests/quote-template-workflow.integration.test.js tests/quote-removal-automation.integration.test.js tests/customer-pdf-workflow.integration.test.js",
+    "test:quotes-contracts:all-db": "node --test tests/quote-catalog.integration.test.js tests/quote-agreements.integration.test.js tests/agreement-template-history.integration.test.js tests/agreement-payments.integration.test.js tests/agreement-booking.integration.test.js tests/agreement-plans.integration.test.js tests/agreement-plan-billing.integration.test.js tests/quote-addons.integration.test.js tests/quote-system-startup.integration.test.js tests/quote-template-workflow.integration.test.js tests/quote-removal-automation.integration.test.js tests/customer-pdf-workflow.integration.test.js tests/agreement-plan-jobs.integration.test.js",
     "test:stripe-account-management": "node --test tests/stripe-account-management.integration.test.js",
     "test:media-storage": "node --test tests/media-storage.integration.test.js",
     "test:permission-governance": "node --test tests/permission-governance.integration.test.js",
@@ -56,7 +56,8 @@
     "test:comms-upgrade": "node --test tests/company-comms-upgrade.integration.test.js tests/company-comms-job-huddles.integration.test.js",
     "test:comms-startup": "node --test tests/company-comms-startup.integration.test.js",
     "test:browser": "node --test tests/browser.test.js",
-    "test:notes": "node --test tests/notes-*.test.js"
+    "test:notes": "node --test tests/notes-*.test.js",
+    "test:agreement-plan-jobs:db": "node --test tests/agreement-plan-jobs.integration.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",

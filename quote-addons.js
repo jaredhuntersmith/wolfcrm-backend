@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { QuoteContractError, calculateQuotePricing, quoteContentHash, quoteInteger } from "./quote-contract-domain.js";
+import { QuoteContractError, calculateQuotePricing, normalizeQuoteLines, quoteContentHash, quoteInteger } from "./quote-contract-domain.js";
 import { resolveAgreementText, generateQuoteAgreementPDF, combineAgreementPDFs } from "./quote-agreement-documents.js";
 import { assertQuoteReferences } from "./services-catalog.js";
 
@@ -10,7 +10,7 @@ const money = cents => new Intl.NumberFormat("en-US", { style: "currency", curre
 // Staff scheduling a quote uses the selected issued scope even if an older
 // client still sends the original editable draft. Existing bound jobs keep the
 // specific revision they were created from until an explicit amendment.
-export async function selectedQuoteScheduleScope(db,{companyId,quoteId,previous,start,end}) {
+export async function selectedQuoteScheduleScope(db,{companyId,quoteId,previous,start,end,requestedServiceItems}) {
   if (!companyId || !(quoteId || previous?.agreement_id)) return null;
   if (!(await db.query("SELECT to_regclass('quote_agreements') IS NOT NULL AS present")).rows[0].present) return null;
   const targetQuote = previous?.quote_id || quoteId;
@@ -27,7 +27,13 @@ export async function selectedQuoteScheduleScope(db,{companyId,quoteId,previous,
   if (!previous && (row.revoked_at || ["declined","superseded"].includes(row.decision))) fail("quote_job_scope_unavailable","Issue a current estimate before scheduling this selected scope.");
   const duration=(new Date(end)-new Date(start))/60000;
   if(duration<row.snapshot.duration_minutes) fail("quote_job_duration_required",`Allow at least ${row.snapshot.duration_minutes} minutes for this estimate's selected services.`);
-  return {agreement_id:row.id,quote_id:row.quote_id,contact_id:row.contact_id,service_items:row.snapshot.pricing.line_items,services:row.snapshot.pricing.line_items.map(line=>line.name),price_cents:previous?.agreement_id?previous.price_cents:row.snapshot.pricing.total_cents};
+  let items=row.snapshot.pricing.line_items;
+  if(previous?.service_plan_id && Array.isArray(requestedServiceItems) && (await db.query("SELECT to_regclass('agreement_plan_jobs') IS NOT NULL AS present")).rows[0].present && (await db.query('SELECT 1 FROM agreement_plan_jobs WHERE job_id=$1 AND company_id=$2',[previous.id,companyId])).rowCount) {
+    const requested=normalizeQuoteLines(requestedServiceItems.map(line=>({...line,price_cents:line.price_cents??line.priceCents})));
+    if(items.some(line=>!requested.some(candidate=>candidate.id===line.id && candidate.qty===line.qty && candidate.service_id===line.service_id))) fail('quote_job_scope_locked','Keep the accepted quote services and quantities. Add extra services to this job, or issue an amendment to replace the original scope.');
+    const ids=new Set(items.map(line=>line.id));items=[...items,...requested.filter(line=>!ids.has(line.id))];
+  }
+  return {agreement_id:row.id,quote_id:row.quote_id,contact_id:row.contact_id,service_items:items,services:items.map(line=>line.name),price_cents:previous?.agreement_id?previous.price_cents:row.snapshot.pricing.total_cents};
 }
 
 // Issued alternatives and their raw merge sources are frozen in the original

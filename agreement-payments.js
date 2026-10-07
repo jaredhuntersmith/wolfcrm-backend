@@ -96,7 +96,7 @@ export function createAgreementPayments({ pool, service, getStripe = service.get
   async function ledger(db, row) {
     return (await db.query(`SELECT p.*,r.method AS offline_method,r.reference AS offline_reference,r.recorded_at AS offline_recorded_at
       FROM payment_records p LEFT JOIN agreement_offline_payment_receipts r ON r.payment_record_id=p.id AND r.company_id=p.company_id
-      WHERE p.company_id=$1 AND p.service_plan_id IS NULL
+      WHERE p.company_id=$1 AND (p.service_plan_id IS NULL OR (p.quote_id=$3 AND to_jsonb(p)->>'enrollment_id' IS NOT NULL))
       AND (p.agreement_id=$2 OR ($3::uuid IS NOT NULL AND p.quote_id=$3)
         OR ($3::uuid IS NOT NULL AND p.job_id IN (SELECT id FROM schedule_events WHERE company_id=$1 AND quote_id=$3 AND contact_id=$4)))
       ORDER BY p.created_at,p.id`, [row.company_id, row.id, row.quote_id, row.contact_id])).rows;
@@ -124,17 +124,18 @@ export function createAgreementPayments({ pool, service, getStripe = service.get
     }
     const originalTotal = Number(row.snapshot.pricing.total_cents);
     const adjustment = service.paymentAdjustmentSummary ? await service.paymentAdjustmentSummary(db, row) : { discount_cents: 0, adjustment_ids: [] };
-    const total = Math.max(0, originalTotal - adjustment.discount_cents), deposit = Math.min(total, Number(row.snapshot.pricing.deposit_cents || 0));
+    const planCollection = await service.planJobCollectionSummary?.(db,row);
+    const total = planCollection?.total_cents ?? Math.max(0, originalTotal - adjustment.discount_cents), deposit = Math.min(total, Number(row.snapshot.pricing.deposit_cents || 0));
     const paid = Math.max(0, gross - refunds);
     const attempts = (await db.query(`SELECT id,payment_record_id,kind,state,transport FROM agreement_payment_attempts WHERE company_id=$1 AND collection_key=$2 AND state=ANY($3::text[]) ORDER BY created_at DESC`, [row.company_id, scopeKey(row), activeStates])).rows;
-    if (attempts.some((attempt) => attempt.state === "review")) review = true;
+    if (attempts.some((attempt) => attempt.state === "review") || planCollection?.review) review = true;
     const roles = (await db.query("SELECT role FROM agreement_signatures WHERE agreement_id=$1", [row.id])).rows.map((signature) => signature.role);
     const signed = row.snapshot.required_signers.every((role) => roles.includes(role)) && (!service.planQuoteReady || await service.planQuoteReady(db,row));
-    return { total_cents: total, original_total_cents: originalTotal, adjustment_cents: adjustment.discount_cents, adjustment_ids: adjustment.adjustment_ids, gross_paid_cents: gross, refunded_cents: refunds, paid_cents: paid,
-      balance_cents: Math.max(0, total - paid), credit_cents: Math.max(0, paid - total), deposit_due_cents: Math.max(0, deposit - paid),
+    return { plan_collection: planCollection || null, total_cents: total, original_total_cents: originalTotal, adjustment_cents: Math.max(0,originalTotal-total), adjustment_ids: adjustment.adjustment_ids, gross_paid_cents: gross, refunded_cents: refunds, paid_cents: paid,
+      balance_cents: Math.max(0, total - paid), credit_cents: Math.max(0, paid - total), deposit_due_cents: planCollection?.defer_deposit ? 0 : Math.max(0, deposit - paid),
       payment_review_required: review, processing: attempts.some((attempt) => attempt.state === "processing"), receipts,
       active_checkout: attempts.find((attempt) => ["creating", "open", "processing"].includes(attempt.state)) || null,
-      can_pay_balance: signed && paid < total && !review && !row.revoked_at && !["declined", "superseded"].includes(row.decision) };
+      can_pay_balance: !planCollection?.managed && signed && paid < total && !review && !row.revoked_at && !["declined", "superseded"].includes(row.decision) };
   }
   async function reserve(row, { request_id, kind, transport, actor_id = null, expected_amount = null }, readiness) {
     if (!row.snapshot.pricing) fail("agreement_has_no_payment", "This standalone agreement has no payment obligation.");
@@ -149,6 +150,7 @@ export function createAgreementPayments({ pool, service, getStripe = service.get
         return (await db.query("SELECT * FROM agreement_payment_attempts WHERE id=$1", [request.attempt_id])).rows[0];
       }
       const summary = await paymentSummary(db, row);
+      if(summary.plan_collection?.managed && (kind!=="deposit" || summary.plan_collection.defer_deposit || summary.plan_collection.frozen)) fail("payment_managed_by_plan","This job is charged to the saved plan card after completion. Use its plan billing status instead of a second checkout.");
       const roles = (await db.query("SELECT role FROM agreement_signatures WHERE agreement_id=$1", [row.id])).rows.map((signature) => signature.role);
       if (!row.snapshot.required_signers.every((role) => roles.includes(role))) fail("payment_signatures_required", "Complete all required signatures before payment.");
       if (row.revoked_at || ["declined", "superseded"].includes(row.decision)) fail("payment_agreement_unavailable", "This estimate is no longer available for payment. Contact the business.");

@@ -31,6 +31,7 @@ test("optional services produce immutable exact revisions before every signer",{
     const company=randomUUID(),otherCompany=randomUUID(),user=randomUUID(),contact=randomUUID(),savedService=randomUUID(),foreignService=randomUUID();
     await pool.query("INSERT INTO companies(id,name,join_code) VALUES($1,'Scope Company','ADDON'),($2,'Other','ADDONOTHER')",[company,otherCompany]);
     await pool.query("INSERT INTO users(id,email,company_id,role) VALUES($1,'addons@example.invalid',$2,'employer')",[user,company]);
+    await pool.query('UPDATE companies SET owner_user_id=$2 WHERE id=$1',[company,user]);
     await pool.query("INSERT INTO sessions(token,user_id) VALUES('addon-fixture',$1)",[user]);
     await pool.query("INSERT INTO contacts(id,user_id,company_id,name,email,address) VALUES($1,$2,$3,'Original Customer','private@example.invalid','123 Original Street')",[contact,user,company]);
     await pool.query("INSERT INTO saved_services(id,company_id,name,created_by,updated_by) VALUES($1,$2,'Windows',$3,$3),($4,$5,'Foreign',$3,$3)",[savedService,company,user,foreignService,otherCompany]);

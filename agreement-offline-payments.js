@@ -58,6 +58,7 @@ export function createAgreementOfflineRecorder({ pool, service, paymentSummary, 
       const roles = (await db.query("SELECT role FROM agreement_signatures WHERE agreement_id=$1", [row.id])).rows.map(signature => signature.role);
       if (!row.snapshot.required_signers.every(role => roles.includes(role))) fail("payment_signatures_required", "Complete all required signatures before recording payment against this agreement.");
       const summary = await paymentSummary(db, row);
+      if (summary.plan_collection?.frozen) fail("payment_managed_by_plan", "This completed job already has a reserved plan payment. Reconcile that payment before recording another receipt.");
       if (summary.payment_review_required) fail("payment_adjustment_review_required", "Resolve the payment review before recording another receipt.");
       if (summary.active_checkout || summary.processing) fail("payment_already_in_progress", "Reconcile or cancel the existing online checkout before recording an offline receipt.");
       if (input.expected_balance_cents !== summary.balance_cents) fail("payment_amount_changed", "The remaining balance changed. Refresh before recording this receipt.");

@@ -15,6 +15,7 @@ test('template defaults, persisted overrides, visibility, drawing and removal wo
     const company=randomUUID(), user=randomUUID(), otherCompany=randomUUID(), otherUser=randomUUID(), employee=randomUUID(), contact=randomUUID();
     await pool.query("INSERT INTO companies(id,name,join_code) VALUES($1,'Template workflow','TPLFLOW'),($2,'Other','TPLOTHER')",[company,otherCompany]);
     await pool.query("INSERT INTO users(id,email,role,company_id) VALUES($1,'workflow@example.invalid','employer',$4),($2,'other@example.invalid','employer',$5),($3,'worker@example.invalid','employee',$4)",[user,otherUser,employee,company,otherCompany]);
+    await pool.query('UPDATE companies SET owner_user_id=CASE WHEN id=$1 THEN $3::uuid ELSE $4::uuid END WHERE id IN ($1,$2)',[company,otherCompany,user,otherUser]);
     await pool.query("INSERT INTO sessions(token,user_id) VALUES('owner',$1),('other',$2),('worker',$3)",[user,otherUser,employee]);
     await pool.query("INSERT INTO employee_permissions(user_id,company_id,permission_preset) VALUES($1,$2,'technician')",[employee,company]);
     await pool.query("INSERT INTO contacts(id,user_id,company_id,name,address) VALUES($1,$2,$3,'Customer','42 Main Street')",[contact,user,company]);

@@ -1,3 +1,4 @@
+import { installPlanJobSchema, createPlanJobBilling } from "./agreement-plan-jobs.js";
 import { installPlanQuotePublication } from "./plan-quote-publication.js";
 import { authoringRequest } from "./agreement-authoring.js";
 import { randomUUID } from 'node:crypto';
@@ -94,9 +95,22 @@ export async function installAgreementPlanSchema(pool) {
     DROP TRIGGER IF EXISTS wolfcrm_restore_canceled_plan_visit ON schedule_events;
     CREATE TRIGGER wolfcrm_restore_canceled_plan_visit AFTER DELETE ON schedule_events FOR EACH ROW EXECUTE FUNCTION wolfcrm_restore_canceled_plan_visit();
   `);
+  await installPlanJobSchema(pool);
 }
 
 export function createAgreementPlans({ pool, service, now = () => new Date(), onPlanActivated = async () => {}, supportedBillingModes = ['manual_per_visit'] }) {
+  const jobs = createPlanJobBilling({pool,service,anchorFirstVisit,now});
+  service.planJobCollectionSummary = jobs.collectionSummary;
+  service.associatePlanJob = jobs.associate;
+  service.refreshCompletedPlanJobs = async enrollmentID => txn(pool,async db=>{
+    const enrollment=(await db.query('SELECT company_id FROM agreement_plan_enrollments WHERE id=$1',[enrollmentID])).rows[0];
+    if(!enrollment)return;
+    await lockCompanySchedule(db,enrollment.company_id);
+    const completed=(await db.query(`SELECT b.job_id FROM agreement_plan_jobs b JOIN schedule_events j ON j.id=b.job_id AND j.company_id=b.company_id
+      WHERE b.enrollment_id=$1 AND j.finished_at IS NOT NULL AND b.completed_at IS NOT NULL
+      AND NOT EXISTS(SELECT 1 FROM agreement_plan_billing_obligations o WHERE o.enrollment_id=b.enrollment_id AND o.job_id=b.job_id) ORDER BY j.finished_at LIMIT 50`,[enrollmentID])).rows;
+    for(const row of completed)await jobs.reserve(db,row.job_id);
+  });
   async function tiers(db, companyID, includeArchived = false) {
     return (await db.query(`SELECT * FROM (SELECT DISTINCT ON(tier_id) * FROM service_plan_tiers WHERE company_id=$1 ORDER BY tier_id,version DESC) latest WHERE ($2 OR archived_at IS NULL) ORDER BY (configuration->>'sort_order')::integer,created_at,tier_id`, [companyID, includeArchived])).rows;
   }
@@ -221,6 +235,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     if (service.preparePlanReplacement) await service.preparePlanReplacement(preliminary);
     let activated;
     const result = await txn(pool, async (db) => {
+      await lockCompanySchedule(db,preliminary.company_id);
       const source=(await db.query('SELECT * FROM quote_agreements WHERE id=$1',[preliminary.base_agreement_id])).rows[0];
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`payment:${preliminary.company_id}:${key(source)}`]);
       const enrollment = (await db.query('SELECT * FROM agreement_plan_enrollments WHERE id=$1 FOR UPDATE', [preliminary.id])).rows[0];
@@ -266,7 +281,14 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     });
     // Membership is durable before automation scheduling. A retryable event
     // remains in the agreement outbox even if the existing scheduler is offline.
-    if (activated) await dispatchActivation(activated);
+    if (activated) {
+      await dispatchActivation(activated);
+      await txn(pool,async db=>{
+        await lockCompanySchedule(db,activated.company_id);
+        const upcoming=(await db.query('SELECT id FROM schedule_events WHERE company_id=$1 AND contact_id=$2 AND finished_at IS NULL ORDER BY start_at,id',[activated.company_id,activated.contact_id])).rows;
+        for(const job of upcoming) await jobs.associate(db,activated.company_id,job.id);
+      });
+    }
     return result;
   }
   async function dispatchActivation(plan) {
@@ -340,6 +362,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
   async function markServiced(req, suppliedPlan, raw) {
     const requestID=id(raw.request_id), jobID=String(raw.job_id||''), requestHash=quoteContentHash({plan_id:suppliedPlan.id,job_id:jobID});
     const result = await txn(pool, async(db)=>{
+      await lockCompanySchedule(db,req.companyId);
       const plan=(await db.query('SELECT * FROM service_plans WHERE id=$1 AND company_id=$2 FOR UPDATE',[suppliedPlan.id,req.companyId])).rows[0];
       if(!plan?.enrollment_id)fail('plan_membership_unavailable','This enrolled membership is unavailable.',404);
       const replay=(await db.query('SELECT * FROM agreement_plan_visit_actions WHERE company_id=$1 AND request_id=$2',[req.companyId,requestID])).rows[0];
@@ -347,7 +370,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       const visit=(await db.query('SELECT * FROM agreement_plan_visits WHERE service_plan_id=$1 AND job_id=$2 FOR UPDATE',[plan.id,jobID])).rows[0];
       const job=(await db.query('SELECT * FROM schedule_events WHERE id=$1 AND company_id=$2 AND contact_id=$3',[jobID,req.companyId,plan.contact_id])).rows[0];
       if(!visit||!job?.finished_at||job.service_plan_id!==plan.id)fail('plan_visit_completion_required','Link this membership visit to its actual job and finish that job before marking service complete.');
-      if(visit.state==='completed')return plan;
+      if(visit.state==='completed'){ await jobs.reserve(db,jobID); return plan; }
       if(!['active','past_due'].includes(plan.status))fail('plan_not_active','Review this membership before consuming another visit.');
       const enrollment=(await db.query('SELECT * FROM agreement_plan_enrollments WHERE id=$1',[plan.enrollment_id])).rows[0];
       await anchorFirstVisit(db,enrollment,plan,visit,job);
@@ -357,6 +380,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
       const next=(await db.query("SELECT min(due_date) AS due FROM agreement_plan_visits WHERE service_plan_id=$1 AND state<>'completed'",[plan.id])).rows[0].due;
       const updated=(await db.query(`UPDATE service_plans SET remaining_visits=CASE WHEN remaining_visits IS NULL THEN NULL ELSE GREATEST(0,remaining_visits-1) END,last_service_date=($2::timestamptz AT TIME ZONE (SELECT COALESCE(timezone,'America/New_York') FROM companies WHERE id=$4))::date,next_service_date=$3,status=CASE WHEN remaining_visits=1 THEN 'expired' ELSE status END,updated_at=now() WHERE id=$1 RETURNING *`,[plan.id,job.finished_at,next,req.companyId])).rows[0];
       await db.query(`INSERT INTO service_plan_events(user_id,company_id,created_by_user_id,service_plan_id,contact_id,event_type,completed_date,notes) VALUES($1,$2,$3,$4,$5,'serviced',$6::date,$7)`,[plan.user_id,req.companyId,req.userId,plan.id,plan.contact_id,job.finished_at,`Completed visit ${visit.sequence}; job ${job.id}`]);
+      await jobs.reserve(db,jobID);
       if(service.reserveCompletedPlanBilling) await service.reserveCompletedPlanBilling(db,enrollment);
       await db.query('UPDATE agreement_plan_enrollments SET next_reconcile_at=now() WHERE id=$1',[enrollment.id]);
       await service.event(db,enrollment.base_agreement_id,'plan_visit_completed',{actor_type:'staff',actor_id:req.userId,payload:{enrollment_id:enrollment.id,service_plan_id:plan.id,visit_id:visit.id,job_id:job.id}});
@@ -370,10 +394,22 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     return result;
   }
   async function completeJob(req, jobID) {
+    const claim=await txn(pool,async db=>{
+      await lockCompanySchedule(db,req.companyId);
+      const claim=await jobs.associate(db,req.companyId,jobID,{allowFinished:true});
+      if(claim && !claim.visit_id) await jobs.reserve(db,jobID);
+      return claim;
+    });
     const plan=(await pool.query('SELECT p.* FROM service_plans p JOIN agreement_plan_visits v ON v.service_plan_id=p.id JOIN schedule_events j ON j.id=v.job_id WHERE v.job_id=$1 AND p.company_id=$2 AND j.finished_at IS NOT NULL',[jobID,req.companyId])).rows[0];
     if(plan) return markServiced(req,plan,{request_id:randomUUID(),job_id:jobID});
+    if(claim) try { await service.reconcilePlanBilling?.(claim.enrollment_id); }
+    catch { console.error('[plan-billing] completed job queued for reconciliation',{job_id:jobID}); }
   }
   async function processMemberships() {
+    const ready=(await pool.query(`SELECT b.job_id,b.company_id,j.created_by FROM agreement_plan_jobs b JOIN schedule_events j ON j.id=b.job_id AND j.company_id=b.company_id
+      WHERE j.finished_at IS NOT NULL AND b.completed_at IS NULL ORDER BY j.finished_at LIMIT 50`)).rows;
+    for(const row of ready) try { await completeJob({companyId:row.company_id,userId:row.created_by},row.job_id); } catch { console.error('[plans] job reconciliation pending',{job_id:row.job_id}); }
+
     const pending=(await pool.query('SELECT p.* FROM service_plans p JOIN agreement_plan_enrollments e ON e.id=p.enrollment_id WHERE e.activation_dispatched_at IS NULL LIMIT 20')).rows;
     for(const plan of pending)await dispatchActivation(plan);
     const completed=(await pool.query(`SELECT v.id AS visit_id,v.job_id,p.* FROM agreement_plan_visits v JOIN service_plans p ON p.id=v.service_plan_id JOIN schedule_events j ON j.id=v.job_id AND j.company_id=p.company_id WHERE v.state='scheduled' AND j.finished_at IS NOT NULL AND p.status IN ('active','past_due') LIMIT 50`)).rows;
@@ -389,7 +425,7 @@ export function createAgreementPlans({ pool, service, now = () => new Date(), on
     const due=enrollment.service_plan_id?(await db.query(`SELECT v.id,v.due_date FROM agreement_plan_visits v JOIN service_plans p ON p.id=v.service_plan_id WHERE v.enrollment_id=$1 AND v.state IN ('due','scheduled') AND p.status='active' AND (v.job_id IS NULL OR NOT EXISTS(SELECT 1 FROM schedule_events WHERE id=v.job_id)) ORDER BY v.due_date,v.sequence LIMIT 1`,[enrollment.id])).rows[0]:null;
     return {plan_setup_pending:!enrollment.service_plan_id?enrollment.signed_at:null,plan_setup_pending_occurrence:enrollment.id,plan_service_due:due?.due_date,plan_service_due_occurrence:due?.id};
   }
-  return { tiers, saveTier, offers, currentMemberships, withReplacement, load, summary, detail, createEnrollment, reconcileEnrollment, paymentAdjustmentSummary, supportedBillingModes, linkVisit, deferVisit,markServiced, completeJob, processMemberships, followupContext };
+  return { tiers, saveTier, offers, currentMemberships, withReplacement, load, summary, detail, createEnrollment, reconcileEnrollment, paymentAdjustmentSummary, supportedBillingModes, associateJob:jobs.associate, linkVisit, deferVisit,markServiced, completeJob, processMemberships, followupContext };
 }
 
 export async function installAgreementPlans({ app, pool, service, authRequired, requireCapability, onPlanActivated, startWorker = true, ...options }) {

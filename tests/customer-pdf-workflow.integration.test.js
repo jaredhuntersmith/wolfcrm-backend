@@ -17,8 +17,10 @@ test('customer PDF workflow preserves drafts, exact exports, signer evidence and
     const company=randomUUID(), otherCompany=randomUUID(), owner=randomUUID(), otherOwner=randomUUID(), colleague=randomUUID(), worker=randomUUID(), contact=randomUUID();
     await pool.query("INSERT INTO companies(id,name,join_code) VALUES($1,'PDF Company','PDFWORK'),($2,'Other','PDFOTHER')",[company,otherCompany]);
     await pool.query("INSERT INTO users(id,email,company_id,role) VALUES($1,'pdfowner@example.invalid',$5,'employer'),($2,'pdfother@example.invalid',$6,'employer'),($3,'pdfcolleague@example.invalid',$5,'employer'),($4,'pdfworker@example.invalid',$5,'employee')",[owner,otherOwner,colleague,worker,company,otherCompany]);
+    await pool.query('UPDATE companies SET owner_user_id=CASE WHEN id=$1 THEN $3::uuid ELSE $4::uuid END WHERE id IN ($1,$2)',[company,otherCompany,owner,otherOwner]);
     await pool.query("INSERT INTO sessions(token,user_id) VALUES('pdfowner',$1),('pdfother',$2),('pdfcolleague',$3),('pdfworker',$4)",[owner,otherOwner,colleague,worker]);
     await pool.query("INSERT INTO employee_permissions(user_id,company_id,permission_preset) VALUES($1,$2,'technician')",[worker,company]);
+    await pool.query("INSERT INTO employee_permissions(user_id,company_id,permission_preset,permission_overrides) VALUES($1,$2,'technician',$3::jsonb)",[colleague,company,JSON.stringify({"quotes.view":true,"settings.manage_company":true})]);
     await pool.query("INSERT INTO contacts(id,user_id,company_id,name,address,phone,email) VALUES($1,$2,$3,'PDF Customer','42 Main Street','5551234567','customer@example.invalid')",[contact,owner,company]);
     const env={NODE_ENV:'test',STRIPE_MODE:'test',QUOTE_PUBLIC_BASE_URL:'http://localhost:3000',QUOTE_LINK_SECRET:'customer-pdf-fixture-key-longer-than-thirty-two-characters'};
     service=await installAgreementSystem({app:backend.app,pool,authRequired:backend.authRequired,requireCapability:backend.requireCapability,getQuoteSettings:backend.getQuoteSettings,env,startWorker:false});

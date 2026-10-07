@@ -197,7 +197,7 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
       for (const item of entries) await db.query("INSERT INTO agreement_plan_billing_obligations(id,enrollment_id,obligation_key,kind,sequence,due_date,amount_cents) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(enrollment_id,obligation_key) DO NOTHING", [randomUUID(), enrollment.id, item.key, item.kind, item.sequence, item.due_date, item.amount_cents]);
       if (enrollment.service_plan_id && ["automatic_per_visit", "manual_per_visit"].includes(billing.mode)) {
         const visits = (await db.query(`SELECT v.*,j.finished_at FROM agreement_plan_visits v JOIN schedule_events j ON j.id=v.job_id AND j.company_id=$2 AND j.contact_id=$3 AND j.service_plan_id=v.service_plan_id
-          WHERE v.enrollment_id=$1 AND v.state<>'skipped' AND ($4='scheduled' OR (v.completed_at IS NOT NULL AND j.finished_at IS NOT NULL))`, [enrollment.id, enrollment.company_id, enrollment.contact_id, billing.collect_on])).rows;
+          WHERE v.enrollment_id=$1 AND NOT EXISTS(SELECT 1 FROM agreement_plan_jobs b WHERE b.job_id=v.job_id) AND v.state<>'skipped' AND ($4='scheduled' OR (v.completed_at IS NOT NULL AND j.finished_at IS NOT NULL))`, [enrollment.id, enrollment.company_id, enrollment.contact_id, billing.collect_on])).rows;
         for (const visit of visits) await db.query("INSERT INTO agreement_plan_billing_obligations(id,enrollment_id,obligation_key,kind,sequence,due_date,amount_cents,job_id) VALUES($1,$2,$3,'visit',$4,$5,$6,$7) ON CONFLICT(enrollment_id,obligation_key) DO NOTHING", [randomUUID(), enrollment.id, `visit:${visit.id}`, visit.sequence, await today(enrollment, db), offer.future_visit.total_cents, visit.job_id]);
       }
     };
@@ -213,6 +213,7 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
       const paymentID = randomUUID();
       await db.query(`INSERT INTO payment_records(id,user_id,company_id,contact_id,service_plan_id,enrollment_id,agreement_id,job_id,payment_type,status,amount_cents,currency,stripe_connected_account_id,stripe_customer_id,stripe_livemode,description)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,'service_plan','pending',$9,'usd',$10,$11,$12,$13)`, [paymentID, owner, enrollment.company_id, enrollment.contact_id, enrollment.service_plan_id, enrollment.id, enrollment.plan_agreement_id, current.job_id, current.amount_cents, enrollment.connected_account_id, enrollment.stripe_customer_id, enrollment.stripe_livemode, `${enrollment.snapshot.configuration.name}: ${current.kind} ${current.sequence}`]);
+      if(current.job_id) await db.query('UPDATE payment_records SET quote_id=(SELECT quote_id FROM agreement_plan_jobs WHERE job_id=$2 AND enrollment_id=$3) WHERE id=$1',[paymentID,current.job_id,enrollment.id]);
       return (await db.query("UPDATE agreement_plan_billing_obligations SET payment_record_id=$2 WHERE id=$1 RETURNING *", [current.id, paymentID])).rows[0];
     });
   }
@@ -320,6 +321,7 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
     try { await gate(enrollment); } catch (error) { if (error.code === "plan_signatures_required") return; throw error; }
     const billing = enrollment.snapshot.configuration.billing;
     if (billing.mode === "manual_per_visit" && !requiresCard(enrollment) && billing.enrollment_fee_cents === 0 && !enrollment.service_plan_id) return;
+    await service.refreshCompletedPlanJobs?.(enrollment.id);
     await ensureObligations(enrollment);
     if (!enrollment.connected_account_id || !enrollment.stripe_customer_id) return;
     for (const setup of (await pool.query("SELECT * FROM agreement_plan_setups WHERE enrollment_id=$1 AND state IN ('open','processing')", [enrollment.id])).rows) await reconcileSetup(enrollment, setup);
@@ -368,9 +370,10 @@ export function createAgreementPlanBilling({ pool, service, plans, getStripe = s
     const commandReview=(await pool.query("SELECT 1 FROM agreement_plan_provider_commands WHERE enrollment_id=$1 AND state='review' LIMIT 1",[enrollment.id])).rowCount>0;
     const visits = (await pool.query("SELECT id,sequence,due_date::text,job_id,state,completed_at FROM agreement_plan_visits WHERE enrollment_id=$1 ORDER BY sequence",[enrollment.id])).rows.map(visit=>{
       const obligation=obligations.find(item=>item.kind==='visit'&&item.sequence===visit.sequence);
-      return {...visit,amount_cents:enrollment.snapshot.future_visit.total_cents,payment_status:obligation?.payment_status || obligation?.state || (visit.state==='completed'?'pending':'not_due'),obligation_id:obligation?.id || null};
+      return {...visit,amount_cents:obligation?.amount_cents ?? enrollment.snapshot.future_visit.total_cents,payment_status:obligation?.payment_status || obligation?.state || (visit.state==='completed'?'pending':'not_due'),obligation_id:obligation?.id || null};
     });
-    return { visits, enrollment_id: enrollment.id, card: enrollment.card_metadata || null, obligations, next_due_date: obligations.find(item => item.state === "scheduled")?.due_date || null, needs_review: commandReview || !!enrollment.billing_error_since || obligations.some(item => item.attention_since!=null) };
+    const jobs=(await pool.query(`SELECT b.job_id,b.visit_id,b.amount_cents,b.credited_cents,b.state,b.error_code,b.pricing,b.completed_at,j.start_at,j.title FROM agreement_plan_jobs b LEFT JOIN schedule_events j ON j.id=b.job_id AND j.company_id=b.company_id WHERE b.enrollment_id=$1 ORDER BY j.start_at,b.created_at`,[enrollment.id])).rows.map(job=>({...job,payment_status:obligations.find(o=>o.job_id===job.job_id)?.payment_status || obligations.find(o=>o.job_id===job.job_id)?.state || (job.error_code?'review':'not_due')}));
+    return { jobs, visits, enrollment_id: enrollment.id, card: enrollment.card_metadata || null, obligations, next_due_date: obligations.find(item => item.state === "scheduled")?.due_date || null, needs_review: jobs.some(j=>j.error_code) || commandReview || !!enrollment.billing_error_since || obligations.some(item => item.attention_since!=null) };
   }
   async function begin(token, enrollmentID, raw = {}) {
     const { row,role } = await service.loadPublic(pool, token);
