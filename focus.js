@@ -28,15 +28,19 @@ const JOB_LEASE_SECONDS = 120;
 const MAX_FEED_PAGE = 50;
 const META_PROVIDER = "meta_graph";
 export const FOCUS_META_DEFAULT_GRAPH_VERSION = "v26.0";
-export const FOCUS_META_DEFAULT_SCOPES = "instagram_basic,pages_show_list";
+// Facebook Login for Business owns consent through config_id. This is the
+// documented permission set that its configuration must grant; it is never
+// serialized into the OAuth URL when config_id is in use.
+export const FOCUS_META_DEFAULT_SCOPES = "instagram_basic,pages_show_list,pages_read_engagement";
 
 export class FocusProviderError extends Error {
-  constructor(code, { statusCode = 503, retryable = false, detail = null } = {}) {
+  constructor(code, { statusCode = 503, retryable = false, detail = null, diagnostic = null } = {}) {
     super(code);
     this.code = code;
     this.statusCode = statusCode;
     this.retryable = retryable;
     this.detail = detail;
+    this.diagnostic = diagnostic;
   }
 }
 
@@ -422,6 +426,7 @@ export function buildFocusCapabilityMatrix(env = process.env) {
       configuration_id_configured: Boolean(loginConfigurationID),
       credentials_configured: metaCredentialsConfigured,
       authorization_parameters: loginConfigurationID ? ["client_id", "redirect_uri", "state", "response_type", "config_id"] : ["client_id", "redirect_uri", "state", "response_type"],
+      required_configuration_permissions: ["instagram_basic", "pages_show_list", "pages_read_engagement"],
       legacy_scope_environment_present: Boolean(env.FOCUS_META_SCOPES),
       legacy_scope_environment_ignored: Boolean(loginConfigurationID && env.FOCUS_META_SCOPES),
       setup_error: metaCredentialsConfigured && !loginConfigurationID ? "meta_login_configuration_required" : null
@@ -528,21 +533,13 @@ class MetaGraphProvider {
       .map((item) => item.permission)
       .sort();
 
-    const pages = await this.graph("/me/accounts", {
-      fields: "id,name,instagram_business_account{id,username}",
-      access_token: token
-    }, "meta_page_list_failed");
-    const pageAccounts = (pages.data || [])
-      .filter((page) => page?.instagram_business_account?.id)
-      .map((page) => ({
-        page_id: String(page.id),
-        page_name: typeof page.name === "string" ? page.name.slice(0, 200) : null,
-        account_id: String(page.instagram_business_account.id),
-        account_username: typeof page.instagram_business_account.username === "string" ? page.instagram_business_account.username.toLowerCase() : null
-      }));
-    const linked = pageAccounts.find((item) => item.account_id === String(accountID)) || pageAccounts.find((item) => !expectedUsername || item.account_username === String(expectedUsername).toLowerCase());
-    if (!linked) throw new FocusProviderError("meta_linked_professional_account_not_found", { statusCode: 409, detail: "Meta returned no Page-linked Instagram Professional account for this connection." });
-    probes.page_list = { status: "available", linked_professional_accounts: pageAccounts.length };
+    const pageDiscovery = await this.linkedProfessionalAccounts(token, "meta_page_list_failed");
+    const pageAccounts = pageDiscovery.accounts;
+    const linked = pageAccounts.find((item) => item.account_id === String(accountID))
+      || pageAccounts.find((item) => expectedUsername && item.account_username === String(expectedUsername).toLowerCase())
+      || (pageAccounts.length === 1 ? pageAccounts[0] : null);
+    if (!linked) throw this.linkedProfessionalAccountError(pageDiscovery, accountID || expectedUsername ? "meta_linked_professional_account_not_found" : null);
+    probes.page_list = { status: "available", managed_pages_returned: pageDiscovery.managed_pages_returned, linked_professional_accounts: pageAccounts.length };
     probes.linked_professional_account = { status: "available", account_id_matches_connection: linked.account_id === String(accountID) };
 
     const profile = await this.graph(`/${encodeURIComponent(linked.account_id)}`, {
@@ -600,11 +597,42 @@ class MetaGraphProvider {
       capabilities: probes
     };
   }
+  async linkedProfessionalAccounts(token, failureCode) {
+    const data = await this.graph("/me/accounts", { fields: "id,name,instagram_business_account{id,username}", access_token: token }, failureCode);
+    const pages = Array.isArray(data.data) ? data.data : [];
+    return {
+      managed_pages_returned: pages.length,
+      accounts: pages
+        .filter((page) => page?.instagram_business_account?.id)
+        .map((page) => ({
+          page_id: String(page.id),
+          page_name: typeof page.name === "string" ? page.name.slice(0, 200) : null,
+          account_id: String(page.instagram_business_account.id),
+          account_username: typeof page.instagram_business_account.username === "string" ? page.instagram_business_account.username.toLowerCase() : null
+        }))
+    };
+  }
+  linkedProfessionalAccountError(discovery, preferredCode = null) {
+    const linkedCount = discovery.accounts.length;
+    const code = preferredCode || (discovery.managed_pages_returned === 0
+      ? "meta_page_access_not_granted"
+      : linkedCount === 0
+        ? "meta_linked_professional_account_not_found"
+        : "meta_linked_professional_account_selection_required");
+    return new FocusProviderError(code, {
+      statusCode: 409,
+      detail: "Meta did not yield exactly one Page-linked Instagram Professional account for this authorization.",
+      diagnostic: {
+        managed_pages_returned: discovery.managed_pages_returned,
+        linked_professional_accounts: linkedCount
+      }
+    });
+  }
   async resolveLinkedProfessionalAccount(token) {
-    const data = await this.graph("/me/accounts", { fields: "id,name,instagram_business_account{id,username}", access_token: token }, "meta_linked_account_discovery_failed");
-    const candidates = (data.data || []).filter((page) => page?.instagram_business_account?.id);
-    if (candidates.length !== 1) throw new FocusProviderError(candidates.length ? "meta_linked_professional_account_selection_required" : "meta_linked_professional_account_not_found", { statusCode: 409, detail: "Connect exactly one eligible linked Instagram Professional account, or extend the account-selection UI before retrying." });
-    return { id: String(candidates[0].instagram_business_account.id), username: candidates[0].instagram_business_account.username || null, page_id: String(candidates[0].id), page_name: candidates[0].name || null };
+    const discovery = await this.linkedProfessionalAccounts(token, "meta_linked_account_discovery_failed");
+    if (discovery.accounts.length !== 1) throw this.linkedProfessionalAccountError(discovery);
+    const account = discovery.accounts[0];
+    return { id: account.account_id, username: account.account_username, page_id: account.page_id, page_name: account.page_name };
   }
   async businessDiscover({ connection, username }) {
     const token = connection?.accessToken;
@@ -740,16 +768,19 @@ export async function installFocusSystem({ app, pool, authRequired, requireCapab
       identity = await consumeMetaOAuthState(pool, state);
       if (!identity) throw new FocusProviderError("meta_oauth_state_invalid", { statusCode: 400 });
       const token = await meta.exchangeCode(code);
-      const account = await meta.resolveLinkedProfessionalAccount(token.token);
       const encrypted = encryptFocusToken(token.token);
       if (!encrypted) throw new FocusProviderError("focus_token_encryption_key_missing");
-      const initialSnapshot = { oauth: { callback: "completed", completed_at: new Date().toISOString() }, page: { id: account.page_id || null, name: account.page_name || null } };
-      await pool.query(`INSERT INTO focus_connections(user_id,company_id,provider,account_id,account_username,token_ciphertext,token_iv,token_tag,token_expires_at,capability_snapshot,status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'verifying',now()) ON CONFLICT(user_id,provider) DO UPDATE SET company_id=EXCLUDED.company_id,account_id=EXCLUDED.account_id,account_username=EXCLUDED.account_username,token_ciphertext=EXCLUDED.token_ciphertext,token_iv=EXCLUDED.token_iv,token_tag=EXCLUDED.token_tag,token_expires_at=EXCLUDED.token_expires_at,capability_snapshot=EXCLUDED.capability_snapshot,status='verifying',last_error_code=NULL,last_checked_at=now(),updated_at=now()`, [identity.user_id, identity.company_id, META_PROVIDER, account.id, account.username, encrypted.ciphertext, encrypted.iv, encrypted.tag, token.expires_in ? new Date(Date.now() + token.expires_in * 1000) : null, initialSnapshot]);
+      // Persist the encrypted grant before resolving Page-linked assets. A
+      // missing Page asset is a provider/configuration diagnosis, never a
+      // reason to discard a successfully exchanged token or hide the error.
+      await persistMetaOAuthToken(pool, identity, encrypted, token);
+      const account = await meta.resolveLinkedProfessionalAccount(token.token);
+      await persistMetaLinkedAccount(pool, identity, account);
       res.redirect(`${process.env.FOCUS_META_CALLBACK_SUCCESS_URL || "wolfcrm://focus-connection"}?status=connected`);
     } catch (error) {
       const failure = safeFocusErrorCode(error, "meta_oauth_callback_failed");
       if (identity) {
-        try { await recordMetaOAuthFailure(pool, identity, failure); }
+        try { await recordMetaOAuthFailure(pool, identity, failure, error); }
         catch (recordError) { console.error("[focus][meta-oauth-callback]", safeFocusErrorCode(recordError, "meta_oauth_failure_record_failed")); }
       }
       console.error("[focus][meta-oauth-callback]", failure);
@@ -1012,19 +1043,19 @@ function redactConnection(row) {
 async function verifyMetaConnection(pool, req, meta) {
   const connection = await scopedConnection(pool, req, META_PROVIDER);
   if (!connection) throw new FocusProviderError("meta_connection_required", { statusCode: 409 });
-  const accessToken = decryptFocusToken(connection);
-  if (!accessToken) {
-    await pool.query(`UPDATE focus_connections SET status='expired',last_error_code='focus_token_unavailable',last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id]);
-    throw new FocusProviderError("focus_token_unavailable", { statusCode: 409 });
+  const decrypted = decryptFocusTokenDetail(connection);
+  if (!decrypted.token) {
+    await pool.query(`UPDATE focus_connections SET status='error',last_error_code=$2,last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id, decrypted.failure]);
+    throw new FocusProviderError(decrypted.failure, { statusCode: 409 });
   }
   try {
-    const verification = await meta.verifyConnection(accessToken, connection.account_id, connection.account_username);
+    const verification = await meta.verifyConnection(decrypted.token, connection.account_id, connection.account_username);
     const snapshot = { ...(connection.capability_snapshot || {}), ...verification };
     const { rows } = await pool.query(`UPDATE focus_connections SET account_id=$2,account_username=$3,token_expires_at=COALESCE($4,token_expires_at),capability_snapshot=$5,status='connected',last_error_code=NULL,last_checked_at=now(),updated_at=now() WHERE id=$1 RETURNING *`, [connection.id, verification.account.id, verification.account.username, verification.token.expires_at, snapshot]);
     return rows[0];
   } catch (error) {
     const failure = safeFocusErrorCode(error, "meta_connection_verification_failed");
-    await pool.query(`UPDATE focus_connections SET status=CASE WHEN $2 IN ('meta_token_invalid','focus_token_unavailable') THEN 'expired' ELSE 'error' END,last_error_code=$2,last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id, failure]);
+    await pool.query(`UPDATE focus_connections SET status=CASE WHEN $2 = 'meta_token_invalid' THEN 'expired' ELSE 'error' END,last_error_code=$2,last_checked_at=now(),updated_at=now() WHERE id=$1`, [connection.id, failure]);
     throw error;
   }
 }
@@ -1442,11 +1473,23 @@ function summarizeProbe(observations) { const hasLive = observations.some((item)
 async function connectedMetaConnection(pool, req) {
   const connection = await scopedConnection(pool, req, META_PROVIDER);
   if (!connection || connection.status !== "connected") throw new FocusProviderError("meta_connection_required");
-  const token = decryptFocusToken(connection); if (!token) throw new FocusProviderError("focus_token_unavailable");
-  return { ...connection, accessToken: token };
+  const decrypted = decryptFocusTokenDetail(connection);
+  if (!decrypted.token) throw new FocusProviderError(decrypted.failure);
+  return { ...connection, accessToken: decrypted.token };
 }
 function encryptFocusToken(value) { const key = encryptionKey(); if (!key) return null; const iv = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", key, iv); const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]); return { ciphertext: ciphertext.toString("base64"), iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64") }; }
-function decryptFocusToken(connection) { const key = encryptionKey(); if (!key || !connection?.token_ciphertext || !connection?.token_iv || !connection?.token_tag) return null; try { const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(connection.token_iv, "base64")); decipher.setAuthTag(Buffer.from(connection.token_tag, "base64")); return Buffer.concat([decipher.update(Buffer.from(connection.token_ciphertext, "base64")), decipher.final()]).toString("utf8"); } catch { return null; } }
+function decryptFocusTokenDetail(connection) {
+  if (!connection?.token_ciphertext || !connection?.token_iv || !connection?.token_tag) return { token: null, failure: "focus_connection_token_missing" };
+  const key = encryptionKey();
+  if (!key) return { token: null, failure: "focus_token_encryption_key_invalid" };
+  try {
+    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(connection.token_iv, "base64"));
+    decipher.setAuthTag(Buffer.from(connection.token_tag, "base64"));
+    const token = Buffer.concat([decipher.update(Buffer.from(connection.token_ciphertext, "base64")), decipher.final()]).toString("utf8");
+    return token ? { token, failure: null } : { token: null, failure: "focus_token_decryption_failed" };
+  } catch { return { token: null, failure: "focus_token_decryption_failed" }; }
+}
+function decryptFocusToken(connection) { return decryptFocusTokenDetail(connection).token; }
 function encryptionKey() { const raw = process.env.FOCUS_TOKEN_ENCRYPTION_KEY; if (!raw) return null; try { const key = Buffer.from(raw, "base64"); return key.length === 32 ? key : null; } catch { return null; } }
 function metaLoginConfigurationID(env = process.env) { const value = typeof env.FOCUS_META_LOGIN_CONFIG_ID === "string" ? env.FOCUS_META_LOGIN_CONFIG_ID.trim() : ""; return value.slice(0, 128); }
 function normalizedMetaOAuthProviderError(value) { const code = String(value || "").trim().toLowerCase().replace(/^meta_oauth_/, "").replace(/[^a-z0-9_]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, ""); return code || null; }
@@ -1469,8 +1512,28 @@ async function consumeMetaOAuthState(pool, state) {
   const { rows } = await pool.query(`DELETE FROM focus_oauth_states WHERE state_hash = $1 AND provider = $2 AND expires_at > now() RETURNING user_id, company_id`, [hashSecret(state), META_PROVIDER]);
   return rows[0] || null;
 }
-async function recordMetaOAuthFailure(pool, identity, providerFailure) {
-  await pool.query(`INSERT INTO focus_connections(user_id,company_id,provider,status,last_error_code,last_checked_at) VALUES($1,$2,$3,'failed',$4,now()) ON CONFLICT(user_id,provider) DO UPDATE SET company_id=EXCLUDED.company_id,status=CASE WHEN focus_connections.status='connected' THEN 'connected' ELSE 'failed' END,last_error_code=EXCLUDED.last_error_code,last_checked_at=now(),updated_at=now()`, [identity.user_id, identity.company_id, META_PROVIDER, providerFailure]);
+async function persistMetaOAuthToken(pool, identity, encrypted, token) {
+  const snapshot = { oauth: { callback: "token_exchange_completed", completed_at: new Date().toISOString() } };
+  await pool.query(`INSERT INTO focus_connections(user_id,company_id,provider,token_ciphertext,token_iv,token_tag,token_expires_at,capability_snapshot,status,last_checked_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'verifying',now()) ON CONFLICT(user_id,provider) DO UPDATE SET company_id=EXCLUDED.company_id,account_id=NULL,account_username=NULL,token_ciphertext=EXCLUDED.token_ciphertext,token_iv=EXCLUDED.token_iv,token_tag=EXCLUDED.token_tag,token_expires_at=EXCLUDED.token_expires_at,capability_snapshot=EXCLUDED.capability_snapshot,status='verifying',last_error_code=NULL,last_checked_at=now(),updated_at=now()`, [identity.user_id, identity.company_id, META_PROVIDER, encrypted.ciphertext, encrypted.iv, encrypted.tag, token.expires_in ? new Date(Date.now() + token.expires_in * 1000) : null, snapshot]);
+}
+async function persistMetaLinkedAccount(pool, identity, account) {
+  const snapshot = { oauth: { callback: "completed", completed_at: new Date().toISOString() }, page: { id: account.page_id || null, name: account.page_name || null } };
+  await pool.query(`UPDATE focus_connections SET account_id=$3,account_username=$4,capability_snapshot=COALESCE(capability_snapshot,'{}'::jsonb) || $5::jsonb,status='verifying',last_error_code=NULL,last_checked_at=now(),updated_at=now() WHERE user_id=$1 AND company_id IS NOT DISTINCT FROM $2 AND provider='${META_PROVIDER}'`, [identity.user_id, identity.company_id, account.id, account.username, JSON.stringify(snapshot)]);
+}
+function safeOAuthDiagnostic(error) {
+  const value = error?.diagnostic;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const pages = Number(value.managed_pages_returned);
+  const linked = Number(value.linked_professional_accounts);
+  if (!Number.isInteger(pages) || !Number.isInteger(linked) || pages < 0 || linked < 0) return null;
+  return { managed_pages_returned: Math.min(pages, 10_000), linked_professional_accounts: Math.min(linked, 10_000) };
+}
+async function recordMetaOAuthFailure(pool, identity, providerFailure, error = null) {
+  const oauth = { callback: "failed", failed_at: new Date().toISOString(), provider_error: providerFailure };
+  const diagnostic = safeOAuthDiagnostic(error);
+  if (diagnostic) oauth.diagnostic = diagnostic;
+  const snapshot = JSON.stringify({ oauth });
+  await pool.query(`INSERT INTO focus_connections(user_id,company_id,provider,capability_snapshot,status,last_error_code,last_checked_at) VALUES($1,$2,$3,$4::jsonb,'error',$5,now()) ON CONFLICT(user_id,provider) DO UPDATE SET company_id=EXCLUDED.company_id,capability_snapshot=COALESCE(focus_connections.capability_snapshot,'{}'::jsonb) || EXCLUDED.capability_snapshot,status=CASE WHEN focus_connections.status='connected' AND focus_connections.token_ciphertext IS NOT NULL AND focus_connections.token_iv IS NOT NULL AND focus_connections.token_tag IS NOT NULL THEN 'connected' ELSE 'error' END,last_error_code=CASE WHEN focus_connections.status='connected' AND focus_connections.token_ciphertext IS NOT NULL AND focus_connections.token_iv IS NOT NULL AND focus_connections.token_tag IS NOT NULL THEN focus_connections.last_error_code ELSE EXCLUDED.last_error_code END,last_checked_at=now(),updated_at=now()`, [identity.user_id, identity.company_id, META_PROVIDER, snapshot, providerFailure]);
 }
 function timingSafeStringEquals(left, right) { const a = Buffer.from(String(left)); const b = Buffer.from(String(right)); return a.length === b.length && timingSafeEqual(a, b); }
 function verifyMetaWebhookSignature(raw, signature) { const secret = process.env.FOCUS_META_APP_SECRET; if (!secret || typeof signature !== "string" || !signature.startsWith("sha256=")) return false; const expected = createHmac("sha256", secret).update(raw).digest("hex"); return timingSafeStringEquals(signature.slice(7), expected); }
