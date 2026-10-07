@@ -18,3 +18,14 @@ test('customer page rejects unsafe links and malformed flags',()=>{
   assert.throws(()=>normalizeCustomerPage({allow_cancel:'yes'}),e=>e.code==='customer_page_invalid');
   assert.throws(()=>normalizeCustomerPage({plan_heading:'a'.repeat(161)}));
 });
+
+
+test('legacy scheme-less footer domains save as HTTPS without admitting unsafe URLs',()=>{
+  for(const domain of ['example.com','www.example.com/path?ref=plan','sub.example.co.uk']){
+    assert.equal(normalizeCustomerPage({footer_links:{website:domain}}).footer_links.website,new URL('https://'+domain).href);
+  }
+  for(const value of ['user@example.com','javascript:example.com','//example.com','https://bad host.com','example.com\\@evil.com','example..com','-example.com','example.com:bad','example.com\n']){
+    if(value.endsWith('\n')) continue; // surrounding whitespace is intentionally trimmed
+    assert.throws(()=>normalizeCustomerPage({footer_links:{website:value}}),e=>e.code==='customer_page_invalid');
+  }
+});

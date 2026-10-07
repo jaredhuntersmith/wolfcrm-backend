@@ -51,11 +51,16 @@ export async function installPlanJobSchema(pool) {
 
 // The original signed quote and the plan snapshot remain immutable. This is
 // the operational job price; clients never calculate the amount to collect.
-export function pricePlanJob(enrollment, original) {
+export function pricePlanJob(enrollment, original, { visitSequence = 1 } = {}) {
+  // The choice is signed with new offers. Old snapshots and frozen claims are
+  // never reinterpreted using a newly edited tier or a new pricing policy.
+  const initialExempt = enrollment.snapshot.pricing_model === 'initial_visit_choice_v1'
+    && enrollment.snapshot.initial_service_completed !== true && visitSequence === 1
+    && enrollment.snapshot.configuration.discount_first_visit !== true;
   const included = enrollment.snapshot.future_visit.line_items;
   const ids = included.map(l => l.service_id).filter(Boolean);
   const offer = calculatePlanOffer({ line_items: original.line_items.map(line => { const agreed=included.find(l=>l.service_id===line.service_id); return agreed ? {...line,price_cents:agreed.price_cents} : line; }), quoted_pricing: original,
-    eligible_service_ids: ids, tier: { ...enrollment.snapshot.configuration, discount_first_visit: true },
+    eligible_service_ids: ids, tier: { ...enrollment.snapshot.configuration, discount_first_visit: !initialExempt },
     tax_rate_basis_points: original.tax_rate_basis_points, tax_inclusive: original.tax_inclusive,
     discount_stacking_policy: enrollment.snapshot.discount_stacking_policy || 'best_price' });
   const pricing = offer?.current_pricing || original;
@@ -116,7 +121,7 @@ export function createPlanJobBilling({ pool, service, anchorFirstVisit, now = ()
       original=calculateQuotePricing({line_items:lines});
       if (!prior && job.price_cents!=null && Number(job.price_cents)!==original.total_cents) fail('plan_job_total_mismatch','The job total must match its priced services before automatic billing.');
     }
-    const { pricing, covered, authorized }=pricePlanJob(enrollment,original);
+    const covered=original.line_items.some(line=>enrollment.snapshot.future_visit.line_items.some(included=>included.service_id===line.service_id));
     let visit=legacyVisit;
     if (covered && !visit) {
       visit=(await db.query("SELECT * FROM agreement_plan_visits WHERE enrollment_id=$1 AND state='due' AND job_id IS NULL ORDER BY sequence LIMIT 1 FOR UPDATE",[enrollment.id])).rows[0];
@@ -129,6 +134,7 @@ export function createPlanJobBilling({ pool, service, anchorFirstVisit, now = ()
     if (!covered && visit) {
       await db.query("UPDATE agreement_plan_visits SET job_id=NULL,state='due' WHERE id=$1 AND completed_at IS NULL",[visit.id]);visit=null;
     }
+    const { pricing, authorized }=pricePlanJob(enrollment,original,{visitSequence:visit?.sequence || 0});
     const state=authorized?'scheduled':'review',error=authorized?null:'plan_job_authorization_required';
     const claim=(await db.query(`INSERT INTO agreement_plan_jobs(job_id,company_id,contact_id,enrollment_id,visit_id,quote_id,original_pricing,pricing,amount_cents,state,error_code)
       VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11)
@@ -150,7 +156,8 @@ export function createPlanJobBilling({ pool, service, anchorFirstVisit, now = ()
     const existing=(await db.query('SELECT * FROM agreement_plan_billing_obligations WHERE enrollment_id=$1 AND job_id=$2',[claim.enrollment_id,jobID])).rows[0];
     if (existing) return existing;
     const enrollment=(await db.query('SELECT * FROM agreement_plan_enrollments WHERE id=$1',[claim.enrollment_id])).rows[0];
-    let error=pricePlanJob(enrollment,claim.original_pricing).authorized ? null : 'plan_job_authorization_required';
+    const visit=claim.visit_id?(await db.query('SELECT sequence FROM agreement_plan_visits WHERE id=$1',[claim.visit_id])).rows[0]:null;
+    let error=pricePlanJob(enrollment,claim.original_pricing,{visitSequence:visit?.sequence || 0}).authorized ? null : 'plan_job_authorization_required';
     const plan=(await db.query('SELECT status FROM service_plans WHERE id=$1',[claim.service_plan_id])).rows[0];
     if (!['active','expired'].includes(plan?.status) || enrollment.canceled_at || enrollment.cancel_requested_at) error='plan_not_active';
     const records=(await db.query(`SELECT * FROM payment_records WHERE company_id=$1 AND contact_id=$2 AND (job_id=$3 OR ($4::uuid IS NOT NULL AND quote_id=$4))`,[claim.company_id,claim.contact_id,jobID,claim.quote_id])).rows;
@@ -169,7 +176,6 @@ export function createPlanJobBilling({ pool, service, anchorFirstVisit, now = ()
     if (amount>0 && amount<50) error='plan_amount_below_minimum';
     await db.query("UPDATE agreement_plan_jobs SET frozen_at=COALESCE(frozen_at,now()),completed_at=$2,credited_cents=$3,state=$4,error_code=$5,updated_at=now() WHERE job_id=$1",[jobID,claim.finished_at,credit,error?'review':'completed',error]);
     if (error) return null;
-    const visit=claim.visit_id?(await db.query('SELECT sequence FROM agreement_plan_visits WHERE id=$1',[claim.visit_id])).rows[0]:null;
     return (await db.query(`INSERT INTO agreement_plan_billing_obligations(id,enrollment_id,obligation_key,kind,sequence,due_date,amount_cents,job_id,state,payment_status)
       VALUES($1,$2,$3,$4,$5,CURRENT_DATE,$6,$7,$8,$8) ON CONFLICT(enrollment_id,obligation_key) DO NOTHING RETURNING *`,[randomUUID(),enrollment.id,`job:${jobID}`,visit?'visit':'job',visit?.sequence || 0,amount,jobID,amount===0?'succeeded':'scheduled'])).rows[0];
   }
@@ -184,7 +190,11 @@ export function createPlanJobBilling({ pool, service, anchorFirstVisit, now = ()
     try { enrollment=choose(rows,row.snapshot.pricing.line_items); }
     catch(error) { if(error.code!=='plan_job_membership_ambiguous') throw error; return {managed:true,total_cents:row.snapshot.pricing.total_cents,review:true,frozen:false}; }
     if (!enrollment) return null;
-    const result=pricePlanJob(enrollment,row.snapshot.pricing);
+    // Preview the next reservable visit; booking recomputes under the company
+    // schedule/enrollment locks before reserving the actual visit and price.
+    const next=(await db.query(`SELECT COALESCE(min(sequence) FILTER (WHERE state='due' AND job_id IS NULL),max(sequence)+1,1) AS sequence
+      FROM agreement_plan_visits WHERE enrollment_id=$1`,[enrollment.id])).rows[0];
+    const result=pricePlanJob(enrollment,row.snapshot.pricing,{visitSequence:Number(next.sequence)});
     return {managed:true,total_cents:result.pricing.total_cents,review:!result.authorized,frozen:false,defer_deposit:fullJobConsent(enrollment),enrollment_id:enrollment.id};
   }
   return { associate, reserve, collectionSummary };

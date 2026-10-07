@@ -16,7 +16,11 @@ export function normalizeFooterLinks(raw = {}) {
   return Object.fromEntries(['website','facebook','instagram','google_reviews'].map(name=>{
     const text=quoteText(links[name],`${name} URL`,2000).trim();
     if(!text)return[name,''];
-    let url;try{url=new URL(text);}catch{fail(`Enter a complete website URL for ${name}.`);}
+    // Older editors copied company domains without a scheme into tier drafts.
+    // Normalize only clear DNS names; never turn an arbitrary scheme or userinfo
+    // into an apparently safe link. No network request is made here.
+    const bareDomain=/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::[0-9]{1,5})?(?:[/?#][^\s\\]*)?$/i.test(text);
+    let url;try{url=new URL(bareDomain ? `https://${text}` : text);}catch{fail(`Enter a complete website URL for ${name}.`);}
     if(!['https:','http:'].includes(url.protocol)||!url.hostname||url.username||url.password)fail(`Use an http or https URL for ${name}.`);
     return[name,url.href];
   }));

@@ -39,14 +39,14 @@ test('contact membership owns full completed-job collection across real booking 
   async function packet(contact,snapshot,quote=null){return (await pool.query("INSERT INTO quote_agreements(id,company_id,quote_id,contact_id,created_by,number,revision,request_id,title,snapshot,packet_hash) VALUES($1,$2,$3,$4,$5,$6,1,$7,'Job',$8::jsonb,$9) RETURNING *",[randomUUID(),company,quote,contact,owner,String(++number),randomUUID(),JSON.stringify(snapshot),randomUUID()])).rows[0];}
   async function sign(row){const session=randomUUID();await pool.query("INSERT INTO agreement_signing_sessions(id,agreement_id,role,token_hash,token_generation,expires_at,verification_method) VALUES($1,$2,'customer',$3,1,now()+interval '1 day','link')",[session,row.id,randomUUID()]);await pool.query("INSERT INTO agreement_signatures(id,agreement_id,session_id,role,request_id,request_hash,printed_name,consent_text,signature,field_values,packet_hash,verification_method,submitted_at) VALUES($1,$2,$3,'customer',$4,'fixture','Synthetic customer','Fixture consent','{}','{}',$5,'link',now())",[randomUUID(),row.id,session,randomUUID(),row.packet_hash]);}
   const lines=(extras=false)=>[{id:randomUUID(),service_id:serviceID,name:'Windows',qty:1,price_cents:15000},...(extras?[{id:randomUUID(),service_id:extraID,name:'Pressure washing',qty:1,price_cents:50000}]:[])];
-  async function fixture({extras=false,activate=true,legacy=false}={}){
-   const contact=randomUUID(),quote=randomUUID(),items=lines(extras),pricing=calculateQuotePricing({line_items:items});
+  async function fixture({extras=false,activate=true,legacy=false,discountFirst=true,windowPrice=15000,serviced=false}={}){
+   const contact=randomUUID(),quote=randomUUID(),items=lines(extras).map(l=>l.service_id===serviceID?{...l,price_cents:windowPrice}:l),pricing=calculateQuotePricing({line_items:items});
    await pool.query("INSERT INTO contacts(id,user_id,company_id,name) VALUES($1,$2,$3,'Synthetic job customer')",[contact,owner,company]);
    await pool.query('INSERT INTO quotes(id,user_id,company_id,contact_id,line_items,total_cents) VALUES($1,$2,$3,$4,$5::jsonb,$6)',[quote,owner,company,contact,JSON.stringify(items),pricing.total_cents]);
    const row=await packet(contact,{kind:'quote',required_signers:['customer'],allow_customer_booking:true,duration_minutes:60,offer_service_plans:true,pricing},quote);await sign(row);
-   const configuration=normalizePlanTier({name:'Bronze',discount:{type:'fixed',value:5000},discount_first_visit:false,service_interval:{unit:'month',count:6},term:{kind:'ongoing'},billing:{mode:'automatic_per_visit'},agreement:{agreement_text:'Care plan',consent_text:'I agree',required_signers:['customer']},cancellation_policy:'Cancel anytime'});
+   const configuration=normalizePlanTier({name:'Bronze',discount:{type:'fixed',value:5000},discount_first_visit:discountFirst,service_interval:{unit:'month',count:6},term:{kind:'ongoing'},billing:{mode:'automatic_per_visit'},agreement:{agreement_text:'Care plan',consent_text:'I agree',required_signers:['customer']},cancellation_policy:'Cancel anytime'});
    const tier={tier_id:randomUUID(),version:1,configuration};await pool.query('INSERT INTO service_plan_tiers(tier_id,version,company_id,configuration,created_by) VALUES($1,1,$2,$3::jsonb,$4)',[tier.tier_id,company,JSON.stringify(configuration),owner]);
-   const offer=buildPlanOffer({agreement:row,tier,eligible_service_ids:[serviceID],today:new Date().toISOString().slice(0,10)});if(legacy)delete offer.collection_model;
+   const offer=buildPlanOffer({agreement:row,tier,eligible_service_ids:[serviceID],serviced,today:new Date().toISOString().slice(0,10)});if(legacy)delete offer.collection_model;
    const planAgreement=await packet(contact,{kind:'plan',required_signers:['customer'],pricing:null,financial_terms:offer});await sign(planAgreement);
    const enrollment=(await pool.query("INSERT INTO agreement_plan_enrollments(id,company_id,contact_id,base_agreement_id,plan_agreement_id,tier_id,tier_version,collection_key,request_id,request_hash,offer_hash,snapshot) VALUES($1,$2,$3,$4,$5,$6,1,$7,$8,'fixture',$9,$10::jsonb) RETURNING *",[randomUUID(),company,contact,row.id,planAgreement.id,tier.tier_id,`quote:${quote}`,randomUUID(),offer.offer_hash,JSON.stringify(offer)])).rows[0];
    const item={contact,quote,row,enrollment,token:service.makeToken(row),items};
@@ -56,6 +56,37 @@ test('contact membership owns full completed-job collection across real booking 
   async function staffJob(item,{items=item.items,quote=false}={}){const id=randomUUID(),start=new Date(Date.now()+86400000+number*7200000);const result=await request(`/api/schedule/${id}`,{title:'Customer job',contact_id:item.contact,quote_id:quote?item.quote:null,start:start.toISOString(),end:new Date(+start+3600000).toISOString(),service_items:items,services:items.map(l=>l.name),price_cents:items.reduce((n,l)=>n+l.price_cents*(l.qty||1),0),worker_user_ids:[]},'PUT');assert.equal(result.status,200,JSON.stringify(result));return result.body;}
   const complete=job=>request(`/api/jobs/${job}/workflow/complete`,{snapshot:[]});
   const owed=async item=>(await pool.query('SELECT * FROM agreement_plan_billing_obligations WHERE enrollment_id=$1',[item.enrollment.id])).rows;
+  await t.test('OFF retains $200 initial quote and charges $150 on the next covered appointment',async()=>{
+   const item=await fixture({discountFirst:false,windowPrice:20000});
+   assert.equal((await payments.paymentSummary(pool,item.row)).total_cents,20000);
+   const available=await booking.availability(item.token),result=await booking.book(item.token,{request_id:randomUUID(),slot_token:available.slots[0].slot_token});
+   const first=(await pool.query('SELECT * FROM schedule_events WHERE id=$1',[result.booking.job_id])).rows[0];assert.equal(first.price_cents,20000);
+   const second=await staffJob(item);assert.equal(second.price_cents,15000);
+   // Completion order cannot transfer a quoted initial price to another job.
+   await complete(second.id);await complete(first.id);await complete(first.id);
+   const amounts=(await owed(item)).map(o=>o.amount_cents).sort((a,b)=>a-b);assert.deepEqual(amounts,[15000,20000]);
+   const summary=await payments.paymentSummary(pool,item.row);assert.equal(summary.total_cents,20000);assert.equal(summary.paid_cents,20000);assert.equal(summary.balance_cents,0);
+  });
+  await t.test('OFF mixed job includes all $700 initially and $650 on subsequent visits',async()=>{
+   const item=await fixture({discountFirst:false,windowPrice:20000,extras:true}),first=await staffJob(item),second=await staffJob(item);
+   assert.equal(first.price_cents,70000);assert.equal(second.price_cents,65000);
+   const before=stripe.counts().pays;await complete(first.id);await complete(second.id);await complete(first.id);
+   assert.deepEqual((await owed(item)).map(o=>o.amount_cents).sort((a,b)=>a-b),[65000,70000]);assert.equal(stripe.counts().pays,before+2);
+  });
+  await t.test('extra-only completion and cancellation do not consume the undiscounted first service',async()=>{
+   const item=await fixture({discountFirst:false,windowPrice:20000});
+   const extra=await staffJob(item,{items:lines(true).slice(1)});await complete(extra.id);
+   const first=await staffJob(item);assert.equal(first.price_cents,20000);
+   await pool.query('DELETE FROM schedule_events WHERE id=$1',[first.id]);
+   const replacement=await staffJob(item);assert.equal(replacement.price_cents,20000);
+   await complete(replacement.id);assert.equal((await staffJob(item)).price_cents,15000);
+  });
+  await t.test('ON discounts first service; enrollment after initial service does not restart first-service exclusion',async()=>{
+   for(const options of [{discountFirst:true},{discountFirst:false,serviced:true}]){
+    const item=await fixture({...options,windowPrice:20000}),job=await staffJob(item);assert.equal(job.price_cents,15000);
+    await complete(job.id);assert.equal((await owed(item))[0].amount_cents,15000);
+   }
+  });
   await t.test('customer books the initial quote, confirms, completes: automatic $100 and no ordinary duplicate',async()=>{
    const item=await fixture(),available=await booking.availability(item.token);
    const result=await booking.book(item.token,{request_id:randomUUID(),slot_token:available.slots[0].slot_token}),jobID=result.booking.job_id;

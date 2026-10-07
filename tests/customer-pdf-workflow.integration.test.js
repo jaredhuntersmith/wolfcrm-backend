@@ -124,6 +124,23 @@ test('customer PDF workflow preserves drafts, exact exports, signer evidence and
       expectStatus(await post(`/api/service-plan-tiers/${tier.tier_id}/archive`,{}),200);
       expectStatus(await post('/api/service-plan-tiers',{request_id:randomUUID(),tier_id:tier.tier_id,expected_version:1,configuration}),409);
     });
+    await t.test('tier draft with inherited bare-domain footer saves OFF, retries once, and reports stale versions as conflict',async()=>{
+      const id=randomUUID(),path=`/api/agreements/editor-drafts/tier/${id}`;
+      const configuration={name:'Silver draft',discount:{type:'fixed',value:7500},discount_first_visit:false,billing:{mode:'automatic_per_visit'},service_interval:{unit:'month',count:3},cancellation_policy:'Cancel future visits with notice.',agreement:{...baseContent,customer_page:{footer_links:{website:'www.example.com'}}}};
+      const draft={schema:1,client:'ios',configuration,editor_state:{discount:'75',fee:'0'}};
+      expectStatus(await request(path,{method:'PUT',body:{request_id:randomUUID(),expected_revision:0,base_version:null,payload:draft}}),200);
+      const restored=expectStatus(await request(path),200);assert.deepEqual(restored.payload,draft);
+      const input={request_id:randomUUID(),tier_id:id,configuration:restored.payload.configuration};
+      const saved=expectStatus(await post('/api/service-plan-tiers',input),201);
+      assert.equal(saved.configuration.agreement.customer_page.footer_links.website,'https://www.example.com/');assert.equal(saved.configuration.discount_first_visit,false);
+      assert.equal(expectStatus(await post('/api/service-plan-tiers',input),201).version,1);
+      const on=expectStatus(await post('/api/service-plan-tiers',{...input,request_id:randomUUID(),expected_version:1,configuration:{...configuration,discount_first_visit:true}}),201);assert.equal(on.configuration.discount_first_visit,true);
+      assert.equal(expectStatus(await post('/api/service-plan-tiers',{...input,request_id:randomUUID(),expected_version:1}),409).error,'plan_tier_changed');
+      expectStatus(await post('/api/service-plan-tiers',{...input,request_id:randomUUID(),expected_version:2},'pdfother'),409);
+      expectStatus(await post('/api/service-plan-tiers',input,'pdfworker'),403);
+      expectStatus(await request(path,{method:'PUT',body:{request_id:randomUUID(),expected_revision:1,base_version:2,payload:null}}),200);
+      assert.equal(expectStatus(await request(path),200).payload,null);
+    });
     await t.test('selected content mode and PDF-only terms control publication; page signature off needs PDF signature',async()=>{
       const quote=await makeQuote();
       const text=await publish(quote,{...pdfContent,agreement_mode:'text',require_page_signature:true,terms_text:'No longer published'});

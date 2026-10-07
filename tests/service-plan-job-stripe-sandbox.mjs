@@ -31,9 +31,9 @@ try{
  const service=createAgreementService({pool,env,getStripe:()=>stripe});await installAgreementPayments({app:backend.app,pool,service,env,getStripe:()=>stripe,startWorker:false});
  const plans=createAgreementPlans({pool,service});const billing=await installAgreementPlanBilling({app:backend.app,pool,service,plans,env,getStripe:()=>stripe,startWorker:false});
  async function packet(snapshot){const id=randomUUID();const row=(await pool.query("INSERT INTO quote_agreements(id,company_id,contact_id,created_by,number,revision,request_id,title,snapshot,packet_hash) VALUES($1,$2,$3,$4,$5,1,$6,'Sandbox fixture',$7::jsonb,$8) RETURNING *",[id,company,contact,owner,id,randomUUID(),JSON.stringify(snapshot),randomUUID()])).rows[0];const session=randomUUID();await pool.query("INSERT INTO agreement_signing_sessions(id,agreement_id,role,token_hash,token_generation,expires_at,verification_method) VALUES($1,$2,'customer',$3,1,now()+interval '1 day','link')",[session,id,randomUUID()]);await pool.query("INSERT INTO agreement_signatures(id,agreement_id,session_id,role,request_id,request_hash,printed_name,consent_text,signature,field_values,packet_hash,verification_method,submitted_at) VALUES($1,$2,$3,'customer',$4,'fixture','Automated fixture','Synthetic fixture authorization','{}','{}',$5,'link',now())",[randomUUID(),id,session,randomUUID(),row.packet_hash]);return row;}
- for(const [fixture,expected,extras] of [['pm_card_visa','succeeded',false],['pm_card_visa','succeeded',true],['pm_card_chargeCustomerFail','failed',true],['pm_card_authenticationRequired','requires_action',true]]){
+ for(const [fixture,expected,extras,discountFirst] of [['pm_card_visa','succeeded',false,false],['pm_card_visa','succeeded',false,true],['pm_card_visa','succeeded',true,false],['pm_card_visa','succeeded',true,true],['pm_card_chargeCustomerFail','failed',true,false],['pm_card_authenticationRequired','requires_action',true,false]]){
   contact=randomUUID();await pool.query("INSERT INTO contacts(id,user_id,company_id,name) VALUES($1,$2,$3,'Synthetic full-job sandbox')",[contact,owner,company]);
-  const expectedAmount=extras?60000:10000;
+  const expectedAmount=20000+(extras?50000:0)-(discountFirst?5000:0);
   const tag=randomUUID();
   const customer=await stripe.customers.create({name:'WolfCRM automated sandbox acceptance',metadata:{wolfcrm_sandbox_acceptance:tag}}, {...opts,idempotencyKey:`acceptance-customer:${tag}`});assert.equal(customer.livemode,false);
   let method,setup;
@@ -45,10 +45,10 @@ try{
    method=await stripe.paymentMethods.attach(fixture,{customer:customer.id},opts);
   }
   assert.equal(method.customer,customer.id);assert.equal(method.livemode,false);
-  const line={id:randomUUID(),service_id:randomUUID(),name:'Windows',qty:1,price_cents:15000};
+  const line={id:randomUUID(),service_id:randomUUID(),name:'Windows',qty:1,price_cents:20000};
   const items=[line,...(extras?[{id:randomUUID(),service_id:randomUUID(),name:'Pressure washing',qty:1,price_cents:50000}]:[])];
   const base=await packet({kind:'quote',required_signers:['customer'],pricing:calculateQuotePricing({line_items:items})});
-  const config={name:'Bronze full-job sandbox',discount:{type:'fixed',value:5000},service_interval:{unit:'month',count:6},term:{kind:'ongoing'},billing:{mode:'automatic_per_visit',collect_on:'completed'},cancellation_policy:'Cancel future work.',agreement:{agreement_text:'Sandbox terms',consent_text:'Authorize the full agreed job balance after completion, including non-plan services',required_signers:['customer']}};
+  const config={name:'Bronze full-job sandbox',discount_first_visit:discountFirst,discount:{type:'fixed',value:5000},service_interval:{unit:'month',count:6},term:{kind:'ongoing'},billing:{mode:'automatic_per_visit',collect_on:'completed'},cancellation_policy:'Cancel future work.',agreement:{agreement_text:'Sandbox terms',consent_text:'Authorize the full agreed job balance after completion, including non-plan services',required_signers:['customer']}};
   const tier={tier_id:randomUUID(),version:1,configuration:config};const offer=buildPlanOffer({agreement:base,tier,eligible_service_ids:[line.service_id],today:'2026-10-07'});
   const agreement=await packet({kind:'plan',required_signers:['customer'],pricing:null,financial_terms:offer});
   await pool.query("INSERT INTO service_plan_tiers(tier_id,version,company_id,configuration,created_by) VALUES($1,1,$2,$3::jsonb,$4)",[tier.tier_id,company,JSON.stringify(config),owner]);
@@ -66,7 +66,7 @@ try{
   const event={id:'evt_local_'+randomUUID(),account:input.account,livemode:false,type:expected==='succeeded'?'payment_intent.succeeded':'payment_intent.payment_failed',data:{object:after.data[0]}};
   assert.equal(await billing.handleWebhook(event),true);assert.equal(await billing.handleWebhook(event),true);
   assert.equal((await billing.billingSummary(enrollment.id)).obligations.length,1);
-  report.checks.push({fixture,expected,result:'PASS',setup_intent:setup?.status||'3DS fixture attached for action-required test only',customer_exists:true,method_attached:true,first_visit:plan.first_visit_date,next_visit:plan.next_service_date,amount_cents:expectedAmount,payment_intents:1,payment_intent_id:after.data[0].id,provider_status:after.data[0].status,repeated_completion_and_webhook:'one obligation and PaymentIntent',hosted_recovery_link:true});
+  report.checks.push({fixture,expected,discount_first_visit:discountFirst,result:'PASS',setup_intent:setup?.status||'3DS fixture attached for action-required test only',customer_exists:true,method_attached:true,first_visit:plan.first_visit_date,next_visit:plan.next_service_date,amount_cents:expectedAmount,payment_intents:1,payment_intent_id:after.data[0].id,provider_status:after.data[0].status,repeated_completion_and_webhook:'one obligation and PaymentIntent',hosted_recovery_link:true});
   console.log(JSON.stringify(report.checks.at(-1)));
  }
  report.status='PASS';

@@ -79,3 +79,18 @@ test('hidden plan wording cannot satisfy required agreement but an attached cont
   assert.throws(()=>normalizePlanTier({...config,agreement:{...withPDF.agreement,show_agreement:false}}),error=>error.code==='plan_agreement_required');
   assert.equal(withPDF.agreement.agreement_text,'Quarterly service.');
 });
+
+
+test('automatic offers retain the chosen initial discount and sign accurate prices and terms',()=>{
+  for(const enabled of [false,true]){
+    const chosen=offer({billing:{mode:'automatic_per_visit'},discount_first_visit:enabled});
+    assert.equal(chosen.configuration.discount_first_visit,enabled);
+    assert.equal(chosen.current_total_cents,enabled?65500:70000);
+    assert.equal(chosen.future_visit.total_cents,25500);
+    assert.equal(chosen.pricing_model,'initial_visit_choice_v1');
+    assert.match(chosen.financial_text,enabled?/discount applies to the initial service/:/initial service keeps its original agreed price/);
+    assert.doesNotMatch(chosen.financial_text,/supersedes any generic/);
+  }
+  const after=buildPlanOffer({agreement,tier:tier({billing:{mode:'automatic_per_visit'}}),eligible_service_ids:[windowID],today:'2026-01-31',serviced:true});
+  assert.equal(after.initial_service_completed,true);
+});
