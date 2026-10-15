@@ -1,3 +1,7 @@
+import {installServicePlanReview} from './service-plan-review.js';
+import {installIdeaParking} from './idea-parking.js';
+import {withFinanceSpace} from './finance-spaces.js';
+import { clearBusinessExceptions } from './business-exceptions.js';
 import { apiRequestID, installAPIFallback } from "./api-errors.js";
 import {installJobHuddles,authorizeCommsCallConversation} from './company-comms/job-huddles.js';
 import {installCollaboration} from './company-comms/collaboration.js';
@@ -15860,6 +15864,12 @@ app.get("/api/business-exceptions", authRequired, requireCapability("dashboard.e
   }
 });
 
+app.post("/api/business-exceptions/clear", authRequired, requireCapability("dashboard.exceptions.manage"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({error:"company_required"});
+  try { res.json(await clearBusinessExceptions(pool, req.companyId, req.userId, req.body)); }
+  catch (error) { res.status(error instanceof BusinessExceptionError ? error.statusCode : 500).json({error:error instanceof BusinessExceptionError ? error.code : "exceptions_clear_failed",message:error instanceof BusinessExceptionError ? error.message : "Could not clear exceptions. Refresh and try again."}); }
+});
+
 app.patch("/api/business-exceptions/:id", authRequired, requireCapability("dashboard.exceptions.manage"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   const exceptionId = String(req.params.id || "").trim();
@@ -16351,7 +16361,7 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
 
     if (employer && hasCapability(req,"finance.planning.view") && req.companyId) {
       const financeSource = await dashboardSource(requestId, "finance_upcoming", async () => {
-        const projection = await loadProjection(pool, req.companyId, 7);
+        const projection = await withFinanceSpace(pool, req.userId, req.companyId, null, db => loadProjection(db, req.companyId, 7));
         return projection;
       }, { events: [] });
       if (financeSource.failed) failedSources.push(financeSource.source);
@@ -17668,6 +17678,7 @@ app.get("/api/service-plans/dashboard", authRequired, requireCapability("payment
       canceled_count: canceled,
       paused_count: paused,
       estimated_mrr_cents: Math.round(mrrCents),
+      estimated_arr_cents: Math.round(mrrCents * 12),
       upcoming: upcoming.map((r) => sanitizeServicePlan(r)),
       recent_events: events.map((e) => ({
         id: e.id,
@@ -19352,6 +19363,8 @@ async function startServer() {
       }
     }
   });
+  await installIdeaParking({app,pool,authRequired});
+  await installServicePlanReview({app,pool,authRequired,requireCapability});
   await installFinanceSystem({
     app,
     pool,

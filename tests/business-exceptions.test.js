@@ -178,3 +178,7 @@ test("lifecycle mutation validation is exact and snooze is bounded", () => {
     (error) => error.code === "business_exception_mutation_invalid"
   );
 });
+
+const {clearBusinessExceptions}=await import('../business-exceptions.js');
+await assert.rejects(clearBusinessExceptions({},'company','actor',{reviewed_before:'bad'}),error=>error.code==='exception_review_expired');
+await assert.rejects(clearBusinessExceptions({},'company','actor',{reviewed_before:'2099-01-01'}),error=>error.code==='exception_review_expired');

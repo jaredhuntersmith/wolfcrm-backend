@@ -365,3 +365,17 @@ function validDate(value) {
 function clean(value) {
   return value == null ? "" : String(value).trim();
 }
+
+// Dismiss the reviewed snapshot, preserving history and exceptions detected later.
+export async function clearBusinessExceptions(db, companyId, userId, raw, now = new Date()) {
+  const before = new Date(raw?.reviewed_before);
+  if (!raw?.reviewed_before || !Number.isFinite(before.getTime()) || before > now || now - before > 24 * 60 * 60 * 1000) {
+    throw new BusinessExceptionError('exception_review_expired', 'Refresh exceptions before clearing them.');
+  }
+  const result = await db.query(`UPDATE business_exceptions
+    SET status='dismissed', snoozed_until=NULL, resolved_at=NULL, resolution_source=NULL,
+        status_updated_at=now(), status_updated_by=$2, updated_at=now()
+    WHERE company_id=$1 AND status IN ('open','snoozed')
+      AND detected_at <= $3 AND status_updated_at <= $3 RETURNING id`, [companyId, userId, before]);
+  return {cleared_count: result.rowCount};
+}

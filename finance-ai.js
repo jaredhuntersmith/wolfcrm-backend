@@ -2775,7 +2775,7 @@ async function executeProposalPayload(pool, proposal) {
     const { rows } = await pool.query(
       `INSERT INTO finance_settings(company_id, minimum_cash_reserve_cents)
        VALUES($1,$2)
-       ON CONFLICT (company_id) DO UPDATE SET minimum_cash_reserve_cents = EXCLUDED.minimum_cash_reserve_cents, updated_at = now()
+       ON CONFLICT (company_id,finance_space_id) DO UPDATE SET minimum_cash_reserve_cents = EXCLUDED.minimum_cash_reserve_cents, updated_at = now()
        RETURNING *`,
       [companyId, reserve]
     );

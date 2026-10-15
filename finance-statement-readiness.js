@@ -1716,7 +1716,7 @@ export function installFinanceStatementReadinessRoutes({ app, pool, authRequired
            company_id, coverage_start_date, opening_balance_method, opening_journal_entry_id,
            version, evidence_fingerprint, evidence_snapshot, reason, reviewed_by
          ) VALUES ($1,$2::date,$3,$4::uuid,$5,$6,$7,$8,$9)
-         ON CONFLICT(company_id) DO UPDATE SET
+         ON CONFLICT(company_id,finance_space_id) DO UPDATE SET
            coverage_start_date=EXCLUDED.coverage_start_date,
            opening_balance_method=EXCLUDED.opening_balance_method,
            opening_journal_entry_id=EXCLUDED.opening_journal_entry_id,
@@ -1919,7 +1919,7 @@ export function installFinanceStatementReadinessRoutes({ app, pool, authRequired
            accountant_review_confirmed, version, chart_fingerprint, evidence_fingerprint,
            evidence_snapshot, reason, reviewed_by
          ) VALUES ($1,$2,$3::date,$4,true,$5,$6,$7,$8,$9,$10)
-         ON CONFLICT(company_id) DO UPDATE SET
+         ON CONFLICT(company_id,finance_space_id) DO UPDATE SET
            earnings_treatment=EXCLUDED.earnings_treatment,
            accountant_reviewed_on=EXCLUDED.accountant_reviewed_on,
            accountant_reference=EXCLUDED.accountant_reference,

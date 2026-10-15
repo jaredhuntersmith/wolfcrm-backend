@@ -6,9 +6,9 @@ import {createNotesDatabases} from './databases.js';
 import {readSnapshot} from './history.js';
 import {randomUUID} from 'node:crypto';
 import {mutate,loadActor,requireCapability,can,fail,uuid,text,checkRevision,authorizeConversation} from '../company-comms/access.js';
-import {authorizePage,noteRoleSQL,validateParent,roles} from './access.js';
+import {authorizePage,noteRoleSQL,noteSharedSQL,validateParent,roles} from './access.js';
 import {blockInput,hydrateBlock,validateBlockReferences} from './blocks.js';
-const pageFields=['id','company_id','creator_id','owner_id','editor_id','conversation_id','parent_id','title','kind','visibility','inherit_access','icon','cover_id','tags','revision','created_at','updated_at','deleted_at','archived_at','template_id','position','access_role'];
+const pageFields=['id','company_id','creator_id','owner_id','editor_id','conversation_id','parent_id','title','kind','visibility','inherit_access','icon','cover_id','tags','revision','created_at','updated_at','deleted_at','archived_at','template_id','position','access_role','is_shared'];
 export function pageDTO(page){return Object.fromEntries(pageFields.map(k=>[k,page[k]??null]));}
 function tags(value){if(!Array.isArray(value)||value.length>30)fail(400,'invalid_tags');return [...new Set(value.map(v=>text(v,60).replace(/^#/,'')))];}
 function limit(value,max=100){return Math.min(max,Math.max(1,Number.parseInt(value,10)||50));}
@@ -40,6 +40,7 @@ export function createNotesWorkspace({pool,notifications}){
   if(q.scope==='archive')where.push('n.archived_at IS NOT NULL');else if(q.scope!=='trash'&&q.include_archive!=='true')where.push('n.archived_at IS NULL');
   if(q.scope==='private')where.push("n.owner_id=$1 AND n.visibility='private' AND n.conversation_id IS NULL AND NOT n.inherit_access");
   if(q.scope==='company')where.push("n.visibility='company'");
+  if(q.scope==='shared_all')where.push(noteSharedSQL());
   if(q.scope==='shared')where.push('EXISTS(SELECT 1 FROM notes_members m WHERE m.page_id=n.id AND m.user_id=$1)');
   if(q.scope==='favorites')where.push('COALESCE(p.favorite,false)');if(q.scope==='pinned')where.push('COALESCE(p.pinned,false)');
   if(q.roots==='true')where.push(`(n.parent_id IS NULL OR NOT EXISTS(SELECT 1 FROM comms_notes p WHERE p.id=n.parent_id AND p.deleted_at IS NULL AND p.archived_at IS NULL AND p.purged_at IS NULL AND (${noteRoleSQL(actor,'p')})>0))`);
@@ -51,7 +52,7 @@ export function createNotesWorkspace({pool,notifications}){
   if(kinds)where.push('EXISTS(SELECT 1 FROM notes_blocks b WHERE b.page_id=n.id AND b.deleted_at IS NULL AND b.type=ANY('+add(kinds)+'::text[]))');
   if(q.search){const term=add('%'+text(q.search,200).replace(/[\\%_]/g,'\\$&')+'%');const properties=can(actor,'notes.databases')?` OR EXISTS(SELECT 1 FROM notes_database_rows r JOIN comms_notes rn ON rn.id=r.id JOIN notes_database_schemas ds ON ds.page_id=r.database_id CROSS JOIN LATERAL jsonb_each_text(r.values) field WHERE (r.id=n.id OR r.database_id=n.id) AND rn.deleted_at IS NULL AND rn.purged_at IS NULL AND (${noteRoleSQL(actor,'rn')})>0 AND EXISTS(SELECT 1 FROM jsonb_array_elements(ds.columns) col WHERE col->>'id'=field.key AND col->>'type' NOT IN ('file','relation','person')) AND field.value ILIKE ${term})`:'';where.push(`(n.title ILIKE ${term} OR ${referenceSearchSQL(actor,term)} OR n.body ILIKE ${term} OR n.tags::text ILIKE ${term} OR EXISTS(SELECT 1 FROM notes_blocks nb JOIN stored_files f ON f.id::text=nb.payload->>'asset_id' WHERE nb.page_id=n.id AND nb.deleted_at IS NULL AND f.cloud_status='active' AND (${await storagePredicate(pool,actor)}) AND (nb.payload->>'ocr' ILIKE ${term} OR f.display_name ILIKE ${term})) OR EXISTS(SELECT 1 FROM notes_comments nc WHERE nc.page_id=n.id AND nc.deleted_at IS NULL AND nc.body ILIKE ${term})${properties})`);}
   const order={title:'n.title,n.id',created:'n.created_at DESC,n.id',manual:'n.position,n.id',creator:'n.creator_id,n.updated_at DESC,n.id',recent:'p.opened_at DESC NULLS LAST,n.updated_at DESC,n.id'}[q.scope==='recent'?'recent':q.sort]||'n.updated_at DESC,n.id';
-  const size=limit(q.limit),offset=Math.max(0,Number.parseInt(q.offset,10)||0);const rows=(await pool.query(`SELECT n.*,${noteRoleSQL(actor)} AS access_role,COALESCE(p.favorite,false) AS favorite,COALESCE(p.pinned,false) AS pinned,p.opened_at FROM comms_notes n LEFT JOIN notes_personal p ON p.page_id=n.id AND p.user_id=$1 WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT ${add(size+1)} OFFSET ${add(offset)}`,values)).rows;
+  const size=limit(q.limit),offset=Math.max(0,Number.parseInt(q.offset,10)||0);const rows=(await pool.query(`SELECT n.*,${noteSharedSQL()} AS is_shared,${noteRoleSQL(actor)} AS access_role,COALESCE(p.favorite,false) AS favorite,COALESCE(p.pinned,false) AS pinned,p.opened_at FROM comms_notes n LEFT JOIN notes_personal p ON p.page_id=n.id AND p.user_id=$1 WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT ${add(size+1)} OFFSET ${add(offset)}`,values)).rows;
   return {pages:rows.slice(0,size).map(n=>({...pageDTO(n),favorite:n.favorite,pinned:n.pinned,opened_at:n.opened_at,preview:[...(n.body||'')].slice(0,200).join('')})),next_offset:rows.length>size?offset+size:null};
  }
  async function create(input,body){return mutate(pool,input,async(db,actor)=>{

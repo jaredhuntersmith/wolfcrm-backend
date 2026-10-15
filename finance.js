@@ -1,3 +1,4 @@
+import {installFinanceSpacesSchema,installFinanceSpaceRoutes,financeScopedPool} from './finance-spaces.js';
 import {
   estimateDebtPayoff,
   requiredPaymentForTarget,
@@ -302,7 +303,7 @@ function goalContributionPayload(row) {
   };
 }
 
-async function installFinanceSchema(pool) {
+export async function installFinanceSchema(pool) {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS finance_accounts (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -542,7 +543,7 @@ export async function ensureFinanceSettings(pool, companyId) {
   const { rows } = await pool.query(
     `INSERT INTO finance_settings (company_id)
      VALUES ($1)
-     ON CONFLICT (company_id) DO UPDATE SET company_id = EXCLUDED.company_id
+     ON CONFLICT (company_id,finance_space_id) DO UPDATE SET company_id = EXCLUDED.company_id
      RETURNING *`,
     [companyId]
   );
@@ -924,6 +925,10 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
   }
 
   await installFinanceSchema(pool);
+  await installFinanceSpacesSchema(pool);
+  const backgroundPool=pool;
+  installFinanceSpaceRoutes({app,pool,authRequired,requireEmployer});
+  pool=financeScopedPool(pool);
 
   app.get("/api/finance/health", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
@@ -988,7 +993,7 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
       const { rows } = await pool.query(
         `INSERT INTO finance_settings (company_id, minimum_cash_reserve_cents, use_available_bank_balance, currency)
          VALUES ($1,$2,$3,$4)
-         ON CONFLICT (company_id) DO UPDATE
+         ON CONFLICT (company_id,finance_space_id) DO UPDATE
            SET minimum_cash_reserve_cents = EXCLUDED.minimum_cash_reserve_cents,
                use_available_bank_balance = EXCLUDED.use_available_bank_balance,
                currency = EXCLUDED.currency,
@@ -1002,6 +1007,11 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
     }
   });
 
+  app.get("/api/finance/projection/jobs", authRequired, requireEmployer, async (req,res) => {
+    try { const {rows}=await pool.query(`SELECT id,title,start_at AS start,end_at AS end,coalesce(color,'blue') AS color,'[]'::json AS reminder_minutes,price_cents,finished_at
+      FROM schedule_events WHERE company_id=$1 AND finished_at IS NULL AND start_at>=current_date AND start_at<current_date+interval '367 days' ORDER BY start_at,id LIMIT 5000`,[req.companyId]);res.json(rows); }
+    catch { res.status(500).json({error:'finance_projection_jobs_failed'}); }
+  });
   app.get("/api/finance/projection", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
@@ -2017,7 +2027,7 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
     }
   });
 
-  installPlaidRoutes({ app, pool, authRequired, requireEmployer });
+  installPlaidRoutes({ app, pool, backgroundPool, authRequired, requireEmployer });
   installReceiptRoutes({ app, pool, authRequired, requireEmployer });
   installFinanceAIRoutes({ app, pool, authRequired, requireEmployer });
   installFinanceAccountingRoutes({ app, pool, authRequired, requireEmployer, getStripe });

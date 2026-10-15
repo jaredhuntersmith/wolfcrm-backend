@@ -364,6 +364,8 @@ export function requiredAutomationCapability(method, path = "") {
 
 export function requiredFinanceCapability(method, path = "") {
   const isRead = method === "GET";
+  if (path === "/api/finance/spaces/combined") return "finance.accounts.view";
+  if (path.includes("/finance/spaces/transfer")) return "finance.manage";
   if (path.includes("/finance/accounting")) {
     return isRead ? "accounting.view" : "accounting.manage";
   }

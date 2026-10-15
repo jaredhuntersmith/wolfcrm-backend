@@ -1175,7 +1175,7 @@ async function syncRecurring(pool, plaid, item) {
   return streams.length;
 }
 
-export function installPlaidRoutes({ app, pool, authRequired, requireEmployer }) {
+export function installPlaidRoutes({ app, pool, backgroundPool = pool, authRequired, requireEmployer }) {
   app.get("/api/finance/plaid/status", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     const status = getPlaidConfig();
@@ -1626,7 +1626,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
              variability, variability_score_cents, first_seen_date, last_seen_date, next_expected_date,
              occurrence_count, confidence_score, confidence_label, source, status, category, account_id
            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'detected',$20,$21)
-           ON CONFLICT (company_id, merchant_normalized, direction, cadence)
+           ON CONFLICT (company_id, merchant_normalized, direction, cadence, finance_space_id)
            DO UPDATE SET
              display_name = EXCLUDED.display_name,
              candidate_type = EXCLUDED.candidate_type,
@@ -1990,6 +1990,7 @@ export function installPlaidRoutes({ app, pool, authRequired, requireEmployer })
   });
 
   app.post("/api/finance/plaid/webhook", async (req, res) => {
+    const pool=backgroundPool;
     const itemId = cleanString(req.body?.item_id, 200);
     const webhookCode = cleanString(req.body?.webhook_code, 80);
     if (!itemId) return res.json({ ok: true });

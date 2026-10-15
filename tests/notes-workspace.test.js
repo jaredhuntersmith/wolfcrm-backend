@@ -15,6 +15,10 @@ test('Notes privacy, roles, concurrency, revisions, hierarchy, trash and legacy 
   await assert.rejects(notes.metadata(actors.alice,page,{expected_revision:1,parent_id:page}),e=>e.status===400);
   const child=await create('alice',{parent_id:page});await assert.rejects(notes.metadata(actors.alice,page,{expected_revision:1,parent_id:child.page.id}),e=>e.status===400);
   a=await notes.share(actors.alice,page,{expected_revision:1,members:[{user_id:f.ids.bob,role:'viewer'},{user_id:f.ids.carol,role:'editor'}]});assert.equal((await notes.get(actors.bob,child.page.id)).page.access_role,1);
+  assert.deepEqual(new Set((await notes.list(actors.alice,{scope:'shared_all'})).pages.map(p=>p.id)),new Set([page,child.page.id]));
+  assert.deepEqual(new Set((await notes.list(actors.bob,{scope:'shared_all'})).pages.map(p=>p.id)),new Set([page,child.page.id]));
+  assert.equal((await notes.get(actors.bob,child.page.id)).page.is_shared,true);
+  assert.equal((await notes.list(actors.admin,{scope:'shared_all'})).pages.length,0);
   const restrictive=await create('alice',{parent_id:page,inherit_access:false});await assert.rejects(notes.get(actors.bob,restrictive.page.id),e=>e.status===404);
   await assert.rejects(notes.editBlocks(actors.bob,page,{client_key:randomUUID(),operations:[]}),e=>e.status===403);
   const second=randomUUID();a=await notes.editBlocks(actors.alice,page,{client_key:randomUUID(),operations:[{id:second,type:'paragraph',payload:{text:'Second'},position:1,expected_revision:0}]});

@@ -14,10 +14,19 @@ export function noteRoleSQL(actor,alias='n') {
  WHEN a.visibility='shared' THEN COALESCE((SELECT m.role FROM notes_members m WHERE m.page_id=a.id AND m.user_id=$1),0)
  ELSE 0 END),0)::int FROM lineage a WHERE (NOT a.inherit_access OR a.parent_id IS NULL) AND (a.id=${alias}.id OR a.deleted_at IS NULL) AND a.company_id=$2 AND NOT EXISTS(SELECT 1 FROM lineage broken WHERE broken.company_id<>$2 OR (broken.id<>${alias}.id AND broken.deleted_at IS NOT NULL)))`;
 }
+// Resolve the effective audience through inherited folders, not the child's stale local flag.
+export function noteSharedSQL(alias='n') {
+ return `(WITH RECURSIVE audience AS (
+ SELECT ${alias}.id,${alias}.parent_id,${alias}.inherit_access,${alias}.visibility,${alias}.conversation_id,ARRAY[${alias}.id] path,0 depth
+ UNION ALL SELECT p.id,p.parent_id,p.inherit_access,p.visibility,p.conversation_id,a.path||p.id,a.depth+1
+ FROM audience a JOIN comms_notes p ON p.id=a.parent_id AND p.company_id=${alias}.company_id AND p.deleted_at IS NULL
+ WHERE a.inherit_access AND a.depth<16 AND NOT p.id=ANY(a.path)
+ ) SELECT COALESCE(bool_or(visibility IN ('shared','company') OR conversation_id IS NOT NULL),false) FROM audience WHERE NOT inherit_access OR parent_id IS NULL)`;
+}
 export async function authorizePage(db,input,pageId,{level=1,trash=false,lock=false}={}) {
  const actor=await loadActor(db,input);requireCapability(actor,'notes.view');
  if(lock)await db.query('SELECT id FROM comms_notes WHERE id=$1 AND company_id=$2 FOR UPDATE',[uuid(pageId),actor.companyId]);
- const page=(await db.query(`SELECT n.*,${noteRoleSQL(actor)} AS access_role FROM comms_notes n WHERE n.id=$3 AND n.company_id=$2 AND n.purged_at IS NULL ${trash?'':'AND n.deleted_at IS NULL'}`,[actor.userId,actor.companyId,uuid(pageId)])).rows[0];
+ const page=(await db.query(`SELECT n.*,${noteSharedSQL()} AS is_shared,${noteRoleSQL(actor)} AS access_role FROM comms_notes n WHERE n.id=$3 AND n.company_id=$2 AND n.purged_at IS NULL ${trash?'':'AND n.deleted_at IS NULL'}`,[actor.userId,actor.companyId,uuid(pageId)])).rows[0];
  if(!page||page.access_role===0)fail(404,'note_unavailable','No Access');
  if(page.access_role<level)fail(403,'note_role_denied','This note is read-only for this action.');
  if(level>=3&&page.conversation_id)await authorizeConversation(db,actor,page.conversation_id,{write:true});
