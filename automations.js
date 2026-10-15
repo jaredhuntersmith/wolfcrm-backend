@@ -1636,15 +1636,15 @@ export async function installAutomationSystem(options) {
   if (!options.disableProcessors) startAutomationProcessors();
 }
 
-export async function emitAutomationEvent(event) {
-  if (!ctx?.pool || !event?.companyId || !event?.eventType) return null;
+export async function emitAutomationEvent(event, { db = null } = {}) {
+  if (!(db || ctx?.pool) || !event?.companyId || !event?.eventType) return null;
   const payload = safeJson(event.payload || {});
   if (Number(payload.automation_event_depth || 0) > AUTOMATION_LIMITS.maxChildDepth) {
     console.warn("[automations] event skipped at depth limit", { eventType: event.eventType, companyId: event.companyId });
     return null;
   }
   try {
-    const { rows } = await ctx.pool.query(
+    const { rows } = await (db || ctx.pool).query(
       `INSERT INTO automation_events(
          id, company_id, event_type, subject_type, subject_id, actor_user_id, source, dedupe_key, payload, occurred_at, processing_status
        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,COALESCE($10::timestamptz, now()),'pending')
@@ -1664,9 +1664,10 @@ export async function emitAutomationEvent(event) {
         event.occurredAt || null
       ]
     );
-    if (!ctx.disableProcessors) setImmediate(() => processAutomationEvents().catch((e) => console.error("[automations] event processor wake failed", e?.message || e)));
+    if (!db && !ctx.disableProcessors) setImmediate(() => processAutomationEvents().catch((e) => console.error("[automations] event processor wake failed", e?.message || e)));
     return rows[0]?.id || null;
   } catch (e) {
+    if (db) throw e;
     console.error("[automations] emit failed", { eventType: event.eventType, code: e?.code, message: e?.message });
     return null;
   }

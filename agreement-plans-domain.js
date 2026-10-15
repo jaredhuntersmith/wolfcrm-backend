@@ -6,8 +6,8 @@ const id = (value) => { if (typeof value !== 'string' || !/^[0-9a-f]{8}-(?:[0-9a
 const amount = (value) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value / 100);
 const boolean = (raw, key, fallback = false) => { if (raw[key] !== undefined && typeof raw[key] !== 'boolean') fail('plan_tier_invalid', `${key} must be true or false.`); return raw[key] ?? fallback; };
 export const PLAN_BILLING_MODES = ['manual_per_visit', 'automatic_per_visit', 'calendar_installments', 'calendar_recurring', 'prepaid'];
-export function normalizePlanInterval(raw = { unit: 'month', count: 3 }) {
-  if (!raw || !['day', 'week', 'month', 'year'].includes(raw.unit)) fail('plan_interval_invalid', 'Choose a day, week, month or year interval.');
+export function normalizePlanInterval(raw = { unit: 'month', count: 3 }, { allowMinutes = false } = {}) {
+  if (!raw || !(allowMinutes ? ['minute', 'day', 'week', 'month', 'year'] : ['day', 'week', 'month', 'year']).includes(raw.unit)) fail('plan_interval_invalid', allowMinutes ? 'Choose a minute, day, week, month or year service interval.' : 'Choose a day, week, month or year billing interval.');
   return { unit: raw.unit, count: quoteInteger(raw.count, 'Interval count', raw.unit === 'day' ? 3650 : 120, 1) };
 }
 export function normalizePlanTier(raw) {
@@ -24,7 +24,7 @@ export function normalizePlanTier(raw) {
   if (!PLAN_BILLING_MODES.includes(billing.mode)) fail('plan_billing_invalid', 'Choose a supported billing mode.');
   if (term.kind !== 'finite' && ['calendar_installments', 'prepaid'].includes(billing.mode)) fail('plan_finite_term_required', 'Installments and prepaid packages need an explicit included visit count.');
   if (billing.mode === 'calendar_recurring' && term.kind !== 'ongoing') fail('plan_ongoing_required', 'Recurring calendar billing requires an ongoing plan. Use installments for a finite package.');
-  if (billing.mode === 'calendar_recurring' && billing.calendar_requires_completed_service && JSON.stringify(normalizePlanInterval(billing.interval)) !== JSON.stringify(normalizePlanInterval(raw.service_interval))) fail('plan_calendar_cadence_mismatch', 'For calendar charges held until job completion, use the same billing and service frequency. Each charge covers one completed visit.');
+  if (billing.mode === 'calendar_recurring' && billing.calendar_requires_completed_service && JSON.stringify(normalizePlanInterval(billing.interval)) !== JSON.stringify(normalizePlanInterval(raw.service_interval, { allowMinutes: true }))) fail('plan_calendar_cadence_mismatch', 'For calendar charges held until job completion, use the same billing and service frequency. Each charge covers one completed visit.');
   const content = normalizeAgreementContent(raw.agreement || {});
   if (!content.consent_text.trim() || (!(content.show_agreement && content.agreement_mode === "text" && content.agreement_text.trim()) && !(content.show_agreement && content.agreement_mode === "pdf" && content.documents.length))) fail('plan_agreement_required', 'Configure plan agreement text or a PDF and explicit signing consent.');
   const policy = quoteText(raw.cancellation_policy, 'Cancellation and renewal terms', 10000).trim();
@@ -35,7 +35,7 @@ export function normalizePlanTier(raw) {
     service_ids: serviceIDs === null ? null : [...new Set(serviceIDs.map(id))],
     visible: boolean(raw, 'visible', true), recommended: boolean(raw, 'recommended'), sort_order: quoteInteger(raw.sort_order ?? 0, 'Display order', 100000),
     discount: normalizeDeposit(raw.discount ?? { type: 'none', value: 0 }), discount_first_visit: boolean(raw, 'discount_first_visit'), current_visit_counts: boolean(raw, 'current_visit_counts'),
-    service_interval: normalizePlanInterval(raw.service_interval),
+    service_interval: normalizePlanInterval(raw.service_interval, { allowMinutes: true }),
     term: { kind: term.kind, visit_count: term.kind === 'finite' ? quoteInteger(term.visit_count, 'Included visits', 1000, 1) : null },
     billing: { mode: billing.mode, save_payment_method: boolean(billing, 'save_payment_method'), calendar_requires_completed_service: boolean(billing, 'calendar_requires_completed_service'), first_charge_date: billing.first_charge_date ? planDate(billing.first_charge_date).toISOString().slice(0,10) : null, interval: normalizePlanInterval(billing.interval ?? { unit: 'month', count: 1 }), installment_count: billing.mode === 'calendar_installments' ? quoteInteger(billing.installment_count, 'Installment count', 1200, 1) : 1,
       first_charge_delay_days: quoteInteger(billing.first_charge_delay_days ?? 0, 'First charge delay', 3650), enrollment_fee_cents: quoteInteger(billing.enrollment_fee_cents ?? 0, 'Enrollment fee'),
@@ -54,9 +54,11 @@ export function planDate(value) {
   return date;
 }
 export function advancePlanDate(dateString, interval, occurrence = 1) {
-  const date = planDate(dateString), { unit, count } = normalizePlanInterval(interval);
+  const date = planDate(dateString), { unit, count } = normalizePlanInterval(interval, { allowMinutes: true });
   quoteInteger(occurrence, 'Occurrence', 3650);
-  if (unit === 'day' || unit === 'week') date.setUTCDate(date.getUTCDate() + count * occurrence * (unit === 'week' ? 7 : 1));
+  // Service due dates are calendar days; appointments retain their own exact timestamps.
+  if (unit === 'minute') date.setUTCDate(date.getUTCDate() + Math.floor(count * occurrence / 1440));
+  else if (unit === 'day' || unit === 'week') date.setUTCDate(date.getUTCDate() + count * occurrence * (unit === 'week' ? 7 : 1));
   else {
     const day = date.getUTCDate(); date.setUTCDate(1);
     date.setUTCMonth(date.getUTCMonth() + count * occurrence * (unit === 'year' ? 12 : 1));

@@ -94,3 +94,17 @@ test('automatic offers retain the chosen initial discount and sign accurate pric
   const after=buildPlanOffer({agreement,tier:tier({billing:{mode:'automatic_per_visit'}}),eligible_service_ids:[windowID],today:'2026-01-31',serviced:true});
   assert.equal(after.initial_service_completed,true);
 });
+
+
+test('minute service cadence is preserved without enabling minute calendar charges', () => {
+  const service_interval = { unit: 'minute', count: 10 };
+  const normalized = normalizePlanTier({ ...config, service_interval, billing: { mode: 'automatic_per_visit' } });
+  assert.deepEqual(normalized.service_interval, service_interval);
+  assert.match(offer({ service_interval, billing: { mode: 'automatic_per_visit' } }).financial_text, /every 10 minutes/);
+  assert.equal(advancePlanDate('2026-10-14', service_interval), '2026-10-14');
+  assert.equal(advancePlanDate('2026-10-14', service_interval, 143), '2026-10-14');
+  assert.equal(advancePlanDate('2026-10-14', service_interval, 144), '2026-10-15');
+  for (const count of [0, -1, 1.5, 121]) assert.throws(() => normalizePlanTier({ ...config, service_interval: { unit: 'minute', count } }));
+  for (const count of [1, 120]) assert.equal(normalizePlanTier({ ...config, service_interval: { unit: 'minute', count } }).service_interval.count, count);
+  assert.throws(() => normalizePlanTier({ ...config, billing: { mode: 'calendar_recurring', interval: service_interval } }), /billing interval/);
+});

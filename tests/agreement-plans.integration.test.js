@@ -36,6 +36,16 @@ test('tier offers, separate consent, conditional adjustments and existing member
     const config={name:'Quarterly windows',discount:{type:'percent',value:1500},discount_first_visit:true,allow_skip:true,service_interval:{unit:'month',count:3},billing:{mode:'manual_per_visit'},term:{kind:'finite',visit_count:4},cancellation_policy:'Cancel future unperformed services with30 days notice. No automatic renewal.',agreement:{agreement_text:'Window plan for {{customer_name}}. {{billing_information}}',consent_text:'I separately agree to this service plan.'}};
     let tier,published,token,offer,enrollment;
     const sign=async(agreement)=>{const link=agreement.customer_url.split('/').at(-1);const session=(await request(`/api/public/agreements/${link}/session`,{method:'POST',token:null,body:{}})).body;const result=await request(`/api/public/agreements/${link}/sign`,{method:'POST',token:null,body:{request_id:randomUUID(),session_token:session.session_token,packet_hash:agreement.packet_hash,printed_name:'Plan Customer',consent:true,signature:drawnSignature(),values:{}}});assert.equal(result.status,200,JSON.stringify(result.body));return result;};
+    await t.test('minute tiers create, edit and reload through the authenticated API',async()=>{
+      const minuteConfig={...config,name:'Minute test',visible:false,service_interval:{unit:'minute',count:1}};
+      const created=await request('/api/service-plan-tiers',{method:'POST',body:{configuration:minuteConfig,request_id:randomUUID()}});
+      assert.equal(created.status,201,JSON.stringify(created.body));assert.deepEqual(created.body.configuration.service_interval,{unit:'minute',count:1});
+      const edited=await request('/api/service-plan-tiers',{method:'POST',body:{tier_id:created.body.tier_id,expected_version:1,configuration:{...minuteConfig,service_interval:{unit:'minute',count:10}},request_id:randomUUID()}});
+      assert.equal(edited.status,201,JSON.stringify(edited.body));assert.equal(edited.body.version,2);
+      const saved=(await request('/api/service-plan-tiers')).body.tiers.find(tier=>tier.tier_id===created.body.tier_id);
+      assert.deepEqual(saved.configuration.service_interval,{unit:'minute',count:10});
+      assert.equal((await request('/api/service-plan-tiers',{method:'POST',body:{configuration:{...minuteConfig,billing:{mode:'manual_per_visit',interval:{unit:'minute',count:10}}}}})).status,400);
+    });
     await t.test('tenant-owned tiers and eligibility use stable catalog references and version checks',async()=>{
       const saved=await request('/api/service-plan-tiers',{method:'POST',body:{configuration:config}});assert.equal(saved.status,201,JSON.stringify(saved.body));tier=saved.body;
       { const response=await request('/api/service-plan-tiers',{token:'plan-other'}); assert.equal(response.status,200,JSON.stringify(response.body)); assert.equal(response.body.tiers.length,0); }

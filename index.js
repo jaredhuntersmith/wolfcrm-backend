@@ -214,6 +214,7 @@ import { installCompanyComms } from "./company-comms/index.js";
 import { installCommsCalls } from "./company-comms/calls/index.js";
 import { storagePredicate } from "./company-comms/assets.js";
 import { authorizeConversation, publish as publishComms, loadActor as loadCommsActor } from "./company-comms/access.js";
+import { installFacebookLeads } from "./facebook-leads/index.js";
 import { installFocusSystem } from "./focus.js";
 import {
   LightingInputError,
@@ -566,6 +567,7 @@ app.use(cors());
 // It has to be registered BEFORE the global JSON body parser below so the
 // raw bytes aren't consumed. The handler is defined further down but the
 // raw-body middleware for that exact path lives here.
+app.use("/webhooks/facebook-leads", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }));
 // Focus receives only Meta-signed raw bytes on its webhook route. This must
 // remain before the JSON parser so a later handler can verify the exact body.
@@ -19306,6 +19308,10 @@ async function startServer() {
     requireView: requireCapability("tasks.view"),
     requireManage: requireCapability("tasks.manage"),
     emitAutomationEvent
+  });
+  app.locals.facebookLeads = await installFacebookLeads({
+    app, pool, authRequired, requireCapability, emitAutomationEvent, sendPushToUsers,
+    markContactDirty: (companyId, contactId, reason) => markGoogleSheetsContactDirty(pool, companyId, contactId, reason)
   });
   await installFocusSystem({
     app,
