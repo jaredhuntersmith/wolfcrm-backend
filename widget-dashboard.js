@@ -12,7 +12,7 @@ const definitions = {
  notifications: ['notifications.view'], messages: ['messaging.customer.view'], company_comms: ['communications.view'], mentions: ['communications.view'],
  leads: ['contacts.view'], quotes: ['quotes.view','contacts.view'], accepted_quotes: ['quotes.view','contacts.view'],
  pipeline: ['pipeline.view','contacts.view'], search_contacts: ['contacts.view'], add_contact: ['contacts.create'],
- add_task: ['tasks.manage'], schedule_appointment: ['schedule.manage','jobs.create'],
+ add_task: ['tasks.manage'], schedule_appointment: ['schedule.create'],
  open_messages: ['messaging.customer.view'], open_comms: ['communications.view'],
  payments: ['payments.view'], invoices: ['payments.view'], deposits: ['payments.view'], booked_sales: ['sales.view_self'],
  plans: ['payments.view'], goals: ['sales.view_self'], weather: ['schedule.view'], crew: ['schedule.view'],
@@ -38,7 +38,7 @@ const unsupported = {
 };
 const financial = new Set(['revenue','profit','expenses']);
 const scheduleKinds = new Set(['schedule','next_appointment','jobs_completed','revenue','directions']);
-const personKinds = new Set([...scheduleKinds,'tasks','due_tasks','leads','quotes','accepted_quotes','pipeline']);
+const personKinds = new Set([...scheduleKinds,'leads','quotes','accepted_quotes','pipeline']);
 const periodKinds = new Set([...scheduleKinds,'profit','expenses','leads']);
 export const BADGE_KINDS = ['notifications','messages','company_comms','mentions','due_tasks','follow_ups','leads','quotes','accepted_quotes'];
 
@@ -124,7 +124,7 @@ export function createWidgetDashboard({pool}) {
   try {
    const range=await widgetDateRange(pool,actor.companyId,f,now);
    const resultBase={state:'ready',startDate:range.start_date,endDate:range.end_date,rows:[]};
-   let person=f.person === 'all' ? null : f.person && f.person !== 'me' ? f.person : actor.userId;
+   let person=f.person === 'all' ? null : f.person && f.person !== 'me' ? f.person : f.person === 'me' || !actor.isCompanyOwner ? actor.userId : null;
    // Team filtering never widens existing non-owner schedule/contact scope.
    if(!actor.isCompanyOwner && person!==actor.userId) return unavailable('Only your own work is available for this module.');
    if(person && !(await pool.query('SELECT 1 FROM users WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL',[person,actor.companyId])).rowCount) return unavailable('This team member is no longer available.');
