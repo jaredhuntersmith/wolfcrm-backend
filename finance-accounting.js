@@ -794,32 +794,7 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     try {
       const today = new Date().toISOString().slice(0, 10);
       const range = parseProfitAndLossRange(req.query.start_date || `${today.slice(0, 7)}-01`, req.query.end_date || today);
-      const { rows } = await pool.query(
-        `SELECT t.id, t.direction, t.amount_cents, t.transaction_date, t.status,
-                t.pending, t.removed_at,
-                COALESCE(
-                  jsonb_agg(jsonb_build_object(
-                    'chart_account_id', s.chart_account_id,
-                    'amount_cents', s.amount_cents,
-                    'chart_account_code', c.code,
-                    'chart_account_name', c.name,
-                    'account_type', c.account_type
-                  ) ORDER BY c.code) FILTER (WHERE s.id IS NOT NULL),
-                  '[]'::jsonb
-                ) AS splits
-           FROM finance_transactions t
-           LEFT JOIN finance_transaction_splits s
-             ON s.transaction_id = t.id AND s.company_id = t.company_id
-           LEFT JOIN finance_chart_accounts c
-             ON c.id = s.chart_account_id AND c.company_id = s.company_id
-          WHERE t.company_id = $1
-            AND t.transaction_date >= $2
-            AND t.transaction_date <= $3
-          GROUP BY t.id
-          ORDER BY t.transaction_date, t.id`,
-        [req.companyId, range.start_date, range.end_date]
-      );
-      res.json(buildProfitAndLoss({ transactions: rows, startDate: range.start_date, endDate: range.end_date }));
+      res.json(await loadProfitAndLoss(pool, req.companyId, range));
     } catch (error) {
       handleAccountingError(res, error, "profit_loss_report_failed");
     }
@@ -902,4 +877,34 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     requireFinanceAccess: requireEmployer,
     ensureChartAccounts: ensureDefaultChartAccounts
   });
+}
+
+// Shared by the Finance report and widgets; caller must provide a finance-space-scoped database.
+export async function loadProfitAndLoss(pool, companyId, range) {
+      const { rows } = await pool.query(
+        `SELECT t.id, t.direction, t.amount_cents, t.transaction_date, t.status,
+                t.pending, t.removed_at,
+                COALESCE(
+                  jsonb_agg(jsonb_build_object(
+                    'chart_account_id', s.chart_account_id,
+                    'amount_cents', s.amount_cents,
+                    'chart_account_code', c.code,
+                    'chart_account_name', c.name,
+                    'account_type', c.account_type
+                  ) ORDER BY c.code) FILTER (WHERE s.id IS NOT NULL),
+                  '[]'::jsonb
+                ) AS splits
+           FROM finance_transactions t
+           LEFT JOIN finance_transaction_splits s
+             ON s.transaction_id = t.id AND s.company_id = t.company_id
+           LEFT JOIN finance_chart_accounts c
+             ON c.id = s.chart_account_id AND c.company_id = s.company_id
+          WHERE t.company_id = $1
+            AND t.transaction_date >= $2
+            AND t.transaction_date <= $3
+          GROUP BY t.id
+          ORDER BY t.transaction_date, t.id`,
+        [companyId, range.start_date, range.end_date]
+      );
+      return buildProfitAndLoss({ transactions: rows, startDate: range.start_date, endDate: range.end_date });
 }

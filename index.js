@@ -1,3 +1,4 @@
+import { installWidgetDashboard } from "./widget-dashboard.js";
 import {installServicePlanReview} from './service-plan-review.js';
 import {installIdeaParking} from './idea-parking.js';
 import {withFinanceSpace} from './finance-spaces.js';
@@ -19251,6 +19252,7 @@ async function startServer() {
   app.locals.permissionGovernance = installPermissionGovernanceRoutes({app,pool,authRequired});
   app.locals.mediaStorage = await installMediaStorage({ app, pool, authRequired, accessPredicate: storagePredicate, onRequest:r=>takeRateLimit(pool,r), onAccess:(...args)=>app.locals.commsAudit?.record(...args) });
   app.locals.comms = await installCompanyComms({app,pool,authRequired,sendPush:sendPushToUsers});
+  installWidgetDashboard({app,pool,authRequired});
   app.locals.browser = await installBrowser({app,pool,authRequired});
   app.locals.notes = await installNotes({app,pool,authRequired,notifications:app.locals.comms.notifications,storage:app.locals.mediaStorage});
   app.locals.commsCollaboration = installCollaboration({app,pool,authRequired,messages:app.locals.comms.messages,notifications:app.locals.comms.notifications,emitAutomationEvent});
