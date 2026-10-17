@@ -4,6 +4,7 @@ import {randomUUID,randomBytes,createHmac} from 'node:crypto';
 import {Client,StreamableHTTPClientTransport} from '@modelcontextprotocol/client';
 import {startLocalPostgres} from './helpers/local-postgres.js';
 import {installMCP} from '../mcp/index.js';
+import {installServiceCatalogSchema} from '../services-catalog.js';
 import {installAgreementSchema,createAgreementService} from '../quote-agreements.js';
 import {installAgreementPaymentSchema} from '../agreement-payments.js';
 import {installAgreementBooking,normalizeBookingSettings,installAgreementBookingSchema} from '../agreement-booking.js';
@@ -16,7 +17,7 @@ import {encrypt,decrypt} from '../retell/security.js';
 test('Retell service credentials, isolated bookings and signed durable reporting',{timeout:180000},async t=>{
  const pg=startLocalPostgres();pg.configureEnvironment();let backend,server;const clients=[];
  try{
-  backend=await import('../index.js');const {app,pool,authRequired}=backend;await backend.bootstrap();await installAgreementBookingSchema(pool);await installGoogleSheetsSchema(pool);
+  backend=await import('../index.js');const {app,pool,authRequired}=backend;await backend.bootstrap();await installServiceCatalogSchema(pool);await installAgreementBookingSchema(pool);await installGoogleSheetsSchema(pool);
   await installAutomationSystem({app,pool,authRequired,requireEmployer:(_r,_s,n)=>n(),disableProcessors:true});
   const a=randomUUID(),b=randomUUID(),owner=randomUUID(),other=randomUUID(),worker=randomUUID();
   await pool.query("INSERT INTO companies(id,name,join_code,owner_user_id,timezone) VALUES($1,'Retell QA A','RTA',$3,'America/New_York'),($2,'Retell QA B','RTB',$4,'America/New_York')",[a,b,owner,other]);
@@ -37,7 +38,8 @@ test('Retell service credentials, isolated bookings and signed durable reporting
   await t.test('three service-only tools, no CRM or financial tool access; settings owner only',async()=>{
    assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['check_job_availability','check_quote_availability','create_appointment']);
    assert.equal((await request('/api/ai-connections/retell','GET',undefined,'rt-worker')).status,403);
-   assert.equal((await available()).booking_enabled,false);
+   await pool.query("INSERT INTO mcp_company_policy(company_id,roles) VALUES($1,'[]')",[a]);
+   assert.equal((await available()).booking_enabled,false,'Retell sponsorship is independent of the OAuth role policy');
    await assert.rejects(()=>client.callTool({name:'crm_search',arguments:{entity:'contacts'}}));
    assert.ok(!JSON.stringify(await settings()).includes(key));
    const encrypted=encrypt('private-provider-key',a,env);assert.equal(decrypt(encrypted,a,env),'private-provider-key');assert.throws(()=>decrypt(encrypted,b,env));
@@ -79,7 +81,7 @@ test('Retell service credentials, isolated bookings and signed durable reporting
    await installAgreementBooking({app,pool,service,authRequired,requireCapability:backend.requireCapability,startWorker:false});
    const bookingSettings=normalizeBookingSettings({enabled:true,minimum_notice_minutes:0,horizon_days:30,start_increment_minutes:30,buffer_before_minutes:15,buffer_after_minutes:15,resource_bundles:[{id:randomUUID(),name:'QA crew',worker_user_ids:[worker],all_services:true,service_ids:[],enabled:true}]});
    await pool.query("UPDATE companies SET customer_booking_settings=$2,business_days='[1,2,3,4,5,6,7]',business_open_time='08:00',business_close_time='18:00' WHERE id=$1",[a,JSON.stringify(bookingSettings)]);
-   config.job_enabled=true;config.job_rules_acknowledged=true;assert.equal((await mutate('',{agent_id:'agent-test',config},'PUT')).status,200);
+   config.job_enabled=true;config.job_rules_acknowledged=true;config.require_quote_acceptance=true;config.require_deposit=true;assert.equal((await mutate('',{agent_id:'agent-test',config},'PUT')).status,200);
    const contact=(await pool.query('SELECT contact_id FROM schedule_events WHERE id=$1',[appointment])).rows[0].contact_id;
    const quote=randomUUID(),agreement=randomUUID(),line={id:randomUUID(),service_id:null,name:'Windows',description:'QA',qty:1,price_cents:20000};
    await pool.query('INSERT INTO quotes(id,user_id,company_id,contact_id,line_items,total_cents) VALUES($1,$2,$3,$4,$5,20000)',[quote,owner,a,contact,JSON.stringify([line])]);
@@ -99,6 +101,31 @@ test('Retell service credentials, isolated bookings and signed durable reporting
    const job=await call('create_appointment',{...input,type:'job',lead_id:contact,services:['Windows'],slot_id:value.slots[0].slot_id,idempotency_key:'call-job'});assert.equal(job.status,'confirmed',JSON.stringify(job));
    const saved=(await pool.query('SELECT * FROM agreement_bookings WHERE job_id=$1',[job.appointment_id])).rows[0];assert.ok(saved.confirmed_at);assert.equal(saved.confirmed_by,owner);
    assert.equal((await pool.query('SELECT count(*)::int n FROM agreement_booking_outbox WHERE job_id=$1',[job.appointment_id])).rows[0].n,1);
+  });
+  await t.test('connection-specific direct job policy, explicit duration profiles and save-time eligibility',async()=>{
+   const serviceID=randomUUID(),lead=randomUUID();
+   await pool.query("INSERT INTO saved_services(id,company_id,name) VALUES($1,$2,'QA direct windows')",[serviceID,a]);
+   await pool.query("INSERT INTO contacts(id,user_id,company_id,name,phone,address) VALUES($1,$2,$3,'Direct job QA','+12025550133',$4)",[lead,owner,a,addr]);
+   config.require_quote_acceptance=false;config.require_deposit=false;
+   assert.equal((await mutate('',{agent_id:'agent-test',config},'PUT')).status,200);
+   const inquiry={address:addr,services:['QA direct windows'],lead_id:lead,property_type:'residential',stories:1,preferred_date_range:range};
+   let value=await call('check_job_availability',inquiry);assert.equal(value.status,'configuration_required');assert.equal(value.eligibility.quote_visit.eligible,true);assert.equal(value.eligibility.direct_job.eligible,false);
+   config.direct_job_profiles=[{id:randomUUID(),name:'Explicit QA profile',service_ids:[serviceID],property_type:'residential',max_stories:2,max_window_count:20,duration_minutes:45}];
+   assert.equal((await mutate('',{agent_id:'agent-test',config},'PUT')).status,200);
+   value=await call('check_job_availability',inquiry);assert.equal(value.reason,'property_requires_quote');
+   inquiry.window_count=10;value=await call('check_job_availability',inquiry);assert.equal(value.eligibility.recommended_path,'job');assert.equal(value.estimated_duration_min,45);assert.ok(value.slots.length);
+   const direct={type:'job',slot_id:value.slots[0].slot_id,customer:{name:'Direct job QA',phone:'+12025550133'},address:addr,services:['QA direct windows'],lead_id:lead,idempotency_key:'direct-policy-changed'};
+   config.require_quote_acceptance=true;assert.equal((await mutate('',{agent_id:'agent-test',config},'PUT')).status,200);
+   assert.equal((await call('create_appointment',direct)).status,'failed');assert.equal((await call('check_job_availability',inquiry)).reason,'accepted_quote_required');
+   config.require_quote_acceptance=false;config.require_deposit=true;assert.equal((await mutate('',{agent_id:'agent-test',config},'PUT')).status,200);assert.equal((await call('check_job_availability',inquiry)).status,'configuration_required');
+   config.require_deposit=false;assert.equal((await mutate('',{agent_id:'agent-test',config},'PUT')).status,200);
+   value=await call('check_job_availability',inquiry);const saved=await call('create_appointment',{...direct,slot_id:value.slots[0].slot_id,idempotency_key:'direct-booked'});assert.equal(saved.status,'confirmed',JSON.stringify(saved));
+   const row=(await pool.query('SELECT * FROM schedule_events WHERE id=$1',[saved.appointment_id])).rows[0];assert.equal((new Date(row.end_at)-new Date(row.start_at))/60000,45);assert.equal(row.quote_id,null);assert.equal(row.price_cents,null,'No invented free price');
+   assert.equal((await call('check_job_availability',{...inquiry,stories:3})).reason,'property_requires_quote');
+   const quote=randomUUID(),agreement=randomUUID(),line={id:randomUUID(),service_id:serviceID,name:'QA direct windows',qty:1,price_cents:10000};
+   await pool.query('INSERT INTO quotes(id,user_id,company_id,contact_id,line_items,total_cents) VALUES($1,$2,$3,$4,$5,10000)',[quote,owner,a,lead,JSON.stringify([line])]);
+   await pool.query("INSERT INTO quote_agreements(id,company_id,quote_id,contact_id,created_by,number,revision,request_id,title,snapshot,packet_hash) VALUES($1,$2,$3,$4,$5,'RT-OBLIGATION',1,$6,'QA issued obligation',$7,'qa-packet-2')",[agreement,a,quote,lead,owner,randomUUID(),JSON.stringify({required_signers:['customer'],allow_customer_booking:true,duration_minutes:60,pricing:{line_items:[line],total_cents:10000,deposit_cents:1000},documents:[]})]);
+   value=await call('check_job_availability',inquiry);assert.equal(value.reason,'agreement_acceptance_required');assert.equal(value.eligibility.requires_deposit,true,'Existing issued agreement obligations survive Riley policy');
   });
   await t.test('signature uses raw bytes and timestamps; duplicate analyzed event is persisted once',async()=>{
    const contact=(await pool.query('SELECT contact_id FROM schedule_events WHERE id=$1',[appointment])).rows[0].contact_id;

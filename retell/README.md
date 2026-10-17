@@ -26,10 +26,16 @@ invalidates the old key immediately. Revocation stops tools and queued reporting
 Booking starts disabled. Configure ZIP service area, quote weekday/hours, visit
 length, notice, horizon, increments, travel padding and workers explicitly. Travel
 padding is a fixed policy, not a live routing estimate. The address must end in a US
-ZIP. Jobs reuse Schedule's current booking policy, timezone, published agreement
-scope/duration, crew qualifications, signatures and confirmed payment. A change to
-Schedule booking policy requires re-saving the Riley acknowledgement. This is not a
-new job estimator: missing/mismatched agreements need a quote or human follow-up.
+ZIP. Jobs reuse Schedule's current booking policy, timezone and crew qualifications.
+Choose Riley-only quote-acceptance and deposit requirements explicitly. A required
+deposit needs a published agreement defining its amount and confirmed payment.
+New direct work without an agreement can book only when both requirements are off
+and an owner-authored profile matches the exact saved services, property type,
+maximum stories/window count and fixed total duration. Issued agreement obligations
+always remain in force. No other booking flow is weakened. A change to
+Schedule booking policy requires re-saving the Riley acknowledgement. Profiles do not infer time from unknown property details. Missing policy, duration,
+staffing or schedule rules returns configuration_required; out-of-profile properties
+require a quote visit. Profiles start empty and test fixtures are never defaults.
 Owner must separately check automatic-booking authorization and save.
 
 ## Retell setup
@@ -51,8 +57,11 @@ A claimed confirmation is stored as reported text; actual confirmation comes onl
 from this connection's saved booking for that call ID.
 
 Riley prompt guidance: collect a full address ending in ZIP; call availability before
-booking; use exact returned slot_id and the same customer/service details. Job checks
-need lead_id and service names matching the published agreement. Only say booked
+booking; use exact returned slot_id and the same customer/service details. Supply dynamic lead_id and address, services (saved names or IDs), property_type,
+stories and window_count when required by the profile. Both availability tools return
+eligibility.quote_visit, eligibility.direct_job, recommended_path and configuration
+requirements. Missing/foreign lead IDs never resolve to an unrelated customer.
+check_job_availability returns direct-job slots only for an eligible lead. Only say booked
 when status is confirmed. pending_approval means no time is reserved. A fresh booking
 attempt after changing inputs needs a distinct intended operation; do not blindly
 change idempotency keys after a timeout. Ask the business to review unclear results.
@@ -83,3 +92,5 @@ its receipt/source before the next reviewed release. OAuth continues independent
 Validation: npm run test:retell, npm run test:mcp, npm run test:agreement-booking:db,
 npm test. All test writes use disposable PostgreSQL fixtures. Real client/call
 verification requires the owner's Retell account and must be reported separately.
+
+Full machine-readable input/output JSON Schemas: docs/retell/TOOLS.json in the iOS repository. Slot-bound facts are revalidated at save; callers may repeat them in create_appointment but cannot change them while keeping a slot. Only confirmed means a saved appointment. Other results reserve no time.

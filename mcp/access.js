@@ -11,7 +11,7 @@ export const scopes=Object.freeze({
  'finance:read':'Read your explicitly selected permitted financial space, including private spaces, reports and expenses'
 });
 export const roles=['owner','admin','manager','sales','technician','office','legacy_employee'];
-export async function loadPrincipal(pool,userId,companyId){
+export async function loadPrincipal(pool,userId,companyId,{enforceOAuthRolePolicy=true}={}){
  const row=(await pool.query(`SELECT u.id,u.email,u.display_name,u.role,u.company_id,c.name AS company_name,c.owner_user_id,c.timezone,
  to_jsonb(p) AS legacy,COALESCE(policy.roles,'["owner"]'::jsonb) AS allowed_roles
  FROM users u JOIN companies c ON c.id=u.company_id
@@ -22,7 +22,7 @@ export async function loadPrincipal(pool,userId,companyId){
  const owner=row.owner_user_id===row.id;
  const access=resolveAccess({role:owner?'employer':'employee',isOwner:owner,preset:row.legacy?.permission_preset,overrides:row.legacy?.permission_overrides,legacy:row.legacy||{}});
  const role=owner?'owner':access.preset;
- if(!row.allowed_roles.includes(role))throw fault(403,'connection_role_disabled','Your company owner has not enabled AI connections for this role.');
+ if(enforceOAuthRolePolicy&&!row.allowed_roles.includes(role))throw fault(403,'connection_role_disabled','Your company owner has not enabled AI connections for this role.');
  return {userId:row.id,companyId:row.company_id,userEmail:row.email,displayName:row.display_name,companyName:row.company_name,
  timezone:row.timezone,role:owner?'employer':'employee',isCompanyOwner:owner,ownerUserId:row.owner_user_id,
  permissions:{...Object.fromEntries(Object.entries(legacyColumnsForCapabilities(access.capabilities)).map(([k,v])=>[k.replace(/_([a-z])/g,(_,x)=>x.toUpperCase()),v])),preset:access.preset,capabilities:access.capabilities},notesReady:true};

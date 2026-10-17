@@ -3,6 +3,7 @@
 import {createServer} from 'node:http';
 import {randomBytes,randomUUID} from 'node:crypto';
 import {startLocalPostgres} from './helpers/local-postgres.js';
+import {installServiceCatalogSchema} from '../services-catalog.js';
 import {installMCP} from '../mcp/index.js';
 import {installCompanyComms} from '../company-comms/index.js';
 import {installNotes} from '../notes/index.js';
@@ -16,10 +17,11 @@ let server,clientReceiver,stopping=false;
 async function stop(){if(stopping)return;stopping=true;try{if(clientReceiver){clientReceiver.closeAllConnections();await new Promise(r=>clientReceiver.close(r));}if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}await rawPool.end();}finally{pg.stop();}}
 for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>void stop().then(()=>process.exit(0)));
 try {
- await backend.bootstrap();
+ await backend.bootstrap();await installServiceCatalogSchema(pool);
  const company=randomUUID(),owner=randomUUID(),employee=randomUUID();
  await pool.query("INSERT INTO companies(id,name,join_code,owner_user_id) VALUES($1,'MCP Browser QA','MCP-QA',$2)",[company,owner]);
  for(const [id,email,role]of [[owner,'mcp-owner@example.invalid','employer'],[employee,'mcp-tech@example.invalid','employee']])await pool.query('INSERT INTO users(id,email,display_name,company_id,role,password_hash) VALUES($1,$2,$3,$4,$5,$6)',[id,email,'QA '+role,company,role,backend.hashPassword('Synthetic-MCP-QA-428!')]);
+ await pool.query("INSERT INTO saved_services(id,company_id,name) VALUES($1,$2,'QA window service')",[randomUUID(),company]);
  await pool.query("INSERT INTO employee_permissions(user_id,company_id,permission_preset,permission_overrides) VALUES($1,$2,'technician','{}')",[employee,company]);
  app.locals.mediaStorage=await installMediaStorage({app,pool,authRequired,accessPredicate:storagePredicate,startWorker:false,bucket:null});
  app.locals.comms=await installCompanyComms({app,pool,authRequired,startWorker:false,sendPush:async()=>{throw new Error('External push forbidden');}});
