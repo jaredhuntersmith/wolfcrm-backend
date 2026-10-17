@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "NODE_ENV=development nodemon index.js",
-    "test": "npm run test:permissions && npm run test:website-builder && npm run test:customer-message-compose && npm run test:contact-update-events && npm run test:contact-search && npm run test:contact-list-filters && npm run test:contact-export && npm run test:contact-import && npm run test:measurements && npm run test:navigation-tabs && npm run test:dashboard-layout && npm run test:schedule-team && npm run test:on-my-way && npm run test:weather && npm run test:assignment-recommendations && npm run test:smart-contact-lists && npm run test:business-exceptions && npm run test:sales-analytics && npm run test:routing && npm run test:finance && npm run test:google-sheets && npm run test:imessage && npm run test:quote-contracts && npm run test:stripe-account-management && npm run test:media-storage && npm run test:permission-routes && npm run test:permission-governance && npm run test:comms-core && npm run test:comms-calls && npm run test:comms-notifications && npm run test:comms-legacy && npm run test:comms-exports && npm run test:comms-audit && npm run test:comms-collaboration && npm run test:comms-upgrade && npm run test:comms-startup && npm run test:browser && npm run test:notes && npm run test:facebook-leads && npm run test:private-workspaces && npm run test:mcp",
+    "test": "npm run test:permissions && npm run test:website-builder && npm run test:customer-message-compose && npm run test:contact-update-events && npm run test:contact-search && npm run test:contact-list-filters && npm run test:contact-export && npm run test:contact-import && npm run test:measurements && npm run test:navigation-tabs && npm run test:dashboard-layout && npm run test:schedule-team && npm run test:on-my-way && npm run test:weather && npm run test:assignment-recommendations && npm run test:smart-contact-lists && npm run test:business-exceptions && npm run test:sales-analytics && npm run test:routing && npm run test:finance && npm run test:google-sheets && npm run test:imessage && npm run test:quote-contracts && npm run test:stripe-account-management && npm run test:media-storage && npm run test:permission-routes && npm run test:permission-governance && npm run test:comms-core && npm run test:comms-calls && npm run test:comms-notifications && npm run test:comms-legacy && npm run test:comms-exports && npm run test:comms-audit && npm run test:comms-collaboration && npm run test:comms-upgrade && npm run test:comms-startup && npm run test:browser && npm run test:notes && npm run test:facebook-leads && npm run test:private-workspaces && npm run test:mcp && npm run test:retell",
     "test:automation-core": "node tests/automation-core.integration.js",
     "test:automation": "npm run test:automation-core",
     "test:finance": "node tests/finance-projection.test.js && node tests/finance-planning.test.js && node tests/finance-plaid.test.js && node tests/finance-receipts.test.js && node tests/finance-accounting.test.js && node tests/finance-general-ledger.test.js && node tests/finance-bank-sources.test.js && node tests/finance-bank-transfers.test.js && node tests/finance-operational-accounting.test.js && node tests/finance-operational-journals.test.js && node tests/finance-operational-applications.test.js && node tests/finance-stripe-settlements.test.js && node tests/finance-statement-readiness.test.js && node tests/finance-cost-allocations.test.js && node tests/finance-mileage-allocations.test.js && node tests/pay-structures.test.js && node tests/finance-payroll-costs.test.js && node tests/finance-payroll-authority.test.js && node tests/finance-payroll-evaluation.test.js && node tests/finance-payroll-journals.test.js && node tests/finance-ai.test.js",
@@ -60,7 +60,8 @@
     "test:agreement-plan-jobs:db": "node --test tests/agreement-plan-jobs.integration.test.js",
     "test:facebook-leads": "node --test tests/facebook-leads.test.js tests/facebook-leads.integration.test.js",
     "test:private-workspaces": "node --test tests/finance-spaces.integration.test.js tests/idea-parking.integration.test.js tests/workspace-controls.integration.test.js",
-    "test:mcp": "node --test tests/mcp*.test.js"
+    "test:mcp": "node --test tests/mcp*.test.js",
+    "test:retell": "node --test tests/retell*.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",
@@ -77,6 +78,7 @@
     "pdf-lib": "1.17.1",
     "pg": "^8.11.3",
     "plaid": "^45.0.0",
+    "retell-sdk": "6.2.8",
     "stripe": "^17.5.0",
     "twilio": "^6.0.2",
     "tz-lookup": "^6.1.25",

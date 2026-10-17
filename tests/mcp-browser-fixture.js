@@ -1,7 +1,7 @@
 // Local browser QA only: disposable PostgreSQL, loopback HTTP, synthetic users,
 // no background processors, no environment/production database reuse.
 import {createServer} from 'node:http';
-import {randomUUID} from 'node:crypto';
+import {randomBytes,randomUUID} from 'node:crypto';
 import {startLocalPostgres} from './helpers/local-postgres.js';
 import {installMCP} from '../mcp/index.js';
 import {installCompanyComms} from '../company-comms/index.js';
@@ -26,7 +26,7 @@ try {
  app.locals.notes=await installNotes({app,pool,authRequired,notifications:app.locals.comms.notifications,storage:app.locals.mediaStorage});
  await installGoogleSheetsSchema(pool);
  await installAutomationSystem({app,pool,authRequired,requireEmployer:(req,res,next)=>req.isCompanyOwner?next():res.sendStatus(403),disableProcessors:true});
- await installMCP({app,pool,rawPool,authRequired,startMaintenance:false,env:{NODE_ENV:'test',MCP_ENABLED:'true',MCP_PUBLIC_ORIGIN:'http://127.0.0.1:18590',MCP_WEB_ORIGIN:'http://127.0.0.1:18589',MCP_REDIRECT_URIS:'["http://127.0.0.1:18591/callback"]'},verifyIdentity:async(email,password)=>{const u=(await pool.query('SELECT id,password_hash FROM users WHERE email=$1',[email])).rows[0];return u&&backend.verifyPassword(password,u.password_hash)?{id:u.id}:null;}});
+ await installMCP({app,pool,rawPool,authRequired,startMaintenance:false,env:{RETELL_ENABLED:'true',RETELL_ENCRYPTION_KEY:randomBytes(32).toString('base64'),NODE_ENV:'test',MCP_ENABLED:'true',MCP_PUBLIC_ORIGIN:'http://127.0.0.1:18590',MCP_WEB_ORIGIN:'http://127.0.0.1:18589',MCP_REDIRECT_URIS:'["http://127.0.0.1:18591/callback"]'},verifyIdentity:async(email,password)=>{const u=(await pool.query('SELECT id,password_hash FROM users WHERE email=$1',[email])).rows[0];return u&&backend.verifyPassword(password,u.password_hash)?{id:u.id}:null;}});
  app.get('/__mcp_qa/ready',(_req,res)=>res.json({ready:true,company_id:company}));
  clientReceiver=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'text/html','Cache-Control':'no-store'});res.end('<h1>Client received authorization</h1>');}).listen(18591,'127.0.0.1');
  server=app.listen(18590,'127.0.0.1',()=>console.log('MCP disposable browser fixture ready on loopback 18590'));

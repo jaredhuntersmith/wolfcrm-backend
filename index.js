@@ -579,6 +579,7 @@ app.use(cors());
 // raw bytes aren't consumed. The handler is defined further down but the
 // raw-body middleware for that exact path lives here.
 app.use("/webhooks/facebook-leads", express.raw({ type: "application/json", limit: "1mb" }));
+app.use("/retell/webhook", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }));
 // Focus receives only Meta-signed raw bytes on its webhook route. This must
 // remain before the JSON parser so a later handler can verify the exact body.

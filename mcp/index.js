@@ -1,3 +1,4 @@
+import {installRetell} from '../retell/index.js';
 import {McpServer} from '@modelcontextprotocol/server';
 import {NodeStreamableHTTPServerTransport} from '@modelcontextprotocol/node';
 import {z} from 'zod';
@@ -19,6 +20,7 @@ const pageSchema=z.object({items:z.array(recordSchema),next_offset:z.number().nu
 function fileDTO(file){return {...pick(file,'id company_id display_name original_filename mime_type category byte_size cloud_status visibility created_at updated_at version'),content_available:['text/plain','text/csv','application/json'].includes(file.mime_type)&&file.byte_size<=262144,content_trust:'untrusted_file_data'};}
 export async function installMCP({app,pool,rawPool=pool,authRequired,verifyIdentity,env=process.env,startMaintenance=true}){
  await installMCPSchema(pool);
+ const retell=await installRetell({app,pool,authRequired,env,startWorker:startMaintenance});
  if(startMaintenance){let cleaning=false;const timer=setInterval(async()=>{if(cleaning)return;cleaning=true;try{await cleanupMCP(rawPool);}catch{console.warn('[mcp] maintenance deferred');}finally{cleaning=false;}},15*60*1000);timer.unref();}
  const enabled=()=>env.MCP_ENABLED==='true';
  const origin=env.MCP_PUBLIC_ORIGIN||'';let parsed;
@@ -79,6 +81,7 @@ export async function installMCP({app,pool,rawPool=pool,authRequired,verifyIdent
    if(req.method==='OPTIONS'){res.set({'Access-Control-Allow-Origin':req.headers.origin||origin,'Access-Control-Allow-Methods':'POST, GET, DELETE, OPTIONS','Access-Control-Allow-Headers':'Authorization, Content-Type, MCP-Protocol-Version, MCP-Session-Id','Access-Control-Expose-Headers':'WWW-Authenticate'});return res.sendStatus(204);}
    if(req.headers.origin)res.set('Access-Control-Allow-Origin',req.headers.origin);
    const token=/^Bearer ([^\s]+)$/i.exec(req.headers.authorization||'')?.[1];
+   if(retell.accepts(token))return await retell.handle(req,res,token);
    let actor=await authenticate(pool,token,resource);await rateLimit(pool,'mcp:'+actor.connectionId);
    if(req.method!=='POST')return res.status(405).set('Allow','POST, OPTIONS').json({error:'method_not_allowed'});
    if(Buffer.byteLength(JSON.stringify(req.body||{}))>65536)throw fault(413,'request_too_large');
