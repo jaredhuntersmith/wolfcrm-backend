@@ -20,6 +20,22 @@ export function stripePaymentMode(env) {
   return mode === "live";
 }
 
+// One collection rule for agreement balances and reporting; provider environments
+// must match, manual entries are explicit, and refunds/disputes remain reviewable.
+export function paymentRecordCollection(payment, currentMode) {
+  const manual = !payment.stripe_payment_intent_id && !payment.stripe_connected_account_id;
+  if (!manual && !(payment.stripe_livemode === currentMode && currentMode !== null)) {
+    return { included: false, gross: 0, refunds: 0, review: true };
+  }
+  const settled = settledStates.includes(payment.status) || payment.status === "disputed";
+  return {
+    included: true,
+    gross: settled ? Number(payment.amount_cents) : 0,
+    refunds: settled ? Number(payment.refunded_amount_cents || 0) : 0,
+    review: payment.refunded_amount_cents > 0 || payment.refund_amount_known === false || !!payment.stripe_dispute_status || ["refunded", "partially_refunded", "disputed"].includes(payment.status)
+  };
+}
+
 export async function installAgreementPaymentSchema(pool) {
   await pool.query(`
     ALTER TABLE payment_records ADD COLUMN IF NOT EXISTS agreement_id UUID;
@@ -110,14 +126,11 @@ export function createAgreementPayments({ pool, service, getStripe = service.get
     const receipts = [];
     for (const payment of records) {
       // Unknown environment is never silently credited as a verified payment.
-      const environmentMatches = payment.stripe_livemode === currentMode && currentMode !== null;
-      const manual = !payment.stripe_payment_intent_id && !payment.stripe_connected_account_id;
-      if (!manual && !environmentMatches) { review = true; continue; }
-      if (payment.refunded_amount_cents > 0 || payment.refund_amount_known === false || payment.stripe_dispute_status || ["refunded", "partially_refunded", "disputed"].includes(payment.status)) review = true;
-      if (settledStates.includes(payment.status) || payment.status === "disputed") {
-        gross += Number(payment.amount_cents);
-        refunds += Number(payment.refunded_amount_cents || 0);
-      }
+      const collection = paymentRecordCollection(payment, currentMode);
+      review ||= collection.review;
+      if (!collection.included) continue;
+      gross += collection.gross;
+      refunds += collection.refunds;
       receipts.push({ id: payment.id, kind: payment.payment_type, amount_cents: Number(payment.amount_cents), status: payment.status,
         paid_at: payment.paid_at, refunded_amount_cents: Number(payment.refunded_amount_cents || 0), receipt_url: payment.receipt_url || null,
         method: payment.offline_method || null, reference: payment.offline_reference || null, recorded_at: payment.offline_recorded_at || null });

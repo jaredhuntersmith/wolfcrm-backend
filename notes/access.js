@@ -6,7 +6,7 @@ export function noteRoleSQL(actor,alias='n') {
  const conversation=can(actor,'communications.view')?`EXISTS(SELECT 1 FROM conversations c ${conversationJoins} WHERE c.id=a.conversation_id AND ${conversationAccessSQL(actor)})`:'false';
  return `(WITH RECURSIVE lineage AS (
  SELECT ${alias}.id,${alias}.parent_id,${alias}.inherit_access,${alias}.owner_id,${alias}.visibility,${alias}.conversation_id,${alias}.company_id,${alias}.deleted_at,ARRAY[${alias}.id] AS path,0 AS depth
- UNION ALL SELECT p.id,p.parent_id,p.inherit_access,p.owner_id,p.visibility,p.conversation_id,p.company_id,p.deleted_at,l.path||p.id,l.depth+1 FROM lineage l JOIN comms_notes p ON p.id=l.parent_id WHERE l.inherit_access AND l.depth<16 AND NOT p.id=ANY(l.path)
+ UNION ALL SELECT p.id,p.parent_id,p.inherit_access,p.owner_id,p.visibility,p.conversation_id,p.company_id,p.deleted_at,l.path||p.id,l.depth+1 FROM lineage l JOIN comms_notes p ON p.id=l.parent_id WHERE l.inherit_access AND NOT p.id=ANY(l.path)
  ) SELECT COALESCE(max(CASE WHEN a.company_id<>$2 THEN 0
  WHEN a.conversation_id IS NOT NULL THEN CASE WHEN ${conversation} THEN ${can(actor,'communications.notes')&&can(actor,'communications.send')?3:1} ELSE 0 END
  WHEN a.owner_id=$1 THEN 4
@@ -20,7 +20,7 @@ export function noteSharedSQL(alias='n') {
  SELECT ${alias}.id,${alias}.parent_id,${alias}.inherit_access,${alias}.visibility,${alias}.conversation_id,ARRAY[${alias}.id] path,0 depth
  UNION ALL SELECT p.id,p.parent_id,p.inherit_access,p.visibility,p.conversation_id,a.path||p.id,a.depth+1
  FROM audience a JOIN comms_notes p ON p.id=a.parent_id AND p.company_id=${alias}.company_id AND p.deleted_at IS NULL
- WHERE a.inherit_access AND a.depth<16 AND NOT p.id=ANY(a.path)
+ WHERE a.inherit_access AND NOT p.id=ANY(a.path)
  ) SELECT COALESCE(bool_or(visibility IN ('shared','company') OR conversation_id IS NOT NULL),false) FROM audience WHERE NOT inherit_access OR parent_id IS NULL)`;
 }
 export async function authorizePage(db,input,pageId,{level=1,trash=false,lock=false}={}) {
@@ -35,7 +35,10 @@ export async function authorizePage(db,input,pageId,{level=1,trash=false,lock=fa
 export async function validateParent(db,actor,pageId,parentId) {
  if(!parentId)return;
  await authorizePage(db,actor,parentId,{level:3});
- const result=await db.query(`WITH RECURSIVE tree AS (SELECT id,parent_id,ARRAY[id] AS path,0 AS depth FROM comms_notes WHERE id=$1 AND company_id=$2 UNION ALL SELECT p.id,p.parent_id,t.path||p.id,t.depth+1 FROM tree t JOIN comms_notes p ON p.id=t.parent_id AND p.company_id=$2 WHERE t.depth<16 AND NOT p.id=ANY(t.path)) SELECT bool_or(id=$3) AS cycle,max(depth)::int AS depth FROM tree`,[uuid(parentId),actor.companyId,uuid(pageId)]);
- const descendants=(await db.query(`WITH RECURSIVE children AS (SELECT id,0 AS depth,ARRAY[id] AS path FROM comms_notes WHERE id=$1 AND company_id=$2 UNION ALL SELECT p.id,c.depth+1,c.path||p.id FROM children c JOIN comms_notes p ON p.parent_id=c.id AND p.company_id=$2 WHERE c.depth<16 AND NOT p.id=ANY(c.path)) SELECT COALESCE(max(depth),0)::int AS depth FROM children`,[pageId,actor.companyId])).rows[0].depth;
- if(result.rows[0].cycle||result.rows[0].depth+descendants>=15)fail(400,'invalid_page_parent','Pages cannot form a cycle or exceed 16 levels.');
+ const result=await db.query(`WITH RECURSIVE tree AS (
+  SELECT id,parent_id,ARRAY[id] AS path,false AS cycle FROM comms_notes WHERE id=$1 AND company_id=$2
+  UNION ALL SELECT p.id,p.parent_id,t.path||p.id,p.id=ANY(t.path) FROM tree t
+  JOIN comms_notes p ON p.id=t.parent_id AND p.company_id=$2 WHERE NOT t.cycle
+ ) SELECT bool_or(id=$3 OR cycle) AS cycle FROM tree`,[uuid(parentId),actor.companyId,uuid(pageId)]);
+ if(result.rows[0].cycle)fail(400,'invalid_page_parent','Notes cannot be moved inside themselves or their descendants.');
 }

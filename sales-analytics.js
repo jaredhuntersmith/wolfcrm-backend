@@ -195,3 +195,35 @@ function isUUID(value) {
 function clean(value) {
   return value == null ? "" : String(value).trim();
 }
+// Accepted-event value is immutable historical sales; current quote edits must not
+// rewrite booked sales. Shared by Sales Tracking and dashboard widgets.
+export function acceptedQuoteValueSQL() {
+  return `COALESCE((
+    SELECT CASE WHEN accepted.payload->>'total_cents' ~ '^[0-9]+$' THEN (accepted.payload->>'total_cents')::bigint END
+      FROM automation_events accepted
+     WHERE accepted.company_id = $1 AND accepted.event_type = 'quote.accepted'
+       AND accepted.subject_id = q.id::text
+     ORDER BY accepted.occurred_at ASC, accepted.id ASC LIMIT 1
+  ), q.total_cents, 0)`;
+}
+
+// Shared definition of a recorded outbound contact attempt; not delivery or response.
+export function outboundContactActivitySQL(company = '$1', before = '$3') {
+  return `SELECT sc.contact_id, sm.created_at AS occurred_at
+           FROM sms_messages sm
+           JOIN sms_conversations sc ON sc.id = sm.conversation_id
+           JOIN phone_lines pl ON pl.id = sc.phone_line_id
+          WHERE pl.company_id = ${company} AND sm.direction = 'outbound'
+            AND sm.deleted_at IS NULL AND sc.deleted_at IS NULL AND sm.created_at < ${before}
+         UNION ALL
+         SELECT ic.contact_id, COALESCE(im.provider_created_at, im.created_at) AS occurred_at
+           FROM imessage_messages im
+           JOIN imessage_conversations ic ON ic.id = im.conversation_id
+          WHERE ic.company_id = ${company} AND im.direction = 'outbound'
+            AND im.deleted_at IS NULL AND ic.deleted_at IS NULL
+            AND COALESCE(im.provider_created_at, im.created_at) < ${before}
+         UNION ALL
+         SELECT pc.contact_id, pc.started_at AS occurred_at
+           FROM phone_calls pc
+          WHERE pc.company_id = ${company} AND pc.direction = 'outbound' AND pc.started_at < ${before}`;
+}

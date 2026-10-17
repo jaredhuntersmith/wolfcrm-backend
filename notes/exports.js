@@ -10,7 +10,7 @@ export function createNotesExports({pool,storage}) {
    // A cloud copy currently retains note-owned text and reference links only.
    // Never freeze independently protected CRM/file/AI/synced details behind just
    // the page's ACL. Full embedded-media export is available through device share.
-   if(mode==='storage'&&hydrated.accessible!==false){block={id:row.id,page_id:row.page_id,type:row.type,position:row.position,revision:row.revision,parent_id:row.parent_id,payload:row.payload,accessible:true};if(['asset','file','image','drawing','scan','video','audio'].includes(row.type))block.payload={asset_id:row.payload.asset_id};if(['ai_result','synced'].includes(row.type))block.payload={};}
+   if(mode==='storage'&&hydrated.accessible!==false){block={id:row.id,page_id:row.page_id,type:row.type,position:row.position,revision:row.revision,parent_id:row.parent_id,payload:row.payload,accessible:true};if(['asset','file','image','drawing','scan','video','audio'].includes(row.type))block.payload=row.payload.recording_id?{recording_id:row.payload.recording_id}:{asset_id:row.payload.asset_id};if(['ai_result','synced'].includes(row.type))block.payload={};}
    size+=JSON.stringify(block).length;if(size>4_000_000)fail(413,'export_too_large','Export currently supports up to 4 MB of note text.');blocks.push(block);
   }
   const data={page:{id:page.id,title:page.title,revision:page.revision},blocks,mode};return {...data,version:createHash('sha256').update(JSON.stringify(data)).digest('hex')};

@@ -1,3 +1,4 @@
+import {createNotesAudio} from './audio.js';
 import {createNotesActivity} from './activity.js';
 import {createNotesPreferences} from './preferences.js';
 import {createNotesTasks} from './tasks.js';
@@ -11,9 +12,13 @@ import {installNotesSchema} from './schema.js';
 import {createNotesWorkspace} from './pages.js';
 import {loadActor,requireCapability} from '../company-comms/access.js';
 import {takeRateLimit} from '../company-comms/rate-limits.js';
-export async function installNotes({app,pool,authRequired,notifications,env=process.env,aiClient,storage}){
- await installNotesSchema(pool);const notes=createNotesWorkspace({pool,notifications}),collaboration=createNotesCollaboration({pool,notifications}),databases=createNotesDatabases({pool,notes}),collections=createNotesCollections({pool,notes}),ai=createNotesAI({pool,env,aiClient}),exports=createNotesExports({pool,storage}),tasks=createNotesTasks({pool,notes,notifications}),preferences=createNotesPreferences({pool}),activity=createNotesActivity({pool});
+export async function installNotes({app,pool,authRequired,notifications,env=process.env,aiClient,storage,audioBucket}){
+ await installNotesSchema(pool);const audio=createNotesAudio({pool,bucket:audioBucket});const notes=createNotesWorkspace({pool,notifications}),collaboration=createNotesCollaboration({pool,notifications}),databases=createNotesDatabases({pool,notes}),collections=createNotesCollections({pool,notes}),ai=createNotesAI({pool,env,aiClient}),exports=createNotesExports({pool,storage}),tasks=createNotesTasks({pool,notes,notifications}),preferences=createNotesPreferences({pool}),activity=createNotesActivity({pool});
  const route=(method,path,fn)=>app[method]('/api/notes'+path,authRequired,async(req,res)=>{res.set('Cache-Control','private, no-store');try{await takeRateLimit(pool,req,path==='/ai'?{bucket:'notes_ai',limit:5}:undefined);res.json(await fn(req));}catch(e){res.status(e.status||503).json({error:e.status?(e.code||e.message):'notes_unavailable',message:e.status?e.message:'Notes is temporarily unavailable. Your local changes are preserved.'});}});
+ route('post','/pages/:id/audio',r=>audio.reserve(r,r.params.id,r.body));
+ route('post','/pages/:id/audio/:audio/parts',r=>audio.part(r,r.params.id,r.params.audio,r.body.part_number));
+ route('post','/pages/:id/audio/:audio/complete',r=>audio.complete(r,r.params.id,r.params.audio));
+ route('get','/pages/:id/audio/:audio/access',r=>audio.access(r,r.params.id,r.params.audio));
  route('get','/capabilities',async r=>{const actor=await loadActor(pool,r);requireCapability(actor,'notes.view');return {version:1,blocks:true,ai_configured:ai.configured()};});
  route('get','/sources/search',async r=>{const actor=await loadActor(pool,r);requireCapability(actor,'notes.view');return {items:await searchSources(pool,actor,r.query.type,r.query.search||'')};});
  route('post','/sources/resolve',async r=>{const actor=await loadActor(pool,r);requireCapability(actor,'notes.view');return (await hydrateSources(pool,actor,[{...r.body,id:'note-source'}])).get('note-source');});

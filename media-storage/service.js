@@ -245,5 +245,15 @@ export function createStorageService({pool,bucket,env=process.env,accessPredicat
     const deleted=(await pool.query("SELECT id,delete_everywhere FROM stored_files WHERE owner_user_id=$1 AND id=ANY($2::uuid[]) AND cloud_status IN ('deleting','deleted')",[actor.userId,ids.map(uuid)])).rows;
     return {deletions:deleted,files:(await pool.query(`SELECT f.*,owner.display_name AS owner_display_name,EXISTS(SELECT 1 FROM users active_owner WHERE active_owner.id=f.owner_user_id AND active_owner.company_id=f.company_id AND active_owner.deleted_at IS NULL) AS sharing_active FROM stored_files f JOIN users owner ON owner.id=f.owner_user_id WHERE (${accessPredicate?await accessPredicate(pool,actor):readableSQL}) AND f.cloud_status='active' AND f.id=ANY($3::uuid[])`,[actor.userId,actor.companyId,ids.map(uuid)])).rows.map(r=>publicFile(r,actor))};
   }
-  return {reserveInTransaction,thumbnailBegin,thumbnailComplete,thumbnailAccess,verify,usage,list,begin,part,complete,patch,access,acknowledge,transferStarted,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
+  async function readText(actor,id) {
+    cloud();const row=await file(pool,actor,id);
+    if(row.company_id!==actor.companyId)fail(404,'file_not_found','File is unavailable in this connection.');
+    if(!['text/plain','text/csv','application/json'].includes(row.mime_type))fail(415,'content_not_supported','Only UTF-8 plain text, CSV and JSON are supported.');
+    if(Number(row.byte_size)>262144)fail(413,'file_too_large','Text content is limited to 256 KiB.');
+    const value=await bucket.readText(row,262144);
+    await file(pool,actor,id); // Recheck access after provider I/O.
+    await audit(pool,row,actor,'mcp_content_read');
+    return {id:row.id,mime_type:row.mime_type,text:value,content_trust:'untrusted_file_data'};
+  }
+  return {readText,reserveInTransaction,thumbnailBegin,thumbnailComplete,thumbnailAccess,verify,usage,list,begin,part,complete,patch,access,acknowledge,transferStarted,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
 }

@@ -11,6 +11,7 @@ export function blockInput(raw) {
  const input=raw.payload||{};if(JSON.stringify(input).length>160000)fail(413,'block_too_large');
  let payload={};
  if(sourceTypes[raw.type])payload={source_type:sourceTypes[raw.type],source_id:text(input.source_id,160),context_type:text(input.context_type||sourceTypes[raw.type],40),...(input.context_id?{context_id:text(input.context_id,160)}:{})};
+ else if(raw.type==='audio'&&input.recording_id)payload={recording_id:uuid(input.recording_id)};
  else if(['image','video','audio','file','drawing','scan','asset'].includes(raw.type))payload={asset_id:uuid(input.asset_id),...(input.preview_id?{preview_id:uuid(input.preview_id)}:{}),...(typeof input.ocr==='string'?{ocr:input.ocr.slice(0,50000)}:{})};
  else if(['page_link','child_page','database','synced','message','conversation','ai_result'].includes(raw.type))payload={target_id:text(input.target_id,160)};
  else if(raw.type==='webpage')payload={...safeWebpage(input),captured_at:text(input.captured_at||new Date().toISOString(),50)};
@@ -31,13 +32,18 @@ export async function hydrateBlock(db,actor,block,depth=0) {
  const p=block.payload;
  try{
   if(sourceTypes[block.type]) {const card=(await hydrateSources(db,actor,[{...p,id:'block'}])).get('block');return card?.accessible&&card.text!=='Unavailable'?{...block,card,accessible:true}:denied;}
+  if(block.type==='audio'&&p.recording_id) {
+   const row=(await db.query('SELECT id,duration,byte_size FROM notes_audio WHERE id=$1 AND page_id=$2 AND company_id=$3 AND ready=true',[p.recording_id,block.page_id,actor.companyId])).rows[0];
+   if(!row)return denied;
+   return {...block,payload:{recording_id:row.id},recording:{id:row.id,duration:Number(row.duration),byte_size:Number(row.byte_size)},accessible:true};
+  }
   if(['image','video','audio','file','drawing','scan','asset'].includes(block.type)) {
    const acl=await storagePredicate(db,actor);const rows=(await db.query(`SELECT f.* FROM stored_files f WHERE f.id=$3 AND f.company_id=$2 AND f.cloud_status='active' AND (${acl})`,[actor.userId,actor.companyId,p.asset_id])).rows;
    if(!rows.length)return denied;const safePayload={asset_id:p.asset_id,...(p.ocr?{ocr:p.ocr}:{})};let preview;
    if(p.preview_id){const result=await db.query(`SELECT f.* FROM stored_files f WHERE f.id=$3 AND f.company_id=$2 AND f.cloud_status='active' AND (${acl})`,[actor.userId,actor.companyId,p.preview_id]);if(result.rows.length){safePayload.preview_id=p.preview_id;preview=publicFile(result.rows[0],actor);}}
    return {...block,payload:safePayload,attachment:publicFile(rows[0],actor),preview,accessible:true};
   }
-  if(['child_page','page_link','database'].includes(block.type)){const {page}=await authorizePage(db,actor,p.target_id);return {...block,card:{accessible:true,interactive:true,title:page.title,source_id:page.id,source_type:'note',revision:page.revision},accessible:true};}
+  if(['child_page','page_link','database'].includes(block.type)){const {page}=await authorizePage(db,actor,p.target_id);return {...block,card:{accessible:true,interactive:true,title:page.title,source_id:page.id,source_type:'note',revision:page.revision,...(block.type==='child_page'?{preview:[...((page.body||'').split(/\r?\n/).map(line=>line.trim()).find(Boolean)||'')].slice(0,200).join(''),access_role:page.access_role}: {})},accessible:true};}
   if(block.type==='ai_result'){
    if(depth>=4)return denied;const result=(await db.query('SELECT * FROM notes_ai_results WHERE id=$1 AND company_id=$2',[uuid(p.target_id),actor.companyId])).rows[0];if(!result)return denied;
    for(const pageId of result.page_ids)await authorizePage(db,actor,pageId);

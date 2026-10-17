@@ -1,3 +1,6 @@
+import { acceptedQuoteValueSQL, outboundContactActivitySQL } from "./sales-analytics.js";
+import {installMCP} from './mcp/index.js';
+import {transactionalPool,internalActor} from './mcp/context.js';
 import { installWidgetDashboard } from "./widget-dashboard.js";
 import {installServicePlanReview} from './service-plan-review.js';
 import {installIdeaParking} from './idea-parking.js';
@@ -239,10 +242,12 @@ const useSSL =
   process.env.DB_SSL === "true" ||
   (process.env.DATABASE_URL && process.env.DATABASE_URL.includes("railway.app"));
 
-const pool = new Pool({
+const rawPool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: useSSL ? { rejectUnauthorized: false } : false
 });
+
+const pool = transactionalPool(rawPool);
 
 // ---------- APNs client (lazy) ----------
 // Real Apple push. Delivers even when the app is closed and the phone is
@@ -566,6 +571,7 @@ const STRIPE_CONNECT_RETURN_URL = process.env.STRIPE_CONNECT_RETURN_URL
 const STRIPE_CONNECT_REFRESH_URL = process.env.STRIPE_CONNECT_REFRESH_URL
   || "https://wolfcrm-backend-production.up.railway.app/stripe/connect/refresh";
 
+app.use(['/mcp','/oauth'], express.json({limit:'64kb'}), express.urlencoded({extended:false,limit:'16kb'}));
 app.use(cors());
 
 // Stripe webhook MUST see the raw request body for signature verification.
@@ -2728,6 +2734,7 @@ async function bootstrap() {
 
 // ---------- auth middleware ----------
 async function authRequired(req, res, next) {
+  if (req[internalActor]) { Object.assign(req, req[internalActor]); if (enforceSensitiveRoute(req,res)) next(); return; }
   const token = bearer(req);
   if (!token) return res.status(401).json({ error: "unauthorized" });
   const { rows } = await pool.query(
@@ -15086,19 +15093,13 @@ async function salesAnalyticsSource(source, fn) {
   }
 }
 
-async function loadSalesAnalyticsSummary(companyId, employeeId, start, end, prefix) {
+async function loadSalesAnalyticsSummary(companyId, employeeId, start, end, prefix, strictCompany = false) {
   const parameters = [companyId, start.toISOString(), end.toISOString(), employeeId];
   const employeeContact = `($4::uuid IS NULL OR c.user_id = $4)`;
-  const quoteCompany = `(q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
+  const quoteCompany = `(q.company_id = $1 OR (${strictCompany ? 'false' : 'true'} AND q.company_id IS NULL AND EXISTS (
     SELECT 1 FROM users quote_owner WHERE quote_owner.id = q.user_id AND quote_owner.company_id = $1
   )))`;
-  const acceptedQuoteValue = `COALESCE((
-    SELECT CASE WHEN accepted.payload->>'total_cents' ~ '^[0-9]+$' THEN (accepted.payload->>'total_cents')::bigint END
-      FROM automation_events accepted
-     WHERE accepted.company_id = $1 AND accepted.event_type = 'quote.accepted'
-       AND accepted.subject_id = q.id::text
-     ORDER BY accepted.occurred_at ASC, accepted.id ASC LIMIT 1
-  ), q.total_cents, 0)`;
+  const acceptedQuoteValue = acceptedQuoteValueSQL();
   const sources = await Promise.all([
     salesAnalyticsSource(`${prefix}.contacts`, async () => (await pool.query(
       `SELECT
@@ -15116,25 +15117,7 @@ async function loadSalesAnalyticsSummary(companyId, employeeId, start, end, pref
       parameters
     )).rows[0]),
     salesAnalyticsSource(`${prefix}.communications`, async () => (await pool.query(
-      `WITH activity AS (
-         SELECT sc.contact_id, sm.created_at AS occurred_at
-           FROM sms_messages sm
-           JOIN sms_conversations sc ON sc.id = sm.conversation_id
-           JOIN phone_lines pl ON pl.id = sc.phone_line_id
-          WHERE pl.company_id = $1 AND sm.direction = 'outbound'
-            AND sm.deleted_at IS NULL AND sc.deleted_at IS NULL AND sm.created_at < $3
-         UNION ALL
-         SELECT ic.contact_id, COALESCE(im.provider_created_at, im.created_at) AS occurred_at
-           FROM imessage_messages im
-           JOIN imessage_conversations ic ON ic.id = im.conversation_id
-          WHERE ic.company_id = $1 AND im.direction = 'outbound'
-            AND im.deleted_at IS NULL AND ic.deleted_at IS NULL
-            AND COALESCE(im.provider_created_at, im.created_at) < $3
-         UNION ALL
-         SELECT pc.contact_id, pc.started_at AS occurred_at
-           FROM phone_calls pc
-          WHERE pc.company_id = $1 AND pc.direction = 'outbound' AND pc.started_at < $3
-       ), scoped_activity AS (
+      `WITH activity AS (${outboundContactActivitySQL()}), scoped_activity AS (
          SELECT a.contact_id, a.occurred_at
            FROM activity a
            JOIN contacts c ON c.id = a.contact_id
@@ -15190,7 +15173,7 @@ async function loadSalesAnalyticsSummary(companyId, employeeId, start, end, pref
          FROM automation_events ae
         WHERE ae.company_id = $1 AND ae.event_type = 'job.created'
           AND ae.occurred_at >= $2 AND ae.occurred_at < $3`,
-      parameters
+      parameters.slice(0, 3)
     )).rows[0]),
     salesAnalyticsSource(`${prefix}.jobs`, async () => (await pool.query(
       `SELECT
@@ -15243,7 +15226,7 @@ async function loadSalesAnalyticsSummary(companyId, employeeId, start, end, pref
   };
 }
 
-async function loadSalesAnalyticsTrend(companyId, employeeId, start, end, bucket, timezone) {
+async function loadSalesAnalyticsTrend(companyId, employeeId, start, end, bucket, timezone, strictCompany = false) {
   const { rows } = await pool.query(
     `WITH facts AS (
        SELECT c.created_at AS occurred_at, 1::bigint AS new_contacts, 0::bigint AS external_leads,
@@ -15258,7 +15241,7 @@ async function loadSalesAnalyticsTrend(companyId, employeeId, start, end, bucket
           AND c.lead_submitted_at >= $2 AND c.lead_submitted_at < $3 AND ($4::uuid IS NULL OR c.user_id = $4)
        UNION ALL
        SELECT q.created_at, 0, 0, 1, 0, 0, 0, 0, 0, 0
-         FROM quotes q WHERE (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
+         FROM quotes q WHERE (q.company_id = $1 OR (${strictCompany ? 'false' : 'true'} AND q.company_id IS NULL AND EXISTS (
            SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
          ))) AND q.created_at >= $2 AND q.created_at < $3 AND ($4::uuid IS NULL OR q.user_id = $4)
        UNION ALL
@@ -15269,7 +15252,7 @@ async function loadSalesAnalyticsTrend(companyId, employeeId, start, end, bucket
                 WHERE accepted.company_id = $1 AND accepted.event_type = 'quote.accepted'
                   AND accepted.subject_id = q.id::text
                 ORDER BY accepted.occurred_at ASC, accepted.id ASC LIMIT 1), q.total_cents, 0), 0
-         FROM quotes q WHERE (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
+         FROM quotes q WHERE (q.company_id = $1 OR (${strictCompany ? 'false' : 'true'} AND q.company_id IS NULL AND EXISTS (
            SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
          ))) AND q.accepted_at >= $2 AND q.accepted_at < $3 AND ($4::uuid IS NULL OR q.user_id = $4)
        UNION ALL
@@ -15306,7 +15289,7 @@ async function loadSalesAnalyticsTrend(companyId, employeeId, start, end, bucket
   return normalizeSalesTrend(rows);
 }
 
-async function loadSalesSourceBreakdown(companyId, employeeId, start, end) {
+async function loadSalesSourceBreakdown(companyId, employeeId, start, end, strictCompany = false) {
   const { rows } = await pool.query(
     `WITH scoped_contacts AS (
        SELECT c.id, c.user_id,
@@ -15335,7 +15318,7 @@ async function loadSalesSourceBreakdown(companyId, employeeId, start, end) {
                 ORDER BY accepted.occurred_at ASC, accepted.id ASC LIMIT 1), q.total_cents, 0))
                 FILTER (WHERE q.accepted_at >= $2 AND q.accepted_at < $3), 0)::bigint AS revenue_sold_cents
          FROM scoped_contacts sc JOIN quotes q ON q.contact_id = sc.id::text
-        WHERE (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
+        WHERE (q.company_id = $1 OR (${strictCompany ? 'false' : 'true'} AND q.company_id IS NULL AND EXISTS (
           SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
         ))) AND ($4::uuid IS NULL OR q.user_id = $4)
           AND ((q.created_at >= $2 AND q.created_at < $3) OR (q.accepted_at >= $2 AND q.accepted_at < $3))
@@ -15380,7 +15363,7 @@ async function loadSalesSourceBreakdown(companyId, employeeId, start, end) {
   return normalizeSalesBreakdown(rows, { identityKey: "source_key", labelKey: "source_label" });
 }
 
-async function loadSalesTeamBreakdown(companyId, start, end) {
+async function loadSalesTeamBreakdown(companyId, start, end, strictCompany = false) {
   const { rows } = await pool.query(
     `WITH team AS (
        SELECT id, COALESCE(NULLIF(display_name, ''), email) AS display_name
@@ -15404,7 +15387,7 @@ async function loadSalesTeamBreakdown(companyId, start, end) {
                   AND accepted.subject_id = q.id::text
                 ORDER BY accepted.occurred_at ASC, accepted.id ASC LIMIT 1), q.total_cents, 0))
                 FILTER (WHERE q.accepted_at >= $2 AND q.accepted_at < $3), 0)::bigint AS revenue_sold_cents
-         FROM quotes q WHERE (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
+         FROM quotes q WHERE (q.company_id = $1 OR (${strictCompany ? 'false' : 'true'} AND q.company_id IS NULL AND EXISTS (
            SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
          ))) AND ((q.created_at >= $2 AND q.created_at < $3) OR (q.accepted_at >= $2 AND q.accepted_at < $3))
          GROUP BY q.user_id
@@ -15454,6 +15437,7 @@ async function loadSalesTeamBreakdown(companyId, start, end) {
 app.get("/api/sales/analytics", authRequired, requireAnyCapability("sales.view_self", "sales.view_all"), async (req, res) => {
   try {
     const range = validateSalesAnalyticsQuery(req.query);
+    const strictCompany = Boolean(req[internalActor]);
     const canViewAll = hasCapability(req, "sales.view_all");
     let employeeId = range.employee_id;
     let employeeName = null;
@@ -15475,12 +15459,12 @@ app.get("/api/sales/analytics", authRequired, requireAnyCapability("sales.view_s
     const company = await pool.query(`SELECT timezone FROM companies WHERE id = $1`, [req.companyId]);
     const timezone = company.rows[0]?.timezone || "America/New_York";
     const [current, previous, trendResult, sourceResult, teamResult, coverageResult] = await Promise.all([
-      loadSalesAnalyticsSummary(req.companyId, employeeId, range.start, range.end, "current"),
-      loadSalesAnalyticsSummary(req.companyId, employeeId, range.previous_start, range.previous_end, "previous"),
-      salesAnalyticsSource("trend", () => loadSalesAnalyticsTrend(req.companyId, employeeId, range.start, range.end, range.bucket, timezone)),
-      salesAnalyticsSource("sources", () => loadSalesSourceBreakdown(req.companyId, employeeId, range.start, range.end)),
+      loadSalesAnalyticsSummary(req.companyId, employeeId, range.start, range.end, "current", strictCompany),
+      loadSalesAnalyticsSummary(req.companyId, employeeId, range.previous_start, range.previous_end, "previous", strictCompany),
+      salesAnalyticsSource("trend", () => loadSalesAnalyticsTrend(req.companyId, employeeId, range.start, range.end, range.bucket, timezone, strictCompany)),
+      salesAnalyticsSource("sources", () => loadSalesSourceBreakdown(req.companyId, employeeId, range.start, range.end, strictCompany)),
       canViewAll && !employeeId
-        ? salesAnalyticsSource("team", () => loadSalesTeamBreakdown(req.companyId, range.start, range.end))
+        ? salesAnalyticsSource("team", () => loadSalesTeamBreakdown(req.companyId, range.start, range.end, strictCompany))
         : Promise.resolve({ source: "team", value: [], failed: false }),
       salesAnalyticsSource("coverage", async () => (await pool.query(
         `SELECT
@@ -15488,7 +15472,7 @@ app.get("/api/sales/analytics", authRequired, requireAnyCapability("sales.view_s
            MIN(occurred_at) FILTER (WHERE event_type = 'job.created') AS booking_history_started_at,
            MIN(occurred_at) FILTER (WHERE event_type = 'quote.accepted') AS quote_journal_started_at,
            (SELECT MIN(q.accepted_at) FROM quotes q
-             WHERE q.accepted_at IS NOT NULL AND (q.company_id = $1 OR (q.company_id IS NULL AND EXISTS (
+             WHERE q.accepted_at IS NOT NULL AND (q.company_id = $1 OR (${strictCompany ? 'false' : 'true'} AND q.company_id IS NULL AND EXISTS (
                SELECT 1 FROM users qu WHERE qu.id = q.user_id AND qu.company_id = $1
              )))) AS quote_acceptance_started_at
          FROM automation_events WHERE company_id = $1`,
@@ -15500,7 +15484,7 @@ app.get("/api/sales/analytics", authRequired, requireAnyCapability("sales.view_s
       ...previous.failedSources,
       ...[trendResult, sourceResult, teamResult, coverageResult].filter((item) => item.failed).map((item) => item.source)
     ])];
-    const coverageWarnings = [];
+    const coverageWarnings = strictCompany ? ["MCP excludes legacy quotes without explicit company ownership."] : [];
     const outcomeStart = coverageResult.value?.outcome_history_started_at || null;
     const bookingStart = coverageResult.value?.booking_history_started_at || null;
     if (coverageResult.failed) {
@@ -19252,7 +19236,15 @@ async function startServer() {
   app.locals.permissionGovernance = installPermissionGovernanceRoutes({app,pool,authRequired});
   app.locals.mediaStorage = await installMediaStorage({ app, pool, authRequired, accessPredicate: storagePredicate, onRequest:r=>takeRateLimit(pool,r), onAccess:(...args)=>app.locals.commsAudit?.record(...args) });
   app.locals.comms = await installCompanyComms({app,pool,authRequired,sendPush:sendPushToUsers});
-  installWidgetDashboard({app,pool,authRequired});
+  installWidgetDashboard({app,pool,authRequired,services:{
+    getAgreementService:()=>app.locals.agreements,
+    weatherService:googleWeatherService,
+    refreshActivity:async companyId=>{
+      const loaded=await loadBusinessExceptionCandidates(companyId,new Date());
+      if(loaded.failedSources.length)throw new Error('business_activity_source_unavailable');
+      await synchronizeBusinessExceptions(companyId,loaded.candidates,loaded.evaluatedTypes);
+    }
+  }});
   app.locals.browser = await installBrowser({app,pool,authRequired});
   app.locals.notes = await installNotes({app,pool,authRequired,notifications:app.locals.comms.notifications,storage:app.locals.mediaStorage});
   app.locals.commsCollaboration = installCollaboration({app,pool,authRequired,messages:app.locals.comms.messages,notifications:app.locals.comms.notifications,emitAutomationEvent});
@@ -19384,11 +19376,15 @@ async function startServer() {
   });
   startGoogleSheetsWorkers(pool);
   startWeatherRiskWorkers();
+  await installMCP({app,pool,rawPool,authRequired,verifyIdentity:async(email,password)=>{
+    const row=(await pool.query('SELECT id,password_hash,deleted_at FROM users WHERE email=$1',[normalizeEmail(email)])).rows[0];
+    return row&&!row.deleted_at&&verifyPassword(password,row.password_hash)?{id:row.id}:null;
+  }});
   installAPIFallback(app);
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }
 
-export { app, bootstrap, pool, startServer, authRequired, requireCapability, getQuoteSettings };
+export { app, bootstrap, pool, startServer, authRequired, requireCapability, getQuoteSettings, rawPool, verifyPassword, hashPassword };
 
 if (process.env.WOLFCRM_SKIP_SERVER_START !== "true") {
   startServer().catch((err) => {

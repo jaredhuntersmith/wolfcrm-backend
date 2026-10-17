@@ -1,11 +1,11 @@
 import {authorizePage} from './access.js';
-// Follow the same bounded inheritance chain as authorization. A child owner does
+// Follow the same acyclic inheritance chain as authorization. A child owner does
 // not gain access to a private inherited parent merely by creating the child.
 export async function noteAudience(db,actor,pageId) {
  const root=(await db.query(`WITH RECURSIVE lineage AS (
   SELECT n.*,ARRAY[n.id] path,0 depth FROM comms_notes n WHERE n.id=$1 AND n.company_id=$2 AND n.purged_at IS NULL
   UNION ALL SELECT p.*,l.path||p.id,l.depth+1 FROM lineage l JOIN comms_notes p ON p.id=l.parent_id AND p.company_id=$2 AND p.purged_at IS NULL
-  WHERE l.inherit_access AND l.depth<16 AND NOT p.id=ANY(l.path)
+  WHERE l.inherit_access AND NOT p.id=ANY(l.path)
  ) SELECT * FROM lineage WHERE NOT inherit_access OR parent_id IS NULL LIMIT 1`,[pageId,actor.companyId])).rows[0];
  if(!root)return [];
  const candidates=(await db.query(`SELECT u.id FROM users u WHERE u.company_id=$1 AND u.deleted_at IS NULL AND (

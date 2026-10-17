@@ -16,6 +16,12 @@ export function createStorageBucket(env = process.env) {
   const args = file => ({ Bucket: file.storage_provider==='legacy_media'?legacyBucket:bucket, Key: file.object_key });
   let orphanMarker;
   return {
+    async readText(file,maxBytes=262144) {
+      const response=await deliveryClient(file).send(new GetObjectCommand(args(file)),{abortSignal:AbortSignal.timeout(10000)});
+      let size=0;const chunks=[];
+      for await (const chunk of response.Body) {size+=chunk.length;if(size>maxBytes){response.Body.destroy();throw Object.assign(new Error('File exceeds the text limit.'),{status:413,code:'file_too_large'});}chunks.push(chunk);}
+      return new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks));
+    },
     async abandonedUploads() {
       const page=await client.send(new ListMultipartUploadsCommand({Bucket:bucket,Prefix:'storage/',MaxUploads:100,KeyMarker:orphanMarker?.key,UploadIdMarker:orphanMarker?.upload}));
       orphanMarker=page.IsTruncated?{key:page.NextKeyMarker,upload:page.NextUploadIdMarker}:undefined;

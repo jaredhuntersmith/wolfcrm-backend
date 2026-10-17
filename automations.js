@@ -1,3 +1,4 @@
+import {afterCommit} from './mcp/context.js';
 import { randomUUID } from "crypto";
 import net from "net";
 import { removeQuote } from "./quote-removal.js";
@@ -1664,7 +1665,7 @@ export async function emitAutomationEvent(event, { db = null } = {}) {
         event.occurredAt || null
       ]
     );
-    if (!db && !ctx.disableProcessors) setImmediate(() => processAutomationEvents().catch((e) => console.error("[automations] event processor wake failed", e?.message || e)));
+    if (!db && !ctx.disableProcessors) afterCommit(() => setImmediate(() => processAutomationEvents().catch((e) => console.error("[automations] event processor wake failed", e?.message || e))));
     return rows[0]?.id || null;
   } catch (e) {
     if (db) throw e;

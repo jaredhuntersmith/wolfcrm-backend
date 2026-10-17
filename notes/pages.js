@@ -32,7 +32,7 @@ export function createNotesWorkspace({pool,notifications}){
   const names=(await db.query('SELECT id,display_name FROM users WHERE company_id=$1 AND id=ANY($2::uuid[])',[actor.companyId,[page.owner_id,page.creator_id,page.editor_id].filter(Boolean)])).rows;const name=id=>names.find(u=>u.id===id)?.display_name||null;
   const literal=page.body||'';const statistics={words:(literal.match(/[\p{L}\p{N}]+/gu)||[]).length,characters:[...literal].length};
   const cover=page.cover_id?await hydrateBlock(db,actor,{id:page.id,page_id:page.id,type:'image',position:0,revision:page.revision,payload:{asset_id:page.cover_id}}):null;
-  return {page:{...pageDTO(page),owner_name:name(page.owner_id),creator_name:name(page.creator_id),editor_name:name(page.editor_id)},blocks,personal,statistics,cover,block_count:count,next_offset:rows.length>size?offset+size:null};
+  return {page:{...pageDTO(page),parent_kind:page.parent_id?(await db.query('SELECT kind FROM comms_notes WHERE id=$1 AND company_id=$2',[page.parent_id,actor.companyId])).rows[0]?.kind:null,owner_name:name(page.owner_id),creator_name:name(page.creator_id),editor_name:name(page.editor_id)},blocks,personal,statistics,cover,block_count:count,next_offset:rows.length>size?offset+size:null};
  }
  async function list(input,q={}){
   const actor=await loadActor(pool,input);requireCapability(actor,'notes.view');const values=[actor.userId,actor.companyId];const add=v=>{values.push(v);return '$'+values.length;};
@@ -44,6 +44,7 @@ export function createNotesWorkspace({pool,notifications}){
   if(q.scope==='shared')where.push('EXISTS(SELECT 1 FROM notes_members m WHERE m.page_id=n.id AND m.user_id=$1)');
   if(q.scope==='favorites')where.push('COALESCE(p.favorite,false)');if(q.scope==='pinned')where.push('COALESCE(p.pinned,false)');
   if(q.roots==='true')where.push(`(n.parent_id IS NULL OR NOT EXISTS(SELECT 1 FROM comms_notes p WHERE p.id=n.parent_id AND p.deleted_at IS NULL AND p.archived_at IS NULL AND p.purged_at IS NULL AND (${noteRoleSQL(actor,'p')})>0))`);
+  if(q.main==='true')where.push("NOT EXISTS(SELECT 1 FROM comms_notes parent WHERE parent.id=n.parent_id AND parent.kind='page')");
   if(q.scope==='databases')where.push("n.kind='database'");if(q.parent_id)where.push('n.parent_id='+add(uuid(q.parent_id)));if(q.creator_id)where.push('n.creator_id='+add(uuid(q.creator_id)));if(q.tag){const tag=text(q.tag,60).replace(/^#/,'');where.push('(n.tags ? '+add(tag)+' OR n.body ~* '+add(inlineTagPattern(tag))+')');}
   if(q.owner_id)where.push('n.owner_id='+add(uuid(q.owner_id)));
   if(q.updated_days){const days=Number(q.updated_days);if(!Number.isInteger(days)||days<1||days>3650)fail(400,'invalid_days');where.push('n.updated_at >= now()-('+add(days)+"::int * interval '1 day')");}
@@ -52,8 +53,8 @@ export function createNotesWorkspace({pool,notifications}){
   if(kinds)where.push('EXISTS(SELECT 1 FROM notes_blocks b WHERE b.page_id=n.id AND b.deleted_at IS NULL AND b.type=ANY('+add(kinds)+'::text[]))');
   if(q.search){const term=add('%'+text(q.search,200).replace(/[\\%_]/g,'\\$&')+'%');const properties=can(actor,'notes.databases')?` OR EXISTS(SELECT 1 FROM notes_database_rows r JOIN comms_notes rn ON rn.id=r.id JOIN notes_database_schemas ds ON ds.page_id=r.database_id CROSS JOIN LATERAL jsonb_each_text(r.values) field WHERE (r.id=n.id OR r.database_id=n.id) AND rn.deleted_at IS NULL AND rn.purged_at IS NULL AND (${noteRoleSQL(actor,'rn')})>0 AND EXISTS(SELECT 1 FROM jsonb_array_elements(ds.columns) col WHERE col->>'id'=field.key AND col->>'type' NOT IN ('file','relation','person')) AND field.value ILIKE ${term})`:'';where.push(`(n.title ILIKE ${term} OR ${referenceSearchSQL(actor,term)} OR n.body ILIKE ${term} OR n.tags::text ILIKE ${term} OR EXISTS(SELECT 1 FROM notes_blocks nb JOIN stored_files f ON f.id::text=nb.payload->>'asset_id' WHERE nb.page_id=n.id AND nb.deleted_at IS NULL AND f.cloud_status='active' AND (${await storagePredicate(pool,actor)}) AND (nb.payload->>'ocr' ILIKE ${term} OR f.display_name ILIKE ${term})) OR EXISTS(SELECT 1 FROM notes_comments nc WHERE nc.page_id=n.id AND nc.deleted_at IS NULL AND nc.body ILIKE ${term})${properties})`);}
   const order={title:'n.title,n.id',created:'n.created_at DESC,n.id',manual:'n.position,n.id',creator:'n.creator_id,n.updated_at DESC,n.id',recent:'p.opened_at DESC NULLS LAST,n.updated_at DESC,n.id'}[q.scope==='recent'?'recent':q.sort]||'n.updated_at DESC,n.id';
-  const size=limit(q.limit),offset=Math.max(0,Number.parseInt(q.offset,10)||0);const rows=(await pool.query(`SELECT n.*,${noteSharedSQL()} AS is_shared,${noteRoleSQL(actor)} AS access_role,COALESCE(p.favorite,false) AS favorite,COALESCE(p.pinned,false) AS pinned,p.opened_at FROM comms_notes n LEFT JOIN notes_personal p ON p.page_id=n.id AND p.user_id=$1 WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT ${add(size+1)} OFFSET ${add(offset)}`,values)).rows;
-  return {pages:rows.slice(0,size).map(n=>({...pageDTO(n),favorite:n.favorite,pinned:n.pinned,opened_at:n.opened_at,preview:[...(n.body||'')].slice(0,200).join('')})),next_offset:rows.length>size?offset+size:null};
+  const size=limit(q.limit),offset=Math.max(0,Number.parseInt(q.offset,10)||0);const rows=(await pool.query(`SELECT n.*,(SELECT parent.kind FROM comms_notes parent WHERE parent.id=n.parent_id) AS parent_kind,${noteSharedSQL()} AS is_shared,${noteRoleSQL(actor)} AS access_role,COALESCE(p.favorite,false) AS favorite,COALESCE(p.pinned,false) AS pinned,p.opened_at FROM comms_notes n LEFT JOIN notes_personal p ON p.page_id=n.id AND p.user_id=$1 WHERE ${where.join(' AND ')} ORDER BY COALESCE(p.pinned,false) DESC,${order} LIMIT ${add(size+1)} OFFSET ${add(offset)}`,values)).rows;
+  return {pages:rows.slice(0,size).map(n=>({...pageDTO(n),parent_kind:n.parent_kind,favorite:n.favorite,pinned:n.pinned,opened_at:n.opened_at,preview:[...(n.body||'')].slice(0,200).join('')})),next_offset:rows.length>size?offset+size:null};
  }
  async function create(input,body){return mutate(pool,input,async(db,actor)=>{
   requireCapability(actor,'notes.create');requireCapability(actor,'notes.view');const pageId=uuid(body.id||randomUUID());
@@ -70,13 +71,34 @@ export function createNotesWorkspace({pool,notifications}){
  async function metadata(input,pageId,body){return mutate(pool,input,async(db,actor)=>{
   await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',['notes-tree:'+actor.companyId]);
   const governance=['parent_id','visibility','inherit_access','archived','trashed','cover_id','tags','icon','position'].some(k=>Object.hasOwn(body,k));
-  const {page}=await authorizePage(db,actor,pageId,{level:governance?4:3,trash:true,lock:true});const oldAudience=governance?await noteAudience(db,actor,pageId):[];checkRevision(page,body.expected_revision);await snapshot(db,page,actor);
+  const {page}=await authorizePage(db,actor,pageId,{level:governance?4:3,trash:true,lock:true});
+  if(body.trashed===true&&page.parent_id&&body.confirmed!==true&&(await db.query("SELECT 1 FROM comms_notes WHERE id=$1 AND kind='page'",[page.parent_id])).rowCount)fail(409,'nested_note_confirmation_required','Hold the note, choose Delete Note, then confirm.');const oldAudience=governance?await noteAudience(db,actor,pageId):[];checkRevision(page,body.expected_revision);await snapshot(db,page,actor);
   const parent=body.parent_id===undefined?page.parent_id:body.parent_id?uuid(body.parent_id):null;await validateParent(db,actor,pageId,parent);
   const visibility=body.visibility??page.visibility;if(!['private','shared','company'].includes(visibility))fail(400,'invalid_visibility');if(visibility==='company')requireCapability(actor,'notes.company');
   const title=body.title===undefined?page.title:text(body.title||'Untitled',150);const newTags=body.tags===undefined?page.tags:tags(body.tags);
   if(page.conversation_id&&(body.visibility!==undefined||body.parent_id!==undefined||body.inherit_access!==undefined))fail(409,'conversation_note_access','Conversation notes retain their conversation access.');
   if(body.cover_id){await validateBlockReferences(db,actor,{id:randomUUID(),page_id:pageId,type:'image',payload:{asset_id:uuid(body.cover_id)}});}
   await db.query(`UPDATE comms_notes SET title=$2,parent_id=$3,visibility=$4,inherit_access=$5,tags=$6,icon=$7,cover_id=$8,position=$9,archived_at=$10,deleted_at=$11 WHERE id=$1`,[pageId,title,parent,visibility,!!parent&&(body.inherit_access??page.inherit_access),JSON.stringify(newTags),body.icon===undefined?page.icon:text(body.icon,32,false),body.cover_id===undefined?page.cover_id:body.cover_id||null,Number.isFinite(body.position)?body.position:page.position,body.archived===undefined?page.archived_at:body.archived?new Date():null,body.trashed===undefined?page.deleted_at:body.trashed?new Date():null]);
+  if(body.parent_id!==undefined && parent!==page.parent_id && page.parent_id){
+   // Moving a page changes containment, not its identity. Keep a regular link in
+   // the old note so moving to a folder cannot leave a broken protected child.
+   const oldParent=(await db.query('SELECT * FROM comms_notes WHERE id=$1 FOR UPDATE',[page.parent_id])).rows[0];
+   const references=(await db.query("SELECT 1 FROM notes_blocks WHERE page_id=$1 AND type='child_page' AND payload->>'target_id'=$2 AND deleted_at IS NULL",[page.parent_id,pageId])).rowCount;
+   if(references){
+    await snapshot(db,oldParent,actor);
+    await db.query("UPDATE notes_blocks SET type='page_link',revision=revision+1,updated_at=now(),editor_id=$3 WHERE page_id=$1 AND type='child_page' AND payload->>'target_id'=$2 AND deleted_at IS NULL",[page.parent_id,pageId,actor.userId]);
+    await changed(db,actor,page.parent_id,'child_moved');
+   }
+  }
+  if(body.trashed!==undefined && page.parent_id){
+   const references=(await db.query("SELECT * FROM notes_blocks WHERE page_id=$1 AND type='child_page' AND payload->>'target_id'=$2",[page.parent_id,pageId])).rows;
+   if(references.length){
+    const parent=(await db.query('SELECT * FROM comms_notes WHERE id=$1 FOR UPDATE',[page.parent_id])).rows[0];
+    await snapshot(db,parent,actor);
+    await db.query("UPDATE notes_blocks SET deleted_at=CASE WHEN $3 THEN now() ELSE NULL END,revision=revision+1,editor_id=$4,updated_at=now() WHERE page_id=$1 AND type='child_page' AND payload->>'target_id'=$2",[page.parent_id,pageId,body.trashed,actor.userId]);
+    await changed(db,actor,page.parent_id,body.trashed?'child_trashed':'child_restored');
+   }
+  }
   await changed(db,actor,pageId,body.trashed!==undefined?(body.trashed?'trashed':'restored'):body.archived!==undefined?(body.archived?'archived':'unarchived'):body.parent_id!==undefined?'moved':'edited');if(governance)await publishNoteChange(db,actor,pageId,'notes.membership.changed',[...oldAudience,...await noteAudience(db,actor,pageId)]);return detail(db,actor,pageId,{trash:'true'});
  });}
  async function editBlocks(input,pageId,body){return mutate(pool,input,async(db,actor)=>{
@@ -86,8 +108,14 @@ export function createNotesWorkspace({pool,notifications}){
   const seen=new Set();for(const op of body.operations){const blockId=uuid(op.id);if(seen.has(blockId))fail(400,'duplicate_block_operation');seen.add(blockId);
    const old=(await db.query('SELECT * FROM notes_blocks WHERE id=$1',[blockId])).rows[0];if(old&&old.page_id!==pageId)fail(404,'block_unavailable');
    if((old?.revision||0)!==op.expected_revision)fail(409,'block_conflict','This block changed. Your local draft has been preserved.');
+   if(old?.type==='child_page' && (op.delete||op.type!=='child_page'||op.payload?.target_id!==old.payload.target_id))fail(409,'protected_child_note','Hold the note and confirm Delete Note to remove it.');
    if(op.delete){if(!old)fail(404,'block_unavailable');const children=(await db.query('SELECT 1 FROM notes_blocks WHERE parent_id=$1 AND deleted_at IS NULL',[blockId])).rowCount;if(children)fail(409,'block_has_children','Move or remove nested blocks first.');await db.query('UPDATE notes_blocks SET deleted_at=now(),revision=revision+1,editor_id=$2,updated_at=now() WHERE id=$1',[blockId,actor.userId]);continue;}
-   const block=blockInput(op);await validateBlockReferences(db,actor,block);
+   const block={...blockInput(op),page_id:pageId};await validateBlockReferences(db,actor,block);
+   if(block.type==='child_page'){
+    const {page:child}=await authorizePage(db,actor,block.payload.target_id);
+    if(child.parent_id!==pageId)fail(400,'invalid_child_note','The nested note must belong to this parent.');
+    if((await db.query("SELECT 1 FROM notes_blocks WHERE page_id=$1 AND type='child_page' AND payload->>'target_id'=$2 AND id<>$3 AND deleted_at IS NULL",[pageId,child.id,blockId])).rowCount)fail(409,'duplicate_child_note');
+   }
    const priorMentions=new Set((old?.payload?.mentions||[]).map(m=>m.user_id));const newMentions=[...new Set((block.payload.mentions||[]).map(m=>m.user_id))].filter(id=>!priorMentions.has(id));
    for(const userId of newMentions)await authorizePage(db,{userId,companyId:actor.companyId},pageId);
    if(block.parent_id){const parents=(await db.query(`WITH RECURSIVE tree AS (SELECT id,parent_id,ARRAY[id] path,0 depth FROM notes_blocks WHERE id=$1 AND page_id=$2 AND deleted_at IS NULL UNION ALL SELECT p.id,p.parent_id,t.path||p.id,t.depth+1 FROM tree t JOIN notes_blocks p ON p.id=t.parent_id AND p.page_id=$2 WHERE t.depth<8 AND NOT p.id=ANY(t.path)) SELECT * FROM tree`,[block.parent_id,pageId])).rows;if(!parents.length||parents.some(p=>p.id===blockId||p.depth>=7))fail(400,'invalid_block_parent');}
@@ -98,7 +126,17 @@ export function createNotesWorkspace({pool,notifications}){
   await db.query(`UPDATE comms_notes SET body=COALESCE((SELECT string_agg(left(payload->>'text',50000),E'\n' ORDER BY position,id) FROM notes_blocks WHERE page_id=$1 AND deleted_at IS NULL),''),content_format='blocks' WHERE id=$1`,[pageId]);
   const saved=await changed(db,actor,pageId,'blocks_edited');await db.query('INSERT INTO notes_operations(page_id,actor_id,client_key,result) VALUES($1,$2,$3,$4)',[pageId,actor.userId,key,JSON.stringify({revision:saved.revision,block_ids:[...seen]})]);const response=await detail(db,actor,pageId);response.changed_blocks=[];for(const block of (await db.query('SELECT * FROM notes_blocks WHERE page_id=$1 AND id=ANY($2::uuid[])',[pageId,[...seen]])).rows)response.changed_blocks.push(await hydrateBlock(db,actor,block));return response;
  });}
- async function personal(input,pageId,body){return mutate(pool,input,async(db,actor)=>{await authorizePage(db,actor,pageId);const old=(await db.query('SELECT * FROM notes_personal WHERE page_id=$1 AND user_id=$2',[pageId,actor.userId])).rows[0]||{};const collapsed=body.collapsed??old.collapsed??[];if(!Array.isArray(collapsed)||collapsed.length>5000)fail(400,'invalid_collapsed');await db.query(`INSERT INTO notes_personal(page_id,user_id,favorite,pinned,opened_at,collapsed) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(page_id,user_id) DO UPDATE SET favorite=$3,pinned=$4,opened_at=$5,collapsed=$6`,[pageId,actor.userId,body.favorite??old.favorite??false,body.pinned??old.pinned??false,body.opened===true?new Date():old.opened_at||null,JSON.stringify(collapsed.map(uuid))]);return {ok:true};});}
+ async function personal(input,pageId,body){return mutate(pool,input,async(db,actor)=>{
+  await authorizePage(db,actor,pageId);
+  for(const key of ['favorite','pinned','opened'])if(body[key]!==undefined&&typeof body[key]!=='boolean')fail(400,'invalid_personal_setting');
+  if(body.collapsed!==undefined&&(!Array.isArray(body.collapsed)||body.collapsed.length>5000))fail(400,'invalid_collapsed');
+  const collapsed=body.collapsed===undefined?null:JSON.stringify(body.collapsed.map(uuid));
+  // Update only supplied fields: an opened-at event cannot undo a simultaneous pin.
+  await db.query(`INSERT INTO notes_personal(page_id,user_id,favorite,pinned,opened_at,collapsed)
+   VALUES($1,$2,COALESCE($3::boolean,false),COALESCE($4::boolean,false),CASE WHEN $5 THEN now() ELSE NULL END,COALESCE($6::jsonb,'[]'))
+   ON CONFLICT(page_id,user_id) DO UPDATE SET favorite=COALESCE($3,notes_personal.favorite),pinned=COALESCE($4,notes_personal.pinned),opened_at=CASE WHEN $5 THEN now() ELSE notes_personal.opened_at END,collapsed=COALESCE($6::jsonb,notes_personal.collapsed)`,[pageId,actor.userId,body.favorite??null,body.pinned??null,body.opened===true,collapsed]);
+  return {ok:true};
+ });}
  async function share(input,pageId,body){return mutate(pool,input,async(db,actor)=>{
   requireCapability(actor,'notes.share');const {page}=await authorizePage(db,actor,pageId,{level:4,lock:true});checkRevision(page,body.expected_revision);if(page.conversation_id)fail(409,'conversation_note_access');
   if(!Array.isArray(body.members)||body.members.length>100)fail(400,'invalid_members');const members=body.members.map(m=>({user_id:uuid(m.user_id),role:roles[m.role]}));if(members.some(m=>!m.role))fail(400,'invalid_role');
@@ -114,6 +152,11 @@ export function createNotesWorkspace({pool,notifications}){
  async function restore(input,pageId,body){return mutate(pool,input,async(db,actor)=>{
   const parentDatabase=(await db.query('SELECT database_id FROM notes_database_rows WHERE id=$1',[uuid(pageId)])).rows[0];if(parentDatabase)await authorizePage(db,actor,parentDatabase.database_id,{level:3,lock:true});
   const {page}=await authorizePage(db,actor,pageId,{level:3,lock:true});checkRevision(page,body.expected_revision);const row={snapshot:await readSnapshot(db,page,body.revision)};await snapshot(db,page,actor);
+  // Restoring old text must neither erase live children nor resurrect a deleted child.
+  const children=(await db.query("SELECT * FROM notes_blocks WHERE page_id=$1 AND type='child_page' AND deleted_at IS NULL",[pageId])).rows;
+  row.snapshot.blocks=row.snapshot.blocks.filter(b=>b.type!=='child_page');
+  const liveIDs=new Set(row.snapshot.blocks.map(b=>b.id));
+  row.snapshot.blocks.push(...children.map(b=>({...b,parent_id:liveIDs.has(b.parent_id)?b.parent_id:null})));
   for(const block of row.snapshot.blocks)await validateBlockReferences(db,actor,block);
   await databases.restoreState(db,actor,page,row.snapshot);
   await db.query('UPDATE notes_blocks SET deleted_at=now(),revision=revision+1 WHERE page_id=$1',[pageId]);
