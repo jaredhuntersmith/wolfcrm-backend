@@ -39,7 +39,7 @@ export async function installMCP({app,pool,rawPool=pool,authRequired,verifyIdent
   const output=await (name==='sales_report'?boundedRead(()=>d.handler(parsed)):d.write||name.startsWith('finance_')||input.entity==='expenses'?d.handler(parsed):transaction(pool,()=>d.handler(parsed)));
   return d.outputSchema.parse(JSON.parse(JSON.stringify(output)));
  };
- const manager=await installConnectionManager({app,pool,authRequired,env,catalog,execute});
+ const manager=await installConnectionManager({app,pool,authRequired,env,catalog,execute,startWorker:startMaintenance});
  const authenticateActor=token=>retell.accepts(token)?retell.authenticate(token):authenticate(pool,token,env.MCP_PUBLIC_ORIGIN+'/mcp');
  const enabled=()=>env.MCP_ENABLED==='true';
  const origin=env.MCP_PUBLIC_ORIGIN||'';let parsed;

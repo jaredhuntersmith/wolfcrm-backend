@@ -1,3 +1,4 @@
+import {installElevenLabs} from '../elevenlabs/index.js';
 import {configSchema,readConfig,missingRules} from '../retell/config.js';
 import {validateBookingConfiguration} from '../retell/settings-validation.js';
 import {randomUUID} from 'node:crypto';
@@ -10,7 +11,7 @@ import {newKey,principal as servicePrincipal} from '../retell/security.js';
 const rule=z.object({allow:z.boolean(),approval:z.boolean()}).strict();
 export const canManage=a=>a.isCompanyOwner||(a.permissions.preset==='admin'&&a.permissions.capabilities['ai.manage']&&a.permissions.capabilities['integrations.manage']);
 const guard=z.object({expected_company_id:z.uuid(),expected_revision:z.number().int().positive()});
-export async function installConnectionManager({app,pool,authRequired,env,catalog,execute}){
+export async function installConnectionManager({app,pool,authRequired,env,catalog,execute,startWorker=true}){
  await installManagerSchema(pool);
  const definitions=new Map(catalog.map(d=>[d.id,d]));
  const audit=(db,row,operation,outcome,userId=row.user_id)=>db.query('INSERT INTO mcp_audit(connection_id,company_id,user_id,operation,outcome) VALUES($1,$2,$3,$4,$5)',[row.id,row.company_id,userId,operation,outcome]);
@@ -142,5 +143,6 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
   if(i.expected_company_id!==req.companyId)throw fault(409,'account_changed');
   await transaction(pool,async db=>{await db.query('SELECT id FROM companies WHERE id=$1 FOR UPDATE',[req.companyId]);await manager(req.userId,req.companyId);const old=(await db.query('SELECT revision FROM mcp_company_policy WHERE company_id=$1',[req.companyId])).rows[0];if((old?.revision||0)!==i.expected_revision)throw fault(409,'policy_changed');await db.query('INSERT INTO mcp_company_policy(company_id,operating_hours) VALUES($1,$2) ON CONFLICT(company_id) DO UPDATE SET operating_hours=$2,revision=mcp_company_policy.revision+1',[req.companyId,JSON.stringify(i.operating_hours)]);await db.query("UPDATE mcp_approvals SET state='rejected',payload=NULL WHERE state='pending' AND connection_id IN(SELECT id FROM mcp_connections WHERE company_id=$1)",[req.companyId]);await db.query("INSERT INTO mcp_audit(company_id,user_id,operation,outcome) VALUES($1,$2,'company.hours_changed','success')",[req.companyId,req.userId]);});res.json({saved:true});
  }));
+ await installElevenLabs({app,pool,authRequired,env,safe,mutate,audit,startWorker});
  const api={check,invoke,decide,manager,initialize};app.locals.connectionManager=api;return api;
 }
