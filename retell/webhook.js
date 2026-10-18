@@ -15,7 +15,7 @@ export function installRetellWebhook({app,pool,env,startWorker=true}){
    if(!Buffer.isBuffer(req.body))throw fault(415,'raw_json_required');
    const raw=req.body.toString('utf8');let parsed;try{parsed=JSON.parse(raw);}catch{throw fault(400,'invalid_json');}
    const agent=parsed?.call?.agent_id;if(typeof agent!=='string'||agent.length>150)throw fault(401,'invalid_signature');
-   const connection=(await pool.query('SELECT * FROM retell_connections WHERE agent_id=$1',[agent])).rows[0];
+   const connection=(await pool.query("SELECT * FROM retell_connections WHERE agent_id=$1 AND provider='retell'",[agent])).rows[0];
    if(!connection?.webhook_secret)throw fault(401,'invalid_signature');
    const signature=req.get('x-retell-signature');
    if(!signature||signature.length>250||!await Retell.verify(raw,decrypt(connection.webhook_secret,connection.company_id,env),signature))throw fault(401,'invalid_signature');

@@ -1,10 +1,13 @@
 // Additive tables; CRM records remain in the existing contacts/calendar/call tables.
 export async function installRetellSchema(db) {
  await db.query(`CREATE TABLE IF NOT EXISTS retell_connections (
- id UUID PRIMARY KEY, company_id UUID NOT NULL UNIQUE REFERENCES companies(id), user_id UUID NOT NULL REFERENCES users(id),
+ id UUID PRIMARY KEY, company_id UUID NOT NULL REFERENCES companies(id), user_id UUID NOT NULL REFERENCES users(id),
  agent_id TEXT UNIQUE, key_hash TEXT UNIQUE, key_prefix TEXT, expires_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ,
  webhook_secret TEXT, config JSONB NOT NULL DEFAULT '{}', revision INTEGER NOT NULL DEFAULT 0,
  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_used_at TIMESTAMPTZ);
+ ALTER TABLE retell_connections ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'retell';
+ ALTER TABLE retell_connections DROP CONSTRAINT IF EXISTS retell_connections_company_id_key;
+ CREATE UNIQUE INDEX IF NOT EXISTS retell_connections_company_provider ON retell_connections(company_id,provider);
  CREATE TABLE IF NOT EXISTS retell_slots (
  id UUID PRIMARY KEY, connection_id UUID NOT NULL REFERENCES retell_connections(id), revision INTEGER NOT NULL,
  payload JSONB NOT NULL, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());

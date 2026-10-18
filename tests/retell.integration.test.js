@@ -44,6 +44,29 @@ test('Retell service credentials, isolated bookings and signed durable reporting
    assert.ok(!JSON.stringify(await settings()).includes(key));
    const encrypted=encrypt('private-provider-key',a,env);assert.equal(decrypt(encrypted,a,env),'private-provider-key');assert.throws(()=>decrypt(encrypted,b,env));
   });
+  await t.test('Jack has independent provider credentials, scopes, owner controls and revocation',async()=>{
+   const jackPath='/api/ai-connections/elevenlabs';
+   const jackSettings=async()=> (await request(jackPath)).body;
+   const jackMutate=async(path,body={},method='POST')=>{const s=await jackSettings();return request(jackPath+path,method,{expected_company_id:a,expected_revision:s.revision,...body});};
+   let snapshot=await jackSettings();assert.equal(snapshot.connection_name,'Jack');assert.equal(snapshot.config.quotes_enabled,true);assert.equal(snapshot.webhook_url,null);assert.equal(snapshot.scopes.includes('calls:report'),false);
+   assert.equal((await request(jackPath,'GET',undefined,'rt-worker')).status,403);
+   assert.equal((await jackMutate('',{config:snapshot.config},'PUT')).status,200);
+   assert.equal((await jackMutate('',{config:snapshot.config,agent_id:'agent-nope'},'PUT')).status,400);
+   const issued=await jackMutate('/key',{valid_days:30});assert.equal(issued.status,200);const jackKey=issued.body.key;assert.match(jackKey,/^wolf_service_/);
+   const jack=await connect(jackKey);const tools=(await jack.listTools()).tools.map(t=>t.name);
+   assert.ok(tools.includes('create_appointment'));assert.equal(tools.length,10);assert.ok(tools.includes('get_quote_context'));assert.equal((await settings()).key_prefix,key.slice(0,20));
+   assert.equal((await pool.query('SELECT count(*)::int n FROM retell_connections WHERE company_id=$1',[a])).rows[0].n,2);
+   const row=(await pool.query("SELECT * FROM retell_connections WHERE company_id=$1 AND provider='elevenlabs'",[a])).rows[0];assert.equal(row.agent_id,null);assert.equal(row.webhook_secret,null);assert.equal(row.config.automatic_booking,false);
+   assert.equal((await request('/api/quote-calculator/config','PUT',{config:{}},jackKey)).status,401);
+   assert.equal((await request(jackPath+'/key','POST',{expected_company_id:b,expected_revision:(await jackSettings()).revision,valid_days:30})).status,409);
+   env.RETELL_ENABLED='false';assert.ok((await jack.listTools()).tools.length);await assert.rejects(()=>client.listTools());env.RETELL_ENABLED='true';
+   env.MCP_SERVICE_KEYS_ENABLED='false';await assert.rejects(()=>jack.listTools());assert.ok((await client.listTools()).tools.length);delete env.MCP_SERVICE_KEYS_ENABLED;
+   const unavailable=await jack.callTool({name:'check_quote_availability',arguments:{address:addr,preferred_date_range:range}});assert.equal(unavailable.structuredContent.booking_enabled,false);
+   const rotated=(await jackMutate('/key',{valid_days:30})).body.key;await assert.rejects(()=>jack.listTools());const fresh=await connect(rotated);
+   await pool.query("UPDATE retell_connections SET expires_at=now()-interval '1 second' WHERE id=$1",[row.id]);await assert.rejects(()=>fresh.listTools());
+   await pool.query("UPDATE retell_connections SET expires_at=now()+interval '1 day' WHERE id=$1",[row.id]);assert.equal((await jackMutate('/revoke')).status,200);await assert.rejects(()=>fresh.listTools());assert.ok((await client.listTools()).tools.length);
+   snapshot=await jackSettings();assert.equal(snapshot.status,'Revoked');assert.ok(!JSON.stringify(snapshot).includes(jackKey));
+  });
   const config=configSchema.parse({quote_enabled:true,postal_codes:['10001'],quote_weekdays:[1,2,3,4,5,6,7],quote_start:'08:00',quote_end:'18:00',quote_duration_minutes:30,minimum_notice_minutes:0,horizon_days:30,start_increment_minutes:30,buffer_before_minutes:15,buffer_after_minutes:15,quote_worker_ids:[worker]});
   await t.test('explicit settings, expiry offsets, service area and scope-bound slots',async()=>{
    assert.equal((await mutate('',{agent_id:'agent-test',webhook_api_key:'test-provider-webhook-key',config},'PUT')).status,200);
@@ -175,6 +198,24 @@ test('Retell service credentials, isolated bookings and signed durable reporting
    const blockedEdit=await client.callTool({name:'save_quote_draft',arguments:{...args,quote_id:q.id,expected_revision:2,request_key:'after-booking'}});assert.ok(blockedEdit.isError);
    const details=await call('get_quote_draft',{quote_id:q.id,section:'answers'});assert.equal(details.data.items[0].answer.value,40);
    const first=await call('list_quote_options',{lead_id:lead,limit:1});assert.equal(first.data.next_offset,1);const second=await call('list_quote_options',{lead_id:lead,limit:1,offset:1});assert.notEqual(first.data.items[0].quote_id,second.data.items[0].quote_id);
+  });
+  await t.test('Jack reads isolated customer context and creates alternatives without pricing access',async()=>{
+   const path='/api/ai-connections/elevenlabs',snapshot=(await request(path)).body;
+   const key=(await request(path+'/key','POST',{expected_company_id:a,expected_revision:snapshot.revision,valid_days:1})).body.key;
+   const jack=await connect(key),query=async(name,args)=>{const r=await jack.callTool({name,arguments:args});return r;};
+   const own=(await pool.query('SELECT id FROM contacts WHERE company_id=$1 LIMIT 1',[a])).rows[0].id;
+   const foreign=(await pool.query('SELECT id FROM contacts WHERE company_id=$1 LIMIT 1',[b])).rows[0].id;
+   assert.ok(!(await query('get_quote_context',{lead_id:own})).isError);
+   assert.ok((await query('get_quote_context',{lead_id:foreign})).isError);
+   const quote=(await pool.query("SELECT id FROM quotes WHERE company_id=$1 AND calculation IS NOT NULL LIMIT 1",[a])).rows[0];
+   const details=await query('get_quote_draft',{quote_id:quote.id});assert.ok(!details.isError);
+   const revision=details.structuredContent.data.quote.revision;
+   const args={quote_id:quote.id,expected_revision:revision,title:'Jack alternative',request_key:'jack-alternative'};
+   const created=await query('duplicate_quote_draft',args);assert.ok(!created.isError);assert.notEqual(created.structuredContent.data.id,quote.id);
+   assert.deepEqual((await query('duplicate_quote_draft',args)).structuredContent,created.structuredContent);
+   await assert.rejects(()=>query('crm_action',{operation:'quote_create'}));
+   const current=(await request(path)).body;await request(path,'PUT',{expected_company_id:a,expected_revision:current.revision,config:{...current.config,quotes_enabled:false}});
+   assert.equal((await jack.listTools()).tools.length,3);await assert.rejects(()=>query('get_quote_context',{lead_id:own}));
   });
   await t.test('expired/revoked/rotated keys and removed membership fail',async()=>{
    await pool.query("UPDATE retell_connections SET expires_at=now()-interval '1 minute' WHERE company_id=$1",[a]);await assert.rejects(()=>connect(key));

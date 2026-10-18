@@ -94,3 +94,12 @@ npm test. All test writes use disposable PostgreSQL fixtures. Real client/call
 verification requires the owner's Retell account and must be reported separately.
 
 Full machine-readable input/output JSON Schemas: docs/retell/TOOLS.json in the iOS repository. Slot-bound facts are revalidated at save; callers may repeat them in create_appointment but cannot change them while keeping a slot. Only confirmed means a saved appointment. Other results reserve no time.
+
+## ElevenLabs / Jack (WOLF-054)
+The service credential and scheduling engine now also supports `/api/ai-connections/elevenlabs`.
+Owner-only key, revoke, settings and review routes are provider/company scoped.
+Jack needs no Retell credentials and has no call-reporting webhook. Its `wolf_service_`
+keys use `MCP_ENABLED` and optional `MCP_SERVICE_KEYS_ENABLED=false` kill switch;
+Retell keys keep `RETELL_ENABLED`. Existing OAuth is unchanged. See root
+`docs/elevenlabs/README.md` for setup, migration and rollback. Do not roll back to
+company-only lookup code after creating a second provider connection.
