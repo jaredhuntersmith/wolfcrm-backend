@@ -5,6 +5,7 @@ import {Client,StreamableHTTPClientTransport} from '@modelcontextprotocol/client
 import {startLocalPostgres} from './helpers/local-postgres.js';
 import {installGoogleSheetsSchema} from '../google-sheets.js';
 import {installAutomationSystem,automationTestHooks} from '../automations.js';
+import {installAgreementBookingSchema} from '../agreement-booking.js';
 import {installMCP} from '../mcp/index.js';
 import {withinHours,accessStatus,alwaysHours,hoursSchema} from '../mcp/hours.js';
 import {controlConnectionFromAutomation} from '../mcp/automation.js';
@@ -22,7 +23,7 @@ test('operating hours: boundaries, overnight, DST, exceptions and intersection',
 test('native manager with real PostgreSQL and SDK: policies, keys, approvals, cap and isolation',{timeout:180000},async t=>{
  const pg=startLocalPostgres();pg.configureEnvironment();let backend,server;const clients=[];
  try{
-  backend=await import('../index.js');await backend.bootstrap();const {pool,rawPool,app,authRequired}=backend;await installGoogleSheetsSchema(pool);await installAutomationSystem({app,pool,authRequired,requireEmployer:(_r,_s,n)=>n(),disableProcessors:true});
+  backend=await import('../index.js');await backend.bootstrap();await installAgreementBookingSchema(backend.pool);const {pool,rawPool,app,authRequired}=backend;await installGoogleSheetsSchema(pool);await installAutomationSystem({app,pool,authRequired,requireEmployer:(_r,_s,n)=>n(),disableProcessors:true});
   const a=randomUUID(),b=randomUUID(),owner=randomUUID(),other=randomUUID(),employee=randomUUID(),admin=randomUUID();
   await pool.query("INSERT INTO companies(id,name,join_code,owner_user_id) VALUES($1,'Manager QA A','MGA',$3),($2,'Manager QA B','MGB',$4)",[a,b,owner,other]);
   for(const [id,cid,role]of [[owner,a,'employer'],[other,b,'employer'],[employee,a,'employee'],[admin,a,'employee']])await pool.query('INSERT INTO users(id,email,display_name,company_id,role) VALUES($1,$2,$3,$4,$5)',[id,id+'@example.invalid','QA user',cid,role]);
@@ -50,6 +51,23 @@ test('native manager with real PostgreSQL and SDK: policies, keys, approvals, ca
    const foreign=(await create('Foreign',other,b)).body;assert.equal((await http(base+'/'+foreign.id+'/revoke','POST',guard())).status,404);
    assert.equal((await save({tool_policy:{future_tool:{allow:true,approval:false}}})).status,400);
    assert.equal((await save({tool_policy:{quote_draft:{allow:true,approval:false}}})).status,403);
+  });
+  await t.test('native booking configuration: no invented duration, isolated choices, incomplete paths and stale acknowledgement',async()=>{
+   assert.equal(row.booking_config.quote_duration_minutes,null);assert.equal(row.booking_config.quote_enabled,false);
+   assert.ok(row.booking_workers.every(w=>w.id!==other));
+   const config={...row.booking_config,postal_codes:['10001']};
+   assert.equal((await save({booking_config:config})).status,200);assert.deepEqual(row.booking_config.postal_codes,['10001']);
+   assert.equal((await save({booking_config:{...config,quote_enabled:true}})).body.error,'booking_rules_incomplete');
+   assert.equal((await save({booking_config:{...config,quote_worker_ids:[other]}})).body.error,'invalid_workers');
+   const foreignService=randomUUID();await pool.query("INSERT INTO saved_services(id,company_id,name) VALUES($1,$2,'Foreign service')",[foreignService,b]);
+   assert.ok(!row.booking_services.some(s=>s.id===foreignService));
+   assert.equal((await save({booking_config:{...config,direct_job_profiles:[{id:randomUUID(),name:'QA',service_ids:[foreignService],property_type:'residential',max_stories:2,max_window_count:null,duration_minutes:60}]}})).body.error,'invalid_profile_services');
+   assert.equal((await save({booking_config:{...config,job_rules_acknowledged:true},automatic_booking:true})).status,200);
+   assert.equal(row.booking_config.job_rules_acknowledged,true);assert.equal(row.automatic_booking,true);
+   await pool.query("UPDATE companies SET customer_booking_settings='{\"enabled\":false,\"qa_changed\":true}' WHERE id=$1",[a]);await fresh();
+   assert.equal(row.booking_config.job_rules_acknowledged,false);assert.ok(row.missing_booking_rules.job.includes('review existing Schedule booking rules'));
+   assert.equal((await save({name:'Renamed without rule consent'})).status,200);assert.equal(row.booking_config.job_rules_acknowledged,false);
+   assert.equal((await save({booking_config:{...row.booking_config,job_enabled:true,job_rules_acknowledged:true,require_quote_acceptance:false,require_deposit:false}})).body.error,'configure_schedule_booking_first');
   });
   await t.test('per-call access and read approval exact arguments, rejection, expiry, no protected data',async()=>{
    assert.equal((await save({tool_policy:{crm_identity:{allow:true,approval:true}}})).status,200);

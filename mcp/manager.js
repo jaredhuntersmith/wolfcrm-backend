@@ -1,3 +1,5 @@
+import {configSchema,readConfig,missingRules} from '../retell/config.js';
+import {validateBookingConfiguration} from '../retell/settings-validation.js';
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {loadPrincipal,permit,scopes,rateLimit,connection} from './access.js';
@@ -89,12 +91,14 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
  async function snapshot(row,actor){
   const company=(await pool.query('SELECT operating_hours FROM mcp_company_policy WHERE company_id=$1',[row.company_id])).rows[0];
   const r=row.kind==='service'?(await pool.query('SELECT config,key_hash,key_prefix,expires_at,revoked_at FROM retell_connections WHERE id=$1',[row.id])).rows[0]:null;
+  const bookingConfig=r?readConfig(r.config):null;
+  if(bookingConfig?.job_rules_acknowledged){const settings=(await pool.query('SELECT customer_booking_settings FROM companies WHERE id=$1',[row.company_id])).rows[0];if(r.config.job_rules_hash!==digest(settings?.customer_booking_settings))bookingConfig.job_rules_acknowledged=false;}
   const status=accessStatus({...row,revoked_at:row.revoked_at||r?.revoked_at},company?.operating_hours,new Date(),{next:true});
   let authentication=row.revoked_at||r?.revoked_at?'revoked':(row.kind==='service'&&!r?.key_hash)?'key_required':new Date(r?.expires_at||row.expires_at)<=new Date()?'expired':'configured';
   try{await loadPrincipal(pool,row.user_id,row.company_id,{enforceOAuthRolePolicy:row.kind==='oauth'});}catch{authentication='membership_inactive';}
   const sponsor=await loadPrincipal(pool,row.user_id,row.company_id,{enforceOAuthRolePolicy:false}).catch(()=>null);
   const effective=sponsor?{...sponsor,scopes:row.kind==='service'?Object.keys(scopes).concat(['availability:read','appointments:book','quotes:read','quotes:draft']):row.scopes}:null;
-  return {...Object.fromEntries(['id','kind','name','description','provider','enabled','paused_until','archived_at','revoked_at','operating_hours','tool_policy','revision','created_at','last_used_at','expires_at'].map(k=>[k,row[k]??null])),company_id:row.company_id,authentication,access:status,key_prefix:r?.key_prefix||null,automatic_booking:r?.config?.automatic_booking||false,catalog:catalog.map(d=>({...d,available:!!effective&&available(d,row,effective)&&d.caps.every(c=>actor.permissions.capabilities[c]),unavailable_reason:row.kind==='service'&&['quote_draft','appointment_create','appointment_update'].includes(d.id)?'Use the calculator draft tools and create_appointment to preserve pricing and booking rules.':null}))};
+  return {...Object.fromEntries(['id','kind','name','description','provider','enabled','paused_until','archived_at','revoked_at','operating_hours','tool_policy','revision','created_at','last_used_at','expires_at'].map(k=>[k,row[k]??null])),company_id:row.company_id,authentication,access:status,key_prefix:r?.key_prefix||null,automatic_booking:r?.config?.automatic_booking||false,booking_config:bookingConfig,booking_workers:r?(await pool.query('SELECT id,display_name AS name FROM users WHERE company_id=$1 AND deleted_at IS NULL ORDER BY display_name LIMIT 200',[row.company_id])).rows:[],booking_services:r?(await pool.query('SELECT id,name FROM saved_services WHERE company_id=$1 AND archived_at IS NULL ORDER BY name LIMIT 500',[row.company_id])).rows:[],missing_booking_rules:r?{quote:missingRules(bookingConfig,'quote'),job:missingRules(bookingConfig,'job')}:null,catalog:catalog.map(d=>({...d,available:!!effective&&available(d,row,effective)&&d.caps.every(c=>actor.permissions.capabilities[c]),unavailable_reason:row.kind==='service'&&['quote_draft','appointment_create','appointment_update'].includes(d.id)?'Use the calculator draft tools and create_appointment to preserve pricing and booking rules.':null}))};
  }
  app.get('/api/ai-connections/manager',authRequired,safe(async(req,res)=>{
   const rows=(await pool.query('SELECT * FROM mcp_connections WHERE company_id=$1 ORDER BY created_at DESC LIMIT 200',[req.companyId])).rows;
@@ -107,18 +111,21 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
  app.post('/api/ai-connections/manager',authRequired,safe(async(req,res)=>{
   const i=z.object({expected_company_id:z.uuid(),name:z.string().trim().min(1).max(100),description:z.string().max(1000).default(''),provider:z.string().max(80).default('')}).strict().parse(req.body);if(i.expected_company_id!==req.companyId)throw fault(409,'account_changed');
   const row=await transaction(pool,async db=>{await lockConnectionSlot(db,req.companyId);await manager(req.userId,req.companyId);const id=randomUUID();
-   await db.query("INSERT INTO retell_connections(id,company_id,user_id,provider,managed,config) VALUES($1,$2,$3,'generic',true,'{\"quotes_enabled\":true}')",[id,req.companyId,req.userId]);
+   await db.query("INSERT INTO retell_connections(id,company_id,user_id,provider,managed,config) VALUES($1,$2,$3,'generic',true,'{\"quotes_enabled\":true,\"quote_duration_minutes\":null}')",[id,req.companyId,req.userId]);
    const r=(await db.query("INSERT INTO mcp_connections(id,user_id,company_id,client_id,scopes,audience,kind,name,description,provider,tool_policy) VALUES($1,$2,$3,'wolf-service',$4,'service','service',$5,$6,$7,'{}') RETURNING *",[id,req.userId,req.companyId,JSON.stringify(Object.keys(scopes)),i.name,i.description,i.provider||null])).rows[0];await audit(db,r,'connection.created','success');return r;});res.status(201).json(await snapshot(row,req.manager));
  }));
  async function mutate(req,work){return transaction(pool,async db=>{const i=guard.parse(req.body);if(i.expected_company_id!==req.companyId)throw fault(409,'account_changed');await db.query('SELECT id FROM companies WHERE id=$1 FOR UPDATE',[req.companyId]);await manager(req.userId,req.companyId);const row=await rowFor(db,z.uuid().parse(req.params.id),req.companyId);if(row.revision!==i.expected_revision)throw fault(409,'connection_changed','Reload this connection before saving.');const result=await work(db,row);await db.query("UPDATE mcp_connections SET revision=revision+1 WHERE id=$1",[row.id]);await db.query("UPDATE mcp_approvals SET state='rejected',payload=NULL WHERE connection_id=$1 AND state='pending'",[row.id]);return result;});}
  app.put('/api/ai-connections/manager/:id',authRequired,safe(async(req,res)=>{
-  const i=guard.extend({name:z.string().trim().min(1).max(100),description:z.string().max(1000),provider:z.string().max(80).nullable(),enabled:z.boolean(),paused_until:z.iso.datetime({offset:true}).nullable(),operating_hours:hoursSchema.nullable(),tool_policy:z.record(z.string(),rule),automatic_booking:z.boolean()}).strict().parse(req.body);
+  const i=guard.extend({name:z.string().trim().min(1).max(100),description:z.string().max(1000),provider:z.string().max(80).nullable(),enabled:z.boolean(),paused_until:z.iso.datetime({offset:true}).nullable(),operating_hours:hoursSchema.nullable(),tool_policy:z.record(z.string(),rule),automatic_booking:z.boolean(),booking_config:configSchema.optional()}).strict().parse(req.body);
   res.json(await mutate(req,async(db,row)=>{
    if(row.revoked_at||row.archived_at)throw fault(409,'connection_inactive');
    const sponsor=await loadPrincipal(db,row.user_id,row.company_id,{enforceOAuthRolePolicy:false});const actor={...sponsor,scopes:row.kind==='service'?Object.keys(scopes).concat(['availability:read','appointments:book','quotes:read','quotes:draft']):row.scopes};
    for(const [id,r]of Object.entries(i.tool_policy)){const d=definitions.get(id),old=row.tool_policy?.[id];if(!d){if(JSON.stringify(r)!==JSON.stringify(old))throw fault(400,'unknown_tool');continue;}const expanding=r.allow&&(!old?.allow||(old.approval&&!r.approval));if(expanding&&(!available(d,row,actor)||d.caps.some(c=>!req.manager.permissions.capabilities[c])))throw fault(403,'tool_not_available');}
    await db.query('UPDATE mcp_connections SET name=$2,description=$3,provider=$4,enabled=$5,paused_until=$6,operating_hours=$7,tool_policy=$8 WHERE id=$1',[row.id,i.name,i.description,i.provider,i.enabled,i.paused_until,JSON.stringify(i.operating_hours),JSON.stringify(i.tool_policy)]);
-   if(row.kind==='service')await db.query("UPDATE retell_connections SET config=jsonb_set(config,'{automatic_booking}',$2::jsonb),revision=revision+1 WHERE id=$1",[row.id,JSON.stringify(i.automatic_booking)]);
+   if(row.kind==='service'){
+    if(i.booking_config){const config=await validateBookingConfiguration(db,req.companyId,{...i.booking_config,automatic_booking:i.automatic_booking});await db.query('UPDATE retell_connections SET config=$2,revision=revision+1 WHERE id=$1',[row.id,JSON.stringify(config)]);}
+    else await db.query("UPDATE retell_connections SET config=jsonb_set(config,'{automatic_booking}',$2::jsonb),revision=revision+1 WHERE id=$1",[row.id,JSON.stringify(i.automatic_booking)]);
+   }
    await audit(db,row,'connection.updated','success',req.userId);return {saved:true};
   }));
  }));
