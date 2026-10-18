@@ -1,4 +1,4 @@
-import {installAgreementSchema} from '../quote-agreements.js';
+import {installAgreementSchema,installAgreementSystem} from '../quote-agreements.js';
 import {validateCatalog} from '../quote-calculator/domain.js';
 // Local browser QA only: disposable PostgreSQL, loopback HTTP, synthetic users,
 // no background processors, no environment/production database reuse.
@@ -20,6 +20,7 @@ async function stop(){if(stopping)return;stopping=true;try{if(clientReceiver){cl
 for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>void stop().then(()=>process.exit(0)));
 try {
  await backend.bootstrap();await installServiceCatalogSchema(pool);await installAgreementSchema(pool);
+ await installAgreementSystem({app,pool,authRequired,requireCapability:backend.requireCapability,getQuoteSettings:backend.getQuoteSettings,env:{NODE_ENV:"test",QUOTE_LINK_SECRET:"synthetic-browser-quote-key-at-least-thirty-two-characters",QUOTE_PUBLIC_BASE_URL:"http://127.0.0.1:18589"},startWorker:false});
  const company=randomUUID(),owner=randomUUID(),employee=randomUUID();
  await pool.query("INSERT INTO companies(id,name,join_code,owner_user_id) VALUES($1,'MCP Browser QA','MCP-QA',$2)",[company,owner]);
  for(const [id,email,role]of [[owner,'mcp-owner@example.invalid','employer'],[employee,'mcp-tech@example.invalid','employee']])await pool.query('INSERT INTO users(id,email,display_name,company_id,role,password_hash) VALUES($1,$2,$3,$4,$5,$6)',[id,email,'QA '+role,company,role,backend.hashPassword('Synthetic-MCP-QA-428!')]);
