@@ -151,6 +151,31 @@ test('Retell service credentials, isolated bookings and signed durable reporting
    assert.equal(JSON.parse((await pool.query("SELECT disposition FROM phone_calls WHERE provider_call_id='claimed-confirmation'")).rows[0].disposition).appointment_status,'unverified');
 
   });
+  await t.test('Riley quote opt-in, configured drafts, alternatives and revision-bound booking',async()=>{
+   const serviceID=randomUUID(),lead=randomUUID();
+   await pool.query("INSERT INTO saved_services(id,company_id,name) VALUES($1,$2,'Calculator QA service')",[serviceID,a]);
+   await pool.query("INSERT INTO contacts(id,user_id,company_id,name,phone,address,lead_info) VALUES($1,$2,$3,'Calculator QA','+12025550177',$4,$5)",[lead,owner,a,addr,JSON.stringify(['Facebook lead synthetic\nWindow count\n30'])]);
+   const calculator={questions:[{id:'windows',label:'Window count',type:'number',unit:'count',required:true,lead_field:'Window count',service_ids:[serviceID]}],services:[{service_id:serviceID,crew_size:1,elapsed_ratio_bp:10000}],components:[{id:'exterior',name:'Exterior',service_ids:[serviceID],scope:'service',unit:'count',quantity_fact:'windows',decimal_quantity:false,selection:'required',money_enabled:true,time_enabled:true,unit_cents:1000,unit_seconds:60,visible:true}]};
+   const conf=await request('/api/quote-calculator/config','PUT',{expected_revision:0,config:calculator});assert.equal(conf.status,200,JSON.stringify(conf));
+   config.quotes_enabled=true;assert.equal((await mutate('',{agent_id:'agent-test',config},'PUT')).status,200);
+   const discovered=(await client.listTools()).tools.map(t=>t.name);assert.equal(discovered.length,10);assert.ok(discovered.includes('save_quote_draft'));
+   const context=await call('get_quote_context',{lead_id:lead});assert.equal(context.data.contact.id,lead);assert.equal(context.data.items[0].answer.value,30);
+   for(const section of ['services','questions','components','policies']){const defs=await call('get_quote_definitions',{service_ids:[serviceID],section,limit:1});assert.ok(defs.data.items.length,JSON.stringify(defs));}
+   const args={contact_id:lead,title:'Option A',request_key:'quote-a',input:{service_ids:[serviceID],answers:{windows:{value:30,source:'confirmed'}}}};
+   const response=await call('save_quote_draft',args);assert.ok(response.data?.id,JSON.stringify(response));const q=response.data;assert.equal(q.calculation.pricing.total_cents,30000);assert.equal(q.calculation.elapsed_seconds,1800);assert.deepEqual((await call('save_quote_draft',args)).data,q);
+   const bad=await client.callTool({name:'save_quote_draft',arguments:{...args,request_key:'cheat',manual:{reason:'cheat',service_cents:{[serviceID]:1}}}});assert.ok(bad.isError);
+   const duplicate=(await call('duplicate_quote_draft',{quote_id:q.id,expected_revision:1,title:'Option B',request_key:'quote-b'})).data;assert.notEqual(duplicate.id,q.id);assert.equal((await call('list_quote_options',{lead_id:lead})).data.items.length,2);
+   assert.equal((await request('/api/quote-calculator/config','PUT',{expected_revision:1,config:calculator},key)).status,401);
+   const inquiry={lead_id:lead,address:addr,quote_id:q.id,quote_revision:1,preferred_date_range:range};let availability=await call('check_job_availability',inquiry);assert.equal(availability.estimated_duration_min,30,JSON.stringify(availability));assert.ok(availability.slots.length);
+   const changed=(await call('save_quote_draft',{...args,quote_id:q.id,expected_revision:1,request_key:'quote-edit',input:{...args.input,answers:{windows:{value:40,source:'confirmed'}}}})).data;assert.equal(changed.revision,2);
+   const stale=await call('create_appointment',{type:'job',slot_id:availability.slots[0].slot_id,lead_id:lead,quote_id:q.id,quote_revision:1,address:addr,customer:{name:'Calculator QA',phone:'+12025550177'},idempotency_key:'stale-quote-booking'});assert.equal(stale.status,'failed');
+   availability=await call('check_job_availability',{...inquiry,quote_revision:2});assert.equal(availability.estimated_duration_min,40);
+   const booked=await call('create_appointment',{type:'job',slot_id:availability.slots[0].slot_id,lead_id:lead,quote_id:q.id,quote_revision:2,address:addr,customer:{name:'Calculator QA',phone:'+12025550177'},idempotency_key:'calculated-booking'});assert.equal(booked.status,'confirmed',JSON.stringify(booked));
+   const record=(await pool.query('SELECT quote_id,price_cents FROM schedule_events WHERE id=$1',[booked.appointment_id])).rows[0];assert.equal(record.quote_id,q.id);assert.equal(record.price_cents,40000);
+   const blockedEdit=await client.callTool({name:'save_quote_draft',arguments:{...args,quote_id:q.id,expected_revision:2,request_key:'after-booking'}});assert.ok(blockedEdit.isError);
+   const details=await call('get_quote_draft',{quote_id:q.id,section:'answers'});assert.equal(details.data.items[0].answer.value,40);
+   const first=await call('list_quote_options',{lead_id:lead,limit:1});assert.equal(first.data.next_offset,1);const second=await call('list_quote_options',{lead_id:lead,limit:1,offset:1});assert.notEqual(first.data.items[0].quote_id,second.data.items[0].quote_id);
+  });
   await t.test('expired/revoked/rotated keys and removed membership fail',async()=>{
    await pool.query("UPDATE retell_connections SET expires_at=now()-interval '1 minute' WHERE company_id=$1",[a]);await assert.rejects(()=>connect(key));
    const next=(await mutate('/key',{valid_days:30})).body.key;await assert.rejects(()=>connect(key));const c=await connect(next);

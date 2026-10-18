@@ -20,10 +20,19 @@ export async function evaluateEligibility({db,app,actor,input}){
  if(!c.job_enabled||jobMissing.length){job.reason=jobMissing.length?'configuration_required':'job_booking_disabled';return finish();}
  if(!lead){job.reason='lead_id_required_for_direct_job';return finish();}
  if(normalizeText(lead.address||'')!==normalizeText(input.address)){job.reason='lead_address_requires_review';return finish();}
+ if(input.quote_id){
+  const q=(await db.query('SELECT * FROM quotes WHERE id=$1 AND company_id=$2 AND contact_id=$3 AND deleted_at IS NULL FOR SHARE',[input.quote_id,actor.companyId,lead.id])).rows[0];
+  if(!q)throw fault(404,'quote_unavailable');if(q.calculation_revision!==input.quote_revision)throw fault(409,'quote_revision_changed');
+  if(!q.calculation||q.calculation.manual||!q.calculation.result.complete_for_scheduling){job.reason='configuration_required';jobMissing.push('complete configured quote, confirmed answers, elapsed duration and crew rules');return finish();}
+  if((await db.query('SELECT id FROM schedule_events WHERE company_id=$1 AND quote_id=$2 LIMIT 1',[actor.companyId,q.id])).rowCount){job.reason='quote_already_scheduled';return finish();}
+  const ids=q.line_items.map(l=>l.service_id);if(input.services?.length&&!same(input.services,ids)&&!same(input.services.map(normalizeText),q.line_items.map(l=>normalizeText(l.name)))){job.reason='quote_scope_changed';return finish();}
+  input={...input,services:ids};result.calculatedQuote=q;result.crewSize=q.calculation.result.crew_size;
+ }
  if(!input.services?.length){job.reason='services_required';return finish();}
  if(!app.locals.agreementBooking||!app.locals.agreements){job.reason='configuration_required';jobMissing.push('agreement booking service');return finish();}
  const rows=(await db.query(`SELECT * FROM quote_agreements WHERE company_id=$1 AND contact_id=$2 AND revoked_at IS NULL AND ($3::uuid IS NULL OR id=$3) ORDER BY created_at DESC LIMIT 20`,[actor.companyId,lead.id,input.agreement_id||null])).rows;
  for(const row of rows){
+  if(input.quote_id&&row.quote_id!==input.quote_id)continue;
   const lines=row.snapshot.pricing?.line_items||[];
   if(!same(input.services.map(normalizeText),lines.map(l=>normalizeText(l.name)))&&!same(input.services,lines.map(l=>l.service_id)))continue;
   const latest=(await db.query('SELECT id FROM quote_agreements WHERE company_id=$1 AND quote_id=$2 AND revoked_at IS NULL ORDER BY revision DESC LIMIT 1',[actor.companyId,row.quote_id])).rows[0];
@@ -39,6 +48,7 @@ export async function evaluateEligibility({db,app,actor,input}){
  }else{
   if(c.require_quote_acceptance){job.reason='accepted_quote_required';return finish();}
   if(c.require_deposit){job.reason='configuration_required';jobMissing.push('a published agreement defining and recording the required deposit');return finish();}
+  if(result.calculatedQuote){result.profile={id:'quote:'+result.calculatedQuote.id};result.duration=Math.ceil(result.calculatedQuote.calculation.result.elapsed_seconds/60);result.lineItems=result.calculatedQuote.line_items;}else{
   const catalog=(await db.query('SELECT id,name FROM saved_services WHERE company_id=$1 AND archived_at IS NULL ORDER BY id LIMIT 501',[actor.companyId])).rows;
   if(catalog.length>500){job.reason='configuration_required';jobMissing.push('service catalog review');return finish();}
   const lines=[];for(const requested of input.services){const matches=catalog.filter(s=>s.id===requested||normalizeText(s.name)===normalizeText(requested));if(matches.length!==1){job.reason='service_requires_quote';return finish();}lines.push({service_id:matches[0].id,name:matches[0].name});}
@@ -47,6 +57,7 @@ export async function evaluateEligibility({db,app,actor,input}){
   if(profiles.length!==1){job.reason='configuration_required';jobMissing.push('one direct-job duration profile for these services and property type');return finish();}
   const profile=profiles[0];if(input.stories>profile.max_stories||profile.max_window_count!==null&&(input.window_count===undefined||input.window_count>profile.max_window_count)){job.reason='property_requires_quote';return finish();}
   result.profile=profile;result.duration=profile.duration_minutes;result.lineItems=lines;
+  }
  }
  const company=(await db.query('SELECT customer_booking_settings,timezone FROM companies WHERE id=$1',[actor.companyId])).rows[0],raw=company.customer_booking_settings||{};
  for(const field of ['minimum_notice_minutes','horizon_days','start_increment_minutes','buffer_before_minutes','buffer_after_minutes'])if(raw[field]===undefined)jobMissing.push(field);

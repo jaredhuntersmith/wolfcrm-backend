@@ -15,8 +15,13 @@ export async function selectedQuoteScheduleScope(db,{companyId,quoteId,previous,
   if (!(await db.query("SELECT to_regclass('quote_agreements') IS NOT NULL AS present")).rows[0].present) return null;
   const targetQuote = previous?.quote_id || quoteId;
   if (targetQuote) {
-    const quote = (await db.query("SELECT id,deleted_at FROM quotes WHERE id=$1 AND company_id=$2 FOR UPDATE",[targetQuote,companyId])).rows[0];
+    const quote = (await db.query("SELECT id,deleted_at,to_jsonb(quotes)->'calculation' AS calculation FROM quotes WHERE id=$1 AND company_id=$2 FOR UPDATE",[targetQuote,companyId])).rows[0];
     if (!quote || (quote.deleted_at && previous?.quote_id !== targetQuote)) fail("quote_not_found", "This quote was removed. Select an active quote for new work.", 404);
+    if (quote.calculation && !previous) {
+      const result=quote.calculation.result;
+      if (!result?.complete_for_scheduling) fail("calculator_incomplete", "Complete the quote inputs and crew configuration before scheduling.");
+      if ((new Date(end)-new Date(start))/1000 < result.elapsed_seconds) fail("quote_job_duration_required", "Allow the calculated elapsed duration for this quote.");
+    }
   }
   const row = previous?.agreement_id
     ? (await db.query("SELECT * FROM quote_agreements WHERE id=$1 AND company_id=$2",[previous.agreement_id,companyId])).rows[0]

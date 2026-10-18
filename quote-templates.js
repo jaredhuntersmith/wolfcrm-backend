@@ -76,6 +76,7 @@ export async function resolveQuoteTemplateOptions(pool, req, raw = {}, { previou
       content.plan_offer_preference = content.quote_defaults.offer_service_plans;
     }
     const options = normalizeQuoteOptions({ ...previous, ...raw, ...content.quote_defaults,
+      ...((raw.duration_minutes ?? previous?.duration_minutes) == null ? {allow_customer_booking:false} : {}),
       optional_addons: [], billing_address: '', public_notes: '', scope_exclusions: '',
       template: { id: source.template_id, version: source.version, name: source.name, content,
         is_customized: quoteContentHash(content) !== quoteContentHash(original) },

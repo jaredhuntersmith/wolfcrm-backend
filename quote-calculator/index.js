@@ -1,0 +1,82 @@
+import {lockCompanySchedule} from '../schedule-booking-guard.js';
+import {z} from 'zod';
+import {randomUUID} from 'node:crypto';
+import {calculate,validateCatalog,inputSchema,overrideSchema} from './domain.js';
+import {dispatch,transaction,digest,fault,internalActor,withDraftOnly} from '../mcp/context.js';
+import {loadPrincipal} from '../mcp/access.js';
+export async function installCalculatorSchema(pool){await pool.query(`
+ CREATE TABLE IF NOT EXISTS quote_calculator_catalog(company_id uuid PRIMARY KEY REFERENCES companies(id),revision integer NOT NULL DEFAULT 1,config jsonb NOT NULL,updated_by uuid REFERENCES users(id),updated_at timestamptz NOT NULL DEFAULT now());
+ ALTER TABLE quotes ADD COLUMN IF NOT EXISTS calculation jsonb;
+ ALTER TABLE quotes ADD COLUMN IF NOT EXISTS calculation_revision integer NOT NULL DEFAULT 0;
+ ALTER TABLE quotes ADD COLUMN IF NOT EXISTS option_group_id uuid;
+ CREATE INDEX IF NOT EXISTS quotes_option_group_idx ON quotes(company_id,option_group_id) WHERE option_group_id IS NOT NULL AND deleted_at IS NULL;
+ CREATE TABLE IF NOT EXISTS quote_calculator_requests(company_id uuid NOT NULL REFERENCES companies(id),actor_id uuid NOT NULL,request_key text NOT NULL,input_hash text NOT NULL,result jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(company_id,actor_id,request_key));
+ CREATE TABLE IF NOT EXISTS quote_calculator_audit(id uuid PRIMARY KEY,company_id uuid NOT NULL,actor_id uuid NOT NULL,connection_id uuid,quote_id uuid,operation text NOT NULL,revision integer,created_at timestamptz NOT NULL DEFAULT now());
+ `);}
+export const saveSchema=z.object({contact_id:z.uuid(),quote_id:z.uuid().optional(),expected_revision:z.number().int().min(0).optional(),title:z.string().min(1).max(160),notes:z.string().max(4000).default(''),input:inputSchema,request_key:z.string().min(1).max(150),use_current_catalog:z.boolean().default(false),manual:overrideSchema.optional()}).strict();
+export const duplicateSchema=z.object({quote_id:z.uuid(),expected_revision:z.number().int().min(1),title:z.string().min(1).max(160),request_key:z.string().min(1).max(150)}).strict();
+export const previewSchema=z.object({quote_id:z.uuid().optional(),input:inputSchema,use_current_catalog:z.boolean().default(false),manual:overrideSchema.optional()}).strict();
+const requireCap=(a,cap)=>{if(!a.permissions?.capabilities?.[cap])throw fault(403,'permission_denied',cap);};
+const empty=()=>({questions:[],components:[],services:[],quote_minimum_cents:null});
+export function createCalculator({app,pool}){
+ async function actor(db,original,cap){const a=await loadPrincipal(db,original.userId,original.companyId,{enforceOAuthRolePolicy:false});requireCap(a,cap);if(original.retell){if(!original.retell.config?.quotes_enabled)throw fault(403,'retell_quotes_not_authorized');const r=(await db.query('SELECT * FROM retell_connections WHERE id=$1 AND company_id=$2 FOR SHARE',[original.retell.id,a.companyId])).rows[0];if(!r||r.revoked_at||!r.config?.quotes_enabled||r.key_hash!==original.retell.key_hash||new Date(r.expires_at)<=new Date())throw fault(403,'retell_connection_inactive');}return {...a,retell:original.retell};}
+ async function getCatalog(db,companyId){const row=(await db.query('SELECT * FROM quote_calculator_catalog WHERE company_id=$1',[companyId])).rows[0];return {revision:row?.revision||0,config:row?.config||empty()};}
+ async function serviceRows(db,companyId,ids=null){return (await db.query('SELECT id,name,default_description,archived_at FROM saved_services WHERE company_id=$1 AND ($2::uuid[] IS NULL OR id=ANY($2)) ORDER BY name LIMIT 501',[companyId,ids])).rows;}
+ async function quote(db,a,id,lock=false){const q=(await db.query(`SELECT * FROM quotes WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL ${lock?'FOR UPDATE':''}`,[id,a.companyId])).rows[0];if(!q)throw fault(404,'quote_unavailable');return q;}
+ async function context(a,contactID){a=await actor(pool,a,'contacts.view');const c=(await pool.query('SELECT id,name,phone,email,address,job_type,lead_info FROM contacts WHERE id=$1 AND company_id=$2',[contactID,a.companyId])).rows[0];if(!c)throw fault(404,'lead_unavailable');const {config}=await getCatalog(pool,a.companyId),known={};
+  const lead=c.lead_info&&typeof c.lead_info==='object'?c.lead_info:{},mapped=new Map();
+  if(Array.isArray(lead))for(const box of lead){if(typeof box!=='string')continue;for(const block of box.split(/\n\n(?=Facebook lead )/)){const [header,label,...rest]=block.split('\n');if(!header?.startsWith('Facebook lead ')||!label||!rest.length)continue;const values=mapped.get(label)||new Set();values.add(rest.join('\n'));mapped.set(label,values);}}
+  for(const q of config.questions){let value;if(q.lead_field&&Object.hasOwn(lead,q.lead_field))value=lead[q.lead_field];else if(q.lead_field&&mapped.get(q.lead_field)?.size===1)value=[...mapped.get(q.lead_field)][0];else if(q.lead_field&&['contact.job_type','contact.address'].includes(q.lead_field))value=c[q.lead_field.slice(8)];
+   if(q.type==='number'&&typeof value==='string'&&/^\d+(\.\d+)?$/.test(value))value=Number(value);
+   if(q.type==='boolean'&&['true','false'].includes(value))value=value==='true';
+   if(value!==undefined&&value!==null&&(q.type==='number'?typeof value==='number':q.type==='boolean'?typeof value==='boolean':q.type==='choice'?q.choices.includes(value):typeof value==='string'))known[q.id]={value,source:'lead_form',...(q.unit?{unit:q.unit}:{})};}
+  return {contact:c,known_answers:known,untrusted_data:true};}
+ async function definitions(a,{service_ids=[],quote_id}={}){a=await actor(pool,a,'quotes.view');if(service_ids.length>10)throw fault(400,'too_many_services');const q=quote_id?await quote(pool,a,quote_id):null,cat=q?.calculation?.catalog||await getCatalog(pool,a.companyId),all=q?.calculation?.service_snapshot||await serviceRows(pool,a.companyId),ids=service_ids.length?service_ids:[];
+  return {revision:cat.revision,services:all.filter(s=>!s.archived_at).map(({id,name})=>({id,name,configured:cat.config.services.some(s=>s.service_id===id)})),config:{...cat.config,components:cat.config.components.filter(c=>c.service_ids.some(s=>ids.includes(s))),questions:cat.config.questions.filter(c=>c.service_ids.some(s=>ids.includes(s))),services:cat.config.services.filter(s=>ids.includes(s.service_id))}};}
+ async function compute(db,a,raw,q){if(raw.manual&&a.retell)throw fault(403,'manual_override_forbidden');const cat=q?.calculation&&!raw.use_current_catalog?q.calculation.catalog:await getCatalog(db,a.companyId);const services=q?.calculation&&!raw.use_current_catalog?q.calculation.service_snapshot:await serviceRows(db,a.companyId);
+  if(!q?.calculation||raw.use_current_catalog)for(const id of raw.input.service_ids)if(!services.some(s=>s.id===id&&!s.archived_at))throw fault(404,'service_unavailable');
+  const calculation=calculate({catalog:cat.config,services,input:raw.input,manual:raw.manual,previous:q?.calculation?.result});
+  const pricing=await dispatch(app,a,'POST','/api/quotes/pricing',{...(q?{quote_id:q.id}:{}),line_items:calculation.services.map(s=>({id:s.service_id,service_id:s.service_id,name:s.name,description:s.description,price_cents:s.cents})),quote_options:{...(q?.quote_options||{}),duration_minutes:calculation.complete_for_scheduling?Math.ceil(calculation.elapsed_seconds/60):null}});
+  calculation.pricing=pricing;return {catalog:cat,service_snapshot:services,input:calculation.input,manual:raw.manual||null,result:calculation};}
+ async function preview(a,raw){raw=previewSchema.parse(raw);a=await actor(pool,a,'quotes.create');const q=raw.quote_id?await quote(pool,a,raw.quote_id):null;return (await compute(pool,a,raw,q)).result;}
+ const view=q=>({id:q.id,contact_id:q.contact_id,title:q.title,total_cents:q.total_cents,created_at:q.created_at,calculation_revision:q.calculation_revision,status:q.status,revision:q.calculation_revision,updated_at:q.updated_at,option_group_id:q.option_group_id,calculation:q.calculation?.result||null,input:q.calculation?.input||null,manual:q.calculation?.manual||null,line_items:q.line_items,quote_options:q.quote_options,notes:q.notes});
+ async function get(a,id){a=await actor(pool,a,'quotes.view');const result=view(await quote(pool,a,id));if(a.retell&&result.manual)throw fault(403,'manual_quote_requires_human');return result;}
+ async function list(a,contactID,{offset=0,limit=30}={}){a=await actor(pool,a,'quotes.view');return (await pool.query('SELECT id,title,status,calculation_revision,option_group_id,calculation FROM quotes WHERE company_id=$1 AND contact_id=$2 AND deleted_at IS NULL ORDER BY updated_at DESC,id LIMIT $3 OFFSET $4',[a.companyId,contactID,Math.min(101,limit),Math.max(0,offset)])).rows.map(q=>({quote_id:q.id,title:q.title,status:q.status,revision:q.calculation_revision,option_group_id:q.option_group_id,price_cents:q.calculation?.result?.subtotal_cents??null,labor_seconds:q.calculation?.result?.labor_seconds??null,elapsed_seconds:q.calculation?.result?.elapsed_seconds??null,complete:q.calculation?.result?.complete_for_presentation??false,services:q.calculation?.result?.services.map(s=>s.name)||[]}));}
+ async function mutate(original,raw,duplicate=false){raw=(duplicate?duplicateSchema:saveSchema).parse(raw);return transaction(pool,async db=>{
+  await lockCompanySchedule(db,original.companyId);await db.query('SELECT id FROM users WHERE id=$1 AND company_id=$2 FOR SHARE',[original.userId,original.companyId]);
+  const a=await actor(db,original,raw.quote_id&&!duplicate?'quotes.edit':'quotes.create');if(raw.manual&&a.retell)throw fault(403,'manual_override_forbidden');
+  await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`calculator:${a.companyId}:${a.userId}:${raw.request_key}`]);
+  const hash=digest({operation:duplicate?'duplicate':'save',raw,connection:a.retell?.id||null}),receipt=(await db.query('SELECT * FROM quote_calculator_requests WHERE company_id=$1 AND actor_id=$2 AND request_key=$3',[a.companyId,a.userId,raw.request_key])).rows[0];if(receipt){if(receipt.input_hash!==hash)throw fault(409,'idempotency_conflict');return receipt.result;}
+  let prior=raw.quote_id?await quote(db,a,raw.quote_id,true):null;if(prior&&prior.calculation_revision!==raw.expected_revision)throw fault(409,'quote_revision_changed');
+  if(prior&&!duplicate&&(prior.status!=='draft'||prior.sent_at||prior.accepted_at||(await db.query('SELECT 1 FROM schedule_events WHERE company_id=$1 AND quote_id=$2 LIMIT 1',[a.companyId,prior.id])).rowCount||(await db.query('SELECT 1 FROM quote_agreements WHERE company_id=$1 AND quote_id=$2 LIMIT 1',[a.companyId,prior.id])).rowCount))throw fault(409,'issued_quote_requires_alternative');
+  if(prior?.calculation?.manual&&a.retell)throw fault(403,'manual_quote_requires_human');
+  if(prior&&!duplicate&&prior.contact_id!==raw.contact_id)throw fault(400,'quote_contact_mismatch');
+  if(duplicate){if(!prior.calculation)throw fault(409,'calculator_quote_required');if(a.retell&&prior.calculation.manual)throw fault(403,'manual_quote_requires_human');raw={...raw,contact_id:prior.contact_id,input:prior.calculation.input,notes:prior.notes||''};}
+  const snapshot=duplicate?structuredClone(prior.calculation):await compute(db,a,raw,prior),r=snapshot.result;
+  const lines=r.services.map(s=>({id:s.service_id,service_id:s.service_id,name:s.name,description:[s.description,...r.lines.filter(l=>l.service_id===s.service_id&&l.visible).map(l=>`${l.name}${l.quantity!==null?`: ${l.quantity} ${l.unit}`:''}${l.description?' — '+l.description:''}${l.show_price?' ($'+(l.cents/100).toFixed(2)+')':''}`)].filter(Boolean).join('\n'),price_cents:s.cents}));
+  const duration=r.complete_for_scheduling?Math.ceil(r.elapsed_seconds/60):null;
+  const options=prior?.quote_options?{...prior.quote_options,duration_minutes:duration}:{duration_minutes:duration};
+  // Draft changes never execute messaging/payment automations. Existing activity events remain recorded.
+  const saved=await withDraftOnly(()=>dispatch(app,{...a,calculatorWrite:true},prior&&!duplicate?'PUT':'POST',prior&&!duplicate?'/api/quotes/'+prior.id:'/api/quotes',{contact_id:raw.contact_id,title:raw.title,notes:raw.notes,line_items:lines,quote_options:options,status:'draft'}));
+  const group=prior?.option_group_id||prior?.id||saved.id,revision=prior&&!duplicate?prior.calculation_revision+1:1;
+  await db.query('UPDATE quotes SET calculation=$3::jsonb,calculation_revision=$4,option_group_id=$5 WHERE id=$1 AND company_id=$2',[saved.id,a.companyId,JSON.stringify(snapshot),revision,group]);
+  const result=view({...saved,calculation:snapshot,calculation_revision:revision,option_group_id:group});
+  await db.query('INSERT INTO quote_calculator_requests(company_id,actor_id,request_key,input_hash,result) VALUES($1,$2,$3,$4,$5::jsonb)',[a.companyId,a.userId,raw.request_key,hash,JSON.stringify(result)]);
+  await db.query('INSERT INTO quote_calculator_audit(id,company_id,actor_id,connection_id,quote_id,operation,revision) VALUES($1,$2,$3,$4,$5,$6,$7)',[randomUUID(),a.companyId,a.userId,a.retell?.id||null,saved.id,duplicate?'duplicate':'save',revision]);return result;
+ });}
+ return {context,definitions,preview,get,list,save:(a,v)=>mutate(a,v),duplicate:(a,v)=>mutate(a,v,true),getCatalog,serviceRows};
+}
+export function installCalculatorRoutes({app,pool,authRequired}){
+ const service=createCalculator({app,pool});app.locals.quoteCalculator=service;
+ const wrap=fn=>async(req,res)=>{res.set('Cache-Control','no-store');try{if(!req.companyId)throw fault(403,'company_required');res.json(await fn(req));}catch(e){res.status(e instanceof z.ZodError?400:e.status||500).json({error:e instanceof z.ZodError?'invalid_calculator_input':e.status?e.code:'calculator_unavailable',message:e instanceof z.ZodError?e.issues.map(i=>i.path.join('.')+': '+i.message).join('; '):e.status?e.message:'Calculator unavailable'});}};
+ app.get('/api/quote-calculator/config',authRequired,wrap(async r=>{requireCap(r,'settings.manage_company');return {...await service.getCatalog(pool,r.companyId),services:await service.serviceRows(pool,r.companyId)};}));
+ app.put('/api/quote-calculator/config',authRequired,wrap(async r=>transaction(pool,async db=>{await db.query('SELECT id FROM users WHERE id=$1 AND company_id=$2 FOR SHARE',[r.userId,r.companyId]);requireCap(await loadPrincipal(db,r.userId,r.companyId,{enforceOAuthRolePolicy:false}),'settings.manage_company');if(r[internalActor])throw fault(403,'human_settings_required');const config=validateCatalog(r.body.config),expected=z.number().int().min(0).parse(r.body.expected_revision);const ids=[...new Set([...config.services.map(s=>s.service_id),...config.questions.flatMap(q=>q.service_ids)])],rows=await service.serviceRows(pool,r.companyId,ids);if(ids.some(id=>!rows.some(s=>s.id===id&&!s.archived_at)))throw fault(404,'service_unavailable');const result=await pool.query(`INSERT INTO quote_calculator_catalog(company_id,config,updated_by) SELECT $1,$2::jsonb,$3 WHERE $4=0 OR EXISTS(SELECT 1 FROM quote_calculator_catalog WHERE company_id=$1) ON CONFLICT(company_id) DO UPDATE SET config=EXCLUDED.config,revision=quote_calculator_catalog.revision+1,updated_by=$3,updated_at=now() WHERE quote_calculator_catalog.revision=$4 RETURNING revision,config`,[r.companyId,JSON.stringify(config),r.userId,expected]);if(!result.rowCount)throw fault(409,'catalog_revision_changed');await db.query('INSERT INTO quote_calculator_audit(id,company_id,actor_id,operation,revision) VALUES($1,$2,$3,$4,$5)',[randomUUID(),r.companyId,r.userId,'catalog.updated',result.rows[0].revision]);return result.rows[0];})));
+ app.get('/api/quote-calculator/definitions',authRequired,wrap(r=>service.definitions(r,{service_ids:String(r.query.services||'').split(',').filter(Boolean).map(v=>z.uuid().parse(v)),quote_id:r.query.quote_id?z.uuid().parse(r.query.quote_id):undefined})));
+ app.get('/api/quote-calculator/context/:id',authRequired,wrap(r=>service.context(r,z.uuid().parse(r.params.id))));
+ app.get('/api/quote-calculator/options/:id',authRequired,wrap(r=>service.list(r,z.uuid().parse(r.params.id))));
+ app.get('/api/quote-calculator/quotes/:id',authRequired,wrap(r=>service.get(r,z.uuid().parse(r.params.id))));
+ app.post('/api/quote-calculator/preview',authRequired,wrap(r=>service.preview(r,r.body)));
+ app.post('/api/quote-calculator/save',authRequired,wrap(r=>service.save(r,r.body)));
+ app.post('/api/quote-calculator/duplicate',authRequired,wrap(r=>service.duplicate(r,r.body)));
+ return service;
+}

@@ -1,3 +1,4 @@
+import {installCalculatorSchema,installCalculatorRoutes} from './quote-calculator/index.js';
 import { acceptedQuoteValueSQL, outboundContactActivitySQL } from "./sales-analytics.js";
 import {installMCP} from './mcp/index.js';
 import {transactionalPool,internalActor} from './mcp/context.js';
@@ -2729,6 +2730,7 @@ async function bootstrap() {
   await installPermissionGovernanceSchema(pool);
   await installStripeAccountManagementSchema(pool);
   await installServiceCatalogSchema(pool);
+  await installCalculatorSchema(pool);
   await installAgreementSchema(pool);
   console.log(`[bootstrap] DB ready @ ${nowIso()}`);
 }
@@ -11120,6 +11122,7 @@ app.post("/webhooks/leads/:token", async (req, res) => {
 
 // ---------- QUOTES ----------
 installServiceCatalogRoutes({ app, pool, authRequired, requireCapability, requireAnyCapability });
+installCalculatorRoutes({app,pool,authRequired});
 
 function sendQuoteValidationError(res, error) {
   if (!(error instanceof QuoteContractError) && !(error instanceof ServiceCatalogError)) return false;
@@ -11157,6 +11160,7 @@ app.get("/api/quotes/:id/pricing", authRequired, requireCapability("quotes.view"
     const scope = quoteScopeSQL(req);
     const quote = (await pool.query(`SELECT * FROM quotes q WHERE ${scope.sql} AND id = $${scope.values.length + 1}`, [...scope.values, req.params.id])).rows[0];
     if (!quote) return res.status(404).json({ error: "not_found" });
+    if(quote.calculation && !quote.calculation.result.complete_for_presentation) return res.status(409).json({error:"estimate_incomplete",message:"Complete the estimate before exporting a price."});
     const options = normalizeQuoteOptions(quote.quote_options || {});
     validateQuoteAddonScope(quote.line_items, options);
     await assertQuoteReferences(pool, req, { line_items: [...quote.line_items,...options.optional_addons], existing_lines: [...quote.line_items,...options.optional_addons] });
@@ -11276,7 +11280,7 @@ app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (re
     let rows;
     if (contactID) {
       rows = (await pool.query(
-        `SELECT id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
+        `SELECT id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at, calculation_revision
          FROM quotes q
          WHERE ${scope.sql} AND contact_id = $${scope.values.length + 1}
          ORDER BY updated_at DESC`,
@@ -11284,7 +11288,7 @@ app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (re
       )).rows;
     } else {
       rows = (await pool.query(
-        `SELECT id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at
+        `SELECT id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at, calculation_revision
          FROM quotes q
          WHERE ${scope.sql}
          ORDER BY updated_at DESC
@@ -11381,6 +11385,7 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
     const before = await pool.query(`SELECT * FROM quotes q WHERE ${scope.sql} AND id = $${scope.values.length + 1}`, [...scope.values, req.params.id]);
     if (!before.rowCount) return res.status(404).json({ error: "not_found" });
     const previous = before.rows[0];
+    if (previous.calculation && !req[internalActor]?.calculatorWrite) return res.status(409).json({error:"use_calculator_editor",message:"Edit this calculated quote with its revision-aware calculator editor."});
     const items = line_items === undefined ? null : normalizeQuoteLines(line_items);
     if (req.body.quote_options !== undefined && (!req.body.quote_options || typeof req.body.quote_options !== "object" || Array.isArray(req.body.quote_options))) throw new QuoteContractError("quote_options_invalid","Quote options must be an object.");
     const options = req.body.quote_options === undefined ? null : await resolveQuoteTemplateOptions(pool, req, req.body.quote_options, { previous: previous.quote_options });

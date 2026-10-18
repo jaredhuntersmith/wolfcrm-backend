@@ -13,10 +13,10 @@ export const scopes=Object.freeze({
 export const roles=['owner','admin','manager','sales','technician','office','legacy_employee'];
 export async function loadPrincipal(pool,userId,companyId,{enforceOAuthRolePolicy=true}={}){
  const row=(await pool.query(`SELECT u.id,u.email,u.display_name,u.role,u.company_id,c.name AS company_name,c.owner_user_id,c.timezone,
- to_jsonb(p) AS legacy,COALESCE(policy.roles,'["owner"]'::jsonb) AS allowed_roles
+ to_jsonb(p) AS legacy,${enforceOAuthRolePolicy ? `COALESCE(policy.roles,'["owner"]'::jsonb)` : `'[]'::jsonb`} AS allowed_roles
  FROM users u JOIN companies c ON c.id=u.company_id
  LEFT JOIN employee_permissions p ON p.user_id=u.id AND p.company_id=u.company_id
- LEFT JOIN mcp_company_policy policy ON policy.company_id=u.company_id
+ ${enforceOAuthRolePolicy ? 'LEFT JOIN mcp_company_policy policy ON policy.company_id=u.company_id' : ''}
  WHERE u.id=$1 AND u.deleted_at IS NULL AND ($2::uuid IS NULL OR u.company_id=$2)`,[userId,companyId||null])).rows[0];
  if(!row)throw fault(401,'membership_inactive');
  const owner=row.owner_user_id===row.id;

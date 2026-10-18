@@ -1,3 +1,5 @@
+import {installAgreementSchema} from '../quote-agreements.js';
+import {validateCatalog} from '../quote-calculator/domain.js';
 // Local browser QA only: disposable PostgreSQL, loopback HTTP, synthetic users,
 // no background processors, no environment/production database reuse.
 import {createServer} from 'node:http';
@@ -17,11 +19,15 @@ let server,clientReceiver,stopping=false;
 async function stop(){if(stopping)return;stopping=true;try{if(clientReceiver){clientReceiver.closeAllConnections();await new Promise(r=>clientReceiver.close(r));}if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}await rawPool.end();}finally{pg.stop();}}
 for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>void stop().then(()=>process.exit(0)));
 try {
- await backend.bootstrap();await installServiceCatalogSchema(pool);
+ await backend.bootstrap();await installServiceCatalogSchema(pool);await installAgreementSchema(pool);
  const company=randomUUID(),owner=randomUUID(),employee=randomUUID();
  await pool.query("INSERT INTO companies(id,name,join_code,owner_user_id) VALUES($1,'MCP Browser QA','MCP-QA',$2)",[company,owner]);
  for(const [id,email,role]of [[owner,'mcp-owner@example.invalid','employer'],[employee,'mcp-tech@example.invalid','employee']])await pool.query('INSERT INTO users(id,email,display_name,company_id,role,password_hash) VALUES($1,$2,$3,$4,$5,$6)',[id,email,'QA '+role,company,role,backend.hashPassword('Synthetic-MCP-QA-428!')]);
- await pool.query("INSERT INTO saved_services(id,company_id,name) VALUES($1,$2,'QA window service')",[randomUUID(),company]);
+ const serviceID=randomUUID(),calculatorLead=randomUUID();
+ await pool.query("INSERT INTO saved_services(id,company_id,name) VALUES($1,$2,'QA window service')",[serviceID,company]);
+ await pool.query("INSERT INTO contacts(id,user_id,company_id,name,lead_info) VALUES($1,$2,$3,'Calculator browser customer',$4)",[calculatorLead,owner,company,JSON.stringify(['Facebook lead synthetic\nWindow count\n30'])]);
+ const calculator=validateCatalog({questions:[{id:'windows',label:'Window count',type:'number',unit:'count',required:true,lead_field:'Window count',service_ids:[serviceID]}],services:[{service_id:serviceID,crew_size:1,elapsed_ratio_bp:10000}],components:[{id:'outside',order:0,name:'Exterior',service_ids:[serviceID],scope:'service',unit:'count',quantity_fact:'windows',decimal_quantity:false,selection:'required',money_enabled:true,time_enabled:true,unit_cents:1000,unit_seconds:60,visible:true},{id:'inside',order:1,name:'Interior',service_ids:[serviceID],scope:'service',unit:'count',quantity_fact:'windows',decimal_quantity:false,selection:'default',money_enabled:true,time_enabled:true,unit_cents:1500,unit_seconds:120,visible:true}]});
+ await pool.query('INSERT INTO quote_calculator_catalog(company_id,config,updated_by) VALUES($1,$2,$3)',[company,JSON.stringify(calculator),owner]);
  await pool.query("INSERT INTO employee_permissions(user_id,company_id,permission_preset,permission_overrides) VALUES($1,$2,'technician','{}')",[employee,company]);
  app.locals.mediaStorage=await installMediaStorage({app,pool,authRequired,accessPredicate:storagePredicate,startWorker:false,bucket:null});
  app.locals.comms=await installCompanyComms({app,pool,authRequired,startWorker:false,sendPush:async()=>{throw new Error('External push forbidden');}});

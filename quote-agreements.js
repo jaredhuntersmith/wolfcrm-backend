@@ -299,6 +299,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       if (quoteId) await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, [`payment:${req.companyId}:quote:${uuid(quoteId)}`]);
       const quote = quoteId ? (await db.query(`SELECT * FROM quotes WHERE id=$1 AND deleted_at IS NULL AND (company_id=$2 OR (company_id IS NULL AND user_id=$3)) FOR UPDATE`, [uuid(quoteId), req.companyId, req.userId])).rows[0] : { id: null, contact_id: quoteText(raw.contact_id, "Customer ID", 200), title: quoteText(raw.title, "Agreement title", 200).trim() || "Agreement", line_items: [], quote_options: {}, updated_at: null };
       if (!quote) problem("quote_not_found", "Save a quote in this company before publishing.", 404);
+      if (quote.calculation && !quote.calculation.result.complete_for_presentation) problem("estimate_incomplete","Complete the estimate before publishing a price.",409);
       const priorRequest = (await db.query(`SELECT * FROM quote_agreements WHERE company_id=$1 AND request_id=$2`, [req.companyId, requestId])).rows[0];
       if (priorRequest) { if (priorRequest.quote_id !== quote.id || (priorRequest.publication_request_hash && priorRequest.publication_request_hash !== publicationRequestHash)) problem("agreement_request_conflict", "This publication request was already used for different content.", 409); return detail(db, priorRequest, { staff: true }); }
       if (service.preparePlanQuoteRevision) await service.preparePlanQuoteRevision(db,req,quote);

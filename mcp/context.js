@@ -29,6 +29,8 @@ export function transactionalPool(raw){
     const value=target[key];return typeof value==='function'?value.bind(target):value;
   }});
 }
+export const isDraftOnly=()=>storage.getStore()?.draftOnly===true;
+export const withDraftOnly=fn=>storage.run({...storage.getStore(),draftOnly:true},fn);
 export const boundedRead=fn=>storage.run({boundedRead:true},fn);
 // Wake existing outbox processors only after the outermost successful commit.
 // Async callbacks inherited from a completed/rolled-back transaction must never

@@ -12,7 +12,7 @@ export async function principal(db,row,env){
  const actor=await loadPrincipal(db,row.user_id,row.company_id,{enforceOAuthRolePolicy:false});
  if(!actor.isCompanyOwner)throw fault(403,'retell_sponsor_inactive');
  for(const cap of ['schedule.view','schedule.create','schedule.manage_team','contacts.create','contacts.edit'])if(!actor.permissions.capabilities[cap])throw fault(403,'permission_denied');
- return {...actor,retell:row,scopes:serviceScopes};
+ return {...actor,retell:row,scopes:row.config?.quotes_enabled?[...serviceScopes,"quotes:read","quotes:draft"]:serviceScopes};
 }
 export async function authenticateRetell(db,token,env){
  if(typeof token!=='string'||!/^wolf_retell_[A-Za-z0-9_-]{43}$/.test(token))throw fault(401,'invalid_service_key');

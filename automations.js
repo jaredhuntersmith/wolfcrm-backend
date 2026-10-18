@@ -1,3 +1,4 @@
+import {isDraftOnly} from './mcp/context.js';
 import {afterCommit} from './mcp/context.js';
 import { randomUUID } from "crypto";
 import net from "net";
@@ -1648,7 +1649,7 @@ export async function emitAutomationEvent(event, { db = null } = {}) {
     const { rows } = await (db || ctx.pool).query(
       `INSERT INTO automation_events(
          id, company_id, event_type, subject_type, subject_id, actor_user_id, source, dedupe_key, payload, occurred_at, processing_status
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,COALESCE($10::timestamptz, now()),'pending')
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,COALESCE($10::timestamptz, now()),$11)
        ON CONFLICT (company_id, dedupe_key) WHERE dedupe_key IS NOT NULL
        DO UPDATE SET id = automation_events.id
        RETURNING id`,
@@ -1662,7 +1663,8 @@ export async function emitAutomationEvent(event, { db = null } = {}) {
         event.source || "backend",
         event.dedupeKey || null,
         JSON.stringify(payload),
-        event.occurredAt || null
+        event.occurredAt || null,
+        isDraftOnly() ? "processed" : "pending"
       ]
     );
     if (!db && !ctx.disableProcessors) afterCommit(() => setImmediate(() => processAutomationEvents().catch((e) => console.error("[automations] event processor wake failed", e?.message || e))));
