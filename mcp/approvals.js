@@ -23,6 +23,7 @@ export async function decideAction({pool,app,userId,companyId,id,expectedHash,de
   if(p.state!=='pending'||new Date(p.expires_at)<=new Date())throw fault(409,'approval_expired');
   if(decision==='reject'){await db.query("UPDATE mcp_approvals SET state='rejected',payload=NULL WHERE id=$1",[id]);return {state:'rejected',result:null};}
   const actor=await connection(pool,p.connection_id);actor.scopes=p.scopes.filter(s=>actor.scopes.includes(s));
+  if(app.locals.connectionManager)await app.locals.connectionManager.check(actor,p.operation);
   const result=await performAction({pool,app,actor,name:p.operation,input:p.payload});
   await db.query("UPDATE mcp_approvals SET state='completed',payload=NULL,result=$2 WHERE id=$1",[id,JSON.stringify(result)]);
   return {state:'completed',result};

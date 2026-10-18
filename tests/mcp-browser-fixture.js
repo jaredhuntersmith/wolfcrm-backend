@@ -24,6 +24,7 @@ try {
  const company=randomUUID(),owner=randomUUID(),employee=randomUUID();
  await pool.query("INSERT INTO companies(id,name,join_code,owner_user_id) VALUES($1,'MCP Browser QA','MCP-QA',$2)",[company,owner]);
  for(const [id,email,role]of [[owner,'mcp-owner@example.invalid','employer'],[employee,'mcp-tech@example.invalid','employee']])await pool.query('INSERT INTO users(id,email,display_name,company_id,role,password_hash) VALUES($1,$2,$3,$4,$5,$6)',[id,email,'QA '+role,company,role,backend.hashPassword('Synthetic-MCP-QA-428!')]);
+ await pool.query("INSERT INTO sessions(token,user_id) VALUES('mcp-native-fixture',$1)",[owner]);
  const serviceID=randomUUID(),calculatorLead=randomUUID();
  await pool.query("INSERT INTO saved_services(id,company_id,name) VALUES($1,$2,'QA window service')",[serviceID,company]);
  await pool.query("INSERT INTO contacts(id,user_id,company_id,name,lead_info) VALUES($1,$2,$3,'Calculator browser customer',$4)",[calculatorLead,owner,company,JSON.stringify(['Facebook lead synthetic\nWindow count\n30'])]);

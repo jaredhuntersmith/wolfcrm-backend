@@ -1,3 +1,4 @@
+import {lockConnectionSlot} from './manager-schema.js';
 import {isIP} from 'node:net';
 import OAuth2Server from '@node-oauth/oauth2-server';
 import {randomUUID,randomBytes} from 'node:crypto';
@@ -68,7 +69,7 @@ export function installOAuth({app,pool,env,verifyIdentity}){
    const redirect=new URL(pending.params.redirect_uri);redirect.searchParams.set('state',pending.params.state);redirect.searchParams.set('iss',origin);
    if(b.step==='deny')redirect.searchParams.set('error','access_denied');
    else {
-    const id=randomUUID();await pool.query('INSERT INTO mcp_connections(id,user_id,company_id,client_id,scopes,audience) VALUES($1,$2,$3,$4,$5,$6)',[id,actor.userId,actor.companyId,pending.params.client_id,JSON.stringify(pending.params.scope.split(' ')),resource]);
+    await lockConnectionSlot(pool,actor.companyId);const id=randomUUID();await pool.query('INSERT INTO mcp_connections(id,user_id,company_id,client_id,scopes,audience) VALUES($1,$2,$3,$4,$5,$6)',[id,actor.userId,actor.companyId,pending.params.client_id,JSON.stringify(pending.params.scope.split(' ')),resource]);
     const request=new OAuth2Server.Request({method:'GET',query:pending.params,headers:{},body:{}}),response=new OAuth2Server.Response();
     const code=await oauth.authorize(request,response,{authenticateHandler:{handle:()=>({id})}});redirect.searchParams.set('code',code.authorizationCode);
     await pool.query("INSERT INTO mcp_audit(connection_id,company_id,user_id,operation,outcome) VALUES($1,$2,$3,'connection.approved','success')",[id,actor.companyId,actor.userId]);

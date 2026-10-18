@@ -30,7 +30,7 @@ export async function loadPrincipal(pool,userId,companyId,{enforceOAuthRolePolic
 export async function connection(pool,id){
  const row=(await pool.query('SELECT * FROM mcp_connections WHERE id=$1 AND revoked_at IS NULL AND expires_at>now()',[id])).rows[0];
  if(!row)throw fault(401,'connection_revoked');
- const actor=await loadPrincipal(pool,row.user_id,row.company_id);return {...actor,connectionId:row.id,scopes:row.scopes,audience:row.audience};
+ const actor=await loadPrincipal(pool,row.user_id,row.company_id,{enforceOAuthRolePolicy:row.kind!=='service'});return {...actor,connectionId:row.id,scopes:row.scopes,audience:row.audience};
 }
 export async function authenticate(pool,token,audience){
  if(typeof token!=='string'||token.length<32||token.length>256)throw fault(401,'invalid_token');

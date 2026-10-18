@@ -7,7 +7,9 @@ export async function installRetellSchema(db) {
  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_used_at TIMESTAMPTZ);
  ALTER TABLE retell_connections ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'retell';
  ALTER TABLE retell_connections DROP CONSTRAINT IF EXISTS retell_connections_company_id_key;
- CREATE UNIQUE INDEX IF NOT EXISTS retell_connections_company_provider ON retell_connections(company_id,provider);
+ ALTER TABLE retell_connections ADD COLUMN IF NOT EXISTS managed BOOLEAN NOT NULL DEFAULT false;
+ DROP INDEX IF EXISTS retell_connections_company_provider;
+ CREATE UNIQUE INDEX IF NOT EXISTS retell_connections_legacy_provider ON retell_connections(company_id,provider) WHERE NOT managed;
  CREATE TABLE IF NOT EXISTS retell_slots (
  id UUID PRIMARY KEY, connection_id UUID NOT NULL REFERENCES retell_connections(id), revision INTEGER NOT NULL,
  payload JSONB NOT NULL, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());

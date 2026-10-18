@@ -1,3 +1,4 @@
+import {controlConnectionFromAutomation} from './mcp/automation.js';
 import {isDraftOnly} from './mcp/context.js';
 import {afterCommit} from './mcp/context.js';
 import { randomUUID } from "crypto";
@@ -85,6 +86,7 @@ const HIDDEN_TRIGGERS = new Set([
 ]);
 
 const CORE_ACTIONS = new Set([
+  "mcp.enable", "mcp.disable", "mcp.pause",
   "contact.create", "contact.add_tag", "contact.update_fields",
   "pipeline.create_opportunity", "pipeline.move_stage",
   "task.create", "task.complete",
@@ -498,6 +500,10 @@ const triggerCatalog = [
 }));
 
 const actionCatalog = [
+  ["mcp.enable", "Enable AI Connection", "AI Connections", "Enable one company connection; preserves permissions and operating hours.", ["generic"], ["default"]],
+  ["mcp.disable", "Disable AI Connection", "AI Connections", "Disable one company connection; preserves permissions and operating hours.", ["generic"], ["default"]],
+  ["mcp.pause", "Pause AI Connection", "AI Connections", "Pause one company connection; preserves permissions and operating hours.", ["generic"], ["default"]],
+
   ["contact.create", "Create Contact", "Contacts", "Creates a company contact.", ["generic"], ["default"]],
   ["contact.delete", "Delete Contact", "Contacts", "Deletes a contact after explicit node confirmation.", ["contact"], ["default"]],
   ["contact.restore", "Restore Contact", "Contacts", "Reserved for future soft-delete restore support.", ["contact"], ["default"]],
@@ -728,6 +734,7 @@ const actionCatalog = [
 }));
 
 const actionExecutors = {
+  "mcp.enable": executeMCPControl, "mcp.disable": executeMCPControl, "mcp.pause": executeMCPControl,
   "contact.create": executeContactCreate,
   "contact.delete": executeContactDelete,
   "contact.restore": executeDeferredAction,
@@ -950,6 +957,8 @@ const actionExecutors = {
 function actionConfigFields(key) {
   const commonText = (name, label) => ({ key: name, label, type: "text" });
   switch (key) {
+    case "mcp.enable": case "mcp.disable": return [{key:"connection_id",label:"AI Connection",type:"mcp_connection"}];
+    case "mcp.pause": return [{key:"connection_id",label:"AI Connection",type:"mcp_connection"},{key:"pause_until",label:"Pause until",type:"datetime"}];
     case "contact.create":
       return ["name", "phone", "email", "address", "job_type", "source", "u1", "u2", "u3", "u4", "u5"].map((field) => commonText(field, field))
         .concat([{ key: "value_cents", label: "Value", type: "money" }, { key: "tags", label: "Tags", type: "tag_list" }, { key: "lat", label: "Latitude", type: "number" }, { key: "lng", label: "Longitude", type: "number" }]);
@@ -3214,6 +3223,8 @@ function validateGraphPayload(payload) {
     if (nodeType === "action" && !actionExecutors[config.action_key]) errors.push(`invalid_action:${nodeKey}`);
     if (nodeType === "trigger" && config.trigger_key === "contact.field_changed" && !config.field) errors.push(`field_change_trigger_missing_field:${nodeKey}`);
     if (nodeType === "action") {
+      if (config.action_key?.startsWith("mcp.") && !/^[0-9a-f-]{36}$/i.test(config.connection_id || "")) errors.push(`connection_required:${nodeKey}`);
+      if (config.action_key === "mcp.pause" && !Number.isFinite(Date.parse(config.pause_until))) errors.push(`pause_until_required:${nodeKey}`);
       if (["contact.add_tag", "contact.remove_tag", "contact.replace_tags"].includes(config.action_key) && !normalizeTags(config.tags || config.tag).length) errors.push(`tags_required:${nodeKey}`);
       if (config.action_key === "contact.delete" && config.confirm_delete !== true) errors.push(`delete_confirmation_required:${nodeKey}`);
       if (["pipeline.create_opportunity", "pipeline.move_stage", "pipeline.reopen"].includes(config.action_key) && !config.stage_id) errors.push(`stage_required:${nodeKey}`);
@@ -9226,3 +9237,9 @@ export const automationTestHooks = {
   triggerCatalog: () => triggerCatalog,
   validateGraphPayload
 };
+
+async function executeMCPControl(run, node, config) {
+ const version=(await ctx.pool.query('SELECT created_by_user_id FROM automation_versions WHERE id=$1 AND company_id=$2',[run.automation_version_id,run.company_id])).rows[0];
+ if(!version?.created_by_user_id)throw new Error('automation_author_unavailable');
+ return controlConnectionFromAutomation(ctx.pool,{companyId:run.company_id,userId:version.created_by_user_id,connectionId:config.connection_id,action:config.action_key.slice(4),pauseUntil:config.pause_until});
+}
