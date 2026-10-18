@@ -69,7 +69,9 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
    await db.query('SELECT id FROM mcp_connections WHERE id=$1 FOR UPDATE',[p.connection_id]);
    Object.assign(p,(await db.query('SELECT * FROM mcp_approvals WHERE id=$1 FOR UPDATE',[id])).rows[0]);
    const row=await rowFor(db,p.connection_id,companyId);
-   if(userId!==row.user_id){try{await manager(userId,companyId);}catch{throw fault(404,'approval_unavailable');}}else await loadPrincipal(db,userId,companyId,{enforceOAuthRolePolicy:false});
+   // Approval arguments/results may contain sponsor-private notes or files.
+   if(userId!==row.user_id)throw fault(404,'approval_unavailable');
+   await loadPrincipal(db,userId,companyId,{enforceOAuthRolePolicy:false});
    if(p.input_hash!==expectedHash)throw fault(409,'proposal_changed');
    if(p.state==='completed'){const a=await actorFor(row);await check(a,p.operation,{revision:p.policy_revision});return {state:'completed',result:p.result};}
    if(p.state!=='pending'||new Date(p.expires_at)<=new Date())throw fault(409,'approval_inactive');
@@ -98,7 +100,7 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
   const rows=(await pool.query('SELECT * FROM mcp_connections WHERE company_id=$1 ORDER BY created_at DESC LIMIT 200',[req.companyId])).rows;
   const connections=[];for(const row of rows)connections.push(await snapshot(await initialize(pool,row),req.manager));
   const company=(await pool.query('SELECT operating_hours,revision FROM mcp_company_policy WHERE company_id=$1',[req.companyId])).rows[0]||{operating_hours:null,revision:0};
-  const approvals=(await pool.query(`SELECT p.id,p.connection_id,p.operation,p.input_hash,p.payload,p.expires_at,g.name AS client_name FROM mcp_approvals p JOIN mcp_connections g ON g.id=p.connection_id WHERE g.company_id=$1 AND p.state='pending' AND p.expires_at>now() AND g.revoked_at IS NULL ORDER BY p.created_at LIMIT 100`,[req.companyId])).rows.map(({payload,...p})=>({...p,preview:JSON.stringify(payload,null,2)}));
+  const approvals=(await pool.query(`SELECT p.id,p.connection_id,p.operation,p.input_hash,p.payload,p.expires_at,g.name AS client_name FROM mcp_approvals p JOIN mcp_connections g ON g.id=p.connection_id WHERE g.company_id=$1 AND g.user_id=$2 AND p.state='pending' AND p.expires_at>now() AND g.revoked_at IS NULL ORDER BY p.created_at LIMIT 100`,[req.companyId,req.userId])).rows.map(({payload,...p})=>({...p,preview:JSON.stringify(payload,null,2)}));
   const activity=(await pool.query('SELECT id::text,connection_id,operation,outcome,created_at FROM mcp_audit WHERE company_id=$1 ORDER BY id DESC LIMIT 200',[req.companyId])).rows;
   res.json({company_id:req.companyId,company_name:req.manager.companyName,mcp_url:env.MCP_PUBLIC_ORIGIN+'/mcp',enabled:env.MCP_ENABLED==='true',limit:10,active_count:rows.filter(r=>!r.revoked_at&&!r.archived_at).length,connections,company_schedule:company,approvals,activity,outbound_calling_enabled:false});
  }));
@@ -114,7 +116,7 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
   res.json(await mutate(req,async(db,row)=>{
    if(row.revoked_at||row.archived_at)throw fault(409,'connection_inactive');
    const sponsor=await loadPrincipal(db,row.user_id,row.company_id,{enforceOAuthRolePolicy:false});const actor={...sponsor,scopes:row.kind==='service'?Object.keys(scopes).concat(['availability:read','appointments:book','quotes:read','quotes:draft']):row.scopes};
-   for(const [id,r]of Object.entries(i.tool_policy)){const d=definitions.get(id);if(!d)throw fault(400,'unknown_tool');if(r.allow&&(!available(d,row,actor)||d.caps.some(c=>!req.manager.permissions.capabilities[c])))throw fault(403,'tool_not_available');}
+   for(const [id,r]of Object.entries(i.tool_policy)){const d=definitions.get(id),old=row.tool_policy?.[id];if(!d){if(JSON.stringify(r)!==JSON.stringify(old))throw fault(400,'unknown_tool');continue;}const expanding=r.allow&&(!old?.allow||(old.approval&&!r.approval));if(expanding&&(!available(d,row,actor)||d.caps.some(c=>!req.manager.permissions.capabilities[c])))throw fault(403,'tool_not_available');}
    await db.query('UPDATE mcp_connections SET name=$2,description=$3,provider=$4,enabled=$5,paused_until=$6,operating_hours=$7,tool_policy=$8 WHERE id=$1',[row.id,i.name,i.description,i.provider,i.enabled,i.paused_until,JSON.stringify(i.operating_hours),JSON.stringify(i.tool_policy)]);
    if(row.kind==='service')await db.query("UPDATE retell_connections SET config=jsonb_set(config,'{automatic_booking}',$2::jsonb),revision=revision+1 WHERE id=$1",[row.id,JSON.stringify(i.automatic_booking)]);
    await audit(db,row,'connection.updated','success',req.userId);return {saved:true};

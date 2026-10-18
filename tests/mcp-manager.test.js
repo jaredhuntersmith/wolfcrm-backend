@@ -55,6 +55,8 @@ test('native manager with real PostgreSQL and SDK: policies, keys, approvals, ca
    assert.equal((await save({tool_policy:{crm_identity:{allow:true,approval:true}}})).status,200);
    const id=randomUUID(),p=await call('crm_identity',{_request_id:id});assert.equal(p.state,'pending');assert.equal(p.result,null);assert.ok(!JSON.stringify(p).includes('Manager QA A'));
    const proposal=(await get()).approvals.find(x=>x.id===p.approval_id);assert.ok(proposal);
+   assert.equal((await http(base,'GET',undefined,admin)).body.approvals.length,0,'admin cannot see sponsor-private proposal arguments');
+   assert.equal((await http('/api/ai-connections/approvals/'+p.approval_id,'POST',{expected_hash:proposal.input_hash,decision:'approve'},admin)).status,404);
    const approve=()=>http('/api/ai-connections/approvals/'+p.approval_id,'POST',{expected_hash:proposal.input_hash,decision:'approve'});
    assert.equal((await approve()).status,200);assert.equal((await approve()).status,200);assert.equal((await call('crm_identity',{_request_id:id})).result.company_id,a);
    await save({tool_policy:{crm_identity:{allow:true,approval:true},crm_get:{allow:true,approval:true}}});
