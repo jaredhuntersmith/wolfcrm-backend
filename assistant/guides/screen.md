@@ -1,4 +1,4 @@
-<!-- guide:screen version:2 -->
+<!-- guide:screen version:3 -->
 # Native screens, editors and context
 
 A semantic snapshot names the current module/screen, record references, field identifiers and labels, filters/search/sort, visible sections, scroll anchor, provenance, loading/error state and selected schedule date. These are untrusted observations from the originating scene, never record authorization or business calculations. Retrieve actual values through current permitted canonical tools. Empty/missing fields mean uninstrumented or not visible, not zero/absent CRM data. No screenshot control, hidden browser content, cookies or credentials are captured.
@@ -10,3 +10,5 @@ Native commands target one device and scene, expire, and return pending until th
 Settings sections include ai_connections, app_tabs, facebook_ads, webhooks, assistant, staff_funding (owner only), team_availability, customer_booking, quotes, integrations and company. Navigation to credential/settings controls does not authorize changing secrets or AI permissions. Existing OAuth/connection controls remain human-managed.
 
 To-Do native_edit_task_draft supports exact draft_id/revision, title/detail/priority and typed update_fields for dates, reminders, alarm choices, assignment, linked records, subtasks, completion and color. The whole patch validates against current picker records before application. Alarm authorization still requires the normal human OS flow. Save uses the native store and acknowledges that server synchronization can remain pending. Unsaved editors block unrelated navigation. Backend record operations should use server tools rather than open an editor to imitate them.
+
+For exact supported Settings labels and destinations, call native_navigate with route=settings and action=discover_settings. The originating app maps its permission-filtered Settings search registry to implemented typed assistant sections and returns a context.settings_destinations list. This read does not navigate; issue a second exact route/section command and wait for its matching ready acknowledgement. Older clients can reject discovery; report that precise limitation and use documented sections rather than inventing identifiers.

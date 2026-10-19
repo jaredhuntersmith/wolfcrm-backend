@@ -66,7 +66,7 @@
     "test:elevenlabs": "node --test tests/elevenlabs.integration.test.js",
     "test:facebook-ads": "node --test tests/facebook-ads.test.js tests/facebook-ads.integration.test.js",
     "test:webhooks": "node --test tests/webhooks.test.js tests/webhooks.integration.test.js tests/webhook-responses.test.js",
-    "test:assistant": "node --test --test-concurrency=1 tests/assistant-unit.test.js tests/assistant.integration.test.js tests/assistant-funding.test.js tests/assistant-routes.test.js tests/assistant-cross-feature.integration.test.js tests/assistant-finance.integration.test.js tests/assistant-geometry.integration.test.js",
+    "test:assistant": "node --test --test-concurrency=1 tests/assistant-unit.test.js tests/assistant.integration.test.js tests/assistant-funding.test.js tests/assistant-routes.test.js tests/assistant-cross-feature.integration.test.js tests/assistant-finance.integration.test.js tests/assistant-geometry.integration.test.js tests/assistant-scheduling-repair.test.js",
     "assistant:inventory": "node assistant/export-inventory.js ../docs/assistant/CAPABILITIES.json",
     "test:assistant:automation": "node tests/assistant-automation-regression.js",
     "test:automation-time-schedule": "node --test --test-concurrency=1 tests/automation-time-schedule.test.js tests/automation-time-schedule.integration.test.js",

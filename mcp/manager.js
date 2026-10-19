@@ -45,6 +45,7 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
   return {row,definition,policy};
  }
  function available(d,row,actor){
+  if(d.id==='assistant_job_create'&&!actor.isCompanyOwner)return false;
   if((d.id.startsWith('native_')||d.id.startsWith('assistant_'))&&row.kind!=='assistant')return false;
   if(d.family==='service'&&!['service','assistant'].includes(row.kind))return false;
   // Service agents must use the calculator and guarded booking workflow.

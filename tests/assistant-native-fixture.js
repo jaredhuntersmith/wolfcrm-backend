@@ -2,6 +2,9 @@
 // synthetic. No existing database, paid provider, customer channel or ad account
 // is used. SIGINT/SIGTERM removes the Unix-socket-only PostgreSQL cluster.
 import assert from 'node:assert/strict';
+import {spawnSync} from 'node:child_process';
+import {createProvider} from '../assistant/models.js';
+const repairLive=process.argv.includes('--repair-live-model');
 import {startLocalPostgres} from './helpers/local-postgres.js';
 import {randomUUID,randomBytes} from 'node:crypto';
 import {writeFile,chmod} from 'node:fs/promises';
@@ -34,6 +37,7 @@ const pg=startLocalPostgres();pg.configureEnvironment();
 const originalFetch=globalThis.fetch;let externalAttempts=0;
 globalThis.fetch=async(input,options)=>{
  const url=new URL(typeof input==='string'?input:input.url||String(input));
+ if(repairLive&&url.origin==='https://api.openai.com'&&url.pathname==='/v1/responses')return originalFetch(input,options);
  if(!['127.0.0.1','localhost','::1','[::1]'].includes(url.hostname)||url.protocol!=='http:'){
   externalAttempts++;throw new Error('Synthetic native fixture rejected non-loopback fetch');
  }
@@ -74,10 +78,19 @@ try {
  await pool.query('INSERT INTO sessions(token,user_id) VALUES($1,$2),($3,$4)',[token,user,staffToken,staff]);
  await pool.query("INSERT INTO contacts(id,user_id,company_id,name,address,lat,lng) VALUES($1,$2,$3,'Jennifer White — fixture','100 Synthetic Road',38.01,-85.01),($4,$2,$3,'Jennifer Adams — fixture','200 Synthetic Road',38.02,-85.02)",[contact,user,company,secondContact]);
  await installMCP({app,pool,authRequired,env,startMaintenance:false,verifyIdentity:async()=>null});
+ let liveProvider;
+ if(repairLive){
+  const secured=spawnSync('railway',['variable','list','--project','ded98d13-d159-4e86-9863-0a2181da4078','--environment','c97fcc63-a130-42b5-8b04-69d09804c9fc','--service','0ea62066-e5e0-4de2-914a-bacb455e5ab4','--json'],{encoding:'utf8'});
+  if(secured.status)throw new Error('Existing owner model funding could not be loaded securely');
+  const values=JSON.parse(secured.stdout);if(!values.OPENAI_API_KEY)throw new Error('Existing owner API funding is unavailable');
+  liveProvider=createProvider({env:{ASSISTANT_OWNER_FUNDING:'true',OPENAI_API_KEY:values.OPENAI_API_KEY}});
+  await pool.query("UPDATE contacts SET name='Jared Smith',address='Partial fixture street' WHERE id=$1",[contact]);
+ }
  const scenarios={};let providerCalls=0;
- const provider={models:async()=>modelCatalog,respond:async(_settings,request,{onText})=>{
+ const provider={models:async()=>modelCatalog,respond:async(_settings,request,{onText,signal})=>{
   providerCalls++;
-  const isHuman=x=>x.role==='user'&&typeof x.content==='string'&&!x.content.startsWith('Untrusted semantic');
+  if(repairLive)return liveProvider.respond(_settings,request,{onText,signal});
+  const isHuman=x=>x.role==='user'&&typeof x.content==='string'&&!x.content.startsWith('Untrusted semantic')&&!x.content.startsWith('Prior conversational intent');
   const latest=request.input.filter(isHuman).at(-1)?.content||'';
   const turnStart=request.input.findLastIndex(isHuman);
   const previous=request.input.slice(turnStart+1).filter(x=>x.type==='function_call').at(-1);
@@ -110,6 +123,11 @@ try {
  }};
  assistant=await installAssistant({app,pool,authRequired,env,provider});
  const control=(req,res,next)=>req.get('authorization')==='Bearer '+token?next():res.status(401).json({error:'fixture_owner_required'});
+ app.get('/__fixture/repair',control,async(_req,res)=>{
+  res.json({jobs:(await pool.query('SELECT id,title,start_at,end_at,service_items FROM schedule_events WHERE company_id=$1 AND contact_id=$2',[company,contact])).rows,
+   steps:(await pool.query('SELECT s.tool,s.state,s.result,s.arguments FROM wolf_assistant_steps s JOIN wolf_assistant_runs r ON r.id=s.run_id WHERE r.company_id=$1 ORDER BY s.started_at',[company])).rows,
+   approvals:(await pool.query("SELECT p.id,p.input_hash,p.operation,p.state FROM mcp_approvals p JOIN mcp_connections c ON c.id=p.connection_id WHERE c.company_id=$1 AND p.state='pending'",[company])).rows});
+ });
  app.get('/__fixture/reference',(_req,res)=>res.type('html').send('<!doctype html><html><head><title>Fixture reference</title></head><body><h1>Fixture reference</h1><p>Synthetic gutter-cleaning reference for native Browser acceptance.</p></body></html>'));
  app.get('/__fixture/objects/:id',(req,res)=>{const bytes=objects.get(req.params.id);if(!bytes)return res.sendStatus(404);res.type('pdf').send(bytes);});
  app.get('/__fixture/state',control,async(_req,res)=>{try{res.json({external_attempts:externalAttempts,provider_calls:providerCalls,runs:(await pool.query('SELECT id,conversation_id,status,output,error_code,context FROM wolf_assistant_runs WHERE company_id=$1 ORDER BY created_at DESC LIMIT 50',[company])).rows,commands:(await pool.query('SELECT id,run_id,command,state,result FROM wolf_assistant_commands ORDER BY expires_at DESC,id DESC LIMIT 100')).rows});}catch(error){console.error('[fixture-state]',error.code||error.name);res.status(503).json({error:'fixture_state_unavailable'});}});
@@ -126,8 +144,8 @@ try {
   await ok('/api/assistant/settings',{expected_revision:session===staffToken?2:1,funding:'owner',model:'gpt-6.1-sol',reasoning:'low',instructions:'Synthetic UI fixture.',memory_enabled:true,monthly_limit_micros:50000000},'PUT',session);
   // Deliberate test identities receive only read/navigation capabilities. The
   // fixture does not enable provider mutations or credential operations.
-  const grants=['assistant_execute','native_navigate','native_refresh_context','crm_search'];
-  await pool.query('UPDATE mcp_connections SET tool_policy=$2,revision=revision+1 WHERE id=$1',[setup.settings.connection_id,JSON.stringify(Object.fromEntries(grants.map(id=>[id,{allow:true,approval:false}])))]);
+  const grants=repairLive?['assistant_execute','native_navigate','native_refresh_context','crm_identity','crm_search','crm_get','crm_availability','assistant_job_create']:['assistant_execute','native_navigate','native_refresh_context','crm_search'];
+  await pool.query('UPDATE mcp_connections SET tool_policy=$2,revision=revision+1 WHERE id=$1',[setup.settings.connection_id,JSON.stringify(Object.fromEntries(grants.map(id=>[id,{allow:true,approval:repairLive&&id==='assistant_job_create'}])))]);
  }
  const createdNote=await ok('/api/notes/pages',{id:note,title:'Fixture acceptance note',visibility:'private'});
  const block=createdNote.blocks[0];

@@ -28,7 +28,7 @@ export function registerWorkspaceTools(tool,{actor,pool,app}){
   return transaction(pool,async db=>{
    await db.query('SELECT id FROM mcp_connections WHERE id=$1 FOR UPDATE',[actor.connectionId]);const fresh=await connection(pool,actor.connectionId);permit(fresh,scope,caps);
    const prior=(await db.query('SELECT * FROM mcp_operations WHERE connection_id=$1 AND request_id=$2',[actor.connectionId,request_id])).rows[0];const hash=digest(raw);
-   if(prior){if(prior.operation!==name||prior.input_hash!==hash)throw fault(409,'idempotency_conflict');return output({replayed:true,request_id,operation:name,message:'This request already completed. Read the current record through its authorized read capability.'});}
+   if(prior){if(prior.operation!==name||prior.input_hash!==hash)throw fault(409,'idempotency_conflict');if(name==='assistant_job_create')return output({...prior.result.data,replayed:true});return output({replayed:true,request_id,operation:name,message:'This request already completed. Read the current record through its authorized read capability.'});}
    const result=output(handler?await handler(i,request_id):await dispatch(app,fresh,method,typeof path==='function'?path(i):path,body?body(i,request_id):i));
    await db.query('INSERT INTO mcp_operations(connection_id,request_id,operation,input_hash,result) VALUES($1,$2,$3,$4,$5)',[actor.connectionId,request_id,name,hash,JSON.stringify(result)]);return result;
   });
