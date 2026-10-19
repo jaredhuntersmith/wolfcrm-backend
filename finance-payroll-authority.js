@@ -1,3 +1,4 @@
+import { lockFinanceSourceRows } from "./finance-source-locks.js";
 import { createHash } from "node:crypto";
 
 const MAX_POLICY_HISTORY = 500;
@@ -623,9 +624,10 @@ async function companyContext(client, companyId) {
 }
 
 async function requireEmployee(client, companyId, employeeId, { active = true, lock = false } = {}) {
+  if (lock) await lockFinanceSourceRows(client, "users", companyId, [employeeId]);
   const { rows } = await client.query(
     `SELECT id, email, display_name, role, deleted_at
-       FROM users WHERE id = $1::uuid AND company_id = $2${active ? " AND deleted_at IS NULL" : ""}${lock ? " FOR UPDATE" : ""}`,
+       FROM users WHERE id = $1::uuid AND company_id = $2${active ? " AND deleted_at IS NULL" : ""}`,
     [employeeId, companyId]
   );
   if (!rows[0]) throw new PayrollAuthorityError("payroll_employee_not_found", "The company employee was not found.", 404);

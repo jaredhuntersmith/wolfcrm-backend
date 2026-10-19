@@ -1,3 +1,4 @@
+import { lockFinanceCompany } from "./finance-locks.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   GeneralLedgerError,
@@ -963,7 +964,7 @@ export function installFinanceBankSourceRoutes({ app, pool, authRequired, requir
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       const accountID = uuid(req.params.accountId, "finance_account_id");
       const accountResult = await client.query(`SELECT * FROM finance_accounts WHERE company_id=$1 AND id=$2 FOR UPDATE`, [req.companyId, accountID]);
       const financeAccount = accountResult.rows[0];
@@ -1067,7 +1068,7 @@ export function installFinanceBankSourceRoutes({ app, pool, authRequired, requir
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       const request = normalizeBankPostingRequest({ body: req.body, transactionID: req.params.transactionId, action });
       if (await replayedPostingRequest(client, req.companyId, request)) {
         await client.query("COMMIT");

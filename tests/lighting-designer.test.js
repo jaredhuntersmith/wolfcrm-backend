@@ -27,3 +27,12 @@ test("asset keys cannot cross company or project boundaries", () => {
   assert.equal(assertLightingAssetKey("company-a", "project-a", `${prefix}source.jpg`), `${prefix}source.jpg`);
   assert.throws(() => assertLightingAssetKey("company-a", "project-a", "companies/company-a/lighting/project-b/source.jpg"), LightingInputError);
 });
+
+
+test("accepts current Swift enum envelope without inventing outer IDs", () => {
+ const metadata={id:layerID,name:"Roofline",isVisible:true,isLocked:false,opacity:1,createdAt:"2026-10-20T12:00:00Z",updatedAt:"2026-10-20T12:00:00Z"};
+ const doc={schemaVersion:1,assets:{},scene:{mode:"day",nightAmount:0},layers:[{kind:"roofline",payload:{metadata,points:[{x:0,y:0},{x:1,y:1}],style:{fixture:"c9",pattern:{colors:[{hex:"#FFD69B"}]},density:.5,previewScale:1,brightness:.8,glowRadius:.6,glowStrength:.7,opacity:1,patternOffset:0},overrides:[],reversed:false}}]};
+ assert.deepEqual(validateLightingDocument(doc),doc);assert.equal(doc.layers[0].id,undefined);
+ assert.throws(()=>validateLightingDocument({...doc,layers:[{...doc.layers[0],id:"11111111-1111-4111-8111-111111111111"}]}),LightingInputError);
+ assert.throws(()=>validateLightingDocument({...doc,layers:[{kind:"roofline",payload:{metadata:{id:"broken"}}}]}),LightingInputError);
+});

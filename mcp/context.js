@@ -4,6 +4,16 @@ import {Socket} from 'node:net';
 import {randomUUID,createHash} from 'node:crypto';
 export const internalActor=Symbol('wolf.mcp.actor');
 const storage=new AsyncLocalStorage();
+const requestCleanupStorage=new AsyncLocalStorage();
+// Canonical services may release an async scoped database lease after res.json.
+// An internal dispatch must await that cleanup before its MCP receipt can use
+// the same transaction (notably RESET ROLE for finance RLS).
+export function trackRequestCleanup(work){
+ const pending=requestCleanupStorage.getStore();
+ if(pending){pending.add(work);work.catch(()=>{});}
+ return work;
+}
+
 export const digest=value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex');
 export function fault(status,code,message=code){return Object.assign(new Error(message),{status,code});}
 // Only in-process MCP operations enter this context. Ordinary requests use the pool unchanged.
@@ -52,14 +62,17 @@ export async function transaction(pool,fn){
 }
 // Internal requests cannot be constructed via HTTP headers. Run the canonical middleware
 // and handlers, including current capability/record checks, without minting a CRM session.
-export function dispatch(app,actor,method,path,body){
+export function dispatch(app,actor,method,path,body,{financeSpaceId}={}){
+  if(financeSpaceId!==undefined&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(financeSpaceId))throw fault(400,'invalid_finance_space');
   return new Promise((resolve,reject)=>{
     const req=new IncomingMessage(new Socket());req.method=method;req.url=path;
-    req.headers={host:'internal.wolf.invalid','content-type':'application/json'};
+    req.headers={host:'internal.wolf.invalid','content-type':'application/json',...(financeSpaceId?{'x-finance-space':financeSpaceId}:{}),...(body!==undefined?{'content-length':String(Buffer.byteLength(JSON.stringify(body)))}:{})};
     req.body=body||{};req._body=true;req[internalActor]=actor;
     const res=new ServerResponse(req);let data='';
     res.write=chunk=>{data+=chunk;return true;};
-    res.end=chunk=>{if(chunk)data+=chunk;try{const value=data?JSON.parse(data):null;if(res.statusCode>=400)reject(fault(res.statusCode,value?.error||'workflow_failed',value?.message));else resolve(value);}catch(e){reject(e);}return res;};
-    app.handle(req,res,error=>reject(error||fault(503,'workflow_unavailable')));
+    const pending=new Set();
+    const finish=async(error)=>{try{while(pending.size){const batch=[...pending];pending.clear();await Promise.all(batch);}if(error)throw error;const value=data?JSON.parse(data):null;if(res.statusCode>=400)throw fault(res.statusCode,value?.error||'workflow_failed',value?.message);resolve(value);}catch(e){reject(e);}};
+    res.end=chunk=>{if(chunk)data+=chunk;queueMicrotask(()=>finish());return res;};
+    requestCleanupStorage.run(pending,()=>app.handle(req,res,error=>queueMicrotask(()=>finish(error||fault(503,'workflow_unavailable')))));
   });
 }

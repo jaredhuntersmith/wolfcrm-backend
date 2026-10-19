@@ -271,7 +271,7 @@ test("schema and routes are additive, tenant-linked, audited, and source preserv
   assert.match(source, /bank-sources\/transactions\/:transactionId\/void/);
   assert.match(source, /Re-check after locking so identical retries remain idempotent/);
   assert.match(source, /operational_receivable_authority_active/);
-  assert.match(source, /SELECT id FROM companies WHERE id=\$1 FOR UPDATE/);
+  assert.match(source, /await lockFinanceCompany\(client, req.companyId\)/);
   assert.doesNotMatch(source, /UPDATE finance_transactions\s+SET/);
   assert.doesNotMatch(source, /DELETE FROM finance_transactions/);
   assert.doesNotMatch(source, /UPDATE finance_transaction_splits\s+SET/);

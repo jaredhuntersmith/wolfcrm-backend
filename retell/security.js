@@ -11,10 +11,12 @@ function encryptionKey(env){const key=Buffer.from(env.RETELL_ENCRYPTION_KEY||'',
 export function encrypt(secret,companyId,env){const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',encryptionKey(env),iv);cipher.setAAD(Buffer.from(companyId));return [iv,Buffer.concat([cipher.update(secret,'utf8'),cipher.final()]),cipher.getAuthTag()].map(b=>b.toString('base64')).join('.');}
 export function decrypt(value,companyId,env){const [iv,data,tag]=value.split('.').map(s=>Buffer.from(s,'base64'));const cipher=createDecipheriv('aes-256-gcm',encryptionKey(env),iv);cipher.setAAD(Buffer.from(companyId));cipher.setAuthTag(tag);return Buffer.concat([cipher.update(data),cipher.final()]).toString('utf8');}
 export async function principal(db,row,env){
- if(!serviceEnabled(row?.provider,env))throw fault(503,'retell_disabled');
- if(!row||row.revoked_at||!row.key_hash||!row.expires_at||new Date(row.expires_at)<=new Date())throw fault(401,'retell_key_inactive');
+ const native=row?.provider==='wolf-assistant'&&row?.key_hash===null;
+ if(native ? env.MCP_ENABLED!=='true'||env.ASSISTANT_ENABLED!=='true' : !serviceEnabled(row?.provider,env))throw fault(503,'retell_disabled');
+ if(!row||row.revoked_at||(!native&&!row.key_hash)||!row.expires_at||new Date(row.expires_at)<=new Date())throw fault(401,'retell_key_inactive');
  const actor=await loadPrincipal(db,row.user_id,row.company_id,{enforceOAuthRolePolicy:false});
- if(!actor.isCompanyOwner&&!(actor.permissions.preset==='admin'&&actor.permissions.capabilities['ai.manage']&&actor.permissions.capabilities['integrations.manage']))throw fault(403,'retell_sponsor_inactive');
+ if(native&&!actor.permissions.capabilities['ai.use'])throw fault(403,'assistant_access_denied');
+ if(!native&&!actor.isCompanyOwner&&!(actor.permissions.preset==='admin'&&actor.permissions.capabilities['ai.manage']&&actor.permissions.capabilities['integrations.manage']))throw fault(403,'retell_sponsor_inactive');
 
  return {...actor,connectionId:row.id,retell:row,scopes:[...Object.keys(scopes),...scopesFor(row)]};
 }

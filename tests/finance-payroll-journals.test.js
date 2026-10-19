@@ -176,7 +176,7 @@ test("schema and routes preserve tenant, lock, audit, and no-cash boundaries", (
   assert.match(source, /CREATE TABLE IF NOT EXISTS finance_payroll_journal_posting_audit/);
   assert.match(source, /finance_payroll_evaluation_periods\(company_id, id\)/);
   assert.match(source, /SELECT pg_advisory_xact_lock/);
-  assert.match(source, /SELECT id FROM companies WHERE id=\$1 FOR UPDATE/);
+  assert.match(source, /await lockFinanceCompany\(client, req.companyId\)/);
   assert.match(source, /FOR UPDATE/);
   assert.match(source, /FOR SHARE/);
   assert.doesNotMatch(source, /UPDATE finance_payroll_evaluation_periods\s+SET/);

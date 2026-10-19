@@ -1,3 +1,8 @@
+import {evaluateAdsTriggers, executeAdsAutomation, validateMetricRule, validateAdsAction} from './facebook-ads/automation.js';
+import {sendHTTPS} from './webhooks/network.js';
+import {mapWebhookResponse,responseMappingsSchema} from './webhooks/responses.js';
+import {timeScheduleSchema,enqueueTimeSchedules,timeScheduleStillCurrent} from './automation-time-schedule.js';
+import {aiTaskConfig} from './assistant/automation.js';
 import {controlConnectionFromAutomation} from './mcp/automation.js';
 import {isDraftOnly} from './mcp/context.js';
 import {afterCommit} from './mcp/context.js';
@@ -41,6 +46,12 @@ const AUTOMATION_SAFETY_DEFAULTS = {
 
 let ctx = null;
 
+function wakeAutomation(work, label) {
+  if (ctx?.disableProcessors) return;
+  afterCommit(() => setImmediate(() => Promise.resolve().then(work).catch((error) =>
+    console.error(`[automations] ${label} failed`, error?.message || error))));
+}
+
 class AutomationError extends Error {
   constructor(code, message, options = {}) {
     super(message || code);
@@ -58,7 +69,7 @@ const SIDE_EFFECT_FREE_ACTIONS = new Set([
 ]);
 
 const CORE_TRIGGERS = new Set([
-  "manual",
+  "manual", "incoming.webhook", "time.schedule",
   "contact.created", "contact.updated", "contact.tag_added", "contact.tag_removed",
   "pipeline.stage_changed", "pipeline.won", "pipeline.lost",
   "job.created", "job.completed", "weather.job_at_risk",
@@ -86,6 +97,8 @@ const HIDDEN_TRIGGERS = new Set([
 ]);
 
 const CORE_ACTIONS = new Set([
+  "webhook.send", "note.create",
+  "assistant.task",
   "mcp.enable", "mcp.disable", "mcp.pause",
   "contact.create", "contact.add_tag", "contact.update_fields",
   "pipeline.create_opportunity", "pipeline.move_stage",
@@ -159,7 +172,14 @@ function deprecationFor(key) {
   return { deprecated: true, deprecated_reason: "Use the broader configurable node in new automations.", replacement_key: replacement };
 }
 
+export const webhookEventCatalog = () => [...triggerCatalog, {
+  key: 'facebook_ads.changed', display_name: 'Facebook Ads change confirmed',
+  description: 'A durable receipt confirms a Facebook delivery or budget change. Uncertain and rejected changes are excluded.', wired: true,
+}];
 const triggerCatalog = [
+  ["time.schedule", "Scheduled time", "Schedule", "Daily, weekly or monthly at a local wall-clock time in the company or explicit IANA timezone. Published rules only. Missed runs catch up within 1–120 minutes (default 15); absent DST times/dates are skipped and repeated times run once.", ["generic"], ["time.schedule"]],
+  ["facebook_ads.metric", "Facebook Ads metric", "Facebook Ads", "Evaluate a configured metric in the ad-account timezone. Provider data may be delayed; published rules only.", ["facebook_ad"], ["facebook_ads.metric"]],
+  ["incoming.webhook", "Incoming Webhook", "Webhooks", "An authenticated external event with approved mapped variables.", ["generic"], ["incoming.webhook"]],
   ["manual", "Manual", "Manual", "Starts when an employer manually runs the automation.", ["generic"], ["manual"]],
   ["contact.created", "Contact Created", "Contacts", "A contact was created.", ["contact"], ["contact.created"]],
   ["contact.updated", "Contact Updated", "Contacts", "A contact was updated.", ["contact"], ["contact.updated"]],
@@ -500,6 +520,10 @@ const triggerCatalog = [
 }));
 
 const actionCatalog = [
+  ["facebook_ads.status", "Change Facebook delivery", "Facebook Ads", "Pause or resume the matched or selected authorized advertising entity.", ["generic", "facebook_ad"], ["default"]],
+  ["facebook_ads.budget", "Change Facebook budget", "Facebook Ads", "Change an eligible budget using a durable retry-safe receipt.", ["generic", "facebook_ad"], ["default"]],
+  ["note.create", "Create Note", "Notes", "Create a company Note using the shared Notes service.", ["generic"], ["default"]],
+  ["assistant.task", "AI Task", "AI", "Run a durable assistant task with the publishing user’s current permissions, capability allowlist, approved model and cost limit. Results and failures remain in run history.", ["generic"], ["default", "error"]],
   ["mcp.enable", "Enable AI Connection", "AI Connections", "Enable one company connection; preserves permissions and operating hours.", ["generic"], ["default"]],
   ["mcp.disable", "Disable AI Connection", "AI Connections", "Disable one company connection; preserves permissions and operating hours.", ["generic"], ["default"]],
   ["mcp.pause", "Pause AI Connection", "AI Connections", "Pause one company connection; preserves permissions and operating hours.", ["generic"], ["default"]],
@@ -734,6 +758,9 @@ const actionCatalog = [
 }));
 
 const actionExecutors = {
+  "facebook_ads.status": executeFacebookAdsAction, "facebook_ads.budget": executeFacebookAdsAction,
+  "note.create": executeWebhookNote,
+  "assistant.task": executeAssistantTask,
   "mcp.enable": executeMCPControl, "mcp.disable": executeMCPControl, "mcp.pause": executeMCPControl,
   "contact.create": executeContactCreate,
   "contact.delete": executeContactDelete,
@@ -955,8 +982,10 @@ const actionExecutors = {
 };
 
 function actionConfigFields(key) {
+  if(key.startsWith("facebook_ads.")) return [{key:"ads",label:"Facebook action",type:"json"}];
   const commonText = (name, label) => ({ key: name, label, type: "text" });
   switch (key) {
+    case "assistant.task": return [commonText("execution_user_id","Publishing user ID"),{key:"instructions",label:"Task instructions",type:"multiline"},{key:"allowed_tools",label:"Allowed capability IDs",type:"string_list"},commonText("model","Verified model ID"),commonText("reasoning","Supported reasoning effort"),{key:"max_steps",label:"Maximum model turns",type:"number"},{key:"max_cost_micros",label:"Estimated USD limit in millionths",type:"number"},{key:"output_destination",label:"Save result to",type:"select",options:["assistant_result","private_note","company_note"]},commonText("output_title","Result title"),{key:"failure_behavior",label:"On failure",type:"select",options:["stop","error_path"]}];
     case "mcp.enable": case "mcp.disable": return [{key:"connection_id",label:"AI Connection",type:"mcp_connection"}];
     case "mcp.pause": return [{key:"connection_id",label:"AI Connection",type:"mcp_connection"},{key:"pause_until",label:"Pause until",type:"datetime"}];
     case "contact.create":
@@ -1264,8 +1293,9 @@ function actionConfigFields(key) {
       return [{ key: "operation", label: "Operation", type: "select", options: ["join", "concat", "uppercase", "lowercase", "trim", "replace", "substring", "split", "length"] }, commonText("value", "Value"), commonText("delimiter", "Delimiter"), commonText("find", "Find"), commonText("replace", "Replace")];
     case "date":
       return [commonText("value", "Date"), { key: "operation", label: "Operation", type: "select", options: ["add", "subtract", "start_of_day", "end_of_day", "next_weekday", "format", "difference"] }, { key: "amount", label: "Amount", type: "number" }, { key: "unit", label: "Unit", type: "select", options: ["minutes", "hours", "days", "weeks", "months", "years"] }, commonText("other", "Other Date")];
+    case "note.create": return [commonText("title", "Title"),commonText("text", "Note text")];
     case "webhook.send":
-      return [commonText("url", "URL"), { key: "method", label: "Method", type: "select", options: ["GET", "POST", "PUT", "PATCH", "DELETE"] }, { key: "headers", label: "Headers", type: "json" }, { key: "body", label: "JSON Body", type: "json" }];
+      return [{key:"destination_id",label:"Outgoing destination",type:"webhook_destination"},{key:"request",label:"Request values",type:"json"}];
     case "automation.start":
       return [commonText("automation_id", "Automation ID")];
     default:
@@ -1274,6 +1304,9 @@ function actionConfigFields(key) {
 }
 
 function triggerConfigFields(key) {
+  if(key === "time.schedule") return [{key:"schedule",label:"Daily/weekly/monthly schedule",type:"json",description:"frequency, time HH:MM, timezone company or IANA, weekdays Monday=1, month_day, missed_run_window_minutes (1–120, default15)"}];
+  if(key === "facebook_ads.metric") return [{key:"ads",label:"Facebook metric rule",type:"json"}];
+  if(key === "incoming.webhook") return [{key:"connection_id",label:"Incoming webhook",type:"webhook_connection"}];
   const sourceOptions = ["manual", "ios", "zapier", "meta", "webhook", "csv", "phone", "map", "schedule", "automation", "system", "other"];
   const fields = [];
   if (key.includes("field_changed") || /_(name|phone|email|address|value|job_type|source|u[1-5]|location|start|end|date|price|material_cost|color|contact|due|title)_changed$/.test(key)) {
@@ -3219,7 +3252,13 @@ function validateGraphPayload(payload) {
     const nodeType = node.node_type || node.nodeType;
     const config = node.config || {};
     validateNodeSafetyConfig(nodeKey, nodeType, config, errors, warnings);
+    if (nodeType === "trigger" && config.trigger_key === "time.schedule" && !timeScheduleSchema.safeParse(config.schedule).success) errors.push(`invalid_time_schedule:${nodeKey}`);
+    if (nodeType === "trigger" && config.trigger_key === "facebook_ads.metric") { try { validateMetricRule(config.ads); } catch { errors.push(`invalid_facebook_metric_rule:${nodeKey}`); } }
+    if(nodeType === "trigger" && config.trigger_key === "incoming.webhook" && !/^[0-9a-f-]{36}$/i.test(config.connection_id||"")) errors.push(`webhook_connection_required:${nodeKey}`);
     if (nodeType === "trigger" && !triggerCatalog.find((t) => t.key === config.trigger_key)) errors.push(`invalid_trigger:${nodeKey}`);
+    if (nodeType === "action" && config.action_key?.startsWith("facebook_ads.")) { try { validateAdsAction(config); } catch { errors.push(`invalid_facebook_action:${nodeKey}`); } }
+    if (config.action_key === "assistant.task" && !aiTaskConfig.safeParse(config).success) errors.push(`invalid_ai_task:${nodeKey}`);
+    if (config.action_key === "webhook.send" && !responseMappingsSchema.safeParse(config.response_mappings||[]).success) errors.push(`invalid_webhook_response_mapping:${nodeKey}`);
     if (nodeType === "action" && !actionExecutors[config.action_key]) errors.push(`invalid_action:${nodeKey}`);
     if (nodeType === "trigger" && config.trigger_key === "contact.field_changed" && !config.field) errors.push(`field_change_trigger_missing_field:${nodeKey}`);
     if (nodeType === "action") {
@@ -3490,6 +3529,7 @@ async function saveDraftGraph(versionId, companyId, payload) {
   const db = await ctx.pool.connect();
   try {
     await db.query("BEGIN");
+    await db.query(`SELECT id FROM automation_versions WHERE id=$1 AND company_id=$2 FOR UPDATE`, [versionId, companyId]);
     await db.query(`DELETE FROM automation_edges WHERE version_id = $1 AND company_id = $2`, [versionId, companyId]);
     await db.query(`DELETE FROM automation_nodes WHERE version_id = $1 AND company_id = $2`, [versionId, companyId]);
     for (const node of payload.nodes || []) {
@@ -3648,7 +3688,7 @@ async function processAutomationEvents() {
     await db.query("BEGIN");
     events = (await db.query(
       `SELECT * FROM automation_events
-        WHERE processing_status IN ('pending','failed')
+        WHERE (processing_status IN ('pending','failed') OR (processing_status='processing' AND locked_at < now() - ($2::int * interval '1 second')))
           AND processed_at IS NULL
           AND (next_attempt_at IS NULL OR next_attempt_at <= now())
           AND (locked_at IS NULL OR locked_at < now() - ($2::int * interval '1 second'))
@@ -3711,13 +3751,15 @@ async function startRunsForEvent(event) {
       [automation.version_id, event.company_id]
     )).rows;
     if (!triggers.some((node) => triggerMatchesEvent(node, event))) continue;
+    const priorWebhookRun = event.source === "incoming_webhook" && ctx.app?.locals?.webhooks ? (await ctx.pool.query("SELECT r.* FROM wolf_webhook_run_identity i JOIN automation_runs r ON r.id=i.run_id WHERE i.event_id=$1 AND i.automation_id=$2",[event.id,automation.id])).rows[0] : null;
+    if(priorWebhookRun){await ctx.app.locals.webhooks.receiptGuard(ctx.pool,event.id);await runAutomation(priorWebhookRun.id);continue;}
     const startDecision = await canStartRun(automation, event);
     if (!startDecision.allowed) {
       if (startDecision.retryable) throw new AutomationError(startDecision.code || "automation_concurrency_full", startDecision.message || "Automation concurrency full", { retryable: true });
       continue;
     }
     const reentryKey = await resolveReentryKey(automation, event);
-    const run = await createRun({
+    const makeRun = () => createRun({
       companyId: event.company_id,
       automationId: automation.id,
       versionId: automation.version_id,
@@ -3728,6 +3770,7 @@ async function startRunsForEvent(event) {
       depth: 0,
       dryRun: false
     });
+    const run = ctx.app?.locals?.webhooks ? await ctx.app.locals.webhooks.runIdentity(event, automation, makeRun) : await makeRun();
     await installRunMonitors(run);
     await logRun(run, null, "info", "trigger.matched", `Trigger matched ${event.event_type}`, { event_id: event.id });
     await runAutomation(run.id);
@@ -3913,7 +3956,7 @@ async function startManualRun(automationId, companyId, userId, body) {
   });
   await installRunMonitors(run);
   await logRun(run, null, "info", body.dry_run ? "run.dry_start" : "run.manual_start", "Manual run started", { subject_type: body.subject_type, subject_id: body.subject_id });
-  if (!ctx.disableProcessors) setImmediate(() => runAutomation(run.id).catch((e) => console.error("[automations] manual run wake failed", e?.message || e)));
+  wakeAutomation(() => runAutomation(run.id), "manual run wake");
   return run;
 }
 
@@ -3953,7 +3996,7 @@ async function startDraftTestRun(automationId, companyId, userId, body) {
     depth: 0
   });
   await logRun(run, null, "info", "run.draft_test_start", "Draft test run started", { subject_type: body.subject_type, subject_id: body.subject_id, trigger_key: triggerKey });
-  if (!ctx.disableProcessors) setImmediate(() => runAutomation(run.id).catch((e) => console.error("[automations] draft test wake failed", e?.message || e)));
+  wakeAutomation(() => runAutomation(run.id), "draft test wake");
   return run;
 }
 
@@ -4010,7 +4053,9 @@ async function executeFromNode(runId, nodeId, scopeKey = "root", arrival = null)
     [runId, node.node_key, scopeKey]
   );
   if (Number(previous.rows[0].completed) > 0 && !node.config?.repeatable && !["merge", "foreach"].includes(node.node_type)) {
-    await traverse(run, graph, node, "default", scopeKey);
+    const completed=(await ctx.pool.query("SELECT output_snapshot FROM automation_run_nodes WHERE run_id=$1 AND node_key=$2 AND scope_key=$3 AND status='completed' ORDER BY completed_at DESC LIMIT 1",[runId,node.node_key,scopeKey])).rows[0];
+    const ports=completed?.output_snapshot?._webhook_resume_ports || ["default"];
+    for(const port of ports)await traverse(run,graph,node,port,scopeKey);
     return;
   }
   const attempt = Number(previous.rows[0].count) + 1;
@@ -4027,7 +4072,9 @@ async function executeFromNode(runId, nodeId, scopeKey = "root", arrival = null)
       await finishRunNode(runNode.id, "completed", result?.output || {});
       return;
     }
-    await finishRunNode(runNode.id, "completed", result?.output || {});
+    const output={...(result?.output||{})};
+    if(await ctx.app?.locals?.webhooks?.isManagedRun(run))output._webhook_resume_ports=result?.ports||[result?.port||"default"];
+    await finishRunNode(runNode.id, "completed", output);
     await ctx.pool.query(`UPDATE automation_runs SET current_node_count = current_node_count + 1, updated_at = now() WHERE id = $1`, [run.id]);
     if (Array.isArray(result?.ports)) {
       for (const port of result.ports) await traverse(run, graph, node, port, scopeKey);
@@ -4083,6 +4130,7 @@ async function triggerMatchesRunAsync(node, run) {
 }
 
 function triggerMatchesEvent(node, event) {
+  if(event.event_type === "incoming.webhook" && node.config?.connection_id !== event.payload?.webhook_connection_id) return false;
   const config = node.config || {};
   const key = config.trigger_key;
   if (!key) return false;
@@ -4307,6 +4355,7 @@ async function executeNode(run, node, runNode, scopeKey = "root", arrival = null
     return { stoppedRun: true, output: { failed: true } };
   }
   if (node.node_type === "sub_automation") {
+    await ctx.app?.locals?.webhooks?.guardNode(run,node);
     return executeAutomationStart(run, node, node.config || {});
   }
   if (node.node_type === "action") {
@@ -4320,7 +4369,20 @@ async function executeNode(run, node, runNode, scopeKey = "root", arrival = null
       return { port: "default", output: { would_execute: actionKey, resolved_config: redact(resolved) } };
     }
     await logRun(run, node, "info", "action.started", `Action started ${actionKey}`, {});
-    const output = await executor(run, node, node.config || {}, scopeKey);
+    const execute = async actor => {
+      if(actor){
+        const context=await buildRunContext(run,{scopeKey});
+        const contactId=resolveTemplate(node.config?.contact_id||"",context);
+        if(contactId)await ctx.app.locals.webhooks.checkContact(actor,contactId);
+        if(actionKey==="job.create"){
+          const start=node.config?.start_at||node.config?.start;
+          if(!start||!resolveDateExpression(start,context))throw new Error("webhook_job_start_required");
+        }
+        if(actionKey==="webhook.send"&&!node.config?.destination_id)throw new Error("webhook_destination_required");
+      }
+      return executor(run, node, node.config || {}, scopeKey);
+    };
+    const output = ctx.app?.locals?.webhooks ? await ctx.app.locals.webhooks.action(run,node,scopeKey,execute) : await execute();
     if (output?.waiting) {
       await ctx.pool.query(`UPDATE automation_run_nodes SET status = 'waiting', output_snapshot = $2::jsonb, updated_at = now() WHERE id = $1`, [runNode.id, JSON.stringify(output)]);
       return output;
@@ -4601,6 +4663,7 @@ async function cancelAutomationRun(runId, companyId, code = "run_canceled", mess
 }
 
 async function cancelRunContinuations(runId) {
+  if(ctx.app?.locals?.assistant)for(const r of (await ctx.pool.query("SELECT * FROM wolf_assistant_runs WHERE automation_run_id=$1 AND status IN ('queued','running','waiting_approval','waiting_client')",[runId])).rows)await ctx.app.locals?.assistant.cancel(r);
   const waits = await ctx.pool.query(`UPDATE automation_waits SET status = 'canceled', updated_at = now() WHERE run_id = $1 AND status = 'waiting' RETURNING id`, [runId]);
   const iterations = await ctx.pool.query(`UPDATE automation_run_iterations SET status = 'canceled', updated_at = now() WHERE run_id = $1 AND status IN ('queued','running','waiting') RETURNING id`, [runId]);
   const nodes = await ctx.pool.query(`UPDATE automation_run_nodes SET status = 'canceled', updated_at = now() WHERE run_id = $1 AND status IN ('queued','running','waiting_retry','waiting') RETURNING id`, [runId]);
@@ -4708,14 +4771,16 @@ function parseDurationMs(value) {
 }
 
 async function processDueWaits() {
+  if(ctx.app?.locals?.webhooks) await settleWebhookDeliveries();
   const db = await ctx.pool.connect();
   let waits = [];
   try {
     await db.query("BEGIN");
     waits = (await db.query(
       `SELECT * FROM automation_waits
-        WHERE status = 'waiting'
-          AND ((resume_at IS NOT NULL AND resume_at <= now()) OR (timeout_at IS NOT NULL AND timeout_at <= now()))
+        WHERE (status = 'waiting'
+          AND ((resume_at IS NOT NULL AND resume_at <= now()) OR (timeout_at IS NOT NULL AND timeout_at <= now())))
+          OR (wait_type = 'assistant' AND status = 'ready' AND updated_at < now() - interval '3 minutes')
         ORDER BY COALESCE(resume_at, timeout_at) ASC
         LIMIT $1
         FOR UPDATE SKIP LOCKED`,
@@ -4792,7 +4857,20 @@ function singleEventFilterMatches(filter, event, wait) {
 async function resumeWait(wait, port) {
   const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1`, [wait.run_id])).rows[0];
   if (!run || ["completed", "failed", "canceled", "stopped"].includes(run.status)) return;
+  if(wait.wait_type==='assistant'){
+    const result=(await ctx.pool.query('SELECT id,status,output,error_code,cost_micros FROM wolf_assistant_runs WHERE id=$1 AND automation_run_id=$2',[wait.event_filter?.assistant_run_id,run.id])).rows[0];
+    if(result&&['queued','running','waiting_approval','waiting_client'].includes(result.status)){
+      await ctx.pool.query("UPDATE automation_waits SET status='waiting',resume_at=now()+interval '15 seconds',updated_at=now() WHERE id=$1",[wait.id]);return;
+    }
+    const output=result||{status:'failed',error_code:'assistant_result_unavailable'};
+    await ctx.pool.query("UPDATE automation_run_nodes SET status=$4,output_snapshot=$3,completed_at=now(),updated_at=now() WHERE run_id=$1 AND node_id=$2 AND scope_key=$5 AND status='waiting'",[run.id,wait.node_id,JSON.stringify(output),output.status==='completed'?'completed':'failed',wait.scope_key||'root']);
+    if(output.status!=='completed'){
+      if(wait.event_filter?.failure_behavior!=='error_path'){await failRun(run,'ai_task_failed',output.error_code||output.status);return;}
+      port='error';
+    }
+  }
   const resumePort = wait.resume_port || port;
+  if(await ctx.app?.locals?.webhooks?.isManagedRun(run))await ctx.pool.query("UPDATE automation_run_nodes SET status='completed',output_snapshot=output_snapshot||$4::jsonb,completed_at=now() WHERE run_id=$1 AND node_id=$2 AND scope_key=$3 AND status='waiting'",[run.id,wait.node_id,wait.scope_key||'root',JSON.stringify({_webhook_resume_ports:[resumePort]})]);
   await ctx.pool.query(`UPDATE automation_waits SET status = CASE WHEN $2 = 'timeout' THEN 'timed_out' ELSE 'completed' END, updated_at = now() WHERE id = $1`, [wait.id, resumePort]);
   const node = (await ctx.pool.query(`SELECT * FROM automation_nodes WHERE id = $1`, [wait.node_id])).rows[0];
   if (node) await logRun(run, node, "info", "wait.resumed", `Wait resumed through ${resumePort}`, { wait_id: wait.id, scope_key: wait.scope_key || "root" });
@@ -4810,7 +4888,16 @@ function startAutomationProcessors() {
   setInterval(() => ctx.pool.query(`UPDATE automation_definitions SET status = 'published', pause_until = NULL WHERE status = 'paused' AND pause_until IS NOT NULL AND pause_until <= now() AND active_version_id IS NOT NULL`).catch(() => {}), 60000).unref?.();
 }
 
-async function processScheduledAutomationEvents() {
+let adsEvaluationInFlight = false;
+async function processScheduledAutomationEvents(now = new Date()) {
+  await enqueueTimeSchedules(ctx.pool,now);
+  // Use the existing scheduler, but isolate slow provider polling from due CRM jobs.
+  if (!adsEvaluationInFlight) {
+    adsEvaluationInFlight = true;
+    evaluateAdsTriggers({pool:ctx.pool,service:ctx.app?.locals?.facebookAds,emitAutomationEvent})
+      .catch(() => console.error("[automations] Facebook Ads evaluation failed"))
+      .finally(() => { adsEvaluationInFlight = false; });
+  }
   const db = await ctx.pool.connect();
   let rows = [];
   try {
@@ -4820,8 +4907,8 @@ async function processScheduledAutomationEvents() {
           SET status = 'firing', locked_at = now(), locked_by = $1, attempt_count = attempt_count + 1, updated_at = now()
         WHERE id IN (
           SELECT id FROM automation_scheduled_events
-           WHERE status IN ('scheduled','failed')
-             AND scheduled_for <= now()
+           WHERE (status IN ('scheduled','failed') OR (status='firing' AND locked_at<now()-interval '120 seconds'))
+             AND scheduled_for <= $2
              AND (next_attempt_at IS NULL OR next_attempt_at <= now())
              AND (locked_at IS NULL OR locked_at < now() - interval '120 seconds')
            ORDER BY scheduled_for ASC
@@ -4829,7 +4916,7 @@ async function processScheduledAutomationEvents() {
            FOR UPDATE SKIP LOCKED
         )
         RETURNING *`,
-      [workerId()]
+      [workerId(),now]
     )).rows;
     await db.query("COMMIT");
   } catch (e) {
@@ -4840,7 +4927,7 @@ async function processScheduledAutomationEvents() {
   }
   for (const row of rows) {
     try {
-      if (!(await shouldFireScheduledAutomationEvent(row))) {
+      if (!(await shouldFireScheduledAutomationEvent(row,now))) {
         await ctx.pool.query(`UPDATE automation_scheduled_events SET status = 'canceled', locked_at = NULL, locked_by = NULL, updated_at = now() WHERE id = $1`, [row.id]);
         continue;
       }
@@ -4869,7 +4956,8 @@ async function processScheduledAutomationEvents() {
   }
 }
 
-async function shouldFireScheduledAutomationEvent(row) {
+async function shouldFireScheduledAutomationEvent(row,now = new Date()) {
+  if(row.event_type === 'time.schedule') return timeScheduleStillCurrent(ctx.pool,row,now);
   if (row.subject_type === "job") {
     const job = (await ctx.pool.query(`SELECT finished_at FROM schedule_events WHERE id = $1 AND company_id = $2`, [row.subject_id, row.company_id])).rows[0];
     if (!job) return false;
@@ -4950,7 +5038,7 @@ async function buildRunContext(run, options = {}) {
   const context = {
     company,
     event: event ? { id: event.id, type: event.event_type, payload: event.payload || {}, subject_type: event.subject_type, subject_id: event.subject_id } : {},
-    variables,
+    variables: {...(event?.source === "incoming_webhook" ? event.payload?.variables || {} : {}),...variables},
     nodes,
     subject: { type: run.subject_type, id: run.subject_id },
     scope: { key: scopeKey },
@@ -6506,7 +6594,7 @@ async function updateReminderArchived(run, node, config, eventType) {
 }
 
 async function executeTaskCreate(run, node, config, scopeKey = "root") {
-  const existingId = await getRunVariable(run.id, `idempotency:${node.id}:task_id`);
+  const existingId = await getRunVariable(run.id, `idempotency:${node.id}${scopeKey === "root" ? "" : ":" + scopeKey}:task_id`);
   if (existingId) {
     const existing = await loadTaskContext(run.company_id, existingId);
     if (existing?.exists) return { task_id: existingId, reused: true };
@@ -6523,7 +6611,7 @@ async function executeTaskCreate(run, node, config, scopeKey = "root") {
      VALUES($1,$2,$3,$4::timestamptz,'[]'::jsonb,$5::jsonb,false,$6) RETURNING *`,
     [id, assignee, title, due, JSON.stringify(subtasks), config.color_hex || "#3478F6"]
   );
-  await setRunVariable(run.id, `idempotency:${node.id}:task_id`, id);
+  await setRunVariable(run.id, `idempotency:${node.id}${scopeKey === "root" ? "" : ":" + scopeKey}:task_id`, id);
   await emitAutomationEvent({ companyId: run.company_id, eventType: "task.created", subjectType: "task", subjectId: id, source: "automation", dedupeKey: `task.created:${id}`, payload: automationPayload(run, node, { task_id: id, title, due_date: due }) });
   await syncAutomationSchedulesForTask(run.company_id, rows[0]);
   return { task_id: id, due_at: rows[0].due_date, title: rows[0].title };
@@ -8114,7 +8202,7 @@ async function executeMeasurementLinkContact(run, node, config) {
 }
 
 async function executeJobCreate(run, node, config, scopeKey = "root", { sourceQuote = null } = {}) {
-  const existingId = await getRunVariable(run.id, `idempotency:${node.id}:job_id`);
+  const existingId = await getRunVariable(run.id, `idempotency:${node.id}${scopeKey === "root" ? "" : ":" + scopeKey}:job_id`);
   if (existingId) {
     const existing = await loadSubject(run.company_id, "job", existingId);
     if (existing) return { job_id: existingId, reused: true };
@@ -8156,7 +8244,7 @@ async function executeJobCreate(run, node, config, scopeKey = "root", { sourceQu
     } catch (error) { await db.query("ROLLBACK"); throw error; }
     finally { db.release(); }
   } else ({ rows } = await insertJob(ctx.pool));
-  await setRunVariable(run.id, `idempotency:${node.id}:job_id`, id);
+  await setRunVariable(run.id, `idempotency:${node.id}${scopeKey === "root" ? "" : ":" + scopeKey}:job_id`, id);
   await emitJobMutationEvents(run.company_id, null, rows[0], "automation", null, automationPayload(run, node, { job_id: id, contact_id: contactId }));
   await syncAutomationSchedulesForJob(run.company_id, rows[0]);
   return { job_id: id, contact_id: contactId, start: rows[0].start_at, end: rows[0].end_at, price_cents: rows[0].price_cents, service_items: rows[0].service_items };
@@ -8784,7 +8872,18 @@ function addCalendarDuration(date, amount, unit) {
 }
 
 async function executeWebhookSend(run, node, config, scopeKey = "root") {
+  if(config.destination_id){
+    if(!ctx.app?.locals?.webhooks) throw new Error("webhooks_unavailable");
+    const output=await ctx.app.locals.webhooks.automationDelivery(run,node,await buildRunContext(run,{scopeKey}),scopeKey);
+    if(output.waiting){
+      const wait=await createWait(run,node,"event",{event_type:"webhook.delivery_settled",event_filter:{delivery_id:output.delivery_id},scope_key:scopeKey});
+      await ctx.pool.query("UPDATE automation_runs SET status='waiting' WHERE id=$1",[run.id]);
+      return {...output,wait_id:wait.id};
+    }
+    return output;
+  }
   const existing = await getConfirmedActionEffect(run.id, node.id, scopeKey, "webhook.send");
+  if (existing?.result?.response_mapping_error) throw new AutomationError("webhook_response_mapping_failed", "Receiver accepted the request; its response could not be mapped. The accepted request will not be resent.", {retryable:false});
   if (existing) return { ...(existing.result || {}), idempotent_replay: true };
   const context = await buildRunContext(run, { scopeKey });
   const method = (config.method || "POST").toString().toUpperCase();
@@ -8794,26 +8893,20 @@ async function executeWebhookSend(run, node, config, scopeKey = "root") {
   const headers = Object.fromEntries(Object.entries(resolveConfig(config.headers || {}, context)).filter(([k]) => !/authorization|cookie|token|secret/i.test(k)));
   const idempotencyKey = config.disable_idempotency_key === true ? null : `wolfcrm-auto-${run.id}-${node.id}-${stablePortId(scopeKey)}`;
   await recordActionEffect(run.id, node.id, scopeKey, "webhook.send", "started", { url: url.origin + url.pathname, method });
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.min(15000, Math.max(1000, Number(config.timeout_ms || 8000))));
   try {
-    const response = await fetch(url, {
-      method,
-      headers: { "content-type": "application/json", ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}), ...headers },
-      body: ["GET", "DELETE"].includes(method) ? undefined : JSON.stringify(resolveConfig(config.body || {}, context)),
-      signal: controller.signal
-    });
-    const text = (await response.text()).slice(0, 4096);
-    if (!response.ok && !config.continue_on_http_error) throw new Error(`webhook_http_${response.status}`);
-    const output = { status: response.status, body: text, headers: safeResponseHeaders(response.headers), idempotency_key: idempotencyKey };
+    const response = await sendHTTPS({url:url.href,method,headers:{...headers,...(idempotencyKey?{'Idempotency-Key':idempotencyKey}:{})},body:['GET','DELETE'].includes(method)?'':JSON.stringify(resolveConfig(config.body||{},context)),timeout_ms:Math.min(10000,Number(config.timeout_ms||8000))});
+    if(response.status<200||response.status>=300)throw new Error(`webhook_http_${response.status}`);
+    const output={status:response.status,idempotency_key:idempotencyKey,response:{}};
+    try { output.response=mapWebhookResponse(response,config.response_mappings||[]); }
+    catch(e){output.response_mapping_error=e.code||'invalid_response_mapping';}
     await recordActionEffect(run.id, node.id, scopeKey, "webhook.send", "confirmed", output, String(response.status));
+    if(output.response_mapping_error)throw new AutomationError("webhook_response_mapping_failed", "Receiver accepted the request; its response could not be mapped. The accepted request will not be resent.", {retryable:false});
     return output;
   } catch (e) {
-    if (e?.name === "AbortError") await recordActionEffect(run.id, node.id, scopeKey, "webhook.send", "outcome_unknown", { reason: "timeout" });
+    if(e.code === 'webhook_response_mapping_failed')throw e;
+    if (["delivery_timeout","delivery_network_error","response_interrupted"].includes(e?.code)) await recordActionEffect(run.id, node.id, scopeKey, "webhook.send", "outcome_unknown", { reason: "timeout" });
     else await recordActionEffect(run.id, node.id, scopeKey, "webhook.send", "failed", { error: e?.message });
     throw e;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -8862,7 +8955,7 @@ async function executeAutomationStart(run, node, config) {
     depth: run.depth + 1,
     dryRun: run.dry_run
   });
-  setImmediate(() => runAutomation(child.id).catch((e) => console.error("[automations] child run failed", e?.message || e)));
+  wakeAutomation(() => runAutomation(child.id), "child run");
   return { child_run_id: child.id };
 }
 
@@ -9048,7 +9141,7 @@ async function retryAutomationRun(runId, companyId, userId) {
   });
   await cloneRecoveryState(run.id, recovery.id, "root");
   await installRunMonitors(recovery);
-  setImmediate(() => runAutomation(recovery.id).catch((e) => console.error("[automations] recovery run failed", e?.message || e)));
+  wakeAutomation(() => runAutomation(recovery.id), "recovery run");
   await logRun(recovery, null, "info", "run.recovery_started", "Recovery run started from beginning", { recovered_from_run_id: run.id });
   return recovery;
 }
@@ -9075,7 +9168,7 @@ async function retryAutomationRunNode(runId, runNodeId, companyId, userId) {
   });
   await cloneRecoveryState(run.id, recovery.id, failedNode.scope_key || "root");
   await installRunMonitors(recovery);
-  setImmediate(() => executeFromNode(recovery.id, failedNode.node_id, failedNode.scope_key || "root").catch((e) => console.error("[automations] recovery node failed", e?.message || e)));
+  wakeAutomation(() => executeFromNode(recovery.id, failedNode.node_id, failedNode.scope_key || "root"), "recovery node");
   await logRun(recovery, null, "info", "run.node_recovery_started", "Recovery run started from failed node", { recovered_from_run_id: run.id, recovered_from_run_node_id: failedNode.id });
   return recovery;
 }
@@ -9107,10 +9200,10 @@ async function retryAutomationIteration(runId, iterationId, companyId, userId) {
     [recovery.id, iteration.foreach_node_id, iteration.foreach_node_key, iteration.parent_scope_key, iteration.scope_key, iteration.iteration_key, iteration.item_index, iteration.item_count, JSON.stringify(iteration.item_data || {}), iteration.id, Number(iteration.attempt_number || 1) + 1]
   )).rows[0];
   await cloneRecoveryState(run.id, recovery.id, iteration.scope_key);
-  setImmediate(async () => {
+  wakeAutomation(async () => {
     const graph = await loadGraph(recovery.automation_version_id, recovery.company_id);
     await traverse(recovery, graph, node, "item", cloned.scope_key);
-  });
+  }, "recovery iteration");
   return recovery;
 }
 
@@ -9230,6 +9323,9 @@ export const automationTestHooks = {
   processDueWaits,
   processScheduledAutomationEvents,
   publishAutomation,
+  retryAutomationRun,
+  retryAutomationRunNode,
+  retryAutomationIteration,
   runAutomation,
   saveDraftGraph,
   startDraftTestRun,
@@ -9242,4 +9338,44 @@ async function executeMCPControl(run, node, config) {
  const version=(await ctx.pool.query('SELECT created_by_user_id FROM automation_versions WHERE id=$1 AND company_id=$2',[run.automation_version_id,run.company_id])).rows[0];
  if(!version?.created_by_user_id)throw new Error('automation_author_unavailable');
  return controlConnectionFromAutomation(ctx.pool,{companyId:run.company_id,userId:version.created_by_user_id,connectionId:config.connection_id,action:config.action_key.slice(4),pauseUntil:config.pause_until});
+}
+
+async function executeFacebookAdsAction(run,node,config,scopeKey="root") {
+ const context=await buildRunContext(run,{scopeKey});
+ return executeAdsAutomation({pool:ctx.pool,service:ctx.app?.locals?.facebookAds,run,node,config,context,scopeKey});
+}
+
+async function executeWebhookNote(run,node,config,scopeKey="root") {
+ if(!ctx.app?.locals?.webhooks||!ctx.app.locals.notes)throw new Error('notes_unavailable');
+ const actor=await ctx.app.locals.webhooks.executionPrincipal(run);
+ const context=await buildRunContext(run,{scopeKey}),id=randomUUID();
+ const note=await ctx.app.locals.notes.create(actor,{id,title:resolveTemplate(config.title||'Webhook note',context),visibility:'company'});
+ const first=note.blocks[0];await ctx.app.locals.notes.editBlocks(actor,id,{client_key:id,operations:[{id:first.id,expected_revision:first.revision,type:'paragraph',payload:{text:resolveTemplate(config.text||'',context)}}]});
+ return {note_id:id};
+}
+
+async function settleWebhookDeliveries(){
+ const waits=(await ctx.pool.query(`SELECT w.*,d.state AS delivery_state,d.id AS delivery_id,d.http_status,d.response_mapped,d.error_code FROM automation_waits w JOIN automation_runs ar ON ar.id=w.run_id AND ar.status IN ('running','queued','waiting') JOIN wolf_webhook_deliveries d ON d.id::text=w.event_filter->>'delivery_id' WHERE w.event_type='webhook.delivery_settled' AND (w.status IN ('waiting','ready') OR (w.status='resuming' AND w.updated_at<now()-interval '2 minutes')) AND d.state IN ('delivered','failed','blocked','expired') LIMIT 25`)).rows;
+ for(const wait of waits){
+  const claimed=(await ctx.pool.query("UPDATE automation_waits SET status='resuming',updated_at=now() WHERE id=$1 AND (status IN ('waiting','ready') OR (status='resuming' AND updated_at<now()-interval '2 minutes')) RETURNING id",[wait.id])).rowCount;
+  if(!claimed)continue;
+  const run=(await ctx.pool.query('SELECT * FROM automation_runs WHERE id=$1',[wait.run_id])).rows[0];
+  if(!run||['completed','canceled','stopped','failed'].includes(run.status))continue;
+  if(wait.delivery_state!=='delivered'){await failRun(run,'webhook_delivery_failed',wait.error_code||'delivery_failed');await ctx.pool.query("UPDATE automation_waits SET status='waiting' WHERE id=$1",[wait.id]);continue;}
+  const output={delivery_id:wait.delivery_id,http_status:wait.http_status,response:wait.response_mapped||{}};
+  await ctx.pool.query("UPDATE automation_run_nodes SET status='completed',output_snapshot=$3,completed_at=now() WHERE run_id=$1 AND node_id=$2 AND scope_key=$4 AND status='waiting'",[run.id,wait.node_id,JSON.stringify(output),wait.scope_key||'root']);
+  await resumeWait(wait,'default');
+ }
+ // Incoming runs have atomic action effects. Resume after a crash between an
+ // effect commit, node completion and traversal without replaying CRM writes.
+ const recover=(await ctx.pool.query(`SELECT r.id FROM automation_runs r WHERE (EXISTS(SELECT 1 FROM wolf_webhook_run_identity i WHERE i.run_id=r.id) OR EXISTS(SELECT 1 FROM automation_waits completed_wait WHERE completed_wait.run_id=r.id AND completed_wait.event_type='webhook.delivery_settled' AND completed_wait.status='completed')) AND r.status IN ('running','waiting','queued') AND r.updated_at<now()-interval '45 seconds' AND NOT EXISTS(SELECT 1 FROM automation_waits w WHERE w.run_id=r.id AND w.status IN ('waiting','ready','resuming')) LIMIT 10`)).rows;
+ for(const r of recover)await runAutomation(r.id);
+}
+
+async function executeAssistantTask(run,node,config,scopeKey) {
+ if(!ctx.app?.locals?.assistant)throw new Error('assistant_unavailable');
+ const result=await ctx.app.locals?.assistant.startAutomation(run,node,config,scopeKey);
+ const wait=await createWait(run,node,'assistant',{resume_at:new Date(Date.now()+15000).toISOString(),scope_key:scopeKey,event_filter:{assistant_run_id:result.id,failure_behavior:config.failure_behavior||'stop'}});
+ await ctx.pool.query("UPDATE automation_runs SET status='waiting',updated_at=now() WHERE id=$1",[run.id]);
+ return {waiting:true,wait_id:wait.id,assistant_run_id:result.id};
 }

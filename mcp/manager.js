@@ -1,3 +1,5 @@
+import {evidenceHash} from '../assistant/context.js';
+import {restrictFields,validFieldPath} from './field-policy.js';
 import {installElevenLabs} from '../elevenlabs/index.js';
 import {configSchema,readConfig,missingRules} from '../retell/config.js';
 import {validateBookingConfiguration} from '../retell/settings-validation.js';
@@ -8,17 +10,18 @@ import {digest,fault,transaction,internalActor} from './context.js';
 import {installManagerSchema,lockConnectionSlot} from './manager-schema.js';
 import {hoursSchema,accessStatus} from './hours.js';
 import {newKey,principal as servicePrincipal} from '../retell/security.js';
-const rule=z.object({allow:z.boolean(),approval:z.boolean()}).strict();
+const legacyOAuthTools=new Set('crm_identity crm_search crm_get crm_customer_history crm_availability sales_report finance_spaces finance_profit_loss notes_search notes_get files_search files_get files_read_text communications_history contact_create contact_update task_create task_complete lead_change_stage appointment_create appointment_update quote_draft note_create'.split(' '));
+const rule=z.object({allow:z.boolean(),approval:z.boolean(),denied_input_fields:z.array(z.string().regex(/^[A-Za-z0-9_.*]+$/)).max(300).optional(),denied_output_fields:z.array(z.string().regex(/^[A-Za-z0-9_.*]+$/)).max(300).optional()}).strict();
 export const canManage=a=>a.isCompanyOwner||(a.permissions.preset==='admin'&&a.permissions.capabilities['ai.manage']&&a.permissions.capabilities['integrations.manage']);
 const guard=z.object({expected_company_id:z.uuid(),expected_revision:z.number().int().positive()});
-export async function installConnectionManager({app,pool,authRequired,env,catalog,execute,startWorker=true}){
+export async function installConnectionManager({app,pool,authRequired,env,catalog,execute,prepare=(_name,input)=>input,startWorker=true}){
  await installManagerSchema(pool);
  const definitions=new Map(catalog.map(d=>[d.id,d]));
  const audit=(db,row,operation,outcome,userId=row.user_id)=>db.query('INSERT INTO mcp_audit(connection_id,company_id,user_id,operation,outcome) VALUES($1,$2,$3,$4,$5)',[row.id,row.company_id,userId,operation,outcome]);
  async function initialize(db,row){
   if(row.tool_policy!==null)return row;
-  const service=row.kind==='service'?(await db.query('SELECT * FROM retell_connections WHERE id=$1',[row.id])).rows[0]:null;
-  const policy=Object.fromEntries(catalog.filter(d=>row.kind==='oauth'?d.family==='crm'&&row.scopes.includes(d.scope):d.family==='service'&&(!d.id.includes('quote')||['check_quote_availability'].includes(d.id)||service?.config?.quotes_enabled)).map(d=>[d.id,{allow:true,approval:row.kind==='oauth'&&d.write}]));
+  const service=['service','assistant'].includes(row.kind)?(await db.query('SELECT * FROM retell_connections WHERE id=$1',[row.id])).rows[0]:null;
+  const policy=Object.fromEntries(catalog.filter(d=>row.kind==='oauth'?legacyOAuthTools.has(d.id)&&d.family==='crm'&&row.scopes.includes(d.scope):d.family==='service'&&(!d.id.includes('quote')||['check_quote_availability'].includes(d.id)||service?.config?.quotes_enabled)).map(d=>[d.id,{allow:true,approval:row.kind==='oauth'&&d.write}]));
   // Compare-and-set makes concurrent first reads safe and never overwrites explicit policy.
   return (await db.query('UPDATE mcp_connections SET tool_policy=$2 WHERE id=$1 AND tool_policy IS NULL RETURNING *',[row.id,JSON.stringify(policy)])).rows[0]||(await db.query('SELECT * FROM mcp_connections WHERE id=$1',[row.id])).rows[0];
  }
@@ -28,7 +31,7 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
  async function check(actor,name,{revision}={}){
   if(env.MCP_ENABLED!=='true')throw fault(503,'mcp_disabled');
   const row=await rowFor(pool,actor.connectionId||actor.retell?.id,actor.companyId);
-  if(row.kind==='service')await servicePrincipal(pool,(await pool.query('SELECT * FROM retell_connections WHERE id=$1',[row.id])).rows[0],env);
+  if(['service','assistant'].includes(row.kind))await servicePrincipal(pool,(await pool.query('SELECT * FROM retell_connections WHERE id=$1',[row.id])).rows[0],env);
   else await connection(pool,row.id);
   const company=(await pool.query('SELECT operating_hours FROM mcp_company_policy WHERE company_id=$1',[row.company_id])).rows[0];
   const status=accessStatus(row,company?.operating_hours);
@@ -42,18 +45,21 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
   return {row,definition,policy};
  }
  function available(d,row,actor){
-  if(d.family==='service'&&row.kind!=='service')return false;
+  if((d.id.startsWith('native_')||d.id.startsWith('assistant_'))&&row.kind!=='assistant')return false;
+  if(d.family==='service'&&!['service','assistant'].includes(row.kind))return false;
   // Service agents must use the calculator and guarded booking workflow.
-  if(row.kind==='service'&&['quote_draft','appointment_create','appointment_update'].includes(d.id))return false;
+  if(['service','assistant'].includes(row.kind)&&['quote_draft','appointment_create','appointment_update'].includes(d.id))return false;
   return actor.scopes.includes(d.scope)&&d.caps.every(c=>actor.permissions.capabilities[c]);
  }
- async function actorFor(row){if(row.kind==='service')return servicePrincipal(pool,(await pool.query('SELECT * FROM retell_connections WHERE id=$1',[row.id])).rows[0],env);return connection(pool,row.id);}
+ async function actorFor(row){if(['service','assistant'].includes(row.kind))return servicePrincipal(pool,(await pool.query('SELECT * FROM retell_connections WHERE id=$1',[row.id])).rows[0],env);return connection(pool,row.id);}
  const envelope=p=>({approval_id:p.id,state:p.state==='pending'&&new Date(p.expires_at)<=new Date()?'expired':p.state,expires_at:new Date(p.expires_at).toISOString(),review_url:env.MCP_WEB_ORIGIN?env.MCP_WEB_ORIGIN+'/settings':null,result:p.state==='completed'?p.result:null,message:p.state==='completed'?'Approved invocation completed.':'Review this exact invocation in WolfCRM Settings → AI Connections. Retry with the same arguments and _request_id equal to approval_request_id.',approval_request_id:p.request_id});
  async function invoke(actor,name,input,requestId){
   const id=actor.connectionId||actor.retell?.id;
   try{
+   input=prepare(name,input);
    const {row,policy}=await check(actor,name);await rateLimit(pool,'managed-tool:'+id,120);
-   if(!policy.approval){const result=await execute(actor,name,input);await pool.query('UPDATE mcp_connections SET last_used_at=now() WHERE id=$1',[id]);await audit(pool,row,name,'success');return result;}
+   restrictFields(input,policy.denied_input_fields,{write:true});
+   if(!policy.approval){const result=restrictFields(await execute(actor,name,input),policy.denied_output_fields);await pool.query('UPDATE mcp_connections SET last_used_at=now() WHERE id=$1',[id]);await audit(pool,row,name,'success');return result;}
    const request=requestId||input.request_id||randomUUID(),hash=digest(input);
    const p=await transaction(pool,async db=>{
     await db.query('SELECT id FROM mcp_connections WHERE id=$1 FOR UPDATE',[id]);await check(actor,name,{revision:row.revision});
@@ -79,8 +85,10 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
    if(p.state==='completed'){const a=await actorFor(row);await check(a,p.operation,{revision:p.policy_revision});return {state:'completed',result:p.result};}
    if(p.state!=='pending'||new Date(p.expires_at)<=new Date())throw fault(409,'approval_inactive');
    if(decision==='reject'){await db.query("UPDATE mcp_approvals SET state='rejected',payload=NULL WHERE id=$1",[id]);await audit(db,row,p.operation,'approval_rejected',userId);return {state:'rejected'};}
-   const actor=await actorFor(row);await check(actor,p.operation,{revision:p.policy_revision});
-   const result=await execute(actor,p.operation,p.payload);
+   const actor=await actorFor(row);actor.assistantInvocation=await app.locals.assistant?.validateApproval(p);const {policy}=await check(actor,p.operation,{revision:p.policy_revision});
+   const prepared=prepare(p.operation,p.payload);if(evidenceHash(prepared)!==evidenceHash(p.payload))throw fault(409,'capability_schema_changed');
+   restrictFields(prepared,policy.denied_input_fields,{write:true});
+   const result=restrictFields(await execute(actor,p.operation,prepared),policy.denied_output_fields);
    await db.query("UPDATE mcp_approvals SET state='completed',payload=NULL,result=$2 WHERE id=$1",[id,JSON.stringify(result)]);await audit(db,row,p.operation,'approval_accepted',userId);return {state:'completed',result};
   });
  }
@@ -91,15 +99,15 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
  }catch(e){res.status(e instanceof z.ZodError?400:e.status||500).json({error:e instanceof z.ZodError?'invalid_connection_settings':e.code||'connection_manager_unavailable',message:e.status?e.message:'Check the connection settings and try again.'});}};
  async function snapshot(row,actor){
   const company=(await pool.query('SELECT operating_hours FROM mcp_company_policy WHERE company_id=$1',[row.company_id])).rows[0];
-  const r=row.kind==='service'?(await pool.query('SELECT config,key_hash,key_prefix,expires_at,revoked_at FROM retell_connections WHERE id=$1',[row.id])).rows[0]:null;
+  const r=['service','assistant'].includes(row.kind)?(await pool.query('SELECT config,key_hash,key_prefix,expires_at,revoked_at FROM retell_connections WHERE id=$1',[row.id])).rows[0]:null;
   const bookingConfig=r?readConfig(r.config):null;
   if(bookingConfig?.job_rules_acknowledged){const settings=(await pool.query('SELECT customer_booking_settings FROM companies WHERE id=$1',[row.company_id])).rows[0];if(r.config.job_rules_hash!==digest(settings?.customer_booking_settings))bookingConfig.job_rules_acknowledged=false;}
   const status=accessStatus({...row,revoked_at:row.revoked_at||r?.revoked_at},company?.operating_hours,new Date(),{next:true});
   let authentication=row.revoked_at||r?.revoked_at?'revoked':(row.kind==='service'&&!r?.key_hash)?'key_required':new Date(r?.expires_at||row.expires_at)<=new Date()?'expired':'configured';
   try{await loadPrincipal(pool,row.user_id,row.company_id,{enforceOAuthRolePolicy:row.kind==='oauth'});}catch{authentication='membership_inactive';}
   const sponsor=await loadPrincipal(pool,row.user_id,row.company_id,{enforceOAuthRolePolicy:false}).catch(()=>null);
-  const effective=sponsor?{...sponsor,scopes:row.kind==='service'?Object.keys(scopes).concat(['availability:read','appointments:book','quotes:read','quotes:draft']):row.scopes}:null;
-  return {...Object.fromEntries(['id','kind','name','description','provider','enabled','paused_until','archived_at','revoked_at','operating_hours','tool_policy','revision','created_at','last_used_at','expires_at'].map(k=>[k,row[k]??null])),company_id:row.company_id,authentication,access:status,key_prefix:r?.key_prefix||null,automatic_booking:r?.config?.automatic_booking||false,booking_config:bookingConfig,booking_workers:r?(await pool.query('SELECT id,display_name AS name FROM users WHERE company_id=$1 AND deleted_at IS NULL ORDER BY display_name LIMIT 200',[row.company_id])).rows:[],booking_services:r?(await pool.query('SELECT id,name FROM saved_services WHERE company_id=$1 AND archived_at IS NULL ORDER BY name LIMIT 500',[row.company_id])).rows:[],missing_booking_rules:r?{quote:missingRules(bookingConfig,'quote'),job:missingRules(bookingConfig,'job')}:null,catalog:catalog.map(d=>({...d,available:!!effective&&available(d,row,effective)&&d.caps.every(c=>actor.permissions.capabilities[c]),unavailable_reason:row.kind==='service'&&['quote_draft','appointment_create','appointment_update'].includes(d.id)?'Use the calculator draft tools and create_appointment to preserve pricing and booking rules.':null}))};
+  const effective=sponsor?{...sponsor,scopes:['service','assistant'].includes(row.kind)?Object.keys(scopes).concat(['availability:read','appointments:book','quotes:read','quotes:draft']):row.scopes}:null;
+  return {...Object.fromEntries(['id','kind','name','description','provider','enabled','paused_until','archived_at','revoked_at','operating_hours','tool_policy','revision','created_at','last_used_at','expires_at'].map(k=>[k,row[k]??null])),company_id:row.company_id,authentication,access:status,key_prefix:r?.key_prefix||null,automatic_booking:r?.config?.automatic_booking||false,booking_config:bookingConfig,booking_workers:r?(await pool.query('SELECT id,display_name AS name FROM users WHERE company_id=$1 AND deleted_at IS NULL ORDER BY display_name LIMIT 200',[row.company_id])).rows:[],booking_services:r?(await pool.query('SELECT id,name FROM saved_services WHERE company_id=$1 AND archived_at IS NULL ORDER BY name LIMIT 500',[row.company_id])).rows:[],missing_booking_rules:r?{quote:missingRules(bookingConfig,'quote'),job:missingRules(bookingConfig,'job')}:null,catalog:catalog.map(d=>({...d,available:!!effective&&available(d,row,effective)&&d.caps.every(c=>actor.permissions.capabilities[c]),unavailable_reason:['service','assistant'].includes(row.kind)&&['quote_draft','appointment_create','appointment_update'].includes(d.id)?'Use the calculator draft tools and create_appointment to preserve pricing and booking rules.':null}))};
  }
  app.get('/api/ai-connections/manager',authRequired,safe(async(req,res)=>{
   const rows=(await pool.query('SELECT * FROM mcp_connections WHERE company_id=$1 ORDER BY created_at DESC LIMIT 200',[req.companyId])).rows;
@@ -120,10 +128,10 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
   const i=guard.extend({name:z.string().trim().min(1).max(100),description:z.string().max(1000),provider:z.string().max(80).nullable(),enabled:z.boolean(),paused_until:z.iso.datetime({offset:true}).nullable(),operating_hours:hoursSchema.nullable(),tool_policy:z.record(z.string(),rule),automatic_booking:z.boolean(),booking_config:configSchema.optional()}).strict().parse(req.body);
   res.json(await mutate(req,async(db,row)=>{
    if(row.revoked_at||row.archived_at)throw fault(409,'connection_inactive');
-   const sponsor=await loadPrincipal(db,row.user_id,row.company_id,{enforceOAuthRolePolicy:false});const actor={...sponsor,scopes:row.kind==='service'?Object.keys(scopes).concat(['availability:read','appointments:book','quotes:read','quotes:draft']):row.scopes};
-   for(const [id,r]of Object.entries(i.tool_policy)){const d=definitions.get(id),old=row.tool_policy?.[id];if(!d){if(JSON.stringify(r)!==JSON.stringify(old))throw fault(400,'unknown_tool');continue;}const expanding=r.allow&&(!old?.allow||(old.approval&&!r.approval));if(expanding&&(!available(d,row,actor)||d.caps.some(c=>!req.manager.permissions.capabilities[c])))throw fault(403,'tool_not_available');}
+   const sponsor=await loadPrincipal(db,row.user_id,row.company_id,{enforceOAuthRolePolicy:false});const actor={...sponsor,scopes:['service','assistant'].includes(row.kind)?Object.keys(scopes).concat(['availability:read','appointments:book','quotes:read','quotes:draft']):row.scopes};
+   for(const [id,r]of Object.entries(i.tool_policy)){const d=definitions.get(id),old=row.tool_policy?.[id];if(!d){if(JSON.stringify(r)!==JSON.stringify(old))throw fault(400,'unknown_tool');continue;}for(const path of r.denied_input_fields||[])if(!validFieldPath(d.input_schema,path))throw fault(400,'unknown_input_field','Unknown input field: '+id+'.'+path);for(const path of r.denied_output_fields||[])if(!validFieldPath(d.output_schema,path))throw fault(400,'unknown_output_field','Unknown output field: '+id+'.'+path);const expanding=r.allow&&(!old?.allow||(old.approval&&!r.approval));if(expanding&&(!available(d,row,actor)||d.caps.some(c=>!req.manager.permissions.capabilities[c])))throw fault(403,'tool_not_available');}
    await db.query('UPDATE mcp_connections SET name=$2,description=$3,provider=$4,enabled=$5,paused_until=$6,operating_hours=$7,tool_policy=$8 WHERE id=$1',[row.id,i.name,i.description,i.provider,i.enabled,i.paused_until,JSON.stringify(i.operating_hours),JSON.stringify(i.tool_policy)]);
-   if(row.kind==='service'){
+   if(['service','assistant'].includes(row.kind)){
     if(i.booking_config){const config=await validateBookingConfiguration(db,req.companyId,{...i.booking_config,automatic_booking:i.automatic_booking});await db.query('UPDATE retell_connections SET config=$2,revision=revision+1 WHERE id=$1',[row.id,JSON.stringify(config)]);}
     else await db.query("UPDATE retell_connections SET config=jsonb_set(config,'{automatic_booking}',$2::jsonb),revision=revision+1 WHERE id=$1",[row.id,JSON.stringify(i.automatic_booking)]);
    }
@@ -137,12 +145,12 @@ export async function installConnectionManager({app,pool,authRequired,env,catalo
    await db.query('UPDATE mcp_connections SET expires_at=now()+make_interval(days=>$2) WHERE id=$1',[row.id,i.valid_days]);await audit(db,row,'credential.rotated','success',req.userId);return {authorization:'Bearer '+key,shown_once:true};
   }));
  }));
- for(const action of ['revoke','archive'])app.post('/api/ai-connections/manager/:id/'+action,authRequired,safe(async(req,res)=>{guard.strict().parse(req.body);res.json(await mutate(req,async(db,row)=>{await db.query(`UPDATE mcp_connections SET revoked_at=COALESCE(revoked_at,now()),enabled=false${action==='archive'?',archived_at=now()':''} WHERE id=$1`,[row.id]);if(row.kind==='service')await db.query('UPDATE retell_connections SET revoked_at=COALESCE(revoked_at,now()),revision=revision+1 WHERE id=$1',[row.id]);await audit(db,row,'connection.'+action,'success',req.userId);return {saved:true};}));}));
+ for(const action of ['revoke','archive'])app.post('/api/ai-connections/manager/:id/'+action,authRequired,safe(async(req,res)=>{guard.strict().parse(req.body);res.json(await mutate(req,async(db,row)=>{await db.query(`UPDATE mcp_connections SET revoked_at=COALESCE(revoked_at,now()),enabled=false${action==='archive'?',archived_at=now()':''} WHERE id=$1`,[row.id]);if(['service','assistant'].includes(row.kind))await db.query('UPDATE retell_connections SET revoked_at=COALESCE(revoked_at,now()),revision=revision+1 WHERE id=$1',[row.id]);await audit(db,row,'connection.'+action,'success',req.userId);return {saved:true};}));}));
  app.put('/api/ai-connections/manager-company-hours',authRequired,safe(async(req,res)=>{
   const i=z.object({expected_company_id:z.uuid(),expected_revision:z.number().int().nonnegative(),operating_hours:hoursSchema.nullable()}).strict().parse(req.body);
   if(i.expected_company_id!==req.companyId)throw fault(409,'account_changed');
   await transaction(pool,async db=>{await db.query('SELECT id FROM companies WHERE id=$1 FOR UPDATE',[req.companyId]);await manager(req.userId,req.companyId);const old=(await db.query('SELECT revision FROM mcp_company_policy WHERE company_id=$1',[req.companyId])).rows[0];if((old?.revision||0)!==i.expected_revision)throw fault(409,'policy_changed');await db.query('INSERT INTO mcp_company_policy(company_id,operating_hours) VALUES($1,$2) ON CONFLICT(company_id) DO UPDATE SET operating_hours=$2,revision=mcp_company_policy.revision+1',[req.companyId,JSON.stringify(i.operating_hours)]);await db.query("UPDATE mcp_approvals SET state='rejected',payload=NULL WHERE state='pending' AND connection_id IN(SELECT id FROM mcp_connections WHERE company_id=$1)",[req.companyId]);await db.query("INSERT INTO mcp_audit(company_id,user_id,operation,outcome) VALUES($1,$2,'company.hours_changed','success')",[req.companyId,req.userId]);});res.json({saved:true});
  }));
  await installElevenLabs({app,pool,authRequired,env,safe,mutate,audit,startWorker});
- const api={check,invoke,decide,manager,initialize};app.locals.connectionManager=api;return api;
+ const api={check,invoke,decide,manager,initialize,actorFor,snapshot};app.locals.connectionManager=api;return api;
 }

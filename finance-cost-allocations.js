@@ -1,3 +1,4 @@
+import { lockFinanceSourceRows } from "./finance-source-locks.js";
 const MAX_REPORT_DAYS = 731;
 const MAX_REPORT_ROWS = 500;
 const MAX_CANDIDATE_JOBS = 100;
@@ -677,11 +678,12 @@ async function loadAllocationRows(pool, companyId, range, limit) {
 }
 
 async function loadEntryDetail(client, companyId, entryId, { lock = false } = {}) {
+  if (lock) await lockFinanceSourceRows(client, "time_clock_entries", companyId, [entryId]);
   const entryResult = await client.query(
     `SELECT e.*, COALESCE(NULLIF(u.display_name, ''), u.email) AS employee_name
        FROM time_clock_entries e
        JOIN users u ON u.id = e.user_id AND u.company_id = e.company_id
-      WHERE e.company_id = $1 AND e.id = $2${lock ? " FOR UPDATE OF e" : ""}`,
+      WHERE e.company_id = $1 AND e.id = $2`,
     [companyId, entryId]
   );
   if (!entryResult.rows[0]) throw new CostAllocationError("time_entry_not_found", "The company time entry was not found.", 404);

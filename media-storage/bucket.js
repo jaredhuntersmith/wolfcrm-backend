@@ -16,6 +16,13 @@ export function createStorageBucket(env = process.env) {
   const args = file => ({ Bucket: file.storage_provider==='legacy_media'?legacyBucket:bucket, Key: file.object_key });
   let orphanMarker;
   return {
+    async readBytes(file,maxBytes=8388608) {
+      const response=await deliveryClient(file).send(new GetObjectCommand(args(file)),{abortSignal:AbortSignal.timeout(10000)});
+      let size=0;const chunks=[];
+      try { for await(const chunk of response.Body){size+=chunk.length;if(size>maxBytes)throw Object.assign(new Error('File exceeds the content limit.'),{status:413,code:'file_too_large'});chunks.push(chunk);} }
+      finally {response.Body?.destroy?.();}
+      return Buffer.concat(chunks);
+    },
     async readText(file,maxBytes=262144) {
       const response=await deliveryClient(file).send(new GetObjectCommand(args(file)),{abortSignal:AbortSignal.timeout(10000)});
       let size=0;const chunks=[];

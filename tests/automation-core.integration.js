@@ -629,16 +629,18 @@ async function testMapServicePaymentAndDedupe() {
   await assertRunCompleted(runs[0].id);
 
   const planId = randomUUID();
+  // Use one explicit past date for both DB state and scheduler input across timezones.
+  const serviceDueDate = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
   await pool.query(
     `INSERT INTO service_plans(id, user_id, company_id, created_by_user_id, contact_id, plan_name, status, price_cents, billing_interval, service_interval, next_service_date)
-     VALUES($1,$2,$3,$2,$4,'Automation Plan','active',10000,'month','month',CURRENT_DATE)`,
-    [planId, seed.userId, seed.companyId, contactId]
+     VALUES($1,$2,$3,$2,$4,'Automation Plan','active',10000,'month','month',$5::date)`,
+    [planId, seed.userId, seed.companyId, contactId, serviceDueDate]
   );
   const st = node("service_trigger", "trigger", { trigger_key: "service_plan.service_due" });
   const sa = node("service_task", "action", { action_key: "service_plan.create_service_task", title: "Service due task" });
   const serviceAutomation = await createAutomation(seed, graphFrom([st, sa], [edge(st, sa)]));
   await publish(seed, serviceAutomation.automationId);
-  await syncAutomationSchedulesForServicePlan(seed.companyId, { id: planId, next_service_date: new Date(Date.now() - 1000).toISOString().slice(0, 10), status: "active", contact_id: contactId });
+  await syncAutomationSchedulesForServicePlan(seed.companyId, { id: planId, next_service_date: serviceDueDate, status: "active", contact_id: contactId });
   await automationTestHooks.processScheduledAutomationEvents();
   await processAll();
   assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM automation_runs WHERE automation_id = $1`, [serviceAutomation.automationId])).count, 1);

@@ -90,6 +90,27 @@ test("largest-remainder suggestions reconcile exact cents deterministically", ()
     (error) => error.code === "mileage_allocation_distance_required");
 });
 
+test("database DATE values keep their civil day and do not make saved allocations stale", () => {
+  const originalTimezone = process.env.TZ;
+  try {
+    for (const timezone of ["UTC", "America/New_York", "Pacific/Auckland"]) {
+      process.env.TZ = timezone;
+      const databaseDay = new Date(2026, 7, 19);
+      const log = approvedLog({ service_date: databaseDay });
+      assert.equal(mileageSourceSnapshot(log, sourceLegs()).source_service_date, "2026-08-19", timezone);
+      const plan = planMileageAllocationUpdate({
+        body: updateBody({ expected_version: 3 }), log, legs: sourceLegs(),
+        currentHeader: { ...savedHeader(), source_service_date: databaseDay },
+        currentLines: savedLines(), jobs: [{ id: "job_1" }]
+      });
+      assert.equal(plan.mode, "replay", timezone);
+    }
+  } finally {
+    if (originalTimezone === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTimezone;
+  }
+});
+
 test("mileage allocations create, replay, reallocate, and clear with exact versions", () => {
   const create = planMileageAllocationUpdate({
     body: updateBody(), log: approvedLog(), legs: sourceLegs(), jobs: [{ id: "job_1" }]

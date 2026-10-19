@@ -1,0 +1,8 @@
+<!-- guide:routes version:2 -->
+# Route calculation and native location
+
+assistant_route_build and assistant_route_recalculate use the existing Google routing service and canonical route persistence. Inputs never accept fabricated distances, travel times, provider plans or totals. Routing provider charges are separate from model estimates. Missing Google configuration is reported before routing. Recalculation binds the current route source_hash; contact ACL/hash and policy are checked again after the provider returns. Stops retain visit state; batches follow the normal native exporter. Manual order changes do not recalculate metrics.
+
+Use actual contact saved coordinates when present. For an uncached contact, native_resolve_location with kind contact and contact_id asks the originating native Routes geocoder; wait for its acknowledgement, then pass that result command_id as coordinate_command_id on that contact stop. The backend verifies the exact contact source hash, current access, originating user/company and unexpired command. Changed contacts require a new resolution. This does not modify contact coordinates behind the user’s back. Explicit addresses and current device location can also resolve through the existing native geocoder/location provider; location requires OS permission and a connected scene. No coordinates are guessed.
+
+A route provider/save outcome that is uncertain is not automatically retried. Successful route and receipt commit together. Inspect current route/receipt before another request. Native navigation can open a saved route’s actual editor; editor values and authoritative Google metrics remain separate.

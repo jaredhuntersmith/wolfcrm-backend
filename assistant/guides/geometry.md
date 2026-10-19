@@ -1,0 +1,8 @@
+<!-- guide:geometry version:1 -->
+# Map, measurements and Lighting
+
+Read actual map_pins/map_pin_get, measurements_list/measurement_get and lighting_projects/lighting_project_get. Saved geographic quantities come from measurement-contract metrics in meters and square meters; native feet are a display conversion. These are drawn estimates, not survey evidence. map_pin_save preserves omitted fields and needs a current hash. Setting won changes the pin, not a Contact; map_pin_contact performs explicit canonical conversion. No address implies invented coordinates.
+
+native_map_edit changes the current real map viewport/filter/list and measurement draft with exact native_draft_id/native_revision from refreshed context. Use list IDs exposed by the current native context. Measurement input is at most 250 real points. These local edits do not claim server sync. Measurement persistence uses measurement_save and its current record hash.
+
+Lighting has seven actual layer envelopes: roofline, fill, wrap, garland, wreath, fixture and bulb. All geometry is normalized photo placement. Density, colors, preview scale, glow and sampled bulb positions are visual settings, never physical footage or material estimates. Stored edits use lighting_design_edit with exact record_hash and preserve other layers/assets. If the current Lighting context says save_state=local_draft, use native_lighting_edit against the exact draft revision; do not overwrite it with a stored project. Native commands support actual tools, paths, layer edits/order, undo/redo, scene, panels, selection, partial style and favorites. Refresh context after each edit. Opening a remote project uses its canonical authorized asset service; source-image capture remains the normal on-device workflow.

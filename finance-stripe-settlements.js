@@ -1,3 +1,4 @@
+import { lockFinanceCompany } from "./finance-locks.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   GeneralLedgerError,
@@ -1470,7 +1471,7 @@ export function installFinanceStripeSettlementRoutes({ app, pool, authRequired, 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       if (await replayedRequest(client, req.companyId, request)) {
         await client.query("COMMIT");
         return res.json({ replayed: true });
@@ -1599,7 +1600,7 @@ export function installFinanceStripeSettlementRoutes({ app, pool, authRequired, 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       if (await replayedRequest(client, req.companyId, request)) {
         await client.query("COMMIT");
         return res.json({ replayed: true });

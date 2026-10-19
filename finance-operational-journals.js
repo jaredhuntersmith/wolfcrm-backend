@@ -1,3 +1,4 @@
+import { lockFinanceCompany } from "./finance-locks.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   GeneralLedgerError,
@@ -820,7 +821,7 @@ export function installFinanceOperationalJournalRoutes({ app, pool, authRequired
     try {
       const request = normalizeOperationalReceivableActionRequest({ body: req.body, operationalSourceID: req.params.sourceId, action });
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       await ensureChartAccounts(client, req.companyId, req.userId);
       await syncOperationalAccountingSources(client, req.companyId);
       if (await replayedRequest(client, req.companyId, request)) {

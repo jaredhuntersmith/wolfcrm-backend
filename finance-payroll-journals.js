@@ -1,3 +1,4 @@
+import { lockFinanceCompany } from "./finance-locks.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   GeneralLedgerError,
@@ -631,7 +632,7 @@ export function installFinancePayrollJournalRoutes({ app, pool, authRequired, re
       const request = normalizePayrollJournalActionRequest({ body: req.body, evaluationPeriodID: req.params.periodId, action });
       await client.query("BEGIN");
       await client.query(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, [`${req.companyId}|supported-payroll`]);
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       await ensureChartAccounts(client, req.companyId, req.userId);
       if (await replayedRequest(client, req.companyId, request)) {
         await client.query("COMMIT");

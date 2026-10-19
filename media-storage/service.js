@@ -245,15 +245,40 @@ export function createStorageService({pool,bucket,env=process.env,accessPredicat
     const deleted=(await pool.query("SELECT id,delete_everywhere FROM stored_files WHERE owner_user_id=$1 AND id=ANY($2::uuid[]) AND cloud_status IN ('deleting','deleted')",[actor.userId,ids.map(uuid)])).rows;
     return {deletions:deleted,files:(await pool.query(`SELECT f.*,owner.display_name AS owner_display_name,EXISTS(SELECT 1 FROM users active_owner WHERE active_owner.id=f.owner_user_id AND active_owner.company_id=f.company_id AND active_owner.deleted_at IS NULL) AS sharing_active FROM stored_files f JOIN users owner ON owner.id=f.owner_user_id WHERE (${accessPredicate?await accessPredicate(pool,actor):readableSQL}) AND f.cloud_status='active' AND f.id=ANY($3::uuid[])`,[actor.userId,actor.companyId,ids.map(uuid)])).rows.map(r=>publicFile(r,actor))};
   }
+  async function contentAccess(actor,id) {
+    const {loadPrincipal}=await import('../mcp/access.js');
+    const fresh=await loadPrincipal(pool,actor.userId,actor.companyId,{enforceOAuthRolePolicy:false});
+    if(!fresh.permissions.capabilities['storage.view']||!fresh.permissions.capabilities['storage.download'])fail(403,'download_denied','File content requires current storage view and download access.');
+    const row=await file(pool,fresh,id);
+    if(row.company_id!==fresh.companyId)fail(404,'file_not_found','File is unavailable in this company.');
+    if(accessPredicate){
+      const {loadActor,can}=await import('../company-comms/access.js'),current=await loadActor(pool,fresh);
+      const independent=(await pool.query(`SELECT 1 FROM stored_files f WHERE f.id=$3 AND (${readableSQL})`,[fresh.userId,fresh.companyId,row.id])).rowCount;
+      if((row.source_protected||!independent)&&!can(current,'communications.download'))fail(403,'download_denied','Downloading shared Company Comms files is not permitted.');
+    }
+    return row;
+  }
+  async function readContent(actor,id,{maxBytes=8388608}={}) {
+    cloud();const row=await contentAccess(actor,id);
+    if(!Number.isSafeInteger(maxBytes)||maxBytes<1||maxBytes>8388608)fail(400,'invalid_content_limit','Content requests support at most 8 MiB.');
+    if(Number(row.byte_size)>maxBytes)fail(413,'file_too_large','File content exceeds the requested limit.');
+    if(!bucket.readBytes)fail(503,'storage_content_unavailable','Authenticated byte access is unavailable for this storage provider.');
+    const bytes=await bucket.readBytes(row,maxBytes);
+    if(bytes.length>maxBytes)fail(413,'file_too_large','File content exceeds the requested limit.');
+    const current=await contentAccess(actor,id);
+    if(current.version!==row.version||current.object_key!==row.object_key)fail(409,'file_changed','The file changed while reading.');
+    await audit(pool,row,actor,'assistant_content_read');
+    return {file:publicFile(row,actor),bytes};
+  }
   async function readText(actor,id) {
-    cloud();const row=await file(pool,actor,id);
+    cloud();const row=await contentAccess(actor,id);
     if(row.company_id!==actor.companyId)fail(404,'file_not_found','File is unavailable in this connection.');
     if(!['text/plain','text/csv','application/json'].includes(row.mime_type))fail(415,'content_not_supported','Only UTF-8 plain text, CSV and JSON are supported.');
     if(Number(row.byte_size)>262144)fail(413,'file_too_large','Text content is limited to 256 KiB.');
     const value=await bucket.readText(row,262144);
-    await file(pool,actor,id); // Recheck access after provider I/O.
+    await contentAccess(actor,id); // Recheck ACL and download access after provider I/O.
     await audit(pool,row,actor,'mcp_content_read');
     return {id:row.id,mime_type:row.mime_type,text:value,content_trust:'untrusted_file_data'};
   }
-  return {readText,reserveInTransaction,thumbnailBegin,thumbnailComplete,thumbnailAccess,verify,usage,list,begin,part,complete,patch,access,acknowledge,transferStarted,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
+  return {contentMetadata:async(actor,id)=>publicFile(await contentAccess(actor,id),actor),readContent,readText,reserveInTransaction,thumbnailBegin,thumbnailComplete,thumbnailAccess,verify,usage,list,begin,part,complete,patch,access,acknowledge,transferStarted,state,remove,cleanup,folders,saveFolder,removeFolder,activity,get:async(actor,id)=>publicFile(await file(pool,actor,id),actor)};
 }

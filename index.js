@@ -1,3 +1,7 @@
+import {installFacebookAds} from './facebook-ads/index.js';
+import {installWebhooks} from './webhooks/service.js';
+import {webhookEventCatalog} from './automations.js';
+import {installAssistant} from './assistant/index.js';
 import {installCalculatorSchema,installCalculatorRoutes} from './quote-calculator/index.js';
 import { acceptedQuoteValueSQL, outboundContactActivitySQL } from "./sales-analytics.js";
 import {installMCP} from './mcp/index.js';
@@ -579,6 +583,12 @@ app.use(cors());
 // It has to be registered BEFORE the global JSON body parser below so the
 // raw bytes aren't consumed. The handler is defined further down but the
 // raw-body middleware for that exact path lives here.
+app.use("/webhooks/incoming", (req,res,next)=>{
+  if(req.method!=="POST")return res.status(405).json({error:"post_json_required"});
+  if(!/^application\/json(?:\s*;|$)/i.test(req.get("content-type")||""))return res.status(415).json({error:"post_json_required"});
+  next();
+}, express.raw({type:"application/json",limit:"64kb",inflate:false}), (error,_req,res,_next)=>res.status(error.type==="entity.too.large"?413:415).json({error:error.type==="entity.too.large"?"payload_too_large":"post_json_required"}));
+app.use("/api/webhook-connections", express.json({limit:"64kb"}), (error,_req,res,_next)=>res.status(error.type==="entity.too.large"?413:400).json({error:error.type==="entity.too.large"?"payload_too_large":"invalid_json"}));
 app.use("/webhooks/facebook-leads", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/elevenlabs/webhook", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/retell/webhook", express.raw({ type: "application/json", limit: "1mb" }));
@@ -14009,6 +14019,25 @@ function sendLightingInputError(res, error) {
   return false;
 }
 
+async function withLightingProjectWrite(req, project, work) {
+  const db = await pool.connect();
+  try {
+    await db.query("BEGIN");
+    for (const [field, table, capability] of [["contact_id", "contacts", "contacts.view"], ["job_id", "schedule_events", "jobs.view"]]) {
+      if (!project[field]) continue;
+      if (!hasCapability(req, capability)) throw new LightingInputError("Linked record access is required.", "permission_denied", 403);
+      const found = await db.query(`SELECT id FROM ${table} WHERE id = $1 AND company_id = $2${table === "contacts" ? " AND deleted_at IS NULL" : ""} FOR SHARE`, [project[field], req.companyId]);
+      if (!found.rowCount) throw new LightingInputError("Linked record is unavailable in this workspace.", "lighting_link_unavailable", 404);
+    }
+    const result = await work(db);
+    await db.query("COMMIT");
+    return result;
+  } catch (error) {
+    await db.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally { db.release(); }
+}
+
 app.get("/api/lighting/projects", authRequired, requireCapability("operations.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
@@ -14028,11 +14057,11 @@ app.post("/api/lighting/projects", authRequired, requireCapability("operations.m
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const project = normalizeLightingProjectInput(req.body);
-    const id = randomUUID();
+    const id = project.id || randomUUID();
     for (const key of ["source_object_key", "preview_object_key", "thumbnail_object_key"]) {
       project[key] = assertLightingAssetKey(req.companyId, id, project[key]);
     }
-    const { rows } = await pool.query(
+    const { rows } = await withLightingProjectWrite(req, project, db => db.query(
       `INSERT INTO lighting_projects(id, company_id, contact_id, job_id, name, property_address, source_object_key, preview_object_key, thumbnail_object_key, document, created_by)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
        ON CONFLICT(id) DO UPDATE SET contact_id = EXCLUDED.contact_id, job_id = EXCLUDED.job_id, name = EXCLUDED.name,
@@ -14042,7 +14071,7 @@ app.post("/api/lighting/projects", authRequired, requireCapability("operations.m
        WHERE lighting_projects.company_id = $2
        RETURNING id, contact_id, job_id, name, property_address, source_object_key, preview_object_key, thumbnail_object_key, document, created_at, updated_at`,
       [id, req.companyId, project.contact_id, project.job_id, project.name, project.property_address, project.source_object_key, project.preview_object_key, project.thumbnail_object_key, JSON.stringify(project.document), req.userId]
-    );
+    ));
     if (!rows.length) return res.status(409).json({ error: "lighting_project_conflict" });
     res.status(201).json(lightingProjectPayload(rows[0]));
   } catch (error) {
@@ -14056,6 +14085,10 @@ app.patch("/api/lighting/projects/:id", authRequired, requireCapability("operati
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
     const project = normalizeLightingProjectInput(req.body, { partial: true });
+    if (Object.hasOwn(project, "id")) {
+      if (project.id?.toLowerCase() !== req.params.id.toLowerCase()) throw new LightingInputError("Project ID cannot be changed.", "lighting_id_immutable");
+      delete project.id;
+    }
     for (const key of ["source_object_key", "preview_object_key", "thumbnail_object_key"]) {
       if (Object.hasOwn(project, key)) project[key] = assertLightingAssetKey(req.companyId, req.params.id, project[key]);
     }
@@ -14066,12 +14099,12 @@ app.patch("/api/lighting/projects/:id", authRequired, requireCapability("operati
       values.push(key === "document" ? JSON.stringify(project[key]) : project[key]);
       return `${key} = $${index + 3}${key === "document" ? "::jsonb" : ""}`;
     });
-    const { rows } = await pool.query(
+    const { rows } = await withLightingProjectWrite(req, project, db => db.query(
       `UPDATE lighting_projects SET ${sets.join(", ")}, updated_at = now()
        WHERE company_id = $1 AND id = $2
        RETURNING id, contact_id, job_id, name, property_address, source_object_key, preview_object_key, thumbnail_object_key, document, created_at, updated_at`,
       values
-    );
+    ));
     if (!rows.length) return res.status(404).json({ error: "lighting_project_not_found" });
     res.json(lightingProjectPayload(rows[0]));
   } catch (error) {
@@ -19383,10 +19416,13 @@ async function startServer() {
   });
   startGoogleSheetsWorkers(pool);
   startWeatherRiskWorkers();
+  await installFacebookAds({app,pool:rawPool,authRequired,requireCapability,emitAutomationEvent});
   await installMCP({app,pool,rawPool,authRequired,verifyIdentity:async(email,password)=>{
     const row=(await pool.query('SELECT id,password_hash,deleted_at FROM users WHERE email=$1',[normalizeEmail(email)])).rows[0];
     return row&&!row.deleted_at&&verifyPassword(password,row.password_hash)?{id:row.id}:null;
   }});
+  await installWebhooks({app,pool,authRequired,emitEvent:emitAutomationEvent,catalog:webhookEventCatalog()});
+  await installAssistant({app,pool,authRequired});
   installAPIFallback(app);
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }

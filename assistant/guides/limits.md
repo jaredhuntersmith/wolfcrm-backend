@@ -1,0 +1,4 @@
+<!-- guide:limits version:2 -->
+# Provider, files and integrations
+
+Verified model metadata is intersected with the selected API funding account. Owner API funding must be explicitly configured; personal API keys are encrypted server-side. There is no silent model or funding fallback. Usage and costs are estimates, not provider balance. Existing ChatGPT OAuth remains separate. Hosted ChatGPT-plan funding requires provider eligibility approval. Outbound voice calls are not assistant capabilities. Facebook Ads and native Webhooks are registered from their completed services. Discover their current schemas; new capabilities remain denied until deliberately enabled. Durable ad receipts, provider approval and webhook retry/deduplication rules apply. Secret rotation, provider login/consent and connection credential administration remain in authenticated human controls. Device-only browser data, OS contacts, local files and credentials cannot be read from backend tools.

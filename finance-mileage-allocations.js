@@ -1,3 +1,4 @@
+import { lockFinanceSourceRows } from "./finance-source-locks.js";
 const MAX_REPORT_DAYS = 731;
 const MAX_REPORT_ROWS = 500;
 const MAX_ALLOCATION_LEGS = 100;
@@ -38,6 +39,15 @@ function dateOnly(value, field) {
     throw new MileageAllocationError(`${field}_invalid`, `${field.replaceAll("_", " ")} is invalid.`);
   }
   return raw;
+}
+
+// PostgreSQL DATE values are parsed as local-midnight Date objects by pg.
+// Keep their civil date; toISOString can shift it in time zones east of UTC.
+function databaseDate(value, field = "service_date") {
+  const raw = value instanceof Date && Number.isFinite(value.getTime())
+    ? `${String(value.getFullYear()).padStart(4, "0")}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`
+    : String(value ?? "").slice(0, 10);
+  return dateOnly(raw, field);
 }
 
 function addDays(value, days) {
@@ -130,10 +140,7 @@ export function mileageSourceSnapshot(log = {}, legs = []) {
   }
   return {
     employee_id: String(log.employee_id),
-    source_service_date: dateOnly(
-      log.service_date instanceof Date ? log.service_date.toISOString().slice(0, 10) : String(log.service_date).slice(0, 10),
-      "service_date"
-    ),
+    source_service_date: databaseDate(log.service_date),
     source_reimbursement_cents: reimbursementCents,
     source_rate_cents_per_mile: rateCents,
     source_total_miles_tenths: scaledNumber(log.total_miles, 10, "total_miles", 10_000_000),
@@ -184,7 +191,7 @@ export function suggestMileageAllocationCents(reimbursementCentsValue, legs = []
 function headerSourceMatches(header, snapshot) {
   if (!header) return false;
   return String(header.employee_id) === snapshot.employee_id
-    && String(header.source_service_date).slice(0, 10) === snapshot.source_service_date
+    && databaseDate(header.source_service_date, "source_service_date") === snapshot.source_service_date
     && Number(header.source_reimbursement_cents) === snapshot.source_reimbursement_cents
     && Number(header.source_rate_cents_per_mile) === snapshot.source_rate_cents_per_mile
     && Number(header.source_total_miles_tenths) === snapshot.source_total_miles_tenths
@@ -378,7 +385,7 @@ function headerPayload(row) {
     id: String(row.id),
     mileage_log_id: String(row.mileage_log_id),
     employee_id: String(row.employee_id),
-    source_service_date: String(row.source_service_date).slice(0, 10),
+    source_service_date: databaseDate(row.source_service_date, "source_service_date"),
     source_reimbursement_cents: safeDbInteger(row.source_reimbursement_cents, "source_reimbursement_cents"),
     source_rate_cents_per_mile: safeDbInteger(row.source_rate_cents_per_mile, "source_rate_cents_per_mile"),
     source_total_miles_tenths: safeDbInteger(row.source_total_miles_tenths, "source_total_miles_tenths"),
@@ -412,7 +419,7 @@ function allocationSnapshot(header, lines) {
   return {
     header: {
       id: String(header.id), mileage_log_id: String(header.mileage_log_id), employee_id: String(header.employee_id),
-      source_service_date: String(header.source_service_date).slice(0, 10),
+      source_service_date: databaseDate(header.source_service_date, "source_service_date"),
       source_reimbursement_cents: Number(header.source_reimbursement_cents),
       source_rate_cents_per_mile: Number(header.source_rate_cents_per_mile),
       source_total_miles_tenths: Number(header.source_total_miles_tenths),
@@ -514,7 +521,7 @@ function mileageStatus(row) {
 function reportEntryPayload(row) {
   return {
     mileage_log_id: String(row.mileage_log_id), employee_id: String(row.employee_id), employee_name: row.employee_name,
-    service_date: String(row.service_date).slice(0, 10), status: row.status,
+    service_date: databaseDate(row.service_date, "service_date"), status: row.status,
     total_miles_tenths: optionalScaledNonnegative(row.total_miles, 10, 10_000_000),
     rate_cents_per_mile: safeDbInteger(row.rate_cents_per_mile, "rate_cents_per_mile"),
     reimbursement_cents: safeDbInteger(row.reimbursement_cents, "reimbursement_cents"),
@@ -555,11 +562,12 @@ async function loadMileageReport(pool, companyId, range, limit) {
 }
 
 async function loadMileageDetail(client, companyId, logId, { lock = false } = {}) {
+  if (lock) await lockFinanceSourceRows(client, "mileage_daily_logs", companyId, [logId]);
   const logResult = await client.query(
     `SELECT ml.*, COALESCE(NULLIF(u.display_name, ''), u.email) AS employee_name
        FROM mileage_daily_logs ml
        JOIN users u ON u.id = ml.employee_id AND u.company_id = ml.company_id
-      WHERE ml.company_id = $1 AND ml.id = $2${lock ? " FOR UPDATE OF ml" : ""}`,
+      WHERE ml.company_id = $1 AND ml.id = $2`,
     [companyId, logId]
   );
   if (!logResult.rows[0]) throw new MileageAllocationError("mileage_log_not_found", "The company mileage log was not found.", 404);
@@ -637,7 +645,7 @@ async function mileageCandidateJobs(client, companyId, log, legs, lines) {
                ABS(EXTRACT(EPOCH FROM (se.start_at - $2::date::timestamp))) ASC,
                se.id
       LIMIT $4`,
-    [companyId, String(log.service_date).slice(0, 10), preferredJobIDs, MAX_CANDIDATE_JOBS]
+    [companyId, databaseDate(log.service_date, "service_date"), preferredJobIDs, MAX_CANDIDATE_JOBS]
   );
   return rows.map((row) => ({
     job_id: String(row.job_id), title: row.title, contact_name: row.contact_name,
@@ -658,7 +666,7 @@ function detailLogPayload(detail) {
   }
   return {
     mileage_log_id: String(detail.log.id), employee_id: String(detail.log.employee_id),
-    employee_name: detail.log.employee_name, service_date: String(detail.log.service_date).slice(0, 10),
+    employee_name: detail.log.employee_name, service_date: databaseDate(detail.log.service_date, "service_date"),
     status: detail.log.status,
     total_miles_tenths: snapshot?.source_total_miles_tenths
       ?? optionalScaledNonnegative(detail.log.total_miles, 10, 10_000_000),

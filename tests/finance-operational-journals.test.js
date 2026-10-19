@@ -188,7 +188,7 @@ test("schema, routes, locks, and source-preservation boundaries are explicit", (
   assert.match(source, /FOR UPDATE OF src/);
   assert.match(source, /FOR SHARE/);
   assert.match(source, /bank_income_authority_active/);
-  assert.match(source, /SELECT id FROM companies WHERE id=\$1 FOR UPDATE/);
+  assert.match(source, /await lockFinanceCompany\(client, req.companyId\)/);
   assert.doesNotMatch(source, /UPDATE finance_operational_sources\s+SET/);
   assert.doesNotMatch(source, /UPDATE schedule_events\s+SET/);
   assert.doesNotMatch(source, /UPDATE payment_records\s+SET/);

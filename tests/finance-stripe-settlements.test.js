@@ -301,7 +301,7 @@ test("schema and routes are additive, tenant-scoped, bounded, audited, and never
   assert.match(source, /applicationEvaluation\.authority_version/);
   assert.match(applicationsSource, /authority_version: Number\(bundle\.application\.version\)/);
   assert.match(source, /source_snapshot->'payout'->>'arrival_date'/);
-  assert.match(source, /SELECT id FROM companies WHERE id=\$1 FOR UPDATE/);
+  assert.match(source, /await lockFinanceCompany\(client, req.companyId\)/);
   assert.doesNotMatch(source, /UPDATE finance_transactions\s+SET/);
   assert.doesNotMatch(source, /UPDATE finance_transaction_splits\s+SET/);
   assert.match(accountingSource, /stripe_settlement_bank_accounting_locked/);

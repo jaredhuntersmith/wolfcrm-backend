@@ -436,6 +436,7 @@ function actionProposalPayload(row) {
     summary: row.summary,
     risk_level: row.risk_level || "normal",
     created_at: row.created_at,
+    updated_at: row.updated_at,
     confirmed_at: row.confirmed_at || null,
     executed_at: row.executed_at || null,
     result: row.result || null,
@@ -989,7 +990,7 @@ const nullableInteger = (description, minimum = 0, maximum = 100_000_000) => ({ 
 const commonDatePeriod = { type: "string", enum: ["custom", "this_month", "last_month", "last_30_days", "this_year", "last_year"] };
 const nullableDate = nullableString("YYYY-MM-DD date", 20);
 const accountTypeSchema = { anyOf: [{ type: "string", enum: ["cash", "checking", "savings", "other"] }, { type: "null" }] };
-const recurrenceSchema = { anyOf: [{ type: "string", enum: ["none", "weekly", "biweekly", "monthly", "yearly"] }, { type: "null" }] };
+const recurrenceSchema = { anyOf: [{ type: "string", enum: ["none", "weekly", "biweekly", "monthly", "quarterly", "yearly"] }, { type: "null" }] };
 const budgetPeriodSchema = { anyOf: [{ type: "string", enum: ["weekly", "monthly", "yearly"] }, { type: "null" }] };
 const debtTypeSchema = { anyOf: [{ type: "string", enum: ["federal_tax", "state_tax", "local_tax", "credit_card", "personal_loan", "business_loan", "auto_loan", "medical", "other"] }, { type: "null" }] };
 const goalTypeSchema = { anyOf: [{ type: "string", enum: ["emergency_fund", "tax_payoff", "equipment_purchase", "vehicle_purchase", "moving_fund", "general_savings", "custom"] }, { type: "null" }] };
@@ -2646,7 +2647,7 @@ async function executeProposalPayload(pool, proposal) {
   if (toolName === "create_manual_account") {
     const name = cleanString(args.name, 120);
     const accountType = normalizeActionType(args.account_type, ["cash", "checking", "savings", "other"], "cash");
-    const startingBalance = parseCents(args.starting_balance_cents ?? 0, "starting_balance_cents");
+    const startingBalance = parseCents(args.starting_balance_cents ?? 0, "starting_balance_cents", { min: -100_000_000 });
     const currency = cleanString(args.currency || "usd", 10).toLowerCase() || "usd";
     const client = await pool.connect();
     try {
@@ -2692,7 +2693,7 @@ async function executeProposalPayload(pool, proposal) {
     return { account: safeAccount(rows[0]) };
   }
   if (toolName === "set_manual_account_balance") {
-    const newBalance = parseCents(args.new_balance_cents, "new_balance_cents");
+    const newBalance = parseCents(args.new_balance_cents, "new_balance_cents", { min: -100_000_000 });
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -2730,7 +2731,7 @@ async function executeProposalPayload(pool, proposal) {
         parseCents(args.amount_cents, "amount_cents"),
         parseDateOnly(args.scheduled_date, "scheduled_date", { nullable: false }),
         cleanString(args.category || "Other", 80) || "Other",
-        ["none", "weekly", "biweekly", "monthly", "yearly"].includes(args.recurrence) ? args.recurrence : "none",
+        ["none", "weekly", "biweekly", "monthly", "quarterly", "yearly"].includes(args.recurrence) ? args.recurrence : "none",
         parseDateOnly(args.recurrence_end_date, "recurrence_end_date"),
         cleanString(args.notes, 1000) || null,
         proposal.owner_user_id
@@ -2750,7 +2751,7 @@ async function executeProposalPayload(pool, proposal) {
       amount_cents: args.amount_cents === null || args.amount_cents === undefined ? Number(current.amount_cents || 0) : parseCents(args.amount_cents, "amount_cents"),
       scheduled_date: parseDateOnly(args.scheduled_date, "scheduled_date") || dateOnlyFromDb(current.scheduled_date),
       category: cleanString(args.category || current.category || "Other", 80) || "Other",
-      recurrence: ["none", "weekly", "biweekly", "monthly", "yearly"].includes(args.recurrence) ? args.recurrence : current.recurrence,
+      recurrence: ["none", "weekly", "biweekly", "monthly", "quarterly", "yearly"].includes(args.recurrence) ? args.recurrence : current.recurrence,
       recurrence_end_date: args.recurrence_end_date === undefined ? dateOnlyFromDb(current.recurrence_end_date) : parseDateOnly(args.recurrence_end_date, "recurrence_end_date"),
       notes: args.notes === undefined ? current.notes : (cleanString(args.notes, 1000) || null)
     };
@@ -2848,13 +2849,24 @@ async function executeProposalPayload(pool, proposal) {
     return { goal: { id: rows[0].id, name: rows[0].name, status: rows[0].status, archived: toolName === "archive_goal" } };
   }
   if (toolName === "create_budget") {
-    const period = normalizePeriod(args.period);
-    const bounds = periodBounds(period);
+    // Match the ordinary native budget editor: explicit date bounds and notes
+    // are persisted, and invalid periods/bounds never silently become defaults.
+    const name = cleanString(args.name, 140), category = cleanString(args.category, 80);
+    const period = args.period === undefined ? "monthly" : args.period;
+    if (!name || !category) throw Object.assign(new Error("Budget name and category are required."), { statusCode: 400, code: !name ? "budget_name_required" : "budget_category_required" });
+    if (!["weekly", "monthly", "yearly"].includes(period)) throw Object.assign(new Error("Choose a valid budget period."), { statusCode: 400, code: "invalid_budget_period" });
+    const start = parseDateOnly(args.start_date || periodBounds(period).start_date, "start_date", { nullable: false });
+    const end = parseDateOnly(args.end_date, "end_date");
+    for (const [field, value] of [["start_date", start], ["end_date", end]]) if (value) {
+      const [year, month, day] = value.split("-").map(Number), parsed = new Date(Date.UTC(year, month - 1, day));
+      if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) throw Object.assign(new Error(`${field} is invalid.`), { statusCode: 400, code: `${field}_invalid` });
+    }
+    if (end && end < start) throw Object.assign(new Error("End date must be after the start date."), { statusCode: 400, code: "budget_end_before_start" });
     const { rows } = await pool.query(
-      `INSERT INTO finance_budgets(company_id, name, category, limit_cents, period, start_date, created_by)
-       VALUES($1,$2,$3,$4,$5,$6,$7)
+      `INSERT INTO finance_budgets(company_id, name, category, limit_cents, period, start_date, end_date, notes, created_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
-      [companyId, cleanString(args.name, 140), cleanString(args.category, 80), parseCents(args.limit_cents, "limit_cents"), period, bounds.start_date, proposal.owner_user_id]
+      [companyId, name, category, parseCents(args.limit_cents, "limit_cents"), period, start, end, cleanString(args.notes, 1000) || null, proposal.owner_user_id]
     );
     return { created: { id: rows[0].id, name: rows[0].name, category: rows[0].category, limit_cents: Number(rows[0].limit_cents || 0), period: rows[0].period } };
   }
@@ -3106,7 +3118,7 @@ async function executeProposalPayload(pool, proposal) {
     const streamRows = await pool.query(`SELECT * FROM finance_plaid_recurring_streams WHERE id = $1 AND company_id = $2 AND is_active = true LIMIT 1`, [streamId, companyId]);
     if (!streamRows.rows.length) throw Object.assign(new Error("Recurring stream was not found."), { statusCode: 404, code: "finance_recurring_stream_not_found" });
     const stream = streamRows.rows[0];
-    const recurrence = normalizeActionType(args.recurrence, ["weekly", "biweekly", "monthly", "yearly"], (stream.frequency || "").toLowerCase().includes("week") ? "weekly" : "monthly");
+    const recurrence = normalizeActionType(args.recurrence, ["weekly", "biweekly", "monthly", "quarterly", "yearly"], (stream.frequency || "").toLowerCase().includes("week") ? "weekly" : "monthly");
     const amount = Number(stream.average_amount_cents ?? stream.last_amount_cents ?? 0);
     if (amount <= 0) throw Object.assign(new Error("Detected recurring stream does not have a usable amount."), { statusCode: 400, code: "recurring_stream_amount_missing" });
     const { rows } = await pool.query(
@@ -3944,6 +3956,9 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
       const payload = req.body?.payload;
       if (!payload || typeof payload !== "object") return res.status(400).json({ error: "finance_ai_action_payload_required", message: "Action payload is required." });
       const toolName = cleanString(payload.tool_name || req.body?.action_type, 100);
+      const original = (await pool.query(`SELECT action_type FROM finance_ai_action_proposals WHERE id=$1 AND company_id=$2 AND owner_user_id=$3`, [req.params.id, req.companyId, req.userId])).rows[0];
+      if (!original) return res.status(404).json({ error: "finance_ai_action_not_found", message: "Action proposal was not found." });
+      if (toolName !== original.action_type) return res.status(409).json({ error: "finance_ai_action_type_mismatch", message: "A proposal's action type cannot be changed by its payload editor." });
       const args = payload.args && typeof payload.args === "object" ? payload.args : {};
       requireFinanceCapabilities(req, ACTION_PERMISSIONS[toolName] || ["finance.ai.use"]);
       if (toolName === "propose_finance_ai_memory" && args.memory_scope === "company") requireFinanceCapability(req, "finance.memories.manage_company");
@@ -4004,12 +4019,17 @@ export function installFinanceAIRoutes({ app, pool, authRequired, requireEmploye
     if (!requireCompany(req, res)) return;
     try {
       requireFinanceCapability(req, "finance.ai.use");
+      const original = (await pool.query(`SELECT action_type,payload FROM finance_ai_action_proposals WHERE id=$1 AND company_id=$2 AND owner_user_id=$3`, [req.params.id, req.companyId, req.userId])).rows[0];
+      if (!original) return res.status(404).json({ error: "finance_ai_action_not_found", message: "Action proposal was not found." });
+      if (!ACTION_DEFINITIONS[original.action_type] || (original.payload?.tool_name || original.action_type) !== original.action_type) return res.status(409).json({ error: "finance_ai_action_type_mismatch", message: "This proposal's action type does not match its payload. Review it before confirming." });
+      requireFinanceCapabilities(req, ACTION_PERMISSIONS[original.action_type] || ["finance.ai.use"]);
+      if (original.action_type === "propose_finance_ai_memory" && original.payload.args?.memory_scope === "company") requireFinanceCapability(req, "finance.memories.manage_company");
       let proposalResult = await pool.query(
         `UPDATE finance_ai_action_proposals
             SET status = 'executing', confirmed_at = COALESCE(confirmed_at, now()), updated_at = now()
-          WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status = 'proposed'
+          WHERE id = $1 AND company_id = $2 AND owner_user_id = $3 AND status = 'proposed' AND action_type=$4 AND payload=$5::jsonb
           RETURNING *`,
-        [req.params.id, req.companyId, req.userId]
+        [req.params.id, req.companyId, req.userId, original.action_type, JSON.stringify(original.payload)]
       );
       if (!proposalResult.rows.length) {
         const existing = await pool.query(`SELECT * FROM finance_ai_action_proposals WHERE id = $1 AND company_id = $2 AND owner_user_id = $3`, [req.params.id, req.companyId, req.userId]);

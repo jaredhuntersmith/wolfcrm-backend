@@ -1,0 +1,82 @@
+import {registerFinanceWorkspaceTools} from './finance-workspace-tools.js';
+import {registerGeometryTools} from './geometry-tools.js';
+import {registerCollaborationTools} from './collaboration-tools.js';
+import {registerAutomationRuntimeTools} from './automation-runtime-tools.js';
+import {registerSchedulingTools} from './scheduling-tools.js';
+import {registerCompanySettingsTools} from './company-settings-tools.js';
+import {registerAutomationGraphTools,redactAutomation} from './automation-graph-tools.js';
+import {registerExpandedTools} from './expanded-tools.js';
+import {registerOperationsTools} from './operations-tools.js';
+import {registerNotesDatabaseTools} from './notes-database-tools.js';
+import {registerProductTools} from './product-tools.js';
+import {z} from 'zod';
+import {digest,dispatch,fault,transaction} from './context.js';
+import {permit,connection} from './access.js';
+import {BLOCK_TYPES} from '../notes/blocks.js';
+const id=z.string().regex(/^[A-Za-z0-9_-]{1,160}$/),uuid=z.uuid(),empty=z.object({}).strict(),json=z.json();
+const title=z.string().trim().min(1).max(200),text=z.string().max(50000);
+const page={limit:z.number().int().min(1).max(100).default(25),offset:z.number().int().nonnegative().default(0)};
+const memo=z.object({data:json,source_hash:z.string(),content_trust:z.literal('untrusted_record_data')});
+const query=i=>{const q=new URLSearchParams();for(const[k,v]of Object.entries(i))if(v!==undefined&&v!==null)q.set(k,String(v));return q.toString();};
+const output=data=>({data:data??null,source_hash:digest(data??null),content_trust:'untrusted_record_data'});
+// Explicitly registered operations only. There is no caller-controlled method,
+// URL, SQL, table name or arbitrary settings update.
+export function registerWorkspaceTools(tool,{actor,pool,app}){
+ const read=(name,description,schema,scope,caps,path,handler)=>tool(name,description,schema,memo,scope,caps,async i=>{permit(actor,scope,caps);return output(handler?await handler(i):await dispatch(app,actor,'GET',typeof path==='function'?path(i):path));});
+ const write=(name,description,schema,scope,caps,method,path,body,handler)=>tool(name,description+' Uses canonical validation and a durable request_id. Stale revisions fail without overwriting newer data.',schema.extend({request_id:uuid}).strict(),memo,scope,caps,async raw=>{
+  const {request_id,...i}=raw;permit(actor,scope,caps);
+  return transaction(pool,async db=>{
+   await db.query('SELECT id FROM mcp_connections WHERE id=$1 FOR UPDATE',[actor.connectionId]);const fresh=await connection(pool,actor.connectionId);permit(fresh,scope,caps);
+   const prior=(await db.query('SELECT * FROM mcp_operations WHERE connection_id=$1 AND request_id=$2',[actor.connectionId,request_id])).rows[0];const hash=digest(raw);
+   if(prior){if(prior.operation!==name||prior.input_hash!==hash)throw fault(409,'idempotency_conflict');return output({replayed:true,request_id,operation:name,message:'This request already completed. Read the current record through its authorized read capability.'});}
+   const result=output(handler?await handler(i,request_id):await dispatch(app,fresh,method,typeof path==='function'?path(i):path,body?body(i,request_id):i));
+   await db.query('INSERT INTO mcp_operations(connection_id,request_id,operation,input_hash,result) VALUES($1,$2,$3,$4,$5)',[actor.connectionId,request_id,name,hash,JSON.stringify(result)]);return result;
+  });
+ },true);
+ registerProductTools({read,write,actor,app,pool});
+ registerExpandedTools({read,write,actor,app,pool});
+ registerOperationsTools({read,write,actor,app,pool});
+ registerAutomationGraphTools({read,write,actor,app,pool});
+ registerAutomationRuntimeTools({read,write,actor,app,pool});
+ registerCollaborationTools({read,write,actor,app,pool});
+ registerGeometryTools({read,write,actor,app,pool});
+ registerFinanceWorkspaceTools({read,write,actor,app,pool});
+ registerSchedulingTools({read,write,actor,app,pool});
+ registerCompanySettingsTools({read,write,actor,app,pool});
+ registerNotesDatabaseTools({read,write,actor,app,pool});
+ read('notes_search_filtered','Search authorized Notes titles, full text and permitted reference text. Supports archive/private/shared/tag/date filters. Follow next_offset; private notes remain owner/member scoped.',z.object({search:z.string().max(200).default(''),scope:z.enum(['all','private','company','shared','favorites','pinned','archive','trash','databases']).default('all'),tag:z.string().max(60).optional(),updated_days:z.number().int().min(1).max(3650).optional(),...page}).strict(),'notes:read',['notes.view'],i=>'/api/notes/pages?'+query(i));
+ read('notes_page','Read one authorized Note and its blocks, reference cards, revision, statistics and pagination. Hidden embedded records remain hidden.',z.object({id:uuid,...page}).strict(),'notes:read',['notes.view'],i=>`/api/notes/pages/${i.id}?${query({limit:i.limit,offset:i.offset})}`);
+ write('notes_metadata','Rename, move, tag, archive, trash/restore, or change a Note’s supported metadata. Sharing and parent validation use the Notes service.',z.object({id:uuid,expected_revision:z.number().int().positive(),title:title.max(150).optional(),parent_id:uuid.nullable().optional(),visibility:z.enum(['private','company','shared']).optional(),inherit_access:z.boolean().optional(),tags:z.array(z.string().max(60)).max(30).optional(),icon:z.string().max(32).optional(),cover_id:uuid.nullable().optional(),position:z.number().min(-1e9).max(1e9).optional(),archived:z.boolean().optional(),trashed:z.boolean().optional()}).strict(),'notes:write',['notes.view'],'PATCH',i=>'/api/notes/pages/'+i.id,({id,...i})=>i);
+ const rich=z.object({start:z.number().int().nonnegative(),length:z.number().int().nonnegative(),bold:z.boolean().optional(),italic:z.boolean().optional(),underline:z.boolean().optional(),strike:z.boolean().optional(),code:z.boolean().optional(),highlight:z.boolean().optional(),link:z.url().optional(),color:z.string().regex(/^#[a-fA-F0-9]{6}$/).optional()}).strict();
+ const payload=z.object({text:text.optional(),runs:z.array(rich).max(3000).optional(),checked:z.boolean().optional(),icon:z.string().max(12).optional(),language:z.string().max(40).optional(),cells:z.array(z.array(z.string().max(2000)).max(20)).max(200).optional(),source_id:id.optional(),target_id:id.optional(),asset_id:uuid.optional(),recording_id:uuid.optional(),preview_id:uuid.optional(),context_type:z.string().max(40).optional(),context_id:id.optional(),url:z.url().optional(),title:z.string().max(500).optional(),description:z.string().max(4000).optional(),captured_at:z.iso.datetime({offset:true}).optional()}).strict();
+ const block=z.object({id:uuid,expected_revision:z.number().int().nonnegative(),type:z.enum(BLOCK_TYPES),parent_id:uuid.nullable().optional(),position:z.number().min(-1e9).max(1e9).optional(),payload,deleted:z.boolean().optional()}).strict();
+ write('notes_edit_blocks','Insert, replace, reorder or delete supported typed Note blocks. Exact block revisions and a client key protect unsaved/concurrent changes; referenced records/files require current access.',z.object({id:uuid,operations:z.array(block).min(1).max(100)}).strict(),'notes:write',['notes.view'],'POST',i=>`/api/notes/pages/${i.id}/blocks`,(i,key)=>({client_key:key,operations:i.operations}));
+ write('notes_personal','Set your own Note favorite, pin or collapsed blocks without changing another user’s preferences.',z.object({id:uuid,favorite:z.boolean().optional(),pinned:z.boolean().optional(),collapsed:z.array(uuid).max(1000).optional()}).strict(),'notes:write',['notes.view'],'PUT',i=>`/api/notes/pages/${i.id}/personal`,({id,...i})=>i);
+ read('notes_versions','Read revision history for an authorized Note.',z.object({id:uuid}).strict(),'notes:read',['notes.view'],i=>`/api/notes/pages/${i.id}/versions`);
+ read('notes_related','Read related Notes using existing permission-aware Notes relationships.',z.object({id:uuid}).strict(),'notes:read',['notes.view'],i=>`/api/notes/pages/${i.id}/related`);
+ read('notes_backlinks','Read authorized backlinks to a Note.',z.object({id:uuid}).strict(),'notes:read',['notes.view'],i=>`/api/notes/pages/${i.id}/backlinks`);
+ read('notes_templates','List available Note templates.',empty,'notes:read',['notes.view'],'/api/notes/templates');
+ read('notes_smart_folders','List your Notes smart folders and saved filters.',empty,'notes:read',['notes.view'],'/api/notes/smart-folders');
+ read('notes_activity','Read authorized Note edit/activity history.',z.object({id:uuid,...page}).strict(),'notes:read',['notes.view'],i=>`/api/notes/pages/${i.id}/activity?${query({limit:i.limit,offset:i.offset})}`);
+ read('ideas_lists','List accessible Idea lists with visibility and current revisions. Personal lists remain private.',empty,'crm:read',[],'/api/idea-parking/lists');
+ read('ideas_search','Search accessible Ideas by text, with explicit bounded pagination over the canonical list response.',z.object({query:z.string().max(200).default(''),list_id:id.optional(),...page}).strict(),'crm:read',[],null,async i=>{const rows=await dispatch(app,actor,'GET','/api/idea-parking/ideas?'+query({list_id:i.list_id}));const matches=rows.filter(x=>x.text.toLowerCase().includes(i.query.toLowerCase()));return {items:matches.slice(i.offset,i.offset+i.limit),next_offset:i.offset+i.limit<matches.length?i.offset+i.limit:null};});
+ write('ideas_save','Create/edit/move one Idea through the canonical 20-word validation and audience rules.',z.object({id,title:text.max(2000),list_id:id.nullable()}).strict(),'crm:write',[],'PUT',i=>'/api/idea-parking/ideas/'+i.id,i=>({text:i.title,list_id:i.list_id}));
+ write('ideas_delete','Delete one Idea you may edit.',z.object({id}).strict(),'crm:write',[],'DELETE',i=>'/api/idea-parking/ideas/'+i.id,()=>({}));
+ write('ideas_list_save','Create, rename, reorder or share an Idea list. Existing lists require their exact revision.',z.object({id,name:title.max(120),expected_revision:z.number().int().positive().optional(),sort_order:z.number().int(),visibility:z.enum(['private','shared','company']),member_ids:z.array(uuid).max(200)}).strict(),'crm:write',[],'PUT',i=>'/api/idea-parking/lists/'+i.id,({id,...i})=>i);
+ write('ideas_list_delete','Delete an owned Idea list; the existing workflow retains its ideas as unfiled.',z.object({id}).strict(),'crm:write',[],'DELETE',i=>'/api/idea-parking/lists/'+i.id,()=>({}));
+ read('automation_catalog','Discover the existing automation triggers, actions, typed configuration fields and conditions. This is the authoritative automation engine catalog.',empty,'crm:read',['automations.view'],'/api/automations/catalog');
+ read('automation_list','List accessible company automations and published/draft status.',empty,'crm:read',['automations.view'],null,async()=>redactAutomation(await dispatch(app,actor,'GET','/api/automations')));
+ read('automation_get','Read an existing company automation, its graph and versions.',z.object({id:uuid}).strict(),'crm:read',['automations.view'],null,async i=>{const value=await dispatch(app,actor,'GET','/api/automations/'+i.id);return {...redactAutomation(value),record_hash:digest(value)};});
+ read('dashboard_layout','Read your authoritative dashboard layout settings.',empty,'crm:read',['dashboard.view'],'/api/dashboard/layout');
+ read('navigation_tabs','Read your current app-tab ordering and visibility.',empty,'crm:read',['settings.view'],'/api/navigation/tabs');
+ read('services_catalog','Read configured service definitions; use calculator tools for prices and time, never model arithmetic.',empty,'crm:read',['quotes.view'],'/api/services');
+ read('quote_settings','Read quote presentation and calculation settings from their existing handler.',empty,'crm:read',['quotes.view'],'/api/quotes/settings');
+ read('schedule_team','Read current worker availability through the canonical schedule service.',empty,'team:read',['schedule.view','jobs.view'],'/api/schedule/team');
+ read('routes_list','Read your authorized routes with existing route visibility.',empty,'crm:read',['routes.view'],'/api/routes');
+ read('route_get','Read a route and its canonical ordered stops.',z.object({id}).strict(),'crm:read',['routes.view'],i=>'/api/routes/'+i.id);
+ read('focus_status','Read Focus availability and provider limits. Does not invoke a paid provider.',empty,'crm:read',['focus.view'],'/api/focus/status');
+ read('focus_capabilities','Read actual supported Focus capabilities and OS/provider limitations.',empty,'crm:read',['focus.view'],'/api/focus/capabilities');
+ read('focus_likes','Read your saved Focus likes.',z.object({...page}).strict(),'crm:read',['focus.view'],i=>'/api/focus/likes?'+query(i));
+ read('focus_creators','Read accessible Focus creators; provider discovery is a separate paid action.',z.object({query:z.string().max(200).default(''),...page}).strict(),'crm:read',['focus.view'],i=>'/api/focus/creators?'+query(i));
+ read('browser_record_links','Read saved webpage cards for an authorized CRM record. Device browsing history remains local.',z.object({type:z.enum(['contact','job','quote','task','note']),id}).strict(),'crm:read',['browser.view','browser.crmShare'],i=>`/api/browser/records/${i.type}/${i.id}/links`);
+}

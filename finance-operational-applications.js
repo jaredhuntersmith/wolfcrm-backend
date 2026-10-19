@@ -1,3 +1,4 @@
+import { lockFinanceCompany } from "./finance-locks.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   GeneralLedgerError,
@@ -1353,7 +1354,7 @@ export function installFinanceOperationalApplicationRoutes({ app, pool, authRequ
         allocation
       });
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       await prepare(client, req.companyId, req.userId);
       const replayed = await replayedRequest(client, req.companyId, request);
       if (replayed) {
@@ -1386,7 +1387,7 @@ export function installFinanceOperationalApplicationRoutes({ app, pool, authRequ
       } : null;
       const request = normalizeMutation(req.body, action, { refund_revision_id: revisionID, expected_revision_version: exactInteger(req.body.expected_source_version, "expected_source_version", 1), allocation });
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       await prepare(client, req.companyId, req.userId);
       const replayed = await replayedRequest(client, req.companyId, request);
       if (replayed) {
@@ -1426,7 +1427,7 @@ export function installFinanceOperationalApplicationRoutes({ app, pool, authRequ
       };
       const request = normalizeMutation(req.body, "post", fields);
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       await prepare(client, req.companyId, req.userId);
       const replayed = await replayedRequest(client, req.companyId, request);
       if (replayed) {
@@ -1451,7 +1452,7 @@ export function installFinanceOperationalApplicationRoutes({ app, pool, authRequ
       const applicationID = uuid(req.params.applicationId, "application_id");
       const request = normalizeMutation(req.body, "void", { application_id: applicationID });
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       await prepare(client, req.companyId, req.userId);
       const replayed = await replayedRequest(client, req.companyId, request);
       if (replayed) {

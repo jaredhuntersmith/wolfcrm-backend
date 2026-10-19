@@ -1,3 +1,4 @@
+import { lockFinanceCompany } from "./finance-locks.js";
 import { createHash } from "node:crypto";
 import {
   allocateExactCents,
@@ -1482,7 +1483,7 @@ export function installFinancePayrollEvaluationRoutes({ app, pool, authRequired,
     try {
       await client.query("BEGIN");
       await client.query(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, [`${req.companyId}|supported-payroll`]);
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       const context = await loadCompanyContext(client, req.companyId);
       const range = parsePayrollEvaluationRange(req.body?.start_date, req.body?.end_date, {
         companyToday: context.company_today,

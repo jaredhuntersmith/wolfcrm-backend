@@ -1,3 +1,4 @@
+import { lockFinanceCompany } from "./finance-locks.js";
 import {
   installOperationalAccountingRoutes,
   installOperationalAccountingSchema
@@ -693,7 +694,7 @@ export function installFinanceAccountingRoutes({ app, pool, authRequired, requir
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(`SELECT id FROM companies WHERE id=$1 FOR UPDATE`, [req.companyId]);
+      await lockFinanceCompany(client, req.companyId);
       await ensureDefaultChartAccounts(client, req.companyId, req.userId);
       const txResult = await client.query(
         `SELECT * FROM finance_transactions WHERE company_id = $1 AND id = $2 FOR UPDATE`,

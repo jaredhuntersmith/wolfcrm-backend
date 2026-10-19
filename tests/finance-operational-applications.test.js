@@ -235,7 +235,7 @@ test("schema and routes preserve sources and keep settlement out of this phase",
   assert.match(source, /UNIQUE\(company_id, payment_record_id, cumulative_refunded_cents\)/);
   assert.match(source, /finance_operational_applications_payment_source_idx/);
   assert.match(source, /finance_operational_applications_refund_revision_idx/);
-  assert.match(source, /SELECT id FROM companies WHERE id=\$1 FOR UPDATE/);
+  assert.match(source, /await lockFinanceCompany\(client, req.companyId\)/);
   assert.match(source, /\/api\/finance\/accounting\/operational-applications/);
   assert.doesNotMatch(source, /UPDATE finance_operational_sources\s+SET/);
   assert.doesNotMatch(source, /stripe\.(paymentIntents|charges|refunds|payouts)/);

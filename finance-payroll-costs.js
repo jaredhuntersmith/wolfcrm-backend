@@ -1,3 +1,4 @@
+import { lockFinanceSourceRows } from "./finance-source-locks.js";
 import { createHash } from "node:crypto";
 import { timeEntryAllocationSnapshot, timeLinkMatchesSnapshot } from "./finance-cost-allocations.js";
 
@@ -632,8 +633,7 @@ function surroundingWorkweekRange(range, weekStart) {
 
 async function loadPayrollEvidence(client, companyId, range, context, { lock = false } = {}) {
   const extended = surroundingWorkweekRange(range, Number(context.week_start));
-  const entryResult = await client.query(
-    `SELECT e.id, e.user_id, e.start_at, e.end_at, COALESCE(e.break_seconds, 0) AS break_seconds,
+  const entrySQL = `SELECT e.id, e.user_id, e.start_at, e.end_at, COALESCE(e.break_seconds, 0) AS break_seconds,
             e.manual_status, e.manual_entry,
             COALESCE(NULLIF(u.display_name, ''), u.email) AS employee_name,
             to_char(e.start_at AT TIME ZONE $4, 'YYYY-MM-DD') AS work_date
@@ -642,25 +642,38 @@ async function loadPayrollEvidence(client, companyId, range, context, { lock = f
       WHERE e.company_id = $1
         AND e.start_at >= ($2::date::timestamp AT TIME ZONE $4)
         AND e.start_at < (($3::date + 1)::timestamp AT TIME ZONE $4)
+        AND ($6::text[] IS NULL OR e.id = ANY($6::text[]))
       ORDER BY e.start_at, e.id
-      LIMIT $5${lock ? " FOR UPDATE OF e" : ""}`,
-    [companyId, extended.start_date, extended.end_date, context.timezone, MAX_PERIOD_ENTRIES + 21]
-  );
+      LIMIT $5`;
+  const entryArgs = [companyId, extended.start_date, extended.end_date, context.timezone, MAX_PERIOD_ENTRIES + 21, null];
+  let entryResult = await client.query(entrySQL, entryArgs);
+  if (lock) {
+    const ids = entryResult.rows.map(row => String(row.id));
+    await lockFinanceSourceRows(client, "time_clock_entries", companyId, ids);
+    // Re-read the locked set through RLS after a concurrent writer has finished.
+    // New rows after selection remain outside this transaction's evidence set.
+    entryResult = await client.query(entrySQL, [...entryArgs.slice(0, 5), ids]);
+  }
   const inPeriodCount = entryResult.rows.filter((row) => row.work_date >= range.start_date && row.work_date <= range.end_date).length;
   if (inPeriodCount > MAX_PERIOD_ENTRIES || entryResult.rows.length > MAX_PERIOD_ENTRIES + 20) {
     throw new PayrollCostError("payroll_cost_entries_too_many", `A recognition period supports at most ${MAX_PERIOD_ENTRIES} time entries.`, 409);
   }
   const employeeIds = [...new Set(entryResult.rows.map((row) => String(row.user_id)))];
-  const payResult = employeeIds.length
-    ? await client.query(
-      `SELECT * FROM employee_pay_structures
+  const paySQL = `SELECT * FROM employee_pay_structures
         WHERE company_id = $1 AND employee_id = ANY($2::uuid[])
           AND effective_from <= $4::date
           AND (effective_to IS NULL OR effective_to >= $3::date)
-        ORDER BY employee_id, effective_from, id${lock ? " FOR UPDATE" : ""}`,
-      [companyId, employeeIds, range.start_date, range.end_date]
-    )
+          AND ($5::text[] IS NULL OR id::text = ANY($5::text[]))
+        ORDER BY employee_id, effective_from, id`;
+  const payArgs = [companyId, employeeIds, range.start_date, range.end_date, null];
+  let payResult = employeeIds.length
+    ? await client.query(paySQL, payArgs)
     : { rows: [] };
+  if (lock && payResult.rows.length) {
+    const ids = payResult.rows.map(row => String(row.id));
+    await lockFinanceSourceRows(client, "employee_pay_structures", companyId, ids);
+    payResult = await client.query(paySQL, [...payArgs.slice(0, 4), ids]);
+  }
   const periodEntryIds = entryResult.rows
     .filter((row) => row.work_date >= range.start_date && row.work_date <= range.end_date)
     .map((row) => String(row.id));

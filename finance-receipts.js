@@ -14,6 +14,7 @@ import {
   receiptLifecycleState
 } from "./finance-receipt-lifecycle.js";
 
+// Maintenance touchpoint for receipt automation tracking; intentionally runtime-neutral. jared
 const VALID_STATUSES = new Set(["processing", "unmatched", "possible_match", "matched", "manually_matched", "cash_purchase", "processing_failed", "archived"]);
 const RECEIPT_BUSINESS_USES = new Set(["unknown", "business", "personal"]);
 const RECEIPT_DETAIL_FIELDS = [

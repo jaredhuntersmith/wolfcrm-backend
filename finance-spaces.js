@@ -1,4 +1,6 @@
+import {installFinanceSourceLocks} from "./finance-source-locks.js";
 import {hasCapability} from './permissions.js';
+import {trackRequestCleanup} from './mcp/context.js';
 import {installFinanceSpaceTransfers} from './finance-space-transfers.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
 
@@ -135,7 +137,7 @@ export async function installFinanceSpacesSchema(pool) {
     SELECT EXISTS(SELECT 1 FROM public.finance_spaces s WHERE s.id=ANY(public.wolf_finance_visible_spaces()) AND s.includes_company_activity)
    $$; REVOKE ALL ON FUNCTION wolf_finance_company_activity() FROM PUBLIC; GRANT EXECUTE ON FUNCTION wolf_finance_company_activity() TO ${role};`);
   // These CRM sources remain company-owned; Finance can import them in one explicitly selected Business space.
-  for(const table of ['schedule_events','payment_records','employee_pay_structures','mileage_daily_logs','mileage_legs','time_clock_entries','time_clock_settings','quotes']) {
+  for(const table of ['schedule_events','payment_records','employee_pay_structures','mileage_daily_logs','time_clock_entries','time_clock_settings','quotes']) {
    const exists=await db.query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1",[table]);
    if(!exists.rowCount)continue;
    const companyCheck=exists.rows.some(r=>r.column_name==='company_id')?"company_id=nullif(current_setting('wolf.finance_company',true),'')::uuid":"false";
@@ -144,6 +146,7 @@ export async function installFinanceSpacesSchema(pool) {
     DROP POLICY IF EXISTS wolf_finance_request_access ON ${quote(table)}; CREATE POLICY wolf_finance_request_access ON ${quote(table)} TO ${role} USING(true) WITH CHECK(true);`);
   }
   await db.query(`GRANT UPDATE(job_id,accounting_link_version,accounting_linked_at,accounting_linked_by,updated_at) ON payment_records TO ${role}; GRANT UPDATE(id) ON schedule_events TO ${role};`);
+  await installFinanceSourceLocks(db);
   await db.query('COMMIT');
   return {tables:tables.length};
  } catch(error) {await db.query('ROLLBACK');throw error;} finally {db.release();}
@@ -157,9 +160,14 @@ export function financeScopedPool(pool) {
    await client.query(`SELECT set_config('wolf.finance_actor',$1,false),set_config('wolf.finance_company',$2,false),set_config('wolf.finance_space',$3,false)`,[scope.userId,scope.companyId,scope.spaceId]);
    await client.query(`SET ROLE ${role}`);
   } catch(error) {client.release(true);throw error;}
-  let released=false, pending=Promise.resolve();
+  let released=false, pending=Promise.resolve(), cleanup=null;
   return {query:(...args)=>{if(released)throw new Error('finance_connection_released');const next=pending.then(()=>client.query(...args));pending=next.catch(()=>{});return next;},
-   release:async()=>{if(released)return;released=true;try {await pending;await client.query('ROLLBACK');await client.query('RESET ROLE; RESET ALL');client.release();}catch {client.release(true);}}};
+   release:()=>{if(cleanup)return cleanup;released=true;cleanup=(async()=>{try {await pending;await client.query('ROLLBACK');await client.query('RESET ROLE; RESET ALL');client.release();}catch(error){client.release(true);throw error;}})();
+    // Register synchronously: canonical handlers may send their response before
+    // their finally block awaits cleanup. Internal callers must not commit an
+    // MCP receipt until the scoped role/GUCs have been restored. Ordinary HTTP
+    // fire-and-forget release still cannot create an unhandled rejection.
+    cleanup.catch(()=>{});return trackRequestCleanup(cleanup);}};
  }
  return {connect,query:async(...args)=>{const db=await connect();try{return await db.query(...args);}finally{await db.release();}}};
 }

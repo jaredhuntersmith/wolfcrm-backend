@@ -59,7 +59,15 @@ export function validateLightingDocument(document) {
     throw new LightingInputError("Lighting document has an invalid layer list.", "lighting_layers_invalid");
   }
   for (const layer of document.layers) {
-    if (!layer || typeof layer !== "object" || typeof layer.kind !== "string" || !UUID.test(layer.id || "")) {
+    if (!layer || typeof layer !== "object" || typeof layer.kind !== "string") {
+      throw new LightingInputError("Lighting document has an invalid layer.", "lighting_layer_invalid");
+    }
+    // Current native enum encoding uses {kind,payload} and payload.metadata.id.
+    // Preserve older stored {id,kind} documents without rewriting their identity.
+    const current = Object.hasOwn(layer, "payload");
+    const identity = current ? layer.payload?.metadata?.id : layer.id;
+    if (!UUID.test(identity || "") || (current && !["roofline", "fill", "wrap", "garland", "wreath", "fixture", "bulb"].includes(layer.kind)) ||
+        (current && layer.id != null && layer.id !== identity)) {
       throw new LightingInputError("Lighting document has an invalid layer.", "lighting_layer_invalid");
     }
   }
