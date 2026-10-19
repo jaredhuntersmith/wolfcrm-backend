@@ -1,3 +1,8 @@
+import {
+  expiredAuthorization,
+  invalidateSharedAuthorization,
+  syncSharedPermissions,
+} from "../facebook-connection/state.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { encrypt, decrypt } from "../facebook-leads/provider.js";
@@ -59,10 +64,20 @@ export function createAdsService({
     );
     if (!c?.token || !["connected", "attention"].includes(c.status))
       throw fault("facebook_ads_disconnected", 409);
+    if (c.unified && expiredAuthorization(c.error_code))
+      throw fault("facebook_reauthorize_required", 409);
     if (c.expires_at && new Date(c.expires_at) <= new Date()) {
+      if (c.unified)
+        await invalidateSharedAuthorization(
+          db,
+          actor.companyId,
+          "facebook_reauthorize_required",
+          "ads",
+          c.token,
+        );
       await db.query(
-        "UPDATE facebook_ads_connections SET status='attention',error_code='facebook_reauthorize_required' WHERE company_id=$1",
-        [actor.companyId],
+        "UPDATE facebook_ads_connections SET status='attention',error_code='facebook_reauthorize_required' WHERE company_id=$1 AND token=$2",
+        [actor.companyId, c.token],
       );
       throw fault("facebook_reauthorize_required", 409);
     }
@@ -72,9 +87,30 @@ export function createAdsService({
     };
   }
   async function request(c, path, params = {}, method = "GET", db = pool) {
+    return provider(
+      c,
+      () => graph.request(path, c.accessToken, params, method),
+      db,
+    );
+  }
+  function providerGraph(c) {
+    return {
+      all: (...args) => provider(c, () => graph.all(...args)),
+      page: (...args) => provider(c, () => graph.page(...args)),
+    };
+  }
+  async function provider(c, work, db = pool) {
     try {
-      return await graph.request(path, c.accessToken, params, method);
+      return await work();
     } catch (e) {
+      if (c.unified && expiredAuthorization(e.code))
+        await invalidateSharedAuthorization(
+          db,
+          c.company_id,
+          e.code,
+          "ads",
+          c.token,
+        );
       if (
         [
           "facebook_reauthorize_required",
@@ -82,8 +118,8 @@ export function createAdsService({
         ].includes(e.code)
       )
         await db.query(
-          "UPDATE facebook_ads_connections SET status='attention',error_code=$2,updated_at=now() WHERE company_id=$1",
-          [c.company_id, e.code],
+          "UPDATE facebook_ads_connections SET status='attention',error_code=$2,updated_at=now() WHERE company_id=$1 AND token=$3",
+          [c.company_id, e.code, c.token],
         );
       throw e;
     }
@@ -100,6 +136,12 @@ export function createAdsService({
         db,
         "SELECT * FROM facebook_ads_accounts WHERE company_id=$1 AND account_id=$2 AND available=true",
         [actor.companyId, accountId],
+      );
+    if (c.operations_enabled === false)
+      throw fault(
+        "facebook_ads_operations_disabled",
+        409,
+        "Ads operations are disabled for this company. Enable them in Facebook connection settings.",
       );
     if (!a || (selected && !a.selected))
       throw fault("ad_account_not_selected", 404);
@@ -128,7 +170,7 @@ export function createAdsService({
     await authorize(actor);
     const c = await one(
       pool,
-      "SELECT status,permissions,error_code,checked_at,expires_at,revision FROM facebook_ads_connections WHERE company_id=$1",
+      "SELECT status,permissions,error_code,checked_at,expires_at,revision,unified,operations_enabled FROM facebook_ads_connections WHERE company_id=$1",
       [actor.companyId],
     );
     return {
@@ -146,12 +188,18 @@ export function createAdsService({
   }
   async function refresh(actor) {
     const c = await connection(actor),
-      permissions = (await graph.all("me/permissions", c.accessToken))
+      permissions = (
+        await providerGraph(c).all("me/permissions", c.accessToken)
+      )
         .filter((x) => x.status === "granted")
         .map((x) => x.permission);
-    const accounts = await graph.all("me/adaccounts", c.accessToken, {
-      fields: accountFields,
-    });
+    const accounts = await providerGraph(c).all(
+      "me/adaccounts",
+      c.accessToken,
+      {
+        fields: accountFields,
+      },
+    );
     const db = await pool.connect();
     try {
       await db.query("BEGIN");
@@ -199,6 +247,14 @@ export function createAdsService({
             : "attention",
         ],
       );
+      if (c.unified)
+        await syncSharedPermissions(
+          db,
+          actor.companyId,
+          permissions,
+          "ads",
+          c.token,
+        );
       await db.query("COMMIT");
     } catch (e) {
       await db.query("ROLLBACK");
@@ -428,7 +484,7 @@ export function createAdsService({
         operator: "IN",
         value: [i.status],
       });
-    const p = await graph.page(
+    const p = await providerGraph(c).page(
       `${path}/${i.level === "campaign" ? "campaigns" : i.level === "adset" ? "adsets" : "ads"}`,
       c.accessToken,
       {
@@ -732,7 +788,9 @@ export function createAdsService({
         context.c.revision,
         context.r,
         context.params.time_range || context.params.date_preset,
-        context.r.compare ? dateWindow(context.r.compare, context.a.timezone_name) : null,
+        context.r.compare
+          ? dateWindow(context.r.compare, context.a.timezone_name)
+          : null,
         cursor || null,
       ]);
     const hit = cache.get(key);
@@ -740,7 +798,7 @@ export function createAdsService({
       return { ...hit.value, cached: true };
     if (inflight.has(key)) return inflight.get(key);
     const work = (async () => {
-      const p = await graph.page(
+      const p = await providerGraph(context.c).page(
         `act_${context.r.account_id}/insights`,
         context.c.accessToken,
         context.params,
@@ -753,7 +811,7 @@ export function createAdsService({
           period: context.r.compare,
           compare: undefined,
         });
-        const page = await graph.page(
+        const page = await providerGraph(other.c).page(
           `act_${context.r.account_id}/insights`,
           other.c.accessToken,
           other.params,
@@ -841,7 +899,7 @@ export function createAdsService({
       progress: progress.async_percent_completion || 0,
     };
     if (status === "completed") {
-      const p = await graph.page(
+      const p = await providerGraph(context.c).page(
         `${row.provider_id}/insights`,
         context.c.accessToken,
         { limit: "100" },

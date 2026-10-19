@@ -1,3 +1,7 @@
+import {
+  expiredAuthorization,
+  invalidateSharedAuthorization,
+} from "../facebook-connection/state.js";
 import { randomUUID } from "node:crypto";
 import { mapLead, mergeContact, fail, FacebookLeadError } from "./domain.js";
 import { transaction, findMatches, safeError } from "./store.js";
@@ -14,11 +18,20 @@ export function createFacebookLeadWorker({
     const scan = table === "facebook_lead_scans";
     return one(
       pool,
-      `UPDATE ${table} j SET status='processing',lease=$1,lease_until=now()+interval '5 minutes',attempts=attempts+1 WHERE j.id=(SELECT q.id FROM ${table} q JOIN facebook_lead_forms f ON f.company_id=q.company_id AND f.form_id=q.form_id JOIN facebook_lead_pages p ON p.company_id=f.company_id AND p.page_id=f.page_id JOIN facebook_lead_connections c ON c.company_id=f.company_id WHERE (q.status IN ('pending','retry') AND q.available_at<=now() OR q.status='processing' AND q.lease_until<now()) AND q.attempts<8 AND p.selected AND p.token IS NOT NULL AND c.token IS NOT NULL ${scan ? "" : "AND f.enabled"} ORDER BY q.available_at,q.id FOR UPDATE OF q SKIP LOCKED LIMIT 1) RETURNING j.*`,
+      `UPDATE ${table} j SET status='processing',lease=$1,lease_until=now()+interval '5 minutes',attempts=attempts+1 WHERE j.id=(SELECT q.id FROM ${table} q JOIN facebook_lead_forms f ON f.company_id=q.company_id AND f.form_id=q.form_id JOIN facebook_lead_pages p ON p.company_id=f.company_id AND p.page_id=f.page_id JOIN facebook_lead_connections c ON c.company_id=f.company_id WHERE (q.status IN ('pending','retry') AND q.available_at<=now() OR q.status='processing' AND q.lease_until<now()) AND q.attempts<8 AND p.selected AND p.token IS NOT NULL AND c.token IS NOT NULL AND NOT c.importing_paused AND (c.expires_at IS NULL OR c.expires_at>now()) AND (NOT c.unified OR (c.status='authorized' AND c.permissions ? 'leads_retrieval')) ${scan ? "" : "AND f.enabled"} ORDER BY q.available_at,q.id FOR UPDATE OF q SKIP LOCKED LIMIT 1) RETURNING j.*`,
       [randomUUID()],
     );
   }
-  async function failed(table, job, error) {
+  async function failed(table, job, error, credential) {
+    if (credential?.unified && expiredAuthorization(error.code)) {
+      await invalidateSharedAuthorization(
+        pool,
+        job.company_id,
+        error.code,
+        "leads",
+        credential.token,
+      );
+    }
     const retry =
       (error.retryable === true || !(error instanceof FacebookLeadError)) &&
       job.attempts < 8;
@@ -42,16 +55,21 @@ export function createFacebookLeadWorker({
       ].includes(error.code)
     ) {
       await pool.query(
-        "UPDATE facebook_lead_connections SET status='attention',error_code=$2 WHERE company_id=$1",
-        [job.company_id, error.code],
+        "UPDATE facebook_lead_connections SET status='attention',error_code=$2 WHERE company_id=$1 AND token=$3",
+        [job.company_id, error.code, credential?.token || null],
       );
       await pool.query(
-        "UPDATE facebook_lead_pages SET retrieval='unavailable',error_code=$3 WHERE company_id=$1 AND page_id=$2",
-        [job.company_id, job.page_id || ""],
+        "UPDATE facebook_lead_pages SET retrieval='unavailable',error_code=$3 WHERE company_id=$1 AND page_id=(SELECT f.page_id FROM facebook_lead_forms f WHERE f.company_id=$1 AND f.form_id=$2) AND EXISTS(SELECT 1 FROM facebook_lead_connections c WHERE c.company_id=$1 AND c.token=$4)",
+        [job.company_id, job.form_id, error.code, credential?.token || null],
       );
     }
   }
   async function processJob(job) {
+    const credential = await one(
+      pool,
+      "SELECT token,unified FROM facebook_lead_connections WHERE company_id=$1",
+      [job.company_id],
+    );
     try {
       const initial = await store.form(pool, job.company_id, job.form_id);
       const fetched = await graph.lead(job.lead_id, store.pageToken(initial));
@@ -75,7 +93,17 @@ export function createFacebookLeadWorker({
         );
         if (!current || current.status !== "processing") return;
         const f = await store.form(db, job.company_id, job.form_id);
-        if (!c?.token || !f.token || !f.selected || !f.enabled) {
+        if (
+          !c?.token ||
+          c.importing_paused ||
+          (c.expires_at && new Date(c.expires_at) <= new Date()) ||
+          (c.unified &&
+            (c.status !== "authorized" ||
+              !c.permissions.includes("leads_retrieval"))) ||
+          !f.token ||
+          !f.selected ||
+          !f.enabled
+        ) {
           await db.query(
             "UPDATE facebook_lead_jobs SET status='pending',lease=NULL,lease_until=NULL,attempts=GREATEST(0,attempts-1) WHERE id=$1",
             [job.id],
@@ -219,7 +247,7 @@ export function createFacebookLeadWorker({
         );
       });
     } catch (e) {
-      await failed("facebook_lead_jobs", job, e);
+      await failed("facebook_lead_jobs", job, e, credential);
     }
   }
   async function finish(db, job, contactID, outcome, issues) {
@@ -233,6 +261,11 @@ export function createFacebookLeadWorker({
     );
   }
   async function processScan(job) {
+    const credential = await one(
+      pool,
+      "SELECT token,unified FROM facebook_lead_connections WHERE company_id=$1",
+      [job.company_id],
+    );
     try {
       const f = await store.form(pool, job.company_id, job.form_id),
         result = await graph.leads(
@@ -251,6 +284,25 @@ export function createFacebookLeadWorker({
           [job.id, job.lease],
         );
         if (!current || current.status !== "processing") return;
+        const c = await one(
+          db,
+          "SELECT * FROM facebook_lead_connections WHERE company_id=$1 FOR UPDATE",
+          [job.company_id],
+        );
+        if (
+          !c?.token ||
+          c.importing_paused ||
+          (c.expires_at && new Date(c.expires_at) <= new Date()) ||
+          (c.unified &&
+            (c.status !== "authorized" ||
+              !c.permissions.includes("leads_retrieval")))
+        ) {
+          await db.query(
+            "UPDATE facebook_lead_scans SET status='pending',lease=NULL,lease_until=NULL,attempts=GREATEST(0,attempts-1) WHERE id=$1",
+            [job.id],
+          );
+          return;
+        }
         const active = await store.form(db, job.company_id, job.form_id);
         if (!active.routed || !active.selected || !active.token) {
           await db.query(
@@ -290,7 +342,7 @@ export function createFacebookLeadWorker({
         );
       });
     } catch (e) {
-      await failed("facebook_lead_scans", job, e);
+      await failed("facebook_lead_scans", job, e, credential);
     }
   }
   async function recover() {
@@ -298,7 +350,7 @@ export function createFacebookLeadWorker({
     await transaction(pool, async (db) => {
       const forms = (
         await db.query(
-          "SELECT f.* FROM facebook_lead_forms f JOIN facebook_lead_pages p USING(company_id,page_id) WHERE f.enabled AND f.routed AND p.selected AND p.token IS NOT NULL AND f.recovery_at<now()-interval '15 minutes' ORDER BY f.recovery_at FOR UPDATE OF f SKIP LOCKED LIMIT 10",
+          "SELECT f.* FROM facebook_lead_forms f JOIN facebook_lead_pages p USING(company_id,page_id) JOIN facebook_lead_connections c ON c.company_id=f.company_id WHERE NOT c.importing_paused AND c.token IS NOT NULL AND (c.expires_at IS NULL OR c.expires_at>now()) AND (NOT c.unified OR (c.status='authorized' AND c.permissions ? 'leads_retrieval')) AND f.enabled AND f.routed AND p.selected AND p.token IS NOT NULL AND f.recovery_at<now()-interval '15 minutes' ORDER BY f.recovery_at FOR UPDATE OF f SKIP LOCKED LIMIT 10",
         )
       ).rows;
       for (const f of forms) {

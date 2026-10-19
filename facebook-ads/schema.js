@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS facebook_ads_connections(
  company_id uuid PRIMARY KEY REFERENCES companies(id), user_id uuid NOT NULL REFERENCES users(id),
  meta_user_id text, token text, permissions jsonb NOT NULL DEFAULT '[]', status text NOT NULL DEFAULT 'disconnected',
  error_code text, checked_at timestamptz, expires_at timestamptz, revision integer NOT NULL DEFAULT 1, updated_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE facebook_ads_connections ADD COLUMN IF NOT EXISTS unified boolean NOT NULL DEFAULT false;
+ALTER TABLE facebook_ads_connections ADD COLUMN IF NOT EXISTS operations_enabled boolean NOT NULL DEFAULT true;
 CREATE TABLE IF NOT EXISTS facebook_ads_oauth_states(
  state_hash text PRIMARY KEY,company_id uuid NOT NULL REFERENCES companies(id),user_id uuid NOT NULL REFERENCES users(id),session_hash text NOT NULL,expires_at timestamptz NOT NULL);
 CREATE INDEX IF NOT EXISTS facebook_ads_oauth_expiry_idx ON facebook_ads_oauth_states(expires_at);

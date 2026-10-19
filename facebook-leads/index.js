@@ -14,7 +14,7 @@ import { createFacebookLeadWorker } from "./worker.js";
 const base = "/api/integrations/facebook-leads";
 const messages = {
   facebook_dedicated_meta_app_required:
-    "Use a dedicated Meta app for Facebook Leads. The existing Focus app has a separate webhook callback.",
+    "Use one Facebook app for Leads and Ads, separate from the existing Focus/Instagram app.",
   facebook_setup_required:
     "Set up the Meta application and backend variables before connecting.",
   facebook_token_expired_reconnect:
@@ -93,9 +93,25 @@ export async function installFacebookLeads({
     res.json(await store.status(req.companyId)),
   );
   scoped("post", "/refresh", async (req, res) =>
-    res.json(await store.refresh(req.companyId)),
+    res.json(
+      app.locals.facebookConnection &&
+        (await app.locals.facebookConnection.isUnified(req.companyId))
+        ? (await app.locals.facebookConnection.refresh({
+            userId: req.userId,
+            companyId: req.companyId,
+          }),
+          await store.status(req.companyId))
+        : await store.refresh(req.companyId),
+    ),
   );
   scoped("post", "/oauth/start", async (req, res) => {
+    if (app.locals.facebookConnection)
+      return res.json(
+        await app.locals.facebookConnection.start(req, {
+          client: req.body?.client,
+          destination: "leads",
+        }),
+      );
     const state = randomBytes(32).toString("base64url"),
       client = req.body?.client === "web" ? "web" : "ios";
     if (client === "web" && env.FACEBOOK_LEADS_WEB_RETURN_URL) {
@@ -115,6 +131,12 @@ export async function installFacebookLeads({
   app.get(
     base + "/oauth/callback",
     wrap(async (req, res) => {
+      if (
+        await app.locals.facebookConnection?.callback(req, res, {
+          allowMissing: true,
+        })
+      )
+        return;
       const state = typeof req.query.state === "string" ? req.query.state : "";
       const identity = (
         await pool.query(
@@ -123,6 +145,8 @@ export async function installFacebookLeads({
         )
       ).rows[0];
       if (!identity) fail("facebook_oauth_state_expired_or_used", 400);
+      if (await app.locals.facebookConnection?.isUnified(identity.company_id))
+        fail("facebook_use_unified_reconnect", 409);
       let result = "authorized";
       try {
         // Re-run the real session and capability middleware. Losing access during OAuth cancels it.
@@ -374,6 +398,13 @@ export async function installFacebookLeads({
     }
   }
   scoped("post", "/disconnect", async (req, res) => {
+    if (await app.locals.facebookConnection?.isUnified(req.companyId)) {
+      await app.locals.facebookConnection.controls(
+        { userId: req.userId, companyId: req.companyId },
+        { lead_importing_paused: true },
+      );
+      return res.json({ ok: true });
+    }
     await transaction(pool, (db) => disconnect(db, req.companyId));
     res.json({ ok: true });
   });
@@ -424,13 +455,20 @@ export async function installFacebookLeads({
             env.FACEBOOK_LEADS_APP_SECRET,
           ),
           code = randomBytes(24).toString("hex");
+        await app.locals.facebookConnection?.revoke(
+          String(data.user_id),
+          env.FACEBOOK_LEADS_APP_ID,
+          { deletion: action === "data-deletion" },
+        );
         await transaction(pool, async (db) => {
-          const rows = (
-            await db.query(
-              "SELECT company_id FROM facebook_lead_connections WHERE meta_user_id=$1",
-              [String(data.user_id)],
-            )
-          ).rows;
+          const rows = app.locals.facebookConnection
+            ? []
+            : (
+                await db.query(
+                  "SELECT company_id FROM facebook_lead_connections WHERE meta_user_id=$1 AND NOT unified",
+                  [String(data.user_id)],
+                )
+              ).rows;
           for (const row of rows)
             // Revocation purges integration data as well: a later deletion callback
             // must not lose its identity-to-company lookup and leave retained history.

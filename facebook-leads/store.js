@@ -1,3 +1,8 @@
+import {
+  expiredAuthorization,
+  invalidateSharedAuthorization,
+  syncSharedPermissions,
+} from "../facebook-connection/state.js";
 import { randomUUID } from "node:crypto";
 import {
   DEFAULT_SETTINGS,
@@ -67,7 +72,7 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
     const s = await settings(pool, company),
       connection = await one(
         pool,
-        "SELECT status,permissions,error_code,checked_at,updated_at FROM facebook_lead_connections WHERE company_id=$1",
+        "SELECT status,permissions,error_code,checked_at,updated_at,unified,importing_paused,expires_at FROM facebook_lead_connections WHERE company_id=$1",
         [company],
       );
     const pages = (
@@ -94,7 +99,7 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
       destinations: DESTINATIONS,
       required_permissions: PERMISSIONS,
       limitations: [
-        "Use a dedicated Meta app for Facebook Leads; preserve the existing Focus Meta app and callback.",
+        "Use one Facebook app for Leads and Ads; keep Focus/Instagram and its callback separate.",
         "Contact notes are device-local and are not a shared writable contact field. Use labeled Lead Info.",
         "Legacy custom fields are Lead Info 1–5. Name and address use combined contact fields.",
         "Optional attribution and export columns depend on Meta permissions and availability.",
@@ -153,6 +158,8 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
         "UPDATE facebook_lead_connections SET permissions=$2::jsonb,status='authorized',error_code=NULL,checked_at=now() WHERE company_id=$1 AND token=$3",
         [company, JSON.stringify(granted), c.token],
       );
+      if (c.unified)
+        await syncSharedPermissions(pool, company, granted, "leads", c.token);
       const pages = (
         await pool.query(
           "SELECT * FROM facebook_lead_pages WHERE company_id=$1 AND selected AND token IS NOT NULL",
@@ -161,6 +168,14 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
       ).rows;
       for (const p of pages) await inspectPage(company, p.page_id);
     } catch (e) {
+      if (c.unified && expiredAuthorization(e.code))
+        await invalidateSharedAuthorization(
+          pool,
+          company,
+          e.code,
+          "leads",
+          c.token,
+        );
       await pool.query(
         "UPDATE facebook_lead_connections SET status='attention',error_code=$2,checked_at=now() WHERE company_id=$1 AND token=$3",
         [company, safeError(e), c.token],

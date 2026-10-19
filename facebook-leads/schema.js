@@ -11,6 +11,9 @@ export async function installFacebookLeadSchema(db) {
       status TEXT NOT NULL DEFAULT 'disconnected', permissions JSONB NOT NULL DEFAULT '[]',
       error_code TEXT, checked_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE facebook_lead_connections ADD COLUMN IF NOT EXISTS unified boolean NOT NULL DEFAULT false;
+    ALTER TABLE facebook_lead_connections ADD COLUMN IF NOT EXISTS importing_paused boolean NOT NULL DEFAULT false;
+    ALTER TABLE facebook_lead_connections ADD COLUMN IF NOT EXISTS expires_at timestamptz;
     CREATE INDEX IF NOT EXISTS facebook_lead_connection_user_idx ON facebook_lead_connections(user_id);
     CREATE INDEX IF NOT EXISTS facebook_lead_connection_meta_idx ON facebook_lead_connections(meta_user_id);
     CREATE TABLE IF NOT EXISTS facebook_lead_pages (

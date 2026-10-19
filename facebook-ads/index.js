@@ -65,11 +65,25 @@ export async function installFacebookAds({
     );
   route("get", "", (req) => service.status(actor(req)));
   route("get", "/catalog", () => service.catalog());
-  route("post", "/refresh", (req) => service.refresh(actor(req)));
+  route("post", "/refresh", async (req) => {
+    if (await app.locals.facebookConnection?.isUnified(req.companyId)) {
+      await app.locals.facebookConnection.refresh(actor(req));
+      return service.status(actor(req));
+    }
+    return service.refresh(actor(req));
+  });
   route("post", "/accounts", (req) =>
     service.select(actor(req), req.body.account_ids),
   );
-  route("post", "/disconnect", (req) => service.disconnect(actor(req)));
+  route("post", "/disconnect", async (req) => {
+    if (await app.locals.facebookConnection?.isUnified(req.companyId)) {
+      await app.locals.facebookConnection.controls(actor(req), {
+        ads_operations_enabled: false,
+      });
+      return service.status(actor(req));
+    }
+    return service.disconnect(actor(req));
+  });
   route("post", "/entities", (req) => service.entities(actor(req), req.body));
   route(
     "get",
@@ -109,7 +123,9 @@ export async function installFacebookAds({
         results.push({
           entity_id: i.entity_id,
           error: e.code || "action_failed",
-          message: e.status ? e.message : "This action could not be completed. Reconcile before retrying.",
+          message: e.status
+            ? e.message
+            : "This action could not be completed. Reconcile before retrying.",
           // Validation/auth failures can be corrected with a new request; transport/server
           // failures retain their IDs because a write may already have been accepted.
           retryable: !(e.status >= 400 && e.status < 500 && e.status !== 429),
@@ -136,6 +152,8 @@ export async function installFacebookAds({
     ).rows,
   }));
   route("post", "/oauth/start", async (req) => {
+    if (app.locals.facebookConnection)
+      return app.locals.facebookConnection.start(req, { destination: "ads" });
     await service.authorize(actor(req), true);
     if (!req.sessionToken) throw fault("human_session_required", 403);
     const state = randomBytes(32).toString("base64url"),
@@ -152,6 +170,12 @@ export async function installFacebookAds({
   app.get(
     base + "/oauth/callback",
     wrap(async (req, res) => {
+      if (
+        await app.locals.facebookConnection?.callback(req, res, {
+          allowMissing: true,
+        })
+      )
+        return;
       const state = typeof req.query.state === "string" ? req.query.state : "";
       const identity = (
         await pool.query(
@@ -160,6 +184,8 @@ export async function installFacebookAds({
         )
       ).rows[0];
       if (!identity) throw fault("oauth_state_expired_or_used");
+      if (await app.locals.facebookConnection?.isUnified(identity.company_id))
+        throw fault("facebook_use_unified_reconnect", 409);
       let result = "attention";
       try {
         const sessions = (
@@ -249,6 +275,10 @@ export async function installFacebookAds({
       const data = signedRequest(
         req.body?.signed_request,
         graph.env.FACEBOOK_LEADS_APP_SECRET,
+      );
+      await app.locals.facebookConnection?.revoke(
+        String(data.user_id),
+        graph.env.FACEBOOK_LEADS_APP_ID,
       );
       await service.revoke(String(data.user_id));
       res.json({ ok: true });

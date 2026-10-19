@@ -1,3 +1,4 @@
+import {installFacebookConnection} from './facebook-connection/index.js';
 import {installFacebookAds} from './facebook-ads/index.js';
 import {installWebhooks} from './webhooks/service.js';
 import {webhookEventCatalog} from './automations.js';
@@ -19417,6 +19418,7 @@ async function startServer() {
   startGoogleSheetsWorkers(pool);
   startWeatherRiskWorkers();
   await installFacebookAds({app,pool:rawPool,authRequired,requireCapability,emitAutomationEvent});
+  await installFacebookConnection({app,pool:rawPool,authRequired,requireCapability});
   await installMCP({app,pool,rawPool,authRequired,verifyIdentity:async(email,password)=>{
     const row=(await pool.query('SELECT id,password_hash,deleted_at FROM users WHERE email=$1',[normalizeEmail(email)])).rows[0];
     return row&&!row.deleted_at&&verifyPassword(password,row.password_hash)?{id:row.id}:null;
