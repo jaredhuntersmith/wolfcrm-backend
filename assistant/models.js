@@ -2,10 +2,11 @@ import OpenAI from 'openai';
 import {decrypt,encrypt} from '../retell/security.js';
 import {fault} from '../mcp/context.js';
 
-// Reviewed official metadata, 2026-10-18. Availability is separately checked with
+// Reviewed official metadata, 2026-10-19. Availability is separately checked with
 // the selected funding account; an alias never silently selects another model.
 export const modelCatalog=Object.freeze([
- {id:'gpt-6.1-sol',name:'GPT-6.1 Sol',reasoning:['low','medium','high','xhigh','max'],input_per_million:2,cached_per_million:0.1,output_per_million:10,web_search:true,image_input:true,file_input:true,source:'https://developers.openai.com/api/docs/models/gpt-6.1-sol',reviewed:'2026-10-18'}
+ {id:'gpt-6.1-sol',name:'GPT-6.1 Sol',reasoning:['low','medium','high','xhigh','max'],input_per_million:2,cached_per_million:0.1,output_per_million:10,web_search:true,image_input:true,file_input:true,source:'https://developers.openai.com/api/docs/models/gpt-6.1-sol',reviewed:'2026-10-18'},
+ {id:'gpt-6-luna',name:'GPT-6 Luna',reasoning:['none','low','medium','high','xhigh','max'],input_per_million:0.1,cached_per_million:0.01,output_per_million:0.5,web_search:true,image_input:true,file_input:true,source:'https://developers.openai.com/api/docs/models/gpt-6-luna',reviewed:'2026-10-19'}
 ]);
 export function modelFor(id,reasoning){const m=modelCatalog.find(m=>m.id===id);if(!m)throw fault(400,'unsupported_model');if(reasoning&&!m.reasoning.includes(reasoning))throw fault(400,'unsupported_reasoning');return m;}
 export function estimateMicros(model,usage={}){

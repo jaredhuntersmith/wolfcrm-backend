@@ -55,6 +55,16 @@ test('assistant durable execution uses shared policy and real tenant boundaries'
    assert.equal((await http('assistant/runs',input)).data.id,first.data.id);assert.equal((await http('assistant/runs',{...input,text:'different'})).status,409);
    assert.equal((await http('assistant/runs/'+first.data.id,undefined,'GET',other)).status,404);assert.equal((await http('assistant/conversations/'+chat,undefined,'GET',other)).status,404);
   });
+  await t.test('owner-funded Luna selection persists and bills its own model rate',async()=>{
+   const before=(await pool.query('SELECT revision,funding,monthly_limit_micros FROM wolf_assistant_settings WHERE user_id=$1',[user])).rows[0];
+   const selected=await http('assistant/settings',{expected_revision:before.revision,funding:before.funding,model:'gpt-6-luna',reasoning:'low',instructions:'Be concise.',memory_enabled:true,monthly_limit_micros:Number(before.monthly_limit_micros)},'PUT');
+   assert.equal(selected.status,200,JSON.stringify(selected));
+   assert.equal(selected.data.model,'gpt-6-luna');assert.equal(selected.data.reasoning,'low');
+   responses.push(request=>{assert.equal(request.model,'gpt-6-luna');assert.equal(request.reasoning.effort,'low');return complete('Luna ready.');});
+   const queued=await http('assistant/runs',{conversation_id:chat,request_key:randomUUID(),text:'Hello Luna'});assert.equal(queued.status,202,JSON.stringify(queued));await engine.tick();
+   const run=(await http('assistant/runs/'+queued.data.id)).data;assert.equal(run.status,'completed',JSON.stringify(run));assert.equal(run.output,'Luna ready.');assert.equal((await pool.query('SELECT model,reasoning FROM wolf_assistant_runs WHERE id=$1',[run.id])).rows[0].model,'gpt-6-luna');assert.equal(Number(run.cost_micros),20);
+   const restored=await http('assistant/settings',{expected_revision:selected.data.revision,funding:before.funding,model:'gpt-6.1-sol',reasoning:'low',instructions:'Be concise.',memory_enabled:true,monthly_limit_micros:Number(before.monthly_limit_micros)},'PUT');assert.equal(restored.status,200,JSON.stringify(restored));
+  });
   await t.test('discovery and selected loading do not bypass a disabled operation',async()=>{
    responses.push(tool('load_capabilities',{ids:['contact_create']}),tool('contact_create',{request_id:randomUUID(),contact:{name:'Must not exist'}}),complete('Denied.'));
    const r=await http('assistant/runs',{conversation_id:chat,request_key:randomUUID(),text:'Create denied contact'});await engine.tick();assert.equal((await http('assistant/runs/'+r.data.id)).data.status,'completed');assert.equal((await pool.query('SELECT count(*)::int n FROM contacts WHERE company_id=$1',[company])).rows[0].n,0);

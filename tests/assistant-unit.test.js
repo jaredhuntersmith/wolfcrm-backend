@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {compactHistory,evidenceHash} from '../assistant/context.js';
 import {validFieldPath,restrictFields} from '../mcp/field-policy.js';
 import {aiTaskConfig} from '../assistant/automation.js';
-import {createProvider,estimateMicros} from '../assistant/models.js';
+import {createProvider,estimateMicros,modelCatalog,modelFor} from '../assistant/models.js';
 import {comparableReadEvidence,retireReadEvidence} from '../assistant/reliability.js';
 
 test('JSONB key order cannot change new receipt/evidence identity',()=>{
@@ -55,6 +55,16 @@ test('Responses streaming uses the chosen model, disables storage and returns us
  const chunks=[];const response=await provider.respond({funding:'personal'},{model:'gpt-6.1-sol',reasoning:{effort:'low'},input:[]},{onText:async text=>chunks.push(text)});
  assert.equal(seen.store,false);assert.equal(seen.stream,true);assert.equal(seen.model,'gpt-6.1-sol');assert.deepEqual(chunks,['Hello']);assert.equal(response.usage.input_tokens,100);
  assert.equal(estimateMicros('gpt-6.1-sol',{input_tokens:100,input_tokens_details:{cached_tokens:50},output_tokens:10}),205);
+});
+
+test('Luna is selectable with low reasoning and uses its own published token rates',async()=>{
+ const luna=modelFor('gpt-6-luna','low');
+ assert.deepEqual(luna.reasoning,['none','low','medium','high','xhigh','max']);
+ assert.equal(modelFor('gpt-6.1-sol','low').id,'gpt-6.1-sol');
+ assert.equal(estimateMicros('gpt-6-luna',{input_tokens:100000,input_tokens_details:{cached_tokens:20000},output_tokens:10000}),13200);
+ const provider=createProvider({clientFactory:()=>({models:{list:async function*(){yield {id:'gpt-6-luna'};yield {id:'unreviewed-model'};}}})});
+ assert.deepEqual((await provider.models({funding:'owner'})).map(model=>model.id),['gpt-6-luna']);
+ assert.ok(modelCatalog.some(model=>model.id==='gpt-6.1-sol'));
 });
 
 test('funding verification never reflects provider credential diagnostics',async()=>{
