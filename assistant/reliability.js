@@ -28,6 +28,11 @@ export function businessOutcome(result){
 // Ignore only presentation metadata that changes on every canonical read.
 // All business values, coverage, and warning fields remain part of the check.
 export function comparableReadEvidence(tool,result){
+ if(tool==='schedule_assignment_recommendations'&&result?.data){
+  const {source_hash,...wrapper}=result;
+  const {generated_at,...data}=result.data;
+  return {...wrapper,data};
+ }
  if(tool!=='sales_report'||!result?.report||!Object.hasOwn(result.report,'generated_at'))return result;
  const {generated_at,...report}=result.report;
  return {...result,report};

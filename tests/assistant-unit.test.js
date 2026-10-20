@@ -20,6 +20,13 @@ test('sales report revalidation ignores only volatile generation time',()=>{
  assert.notEqual(evidenceHash(comparableReadEvidence('sales_report',report)),evidenceHash(comparableReadEvidence('sales_report',{...reread,report:{...reread.report,partial:true}})));
  assert.notEqual(evidenceHash(comparableReadEvidence('finance_profit_loss',report)),evidenceHash(comparableReadEvidence('finance_profit_loss',reread)));
 });
+test('worker recommendations ignore generated timestamp and its derived hash only',()=>{
+ const first={data:{generated_at:'2026-10-20T01:00:00Z',target_job:{id:'job',updated_at:'2026-10-19T20:00:00Z'},recommendations:[{worker_id:'worker',eligible:true,conflicts:[]}],warnings:[]},source_hash:'first',content_trust:'untrusted_record_data'};
+ const second={...first,data:{...first.data,generated_at:'2026-10-20T01:00:01Z'},source_hash:'second'};
+ assert.equal(evidenceHash(comparableReadEvidence('schedule_assignment_recommendations',first)),evidenceHash(comparableReadEvidence('schedule_assignment_recommendations',second)));
+ assert.notEqual(evidenceHash(comparableReadEvidence('schedule_assignment_recommendations',first)),evidenceHash(comparableReadEvidence('schedule_assignment_recommendations',{...second,data:{...second.data,recommendations:[{worker_id:'worker',eligible:false,conflicts:['busy']}]}})));
+ assert.notEqual(evidenceHash(comparableReadEvidence('schedule_assignment_recommendations',first)),evidenceHash(comparableReadEvidence('schedule_assignment_recommendations',{...second,data:{...second.data,warnings:['coverage unavailable']}})));
+});
 test('confirmed write retires prior read values without discarding their receipts',()=>{
  const history=[{type:'function_call_output',call_id:'read',output:JSON.stringify({page:{revision:2,private:true}})},{type:'function_call_output',call_id:'other',output:JSON.stringify({ok:true})}];
  const retired=retireReadEvidence(history,[{call_id:'read',tool:'notes_page'}]);
