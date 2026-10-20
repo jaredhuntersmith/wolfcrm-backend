@@ -7,7 +7,7 @@ import {executeExternal} from './external.js';
 import {prepareFile,fileRequest,fileExtractionSchema} from './files.js';
 import {createFundingService} from './funding.js';
 import {evidenceHash,compactHistory} from './context.js';
-import {pinnedReadArguments,discoverCatalog,clockContext,businessOutcome,retireReadEvidence} from './reliability.js';
+import {pinnedReadArguments,discoverCatalog,clockContext,businessOutcome,comparableReadEvidence,retireReadEvidence} from './reliability.js';
 import {productGuides} from './guides.js';
 
 const terminal=new Set(['completed','failed','cancelled','interrupted']);
@@ -64,7 +64,7 @@ export function createEngine({app,pool,provider,env=process.env,externalExecutor
     const {policy}=await app.locals.connectionManager.check(a,s.tool);
     const input=d.inputSchema.parse(pinnedReadArguments(s.tool,s.arguments,s.result));restrictFields(input,policy.denied_input_fields,{write:true});
     const current=restrictFields(await app.locals.capabilityService.execute(a,s.tool,input),policy.denied_output_fields);
-    if(evidenceHash(current)!==evidenceHash(s.result))throw fault(409,'source_changed');
+    if(evidenceHash(comparableReadEvidence(s.tool,current))!==evidenceHash(comparableReadEvidence(s.tool,s.result)))throw fault(409,'source_changed');
    }catch(e){const category=e.code==='source_changed'?'source_changed':'source_access_changed';await event(run.id,'source_validation_failed',{capability:s.tool,error:category,cause:safeCode(e)});throw fault(409,category,'A previously read source changed or is no longer accessible. Start a new task to retrieve current data.');}
   }
  }
@@ -210,10 +210,11 @@ export function createEngine({app,pool,provider,env=process.env,externalExecutor
     if(gate.state!=='completed'){const result=await step(run,gate);if(result===null)return;if(result.error)throw fault(403,'assistant_execution_denied');}
     const pending=(await pool.query("SELECT * FROM wolf_assistant_steps WHERE run_id=$1 AND call_id NOT IN ('wolf_final_delivery','wolf_execution_gate') AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements($2::jsonb) item WHERE item->>'type'='function_call_output' AND item->>'call_id'=wolf_assistant_steps.call_id) ORDER BY started_at NULLS FIRST,call_id",[run.id,JSON.stringify(run.history)])).rows;
     for(const s of pending){const result=await step(run,s);if(result===null)return;
-     if(s.tool==='assistant_job_create'&&businessOutcome(result).status==='succeeded'){
+     const definition=app.locals.capabilityService.definitions(a).find(d=>d.id===s.tool);
+     if(definition?.write&&businessOutcome(result).status==='succeeded'){
       const completed=(await pool.query("SELECT call_id,tool FROM wolf_assistant_steps WHERE run_id=$1 AND state='completed'",[run.id])).rows;
       const defs=app.locals.capabilityService.definitions(a);const reads=completed.filter(x=>defs.some(d=>d.id===x.tool&&!d.write&&d.id!=='assistant_execute'));
-      run.history=retireReadEvidence(run.history,reads);await event(run.id,'evidence_retired',{reason:'confirmed_job_change',capabilities:reads.map(x=>x.tool)});
+      run.history=retireReadEvidence(run.history,reads);await event(run.id,'evidence_retired',{reason:'confirmed_write',write_capability:s.tool,capabilities:reads.map(x=>x.tool)});
      }
      run.history.push({type:'function_call_output',call_id:s.call_id,output:JSON.stringify(result)});await pool.query('UPDATE wolf_assistant_runs SET history=$2 WHERE id=$1',[run.id,JSON.stringify(run.history)]);}
     await actor(run);

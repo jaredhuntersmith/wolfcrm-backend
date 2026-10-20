@@ -153,6 +153,21 @@ test('assistant durable execution uses shared policy and real tenant boundaries'
    assert.equal((await http('notes/pages/'+created.id,undefined,'GET',other)).status,404);
    await app.locals.connectionManager.invoke(actor,'ideas_save',{id:randomUUID(),title:'Improve the follow-up checklist',list_id:null,request_id:randomUUID()},randomUUID());const ideas=await app.locals.connectionManager.invoke(actor,'ideas_search',{query:'follow-up'},randomUUID());assert.equal(ideas.data.items.length,1);
   });
+  await t.test('confirmed Note edit retires its own stale page read and allows a fresh read',async()=>{
+   const connection=(await pool.query('SELECT * FROM mcp_connections WHERE id=$1',[id])).rows[0],actor=await app.locals.connectionManager.actorFor(connection);
+   for(const name of ['note_create','notes_page','notes_edit_blocks'])await grant(name);
+   const note=await app.locals.connectionManager.invoke(actor,'note_create',{request_id:randomUUID(),title:'Self-edit evidence fixture',text:'Before edit',visibility:'private'},randomUUID());
+   const before=(await app.locals.connectionManager.invoke(actor,'notes_page',{id:note.id},randomUUID())).data;
+   const block=before.blocks.find(b=>b.payload.text==='Before edit');assert.ok(block);
+   responses.push(tool('load_capabilities',{ids:['notes_page','notes_edit_blocks']}),tool('notes_page',{id:note.id}),tool('notes_edit_blocks',{request_id:randomUUID(),id:note.id,operations:[{id:block.id,expected_revision:block.revision,type:block.type,payload:{text:'After edit'},position:block.position}]}),tool('notes_page',{id:note.id}),complete('Verified fresh Note.'));
+   const started=await http('assistant/runs',{conversation_id:chat,request_key:randomUUID(),text:'Edit then verify the synthetic Note'});await engine.tick();
+   const result=(await http('assistant/runs/'+started.data.id)).data;assert.equal(result.status,'completed',JSON.stringify(result));
+   const pageSteps=(await pool.query("SELECT result FROM wolf_assistant_steps WHERE run_id=$1 AND tool='notes_page' ORDER BY started_at",[started.data.id])).rows;
+   assert.equal(pageSteps.length,2);assert.ok(pageSteps[1].result.data.blocks.some(b=>b.payload.text==='After edit'));
+   const history=(await pool.query('SELECT history FROM wolf_assistant_runs WHERE id=$1',[started.data.id])).rows[0].history;
+   assert.ok(history.some(x=>x.type==='function_call_output'&&JSON.parse(x.output).evidence_retired===true));
+   assert.ok(result.events.some(e=>e.kind==='evidence_retired'&&e.data.write_capability==='notes_edit_blocks'));
+  });
   await t.test('Note sharing and revision restore preserve current audience and private boundaries',async()=>{
    const actor=await app.locals.connectionManager.actorFor((await pool.query('SELECT * FROM mcp_connections WHERE id=$1',[id])).rows[0]);
    const invoke=(name,input)=>app.locals.connectionManager.invoke(actor,name,input,randomUUID());
