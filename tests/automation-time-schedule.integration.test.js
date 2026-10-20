@@ -33,6 +33,9 @@ test('existing scheduler emits one exact published trigger; pause, stale version
   const row=(await pool.query("SELECT * FROM automation_scheduled_events WHERE company_id=$1",[company])).rows;
   assert.equal(row.length,1);assert.equal(row[0].payload.trigger_node_id,trigger);
   assert.equal(await timeScheduleStillCurrent(pool,row[0],now),true);
+  await pool.query("UPDATE automation_definitions SET metadata=$2::jsonb WHERE id=$1",[definition,JSON.stringify({activation_schedule:{timezone:'company',windows:[{kind:'once',start_at:'2026-10-19T19:00:31Z'}]}})]);
+  assert.equal(await timeScheduleStillCurrent(pool,row[0],now),false,'closed activation window cancels a queued clock event');
+  await pool.query("UPDATE automation_definitions SET metadata='{}'::jsonb WHERE id=$1",[definition]);
   await pool.query("UPDATE companies SET automations_enabled=false WHERE id=$1",[company]);
   assert.equal(await timeScheduleStillCurrent(pool,row[0],now),false);
   await pool.query("UPDATE companies SET automations_enabled=true WHERE id=$1",[company]);

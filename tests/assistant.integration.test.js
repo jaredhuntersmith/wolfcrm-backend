@@ -306,8 +306,112 @@ test('assistant durable execution uses shared policy and real tenant boundaries'
    const automationSettings=await read('automation_settings');const automationSaved=await write('automation_settings_save',{expected_source_hash:automationSettings.source_hash,changes:{automation_sms_max_per_contact_hour:3}});assert.equal(automationSaved.data.automation_sms_max_per_contact_hour,3);assert.equal(automationSaved.data.automated_customer_messages_enabled,automationSettings.data.automated_customer_messages_enabled);await assert.rejects(write('automation_settings_save',{expected_source_hash:automationSettings.source_hash,changes:{automation_sms_max_per_contact_hour:4}}),e=>e.code==='automation_settings_changed');
    const time=await read('time_clock_settings');assert.equal((await write('time_clock_settings_save',{expected_source_hash:time.source_hash,week_start:0})).data.week_start,0);await pool.query('UPDATE companies SET logo_data_url=$2 WHERE id=$1',[company,originalLogo]);
   });
+  await t.test('bounded automation discovery exposes reviewed stage and SMS schemas and company folders',async()=>{
+   for(const name of ['automation_catalog','automation_catalog_page','automation_node_schema','automation_folders','automation_create','automation_draft','automation_graph_save','automation_publish','automation_off','automation_get','automation_activation_schedule_set'])await grant(name);
+   const actor=await app.locals.connectionManager.actorFor((await pool.query('SELECT * FROM mcp_connections WHERE id=$1',[id])).rows[0]);
+   const read=(name,args)=>app.locals.connectionManager.invoke(actor,name,args,randomUUID());
+   const legacy=await read('automation_catalog',{});
+   assert.ok(Buffer.byteLength(JSON.stringify(legacy))<48000,'legacy catalog exceeded assistant result limit');
+   assert.ok(legacy.data.sections.triggers.engine_entry_count>0&&legacy.data.sections.actions.engine_entry_count>0);
+   assert.equal(legacy.data.browse_tool,'automation_catalog_page');assert.equal(legacy.data.schema_tool,'automation_node_schema');
+   assert.ok(!Array.isArray(legacy.data.triggers)&&!Array.isArray(legacy.data.actions),'legacy MCP catalog must not return the full engine arrays');
+   const stage=await read('automation_catalog_page',{section:'triggers',query:'pipeline.stage_entered'});
+   assert.ok(stage.data.items.some(item=>item.key==='pipeline.stage_entered'&&item.authoring_status==='supported'));
+   assert.ok(Buffer.byteLength(JSON.stringify(stage))<48000);
+   const sms=await read('automation_catalog_page',{section:'actions',query:'sms.send'});
+   assert.ok(sms.data.items.some(item=>item.key==='sms.send'&&item.authoring_status==='supported'));
+   assert.ok(Buffer.byteLength(JSON.stringify(sms))<48000);
+   const first=await read('automation_catalog_page',{section:'triggers',limit:20});
+   const second=await read('automation_catalog_page',{section:'triggers',limit:20,offset:first.data.next_offset});
+   assert.equal(first.data.items.length,20);assert.equal(first.data.next_offset,20);
+   assert.ok(!first.data.items.some(item=>second.data.items.some(next=>next.key===item.key)));
+   assert.ok(Buffer.byteLength(JSON.stringify(first))<48000);
+   assert.ok(Buffer.byteLength(JSON.stringify(second))<48000);
+   for(const section of ['triggers','actions','logic_nodes','condition_fields','template_variables','sources']){
+    let offset=0,total,seen=new Set();
+    do{
+     const page=await read('automation_catalog_page',{section,offset,limit:20});
+     assert.ok(Buffer.byteLength(JSON.stringify(page))<48000,section+' page exceeded assistant result limit');
+     total=page.data.total;
+     for(const item of page.data.items){assert.ok(!seen.has(item.key),section+' repeated '+item.key);seen.add(item.key);}
+     offset=page.data.next_offset;
+    }while(offset!==null);
+    assert.equal(seen.size,total,section+' omitted catalog entries');
+   }
+   const variable=(await read('automation_catalog_page',{section:'template_variables',query:'contact.name'})).data.items[0];
+   assert.equal(variable.token,'{{contact.name}}');
+   assert.equal((await read('automation_catalog_page',{section:'actions',query:'mcp.enable'})).data.items.length,0);
+   const stageSchema=(await read('automation_node_schema',{kind:'trigger',key:'pipeline.stage_entered'})).data;
+   const smsSchema=(await read('automation_node_schema',{kind:'action',key:'sms.send'})).data;
+   assert.ok(stageSchema.schema.properties.stage_ids);assert.ok(smsSchema.schema.properties.body);assert.ok(smsSchema.schema.properties.phone);
+   await assert.rejects(read('automation_node_schema',{kind:'action',key:'mcp.enable'}),e=>e.code==='human_managed_automation_action');
+   const ownFolder=randomUUID(),foreignFolder=randomUUID();
+   await pool.query('INSERT INTO automation_folders(id,company_id,name) VALUES($1,$2,$3),($4,$5,$6)',[ownFolder,company,'Own workspace',foreignFolder,otherCompany,'Other workspace']);
+   const folders=(await read('automation_folders',{})).data.items;
+   assert.ok(folders.some(folder=>folder.id===ownFolder));assert.ok(!folders.some(folder=>folder.id===foreignFolder));
+   await pool.query("INSERT INTO automation_folders(company_id,name) SELECT $1, 'Long ' || lpad(n::text, 4, '0') || repeat('x', 4500) FROM generate_series(1,10) n",[company]);
+   let folderOffset=0,folderCount=0,folderPages=0;
+   do{
+    const page=await read('automation_folders',{offset:folderOffset,limit:25});
+    assert.ok(Buffer.byteLength(JSON.stringify(page))<48000,'folder page exceeded assistant result limit');
+    folderCount+=page.data.items.length;folderPages++;
+    folderOffset=page.data.next_offset;
+   }while(folderOffset!==null);
+   assert.equal(folderCount,11);assert.ok(folderPages>1,'large folder names should split pages');
+   const create=(folder_id)=>app.locals.connectionManager.invoke(actor,'automation_create',{name:'Scoped fixture',description:'No external effects',folder_id,request_id:randomUUID()},randomUUID());
+   await assert.rejects(create(foreignFolder),e=>e.code==='automation_folder_unavailable');
+   const authored=(await create(ownFolder)).data;
+   assert.equal(authored.folder_id,ownFolder);
+   const invoke=(name,args)=>app.locals.connectionManager.invoke(actor,name,{request_id:randomUUID(),...args},randomUUID());
+   assert.equal((await invoke('automation_off',{id:authored.id})).data.status,'off');
+   const initial=(await read('automation_draft',{id:authored.id})).data;
+   const triggerId=randomUUID(),smsId=randomUUID(),endId=randomUUID();
+   const graph={id:authored.id,expected_graph_hash:initial.graph_hash,nodes:[
+    {id:triggerId,node_key:'stage',node_type:'trigger',title:'Any stage entered',config:{trigger_key:'pipeline.stage_entered'}},
+    {id:smsId,node_key:'sms',node_type:'action',title:'Notify fixed recipient',config:{action_key:'sms.send',target_mode:'phone_number',phone:'+15555550123',body:'New stage contact: {{contact.name}}'}},
+    {id:endId,node_key:'end',node_type:'end',title:'End',config:{}}
+   ],edges:[{id:randomUUID(),source_node_id:triggerId,target_node_id:smsId},{id:randomUUID(),source_node_id:smsId,target_node_id:endId}],settings:{}};
+   await assert.rejects(invoke('automation_graph_save',{...graph,nodes:graph.nodes.map(node=>node.id===smsId?{...node,config:{action_key:'sms.send',target_mode:'phone_number',phone:'+15555550123'}}:node)}),e=>e.status===400);
+   const saved=(await invoke('automation_graph_save',graph)).data;
+   assert.equal(saved.node_count,3);assert.equal(saved.edge_count,2);
+   const checked=(await read('automation_draft',{id:authored.id})).data;
+   assert.equal(checked.graph_hash,saved.graph_hash);
+   const published=(await invoke('automation_publish',{id:authored.id,expected_graph_hash:checked.graph_hash})).data;
+   assert.equal(published.valid,true);
+   const off=(await read('automation_get',{id:authored.id})).data;
+   assert.equal(off.status,'off');assert.equal(off.active.nodes.find(node=>node.node_key==='sms').config.body,'New stage contact: {{contact.name}}');
+   const beforeSchedule=(await pool.query('SELECT metadata,updated_at FROM automation_definitions WHERE id=$1',[authored.id])).rows[0];
+   const once={timezone:'company',windows:[{kind:'once',start_at:'2027-01-01T00:00:01-05:00',end_at:'2027-01-02T00:00:03-05:00'}]};
+   const invalidRequest=randomUUID();
+   await assert.rejects(app.locals.connectionManager.invoke(actor,'automation_activation_schedule_set',{id:authored.id,expected_record_hash:off.record_hash,schedule:{timezone:'America/New_York',windows:[{kind:'weekly',weekdays:[1],start_time:'09:00',end_time:'17:00:00'}]},request_id:invalidRequest},randomUUID()),e=>e.name==='ZodError');
+   for(const invalid of [
+    {timezone:'UTC',windows:[{kind:'once'}]},
+    {timezone:'not/a-zone',windows:[{kind:'once',start_at:'2027-01-01T00:00:01Z'}]},
+    {timezone:'UTC',windows:[{kind:'weekly',weekdays:[1,1],start_time:'09:00:00',end_time:'17:00:00'}]}
+   ])await assert.rejects(invoke('automation_activation_schedule_set',{id:authored.id,expected_record_hash:off.record_hash,schedule:invalid}),e=>e.name==='ZodError');
+   const unchanged=(await pool.query('SELECT metadata,updated_at FROM automation_definitions WHERE id=$1',[authored.id])).rows[0];
+   assert.deepEqual(unchanged,beforeSchedule);
+   assert.equal((await pool.query('SELECT count(*)::int n FROM mcp_operations WHERE connection_id=$1 AND request_id=$2',[id,invalidRequest])).rows[0].n,0);
+   const foreignAutomation=(await pool.query("INSERT INTO automation_definitions(company_id,name) VALUES($1,'Foreign activation schedule') RETURNING id",[otherCompany])).rows[0].id;
+   await assert.rejects(invoke('automation_activation_schedule_set',{id:foreignAutomation,expected_record_hash:off.record_hash,schedule:once}),e=>e.status===404);
+   const setOnce=(await invoke('automation_activation_schedule_set',{id:authored.id,expected_record_hash:off.record_hash,schedule:once})).data;
+   assert.deepEqual(setOnce.activation_schedule,once);assert.equal(setOnce.status,'off');assert.equal(setOnce.eligible_now,false);
+   await assert.rejects(invoke('automation_activation_schedule_set',{id:authored.id,expected_record_hash:off.record_hash,schedule:null}),e=>e.code==='automation_changed');
+   assert.deepEqual((await pool.query("SELECT metadata->'activation_schedule' AS schedule FROM automation_definitions WHERE id=$1",[authored.id])).rows[0].schedule,once);
+   const weekly={timezone:'America/New_York',windows:[{kind:'weekly',weekdays:[1,3,5],start_time:'08:30:01',end_time:'17:45:59'}]};
+   const setWeekly=(await invoke('automation_activation_schedule_set',{id:authored.id,expected_record_hash:setOnce.record_hash,schedule:weekly})).data;
+   assert.deepEqual(setWeekly.activation_schedule,weekly);assert.equal(setWeekly.status,'off');
+   const cleared=(await invoke('automation_activation_schedule_set',{id:authored.id,expected_record_hash:setWeekly.record_hash,schedule:null})).data;
+   assert.equal(cleared.activation_schedule,null);assert.equal(cleared.status,'off');
+   assert.equal((await pool.query('SELECT count(*)::int n FROM automation_runs WHERE automation_id=$1',[authored.id])).rows[0].n,0);
+   responses.push(tool('load_capabilities',{ids:['automation_catalog_page']}),tool('automation_catalog_page',{section:'triggers',query:'pipeline.stage_entered'}),complete('Stage schema found.'));
+   const queued=await http('assistant/runs',{conversation_id:chat,request_key:randomUUID(),text:'Find the stage-entered trigger'});await engine.tick();
+   assert.equal((await http('assistant/runs/'+queued.data.id)).data.status,'completed');
+   const step=(await pool.query("SELECT result FROM wolf_assistant_steps WHERE run_id=$1 AND tool='automation_catalog_page'",[queued.data.id])).rows[0];
+   assert.ok(step.result.data.items.some(item=>item.key==='pipeline.stage_entered'));assert.equal(step.result.error,undefined);
+  });
   await t.test('existing automation graphs edit typed ordinary actions, logic and lifecycle without stale overwrites',async()=>{
-   const names=['automation_create','automation_get','automation_draft','automation_node_schema','automation_graph_save','automation_publish','automation_duplicate','automation_archive','automation_ensure_draft','automation_metadata_save'];for(const name of names)await grant(name);
+   const names=['automation_create','automation_get','automation_draft','automation_node_schema','automation_graph_save','automation_publish','automation_pause','automation_off','automation_resume','automation_duplicate','automation_archive','automation_ensure_draft','automation_metadata_save'];for(const name of names)await grant(name);
    const actor=await app.locals.connectionManager.actorFor((await pool.query('SELECT * FROM mcp_connections WHERE id=$1',[id])).rows[0]);const invoke=(name,args)=>app.locals.connectionManager.invoke(actor,name,{request_id:randomUUID(),...args},randomUUID());
    const created=(await invoke('automation_create',{name:'Typed graph fixture',description:'No real external effects'})).data;
    const first=(await app.locals.connectionManager.invoke(actor,'automation_draft',{id:created.id},randomUUID())).data;
@@ -321,6 +425,13 @@ test('assistant durable execution uses shared policy and real tenant boundaries'
    await assert.rejects(invoke('automation_graph_save',{...graph,expected_graph_hash:live.graph_hash,nodes:graph.nodes.map(n=>n.id===action?{...n,config:{action_key:'mcp.enable',connection_id:id}}:n)}),e=>e.code==='human_managed_automation_action');
    await invoke('automation_publish',{id:created.id,expected_graph_hash:live.graph_hash});
    const started=await http('automations/'+created.id+'/manual-run',{});await automationTestHooks.runAutomation(started.data.id);assert.equal((await pool.query("SELECT count(*)::int n FROM todo_tasks WHERE company_id=$1 AND title='Typed task from graph'",[company])).rows[0].n,1);
+   await assert.rejects(invoke('automation_pause',{id:created.id}),e=>e.name==='ZodError');
+   assert.equal((await invoke('automation_off',{id:created.id})).data.status,'off');
+   assert.equal((await app.locals.connectionManager.invoke(actor,'automation_get',{id:created.id},randomUUID())).data.status,'off');
+   await assert.rejects(invoke('automation_pause',{id:created.id,pause_until:'2020-01-01T00:00:00Z'}),e=>e.code==='invalid_pause_until');
+   const until=new Date(Date.now()+60000).toISOString();
+   assert.equal((await invoke('automation_pause',{id:created.id,pause_until:until})).data.status,'paused');
+   assert.equal((await invoke('automation_resume',{id:created.id})).data.status,'published');
    const draft=(await invoke('automation_ensure_draft',{id:created.id})).data;const minimal=n=>({id:n.id,node_key:n.node_key,node_type:n.node_type,title:n.title,position_x:n.position_x,position_y:n.position_y,config:n.config});
    const nodes=draft.graph.nodes.map(minimal),task=nodes.find(n=>n.node_key==='task'),ending=nodes.find(n=>n.node_key==='end');task.config.title='Revised ordinary action';const condition=randomUUID();nodes.push({id:condition,node_key:'branch',node_type:'condition',title:'Branch',config:{condition:{field:'event.source',operator:'equals',value:'manual'}}});
    const edges=draft.graph.edges.filter(e=>e.source_node_id!==task.id).map(e=>({id:e.id,source_node_id:e.source_node_id,target_node_id:e.target_node_id,source_port:e.source_port||'default',target_port:e.target_port||'default'}));edges.push({id:randomUUID(),source_node_id:task.id,target_node_id:condition},{id:randomUUID(),source_node_id:condition,target_node_id:ending.id,source_port:'true'},{id:randomUUID(),source_node_id:condition,target_node_id:ending.id,source_port:'false'});
