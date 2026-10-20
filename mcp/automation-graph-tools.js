@@ -62,6 +62,50 @@ export function assertAutomationGraphPublication(graph){
 }
 export function registerAutomationGraphTools({read,write,actor,app,pool}){
  const catalog=()=>dispatch(app,actor,'GET','/api/automations/catalog');
+ const authorable={
+  triggers:new Set(review.triggers.filter(x=>x.status==='supported').map(x=>x.id)),
+  actions:new Set(review.actions.filter(x=>x.status==='supported').map(x=>x.id))
+ };
+ read('automation_catalog_page','Browse the current automation engine in small, searchable pages before authoring. Triggers and actions include only explicitly reviewed AI-authorable entries. Use automation_node_schema for the exact trigger/action configuration; this does not grant write or publish access.',z.object({section:z.enum(['triggers','actions','logic_nodes','condition_fields','template_variables','sources']),query:z.string().trim().max(160).default(''),category:z.string().trim().max(100).optional(),offset:z.number().int().nonnegative().default(0),limit:z.number().int().min(1).max(20).default(20)}).strict(),'crm:read',['automations.view'],null,async i=>{
+  const full=await catalog(),entries=full[i.section]||[];
+  const allowed=authorable[i.section];
+  const matches=entries.filter(entry=>{
+   const key=typeof entry==='string'?entry:entry.key;
+   if(allowed&&!allowed.has(key))return false;
+   if(i.category&&String(entry.category||'').toLowerCase()!==i.category.toLowerCase())return false;
+   return !i.query||[key,entry.display_name,entry.category,entry.description].filter(Boolean).join(' ').toLowerCase().includes(i.query.toLowerCase());
+  });
+  const project=entry=>{
+   if(typeof entry==='string')return i.section==='template_variables'?{key:entry,token:`{{${entry}}}`}:{key:entry};
+   if(i.section==='template_variables')return {key:entry.key,token:entry.token};
+   if(i.section==='condition_fields')return {key:entry.key,display_name:entry.display_name,category:entry.category,value_type:entry.value_type,operators:entry.operators};
+   return {key:entry.key,display_name:entry.display_name,category:entry.category,description:entry.description,authoring_status:allowed?'supported':'canonical_logic',outputs:entry.outputs||[],supported_subject_types:entry.supported_subject_types||[],config_field_keys:(entry.config_fields||[]).map(field=>field.key)};
+  };
+  // The assistant rejects tool results over 48 KB. Leave headroom for the MCP
+  // wrapper and let a later page start at the first item that did not fit.
+  const items=[];
+  for(const entry of matches.slice(i.offset,i.offset+i.limit)){
+   const item=project(entry);
+   if(Buffer.byteLength(JSON.stringify({section:i.section,items:[...items,item],total:matches.length,next_offset:i.offset+items.length+1}))>40000){
+    if(!items.length)throw fault(413,'automation_catalog_entry_too_large','The catalog entry cannot fit in an assistant result.');
+    break;
+   }
+   items.push(item);
+  }
+  return {section:i.section,items,total:matches.length,next_offset:i.offset+items.length<matches.length?i.offset+items.length:null};
+ });
+ read('automation_folders','List company-owned automation workspaces/folders for optional draft placement. Results are scoped to the current company.',z.object({offset:z.number().int().nonnegative().default(0),limit:z.number().int().min(1).max(100).default(25)}).strict(),'crm:read',['automations.view'],null,async i=>{
+  const rows=(await pool.query('SELECT id,name,sort_order FROM automation_folders WHERE company_id=$1 ORDER BY sort_order,name,id LIMIT $2 OFFSET $3',[actor.companyId,i.limit+1,i.offset])).rows;
+  const items=[];
+  for(const row of rows.slice(0,i.limit)){
+   if(Buffer.byteLength(JSON.stringify({items:[...items,row],next_offset:i.offset+items.length+1}))>40000){
+    if(!items.length)throw fault(413,'automation_folder_entry_too_large','The folder entry cannot fit in an assistant result.');
+    break;
+   }
+   items.push(row);
+  }
+  return {items,next_offset:rows.length>items.length?i.offset+items.length:null};
+ });
  async function definition(kind,key){
   const reviewed=review[kind==='action'?'actions':'triggers'].find(x=>x.id===key);
   if(!reviewed||reviewed.status!=='supported')throw fault(403,reviewed?.status==='human_only'?'human_managed_automation_action':'automation_action_not_mapped',reviewed?.reason||'This action/trigger must be explicitly reviewed before assistant authoring.');

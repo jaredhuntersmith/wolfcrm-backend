@@ -45,15 +45,24 @@ const state = {
   stripeCalls: []
 };
 
-const fakeApp = {
-  get() {},
-  post() {},
-  put() {},
-  patch() {},
-  delete() {}
-};
+const routes = new Map();
+const fakeApp = Object.fromEntries(["get", "post", "put", "patch", "delete"].map((method) => [method, (path, ...handlers) => {
+  routes.set(`${method.toUpperCase()} ${path}`, handlers);
+}]));
+
+async function callRoute(method, path, { companyId, userId, id, body = {} }) {
+  const handler = routes.get(`${method} ${path}`)?.at(-1);
+  assert.ok(handler, `route missing: ${method} ${path}`);
+  const response = { code: 200, body: null, status(code) { this.code = code; return this; }, json(body) { this.body = body; return this; } };
+  await handler({ companyId, userId, params: { id }, body }, response);
+  return response;
+}
 
 function authNoop(_req, _res, next) {
+  if (typeof next === "function") next();
+}
+
+function employerNoop(_req, _res, next) {
   if (typeof next === "function") next();
 }
 
@@ -111,7 +120,7 @@ async function bootstrapSchema() {
     app: fakeApp,
     pool,
     authRequired: authNoop,
-    requireEmployer: authNoop,
+    requireEmployer: employerNoop,
     sendPushToUsers,
     createTwilioClient: fakeTwilioClient,
     twilioPublicUrl,
@@ -376,6 +385,36 @@ async function testDraftRunSafety() {
   assert.equal(typeof detail.run.active_execution_ms, "number");
 }
 
+async function testStageEnteredSmsDryRunTemplateAndRecipient() {
+  const seed = await seedCompany();
+  const eventContactName = "Stage Event Customer";
+  const eventContactId = await createContact(seed, { name: eventContactName, phone: "6062131072" });
+  const opportunityId = randomUUID();
+  await pool.query(
+    `INSERT INTO opportunities(id, user_id, company_id, contact_id, state, stage_id) VALUES($1,$2,$3,$4,'stage',$5)`,
+    [opportunityId, seed.userId, seed.companyId, eventContactId, seed.stageId]
+  );
+  const fixedRecipientPhone = "+15550001234";
+  const trigger = node("stage_trigger", "trigger", { trigger_key: "pipeline.stage_entered", stage_id: seed.stageId });
+  const sms = node("stage_sms", "action", { action_key: "sms.send", target_mode: "phone_number", phone: fixedRecipientPhone, body: "Hello {{contact.name}}" });
+  const created = await createAutomation(seed, graphFrom([trigger, sms], [edge(trigger, sms)]));
+  state.smsCalls = [];
+  const run = await automationTestHooks.startDraftTestRun(created.automationId, seed.companyId, seed.userId, {
+    subject_type: "opportunity",
+    subject_id: opportunityId,
+    trigger_key: "pipeline.stage_entered",
+    payload: { opportunity_id: opportunityId, contact_id: eventContactId, stage_id: seed.stageId }
+  });
+  await automationTestHooks.runAutomation(run.id);
+  await assertRunCompleted(run.id);
+  const snapshot = await scalar(`SELECT output_snapshot FROM automation_run_nodes WHERE run_id = $1 AND node_key = 'stage_sms'`, [run.id]);
+  assert.equal(snapshot.output_snapshot.would_execute, "sms.send");
+  assert.equal(snapshot.output_snapshot.resolved_config.phone, fixedRecipientPhone);
+  assert.equal(snapshot.output_snapshot.resolved_config.body, `Hello ${eventContactName}`);
+  assert.equal(state.smsCalls.length, 0, "dry-run must not send through the provider");
+  assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM sms_messages WHERE conversation_id IN (SELECT id FROM sms_conversations WHERE contact_id = $1)`, [eventContactId])).count, 0);
+}
+
 async function testContactToTag() {
   const seed = await seedCompany();
   const t = node("trigger_1", "trigger", { trigger_key: "contact.created" });
@@ -602,6 +641,129 @@ async function testPauseAndPauseUntil() {
   await waitForRuns(seed, created.automationId, 2, "pause until expired");
 }
 
+async function testLifecycleRouteGuardsAndFolders() {
+  for (const key of ["POST /api/automations/:id/off", "PUT /api/automations/:id/activation-schedule"]) {
+    assert.deepEqual(routes.get(key)?.slice(0, 2), [authNoop, employerNoop], `${key} must require an authenticated employer`);
+  }
+  const seed = await seedCompany();
+  const other = await seedCompany();
+  const ownFolderId = randomUUID();
+  const foreignFolderId = randomUUID();
+  await pool.query(`INSERT INTO automation_folders(id,company_id,name) VALUES($1,$2,'Own'),($3,$4,'Foreign')`, [ownFolderId, seed.companyId, foreignFolderId, other.companyId]);
+  const deniedCreate = await callRoute("POST", "/api/automations", { ...seed, body: { name: "Wrong folder", folder_id: foreignFolderId } });
+  assert.equal(deniedCreate.code, 400);
+  assert.equal(deniedCreate.body.error, "invalid_folder_id");
+  const created = await callRoute("POST", "/api/automations", { ...seed, body: { name: "Own folder", folder_id: ownFolderId } });
+  assert.equal(created.code, 201);
+  const id = created.body.id;
+  const deniedPatch = await callRoute("PATCH", "/api/automations/:id", { ...seed, id, body: { folder_id: foreignFolderId } });
+  assert.equal(deniedPatch.code, 400);
+  assert.equal(deniedPatch.body.error, "invalid_folder_id");
+  const listing = await callRoute("GET", "/api/automations", seed);
+  const row = listing.body.find((item) => item.id === id);
+  assert.equal(row.folder_id, ownFolderId);
+  assert.equal(row.folder_name, "Own");
+
+  await pool.query(`UPDATE automation_definitions SET status = 'paused', pause_until = now() - interval '1 second', folder_id = $2 WHERE id = $1`, [id, foreignFolderId]);
+  const protectedListing = await callRoute("GET", "/api/automations", seed);
+  const protectedRow = protectedListing.body.find((item) => item.id === id);
+  assert.equal(protectedRow.status, "draft", "expired pause on an unpublished automation returns to Draft");
+  assert.equal(protectedRow.folder_id, null, "a pre-existing foreign folder association must not appear in a list");
+  assert.equal(protectedRow.folder_name, null);
+}
+
+async function testActivationLifecycle() {
+  const seed = await seedCompany();
+  const trigger = node("manual_trigger", "trigger", { trigger_key: "manual" });
+  const created = await createAutomation(seed, graphFrom([trigger], []));
+  await publish(seed, created.automationId);
+  const status = async () => (await scalar(`SELECT status FROM automation_definitions WHERE id = $1`, [created.automationId])).status;
+  assert.equal(await status(), "published");
+  const firstLive = await automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, {});
+  await pool.query(`UPDATE automation_runs SET status = 'failed' WHERE id = $1`, [firstLive.id]);
+
+  const window = { timezone: "company", windows: [{ kind: "weekly", weekdays: [1, 2, 3, 4, 5, 6, 7], start_time: "00:00:00", end_time: "23:59:59" }] };
+  const saved = await callRoute("PUT", "/api/automations/:id/activation-schedule", { ...seed, id: created.automationId, body: { schedule: window } });
+  assert.equal(saved.code, 200);
+  assert.deepEqual(saved.body.activation_schedule, window);
+  assert.deepEqual(saved.body.metadata.activation_schedule, window);
+  assert.equal(saved.body.metadata.reentry_mode, "after_previous_completion", "schedule update preserves unrelated metadata");
+  const invalid = await callRoute("PUT", "/api/automations/:id/activation-schedule", { ...seed, id: created.automationId, body: { schedule: { timezone: "UTC", windows: [] } } });
+  assert.equal(invalid.code, 400);
+  const cleared = await callRoute("PUT", "/api/automations/:id/activation-schedule", { ...seed, id: created.automationId, body: { schedule: null } });
+  assert.equal(cleared.code, 200);
+  assert.equal(cleared.body.activation_schedule, null);
+
+  const off = await callRoute("POST", "/api/automations/:id/off", { ...seed, id: created.automationId });
+  assert.equal(off.code, 200);
+  await publish(seed, created.automationId);
+  assert.equal(await status(), "off", "applying a draft must preserve Off");
+  await assert.rejects(() => automationTestHooks.retryAutomationRun(firstLive.id, seed.companyId, seed.userId), { code: "automation_not_active" });
+  await callRoute("POST", "/api/automations/pause-all", { ...seed });
+  await callRoute("POST", "/api/automations/resume-all", { ...seed });
+  assert.equal(await status(), "off", "system pause and resume must preserve individual Off");
+  await assert.rejects(() => automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, {}), { code: "automation_not_active" });
+  assert.ok(await automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, { dry_run: true }), "preview remains available while Off");
+
+  const future = new Date(Date.now() + 60_000).toISOString();
+  const missingPauseUntil = await callRoute("POST", "/api/automations/:id/pause", { ...seed, id: created.automationId });
+  assert.equal(missingPauseUntil.code, 400, "Pause Until requires a future timestamp; indefinite Off has its own endpoint");
+  const paused = await callRoute("POST", "/api/automations/:id/pause", { ...seed, id: created.automationId, body: { pause_until: future } });
+  assert.equal(paused.code, 200);
+  assert.equal(paused.body.status, "paused");
+  await publish(seed, created.automationId);
+  assert.equal(await status(), "paused", "applying a draft must preserve Pause Until");
+  await assert.rejects(() => automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, {}), { code: "automation_not_active" });
+  await pool.query(`UPDATE automation_definitions SET pause_until = now() - interval '1 second' WHERE id = $1`, [created.automationId]);
+  assert.ok(await automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, {}), "Pause Until becomes eligible without waiting for a poll");
+
+  const closed = { timezone: "UTC", windows: [{ kind: "once", start_at: new Date(Date.now() + 60_000).toISOString() }] };
+  await pool.query(`UPDATE automation_definitions SET status = 'published', pause_until = NULL, metadata = metadata || $2::jsonb WHERE id = $1`, [created.automationId, JSON.stringify({ activation_schedule: closed })]);
+  await assert.rejects(() => automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, {}), { code: "automation_not_active" });
+  const open = { timezone: "UTC", windows: [{ kind: "once", start_at: new Date(Date.now() - 60_000).toISOString(), end_at: new Date(Date.now() + 60_000).toISOString() }] };
+  await pool.query(`UPDATE automation_definitions SET metadata = metadata || $2::jsonb WHERE id = $1`, [created.automationId, JSON.stringify({ activation_schedule: open })]);
+  assert.ok(await automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, {}));
+  await pool.query(`UPDATE companies SET automations_enabled = false WHERE id = $1`, [seed.companyId]);
+  await assert.rejects(() => automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, {}), { code: "automation_not_active" });
+}
+
+async function testSmsTargetModePrecedence() {
+  const seed = await seedCompany();
+  const selected = await createContact(seed, { phone: "6062131071" });
+  const current = await createContact(seed, { phone: "6062131072" });
+  const run = { company_id: seed.companyId, subject_type: "contact", subject_id: current };
+  const context = { contact: { id: current } };
+  const stale = { conversation_id: randomUUID(), phone: "+16062139999", contact_id: selected };
+  const explicit = await automationTestHooks.resolveSmsTarget(run, context, { ...stale, target_mode: "specific_contact" });
+  assert.equal(explicit.contact_id, selected);
+  assert.equal(explicit.phone, "6062131071");
+  const currentTarget = await automationTestHooks.resolveSmsTarget(run, context, { ...stale, target_mode: "current_contact" });
+  assert.equal(currentTarget.contact_id, current);
+  assert.equal(currentTarget.phone, "6062131072");
+  const legacy = await automationTestHooks.resolveSmsTarget(run, context, { phone: "+16062139999" });
+  assert.equal(legacy.phone, "+16062139999");
+  for (const targetMode of ["specific_contact", "contact_template"]) {
+    await assert.rejects(() => automationTestHooks.resolveSmsTarget(run, context, { ...stale, target_mode: targetMode, contact_id: null }), { message: "contact_id_required" });
+    await assert.rejects(() => automationTestHooks.resolveIMessageTarget(run, context, { ...stale, target_mode: targetMode, contact_id: null }), { message: "contact_id_required" });
+  }
+  await assert.rejects(() => automationTestHooks.resolveSmsTarget(run, context, { ...stale, target_mode: "contact_template", contact_id: "{{variables.missing}}" }), { message: "contact_id_required" });
+  for (const targetMode of ["node_output", "job_contact", "quote_contact", "service_plan_contact"]) {
+    const derived = await automationTestHooks.resolveSmsTarget(run, context, { ...stale, target_mode: targetMode, contact_id: null });
+    assert.equal(derived.contact_id, current, `${targetMode} may derive the event Contact`);
+    const derivedIMessage = await automationTestHooks.resolveIMessageTarget(run, context, { ...stale, target_mode: targetMode, contact_id: null });
+    assert.equal(derivedIMessage.contact_id, current);
+  }
+  const line = await scalar(`SELECT id FROM phone_lines WHERE company_id = $1`, [seed.companyId]);
+  const conversationId = randomUUID();
+  await pool.query(`INSERT INTO sms_conversations(id,phone_line_id,external_phone_number,contact_id) VALUES($1,$2,$3,$4)`, [conversationId, line.id, "+16062135555", selected]);
+  const conversation = await automationTestHooks.resolveSmsTarget(run, { ...context, sms: { conversation_id: randomUUID() }, variables: { selected_conversation_id: conversationId } }, {
+    ...stale, target_mode: "current_conversation", conversation_id: "{{variables.selected_conversation_id}}"
+  });
+  assert.equal(conversation.conversation_id, conversationId, "configured conversation template takes precedence over current event conversation");
+  assert.equal(conversation.phone, "+16062135555");
+  await assert.rejects(() => automationTestHooks.resolveSmsTarget(run, context, { ...stale, target_mode: "specific_contact", contact_id: randomUUID() }), { message: "contact_not_found" });
+}
+
 async function testMapServicePaymentAndDedupe() {
   const seed = await seedCompany();
   const contactId = await createContact(seed);
@@ -795,6 +957,7 @@ const tests = [
   ["Publish", testPublishAndRepublish],
   ["Draft-not-live", testDraftDoesNotRun],
   ["Draft Test", testDraftRunSafety],
+  ["Stage entered -> fixed phone SMS dry-run", testStageEnteredSmsDryRunTemplateAndRecipient],
   ["Contact -> Tag", testContactToTag],
   ["Contact -> Pipeline", testContactToPipeline],
   ["Contact -> SMS", testContactToSms],
@@ -807,6 +970,9 @@ const tests = [
   ["Job completed trigger", testJobCompletedTrigger],
   ["Wait, due resume, cancel wait", testWaitPauseCancel],
   ["Pause and Pause Until", testPauseAndPauseUntil],
+  ["Lifecycle route guards and folder ownership", testLifecycleRouteGuardsAndFolders],
+  ["Activation lifecycle", testActivationLifecycle],
+  ["SMS target mode precedence", testSmsTargetModePrecedence],
   ["Map pin, service due, payment dedupe", testMapServicePaymentAndDedupe],
   ["Foreach, Merge ALL, Re-entry, Run completion", testForeachMergeReentryAndRunCompletion],
   ["Validation, catalog, scope, dry-run external safety", testValidationCatalogScopeAndDryRunExternalSafety]

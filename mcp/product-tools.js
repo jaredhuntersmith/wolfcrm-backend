@@ -5,6 +5,7 @@ import {dispatch,digest,fault} from './context.js';
 import {TAB_CATALOG} from '../navigation-tabs.js';
 import {DASHBOARD_CARD_CATALOG} from '../dashboard-layout.js';
 import {aiTaskConfig} from '../assistant/automation.js';
+import {activationScheduleSchema} from '../automation-time-schedule.js';
 
 const uuid=z.uuid(),id=z.string().regex(/^[A-Za-z0-9_-]{1,160}$/),title=z.string().trim().min(1).max(200),text=z.string().max(20000),empty=z.object({}).strict();
 const color=z.string().regex(/^#[0-9a-fA-F]{6}$/).nullable(),date=z.iso.datetime({offset:true}).nullable();
@@ -30,7 +31,10 @@ export function registerProductTools({read,write,actor,app,pool}){
  write('lighting_project_delete','Delete a Lighting project through canonical company authorization.',z.object({id:uuid}).strict(),'crm:write',['operations.manage'],'DELETE',i=>'/api/lighting/projects/'+i.id,()=>({}));
  write('communications_send','Send one message in an authorized Company Comms conversation. Membership, history, mention and attachment permissions apply; client key is idempotent.',z.object({conversation_id:id,body:text,reply_root_id:id.optional(),asset_ids:z.array(uuid).max(10).default([])}).strict(),'crm:write',['communications.view','communications.send'],'POST',i=>`/api/comms/conversations/${i.conversation_id}/messages`,(i,key)=>({body:i.body,reply_root_id:i.reply_root_id,asset_ids:i.asset_ids,client_key:key}));
  write('communications_mark_read','Mark an authorized Company Comms conversation read through an explicitly selected visible message.',z.object({conversation_id:id,last_message_id:uuid}).strict(),'crm:write',['communications.view'],'POST',i=>`/api/comms/conversations/${i.conversation_id}/read`,i=>({last_message_id:i.last_message_id}));
- write('automation_create','Create an automation draft. Read automation_catalog for supported schedules and triggers. This does not publish or enable it.',z.object({name:title,description:text,folder_id:uuid.nullable().optional()}).strict(),'crm:write',['automations.manage'],'POST','/api/automations',i=>i);
+ write('automation_create','Create a named automation draft. First use automation_catalog_page and automation_node_schema for reviewed trigger/action definitions; use automation_folders for optional company-owned placement. This does not publish or enable it.',z.object({name:title,description:text,folder_id:uuid.nullable().optional()}).strict(),'crm:write',['automations.manage'],'POST',null,null,async i=>{
+  if(i.folder_id&&!(await pool.query('SELECT id FROM automation_folders WHERE id=$1 AND company_id=$2',[i.folder_id,actor.companyId])).rowCount)throw fault(404,'automation_folder_unavailable');
+  return dispatch(app,actor,'POST','/api/automations',i);
+ });
  read('automation_draft','Read an existing automation draft and an exact graph hash for guarded edits. Does not create or modify a draft.',z.object({id:uuid}).strict(),'crm:read',['automations.manage'],null,async i=>{const detail=await dispatch(app,actor,'GET',`/api/automations/${i.id}`);const graph=detail.draft;if(!graph)throw fault(409,'automation_draft_required');return {graph:redactAutomation(graph),graph_hash:digest(graph)};});
  const node=z.object({id:uuid,node_key:z.string().regex(/^[a-zA-Z0-9_]{1,80}$/),node_type:z.enum(['trigger','action','end']),title,position_x:z.number().default(0),position_y:z.number().default(0),config:z.record(z.string(),z.json())}).strict();
  const edge=z.object({id:uuid,source_node_id:uuid,target_node_id:uuid,source_port:z.enum(['default','error']).default('default'),target_port:z.literal('default').default('default')}).strict();
@@ -41,6 +45,13 @@ export function registerProductTools({read,write,actor,app,pool}){
   return dispatch(app,actor,'PUT',`/api/automations/${i.id}/draft/graph`,{nodes:i.nodes,edges:i.edges,settings:i.settings});
  });
  write('automation_publish','Validate and publish the exact reviewed automation draft through the existing engine. Read automation_draft for its graph_hash.',z.object({id:uuid,expected_graph_hash:z.string().regex(/^[a-f0-9]{64}$/)}).strict(),'crm:write',['automations.manage'],'POST',null,null,async i=>{await pool.query('SELECT id FROM automation_versions WHERE automation_id=$1 AND company_id=$2 FOR UPDATE',[i.id,actor.companyId]);const d=(await dispatch(app,actor,'GET',`/api/automations/${i.id}`)).draft;if(!d||digest(d)!==i.expected_graph_hash)throw fault(409,'automation_draft_changed');await assertAutomationRuntimePublication({app,pool,actor,graph:d});return dispatch(app,actor,'POST',`/api/automations/${i.id}/publish`,{});});
- write('automation_pause','Pause an existing automation without changing its graph.',z.object({id:uuid,pause_until:date.optional()}).strict(),'crm:write',['automations.manage'],'POST',i=>`/api/automations/${i.id}/pause`,({id,...i})=>i);
+ write('automation_activation_schedule_set','Set or clear an automation activation schedule without changing its graph or Off/pause state. Use automation_get record_hash. A schedule has a company or IANA timezone and 1-32 once/weekly windows; once uses offset-aware timestamps and weekly uses Monday=1 through Sunday=7 with HH:mm:ss boundaries. Null clears the schedule.',z.object({id:uuid,expected_record_hash:z.string().regex(/^[a-f0-9]{64}$/),schedule:activationScheduleSchema.nullable()}).strict(),'crm:write',['automations.manage'],'PUT',null,null,async i=>{
+  const current=await dispatch(app,actor,'GET',`/api/automations/${i.id}`);
+  if(digest(current)!==i.expected_record_hash)throw fault(409,'automation_changed');
+  const saved=await dispatch(app,actor,'PUT',`/api/automations/${i.id}/activation-schedule`,{schedule:i.schedule});
+  return {id:saved.id,status:saved.status,activation_schedule:saved.activation_schedule,eligible_now:saved.eligible_now,updated_at:saved.updated_at,record_hash:digest(saved)};
+ });
+ write('automation_pause','Pause an existing automation until a future ISO timestamp with a UTC offset. The canonical service validates the time; this does not change its graph.',z.object({id:uuid,pause_until:z.iso.datetime({offset:true})}).strict(),'crm:write',['automations.manage'],'POST',i=>`/api/automations/${i.id}/pause`,({id,...i})=>i);
+ write('automation_off','Turn an existing automation Off until explicitly resumed. This does not change its graph or publish a draft.',z.object({id:uuid}).strict(),'crm:write',['automations.manage'],'POST',i=>`/api/automations/${i.id}/off`,()=>({}));
  write('automation_resume','Resume an existing published automation under the normal authorized management flow.',z.object({id:uuid}).strict(),'crm:write',['automations.manage'],'POST',null,null,async i=>{const d=await dispatch(app,actor,'GET',`/api/automations/${i.id}`);if(d.active)await assertAutomationRuntimePublication({app,pool,actor,graph:d.active});return dispatch(app,actor,'POST',`/api/automations/${i.id}/resume`,{});});
 }

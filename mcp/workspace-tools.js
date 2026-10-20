@@ -64,7 +64,16 @@ export function registerWorkspaceTools(tool,{actor,pool,app}){
  write('ideas_delete','Delete one Idea you may edit.',z.object({id}).strict(),'crm:write',[],'DELETE',i=>'/api/idea-parking/ideas/'+i.id,()=>({}));
  write('ideas_list_save','Create, rename, reorder or share an Idea list. Existing lists require their exact revision.',z.object({id,name:title.max(120),expected_revision:z.number().int().positive().optional(),sort_order:z.number().int(),visibility:z.enum(['private','shared','company']),member_ids:z.array(uuid).max(200)}).strict(),'crm:write',[],'PUT',i=>'/api/idea-parking/lists/'+i.id,({id,...i})=>i);
  write('ideas_list_delete','Delete an owned Idea list; the existing workflow retains its ideas as unfiled.',z.object({id}).strict(),'crm:write',[],'DELETE',i=>'/api/idea-parking/lists/'+i.id,()=>({}));
- read('automation_catalog','Discover the existing automation triggers, actions, typed configuration fields and conditions. This is the authoritative automation engine catalog.',empty,'crm:read',['automations.view'],'/api/automations/catalog');
+ read('automation_catalog','Get a compact overview of the current automation engine. Use automation_catalog_page to search or page reviewed AI-authorable entries, then automation_node_schema for exact trigger/action fields. The complete native editor catalog is too large for an assistant result.',empty,'crm:read',['automations.view'],null,async()=>{
+  const full=await dispatch(app,actor,'GET','/api/automations/catalog');
+  const sections=['triggers','actions','logic_nodes','condition_fields','template_variables','sources'];
+  const summary=items=>{
+   const categories=new Map();
+   for(const item of items)if(item&&typeof item==='object'&&item.category)categories.set(item.category,(categories.get(item.category)||0)+1);
+   return {engine_entry_count:items.length,top_categories:[...categories].sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0])).slice(0,8).map(([name,count])=>({name,count}))};
+  };
+  return {sections:Object.fromEntries(sections.map(section=>[section,summary(full[section]||[])])),browse_tool:'automation_catalog_page',schema_tool:'automation_node_schema',guidance:'Search one section with automation_catalog_page; follow next_offset for more reviewed entries. For a selected trigger or action, call automation_node_schema with kind and key before graph save. The full /api/automations/catalog remains available to native and web editors.'};
+ });
  read('automation_list','List accessible company automations and published/draft status.',empty,'crm:read',['automations.view'],null,async()=>redactAutomation(await dispatch(app,actor,'GET','/api/automations')));
  read('automation_get','Read an existing company automation, its graph and versions.',z.object({id:uuid}).strict(),'crm:read',['automations.view'],null,async i=>{const value=await dispatch(app,actor,'GET','/api/automations/'+i.id);return {...redactAutomation(value),record_hash:digest(value)};});
  read('dashboard_layout','Read your authoritative dashboard layout settings.',empty,'crm:read',['dashboard.view'],'/api/dashboard/layout');

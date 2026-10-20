@@ -1,7 +1,7 @@
 import {evaluateAdsTriggers, executeAdsAutomation, validateMetricRule, validateAdsAction} from './facebook-ads/automation.js';
 import {sendHTTPS} from './webhooks/network.js';
 import {mapWebhookResponse,responseMappingsSchema} from './webhooks/responses.js';
-import {timeScheduleSchema,enqueueTimeSchedules,timeScheduleStillCurrent} from './automation-time-schedule.js';
+import {timeScheduleSchema,activationScheduleSchema,activationScheduleAllows,enqueueTimeSchedules,timeScheduleStillCurrent} from './automation-time-schedule.js';
 import {aiTaskConfig} from './assistant/automation.js';
 import {controlConnectionFromAutomation} from './mcp/automation.js';
 import {isDraftOnly} from './mcp/context.js';
@@ -1771,7 +1771,7 @@ export async function syncAutomationSchedulesForJob(companyId, job) {
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
-      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'job.relative_time'`,
+      WHERE d.company_id = $1 AND (d.status = 'published' OR (d.status = 'paused' AND d.pause_until <= now())) AND n.config->>'trigger_key' = 'job.relative_time'`,
     [companyId]
   )).rows;
   for (const trigger of relativeTriggers) {
@@ -1837,7 +1837,7 @@ export async function syncAutomationSchedulesForSmsOutbound(companyId, message) 
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
-      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'sms.no_reply'`,
+      WHERE d.company_id = $1 AND (d.status = 'published' OR (d.status = 'paused' AND d.pause_until <= now())) AND n.config->>'trigger_key' = 'sms.no_reply'`,
     [companyId]
   )).rows;
   for (const trigger of triggers) {
@@ -1865,7 +1865,7 @@ export async function syncAutomationSchedulesForSmsConversationActivity(companyI
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
-      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'sms.conversation_inactive'`,
+      WHERE d.company_id = $1 AND (d.status = 'published' OR (d.status = 'paused' AND d.pause_until <= now())) AND n.config->>'trigger_key' = 'sms.conversation_inactive'`,
     [companyId]
   )).rows;
   for (const trigger of triggers) {
@@ -1898,7 +1898,7 @@ export async function syncAutomationSchedulesForVoicemail(companyId, voicemail) 
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
-      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'voicemail.unread_for'`,
+      WHERE d.company_id = $1 AND (d.status = 'published' OR (d.status = 'paused' AND d.pause_until <= now())) AND n.config->>'trigger_key' = 'voicemail.unread_for'`,
     [companyId]
   )).rows;
   for (const trigger of triggers) {
@@ -1954,7 +1954,7 @@ async function syncActiveQuoteSchedules(companyId, quote, db) {
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
-      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'quote.followup_due'`,
+      WHERE d.company_id = $1 AND (d.status = 'published' OR (d.status = 'paused' AND d.pause_until <= now())) AND n.config->>'trigger_key' = 'quote.followup_due'`,
     [companyId]
   )).rows;
   for (const trigger of triggers) {
@@ -2004,7 +2004,7 @@ export async function syncAutomationSchedulesForServicePlan(companyId, plan) {
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
-      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = ANY($2::text[])`,
+      WHERE d.company_id = $1 AND (d.status = 'published' OR (d.status = 'paused' AND d.pause_until <= now())) AND n.config->>'trigger_key' = ANY($2::text[])`,
     [companyId, ["service_plan.service_upcoming", "service_plan.service_overdue"]]
   )).rows;
   for (const trigger of triggers) {
@@ -2036,7 +2036,7 @@ export async function syncAutomationSchedulesForMapPin(companyId, pin, basis = "
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
-      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = 'map.pin_followup_due'`,
+      WHERE d.company_id = $1 AND (d.status = 'published' OR (d.status = 'paused' AND d.pause_until <= now())) AND n.config->>'trigger_key' = 'map.pin_followup_due'`,
     [companyId]
   )).rows;
   for (const trigger of triggers) {
@@ -2072,7 +2072,7 @@ export async function syncAutomationSchedulesForTimeEntry(companyId, entry) {
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
-      WHERE d.company_id = $1 AND d.status = 'published' AND n.config->>'trigger_key' = ANY($2::text[])`,
+      WHERE d.company_id = $1 AND (d.status = 'published' OR (d.status = 'paused' AND d.pause_until <= now())) AND n.config->>'trigger_key' = ANY($2::text[])`,
     [companyId, ["time_clock.shift_duration_reached", "time_clock.overtime_threshold_reached", "time_clock.missed_clock_out"]]
   )).rows;
   const start = new Date(entry.start_at);
@@ -2840,7 +2840,6 @@ function installAutomationRoutes() {
   app.post("/api/automations/pause-all", authRequired, requireEmployer, async (req, res) => {
     try {
       await ctx.pool.query(`UPDATE companies SET automations_enabled = false, updated_at = now() WHERE id = $1`, [req.companyId]);
-      await ctx.pool.query(`UPDATE automation_definitions SET status = 'paused', updated_at = now() WHERE company_id = $1 AND status = 'published'`, [req.companyId]);
       res.json({ ok: true });
     } catch (e) {
       console.error("[automations] pause all failed", e?.message || e);
@@ -2851,7 +2850,6 @@ function installAutomationRoutes() {
   app.post("/api/automations/resume-all", authRequired, requireEmployer, async (req, res) => {
     try {
       await ctx.pool.query(`UPDATE companies SET automations_enabled = true, automation_emergency_stopped_at = NULL, updated_at = now() WHERE id = $1`, [req.companyId]);
-      await ctx.pool.query(`UPDATE automation_definitions SET status = 'published', pause_until = NULL, updated_at = now() WHERE company_id = $1 AND status = 'paused'`, [req.companyId]);
       res.json({ ok: true });
     } catch (e) {
       console.error("[automations] resume all failed", e?.message || e);
@@ -2873,14 +2871,18 @@ function installAutomationRoutes() {
   app.get("/api/automations", authRequired, requireEmployer, async (req, res) => {
     try {
       const { rows } = await ctx.pool.query(
-        `SELECT d.id, d.name, d.description, d.status, d.folder_id, f.name AS folder_name,
+        `SELECT d.id, d.name, d.description,
+                CASE WHEN d.status = 'paused' AND d.pause_until <= now() THEN CASE WHEN d.active_version_id IS NULL THEN 'draft' ELSE 'published' END
+                     WHEN d.status = 'published' AND d.pause_until > now() THEN 'paused'
+                     ELSE d.status END AS status,
+                f.id AS folder_id, f.name AS folder_name,
                 d.active_version_id, av.version_number AS published_version_number, d.pause_until,
-                d.allow_manual_trigger, d.created_at, d.updated_at,
+                d.allow_manual_trigger, d.metadata, d.created_at, d.updated_at,
                 (SELECT COUNT(*)::int FROM automation_runs r WHERE r.automation_id = d.id AND r.created_at > now() - interval '7 days') AS recent_run_count,
                 (SELECT r.status FROM automation_runs r WHERE r.automation_id = d.id ORDER BY r.created_at DESC LIMIT 1) AS last_run_status,
                 (SELECT r.created_at FROM automation_runs r WHERE r.automation_id = d.id ORDER BY r.created_at DESC LIMIT 1) AS last_triggered_at
            FROM automation_definitions d
-           LEFT JOIN automation_folders f ON f.id = d.folder_id
+           LEFT JOIN automation_folders f ON f.id = d.folder_id AND f.company_id = d.company_id
            LEFT JOIN automation_versions av ON av.id = d.active_version_id
           WHERE d.company_id = $1 AND d.status <> 'archived'
           ORDER BY d.updated_at DESC`,
@@ -2896,13 +2898,18 @@ function installAutomationRoutes() {
   app.post("/api/automations", authRequired, requireEmployer, async (req, res) => {
     const name = (req.body?.name || "").toString().trim();
     if (!name) return res.status(400).json({ error: "name_required" });
+    const folderId = req.body?.folder_id || null;
     const db = await ctx.pool.connect();
     try {
       await db.query("BEGIN");
+      if (folderId && !(await automationFolderOwned(folderId, req.companyId, db))) {
+        await db.query("ROLLBACK");
+        return res.status(400).json({ error: "invalid_folder_id" });
+      }
       const definition = await db.query(
         `INSERT INTO automation_definitions(company_id, folder_id, name, description, created_by_user_id, updated_by_user_id, metadata)
          VALUES($1,$2,$3,$4,$5,$5,$6::jsonb) RETURNING *`,
-        [req.companyId, req.body?.folder_id || null, name, req.body?.description || null, req.userId, JSON.stringify({ reentry_mode: "after_previous_completion" })]
+        [req.companyId, folderId, name, req.body?.description || null, req.userId, JSON.stringify({ reentry_mode: "after_previous_completion" })]
       );
       const version = await db.query(
         `INSERT INTO automation_versions(automation_id, company_id, version_number, status, created_by_user_id)
@@ -2980,12 +2987,15 @@ function installAutomationRoutes() {
     const values = [req.params.id, req.companyId, req.userId];
     for (const key of allowed) {
       if (Object.prototype.hasOwnProperty.call(req.body || {}, key)) {
-        values.push(key === "metadata" ? JSON.stringify(req.body[key] || {}) : req.body[key]);
+        values.push(key === "metadata" ? JSON.stringify(req.body[key] || {}) : key === "folder_id" ? (req.body[key] || null) : req.body[key]);
         sets.push(`${key} = $${values.length}${key === "metadata" ? "::jsonb" : ""}`);
       }
     }
     if (!sets.length) return res.status(400).json({ error: "no_changes" });
     try {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, "folder_id") && req.body.folder_id && !(await automationFolderOwned(req.body.folder_id, req.companyId))) {
+        return res.status(400).json({ error: "invalid_folder_id" });
+      }
       const { rows } = await ctx.pool.query(
         `UPDATE automation_definitions SET ${sets.join(", ")}, updated_by_user_id = $3, updated_at = now()
           WHERE id = $1 AND company_id = $2 RETURNING *`,
@@ -3025,10 +3035,11 @@ function installAutomationRoutes() {
 
   app.post("/api/automations/:id/pause", authRequired, requireEmployer, async (req, res) => {
     try {
-      const pauseUntil = req.body?.pause_until || null;
+      const pauseUntil = req.body?.pause_until ?? null;
+      if (!pauseUntil || !Number.isFinite(Date.parse(pauseUntil)) || Date.parse(pauseUntil) <= Date.now()) return res.status(400).json({ error: "invalid_pause_until" });
       const { rows } = await ctx.pool.query(
         `UPDATE automation_definitions SET status = 'paused', pause_until = $3::timestamptz, updated_by_user_id = $4, updated_at = now()
-          WHERE id = $1 AND company_id = $2 RETURNING *`,
+          WHERE id = $1 AND company_id = $2 AND status <> 'archived' RETURNING *`,
         [req.params.id, req.companyId, pauseUntil, req.userId]
       );
       if (!rows.length) return res.status(404).json({ error: "not_found" });
@@ -3043,13 +3054,49 @@ function installAutomationRoutes() {
       const { rows } = await ctx.pool.query(
         `UPDATE automation_definitions SET status = CASE WHEN active_version_id IS NULL THEN 'draft' ELSE 'published' END,
              pause_until = NULL, updated_by_user_id = $3, updated_at = now()
-          WHERE id = $1 AND company_id = $2 RETURNING *`,
+          WHERE id = $1 AND company_id = $2 AND status <> 'archived' RETURNING *`,
         [req.params.id, req.companyId, req.userId]
       );
       if (!rows.length) return res.status(404).json({ error: "not_found" });
       res.json(rows[0]);
     } catch (e) {
       res.status(500).json({ error: "automation_resume_failed" });
+    }
+  });
+
+  app.post("/api/automations/:id/off", authRequired, requireEmployer, async (req, res) => {
+    try {
+      const { rows } = await ctx.pool.query(
+        `UPDATE automation_definitions SET status = 'off', pause_until = NULL, updated_by_user_id = $3, updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND status <> 'archived' RETURNING *`,
+        [req.params.id, req.companyId, req.userId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "not_found" });
+      res.json(rows[0]);
+    } catch (e) {
+      res.status(500).json({ error: "automation_off_failed" });
+    }
+  });
+
+  app.put("/api/automations/:id/activation-schedule", authRequired, requireEmployer, async (req, res) => {
+    if (!Object.prototype.hasOwnProperty.call(req.body || {}, "schedule")) return res.status(400).json({ error: "schedule_required" });
+    const schedule = req.body.schedule;
+    if (schedule !== null) {
+      const parsed = activationScheduleSchema.safeParse(schedule);
+      if (!parsed.success) return res.status(400).json({ error: "invalid_activation_schedule", message: parsed.error.issues[0]?.message || "Check the activation windows.", issues: parsed.error.issues });
+    }
+    try {
+      const { rows } = await ctx.pool.query(
+        `UPDATE automation_definitions SET metadata = CASE WHEN $3::jsonb IS NULL THEN metadata - 'activation_schedule'
+             ELSE metadata || jsonb_build_object('activation_schedule', $3::jsonb) END,
+             updated_by_user_id = $4, updated_at = now()
+          WHERE id = $1 AND company_id = $2 AND status <> 'archived' RETURNING id`,
+        [req.params.id, req.companyId, schedule === null ? null : JSON.stringify(schedule), req.userId]
+      );
+      if (!rows.length) return res.status(404).json({ error: "not_found" });
+      res.json(await loadAutomationDetail(req.params.id, req.companyId));
+    } catch (e) {
+      res.status(500).json({ error: "automation_activation_schedule_failed" });
     }
   });
 
@@ -3112,6 +3159,7 @@ function installAutomationRoutes() {
       res.status(202).json(run);
     } catch (e) {
       console.error("[automations] manual run failed", e?.message || e);
+      if (e?.code === "automation_not_active") return res.status(409).json({ error: e.code, message: e.message });
       res.status(500).json({ error: "automation_manual_run_failed" });
     }
   });
@@ -3158,6 +3206,7 @@ function installAutomationRoutes() {
       if (!result) return res.status(404).json({ error: "not_found" });
       res.status(202).json(result);
     } catch (e) {
+      if (e?.code === "automation_not_active") return res.status(409).json({ error: e.code, message: e.message });
       res.status(500).json({ error: "automation_retry_failed" });
     }
   });
@@ -3168,6 +3217,7 @@ function installAutomationRoutes() {
       if (!result) return res.status(404).json({ error: "not_found" });
       res.status(202).json(result);
     } catch (e) {
+      if (e?.code === "automation_not_active") return res.status(409).json({ error: e.code, message: e.message });
       res.status(500).json({ error: "automation_node_retry_failed" });
     }
   });
@@ -3178,17 +3228,52 @@ function installAutomationRoutes() {
       if (!result) return res.status(404).json({ error: "not_found" });
       res.status(202).json(result);
     } catch (e) {
+      if (e?.code === "automation_not_active") return res.status(409).json({ error: e.code, message: e.message });
       res.status(500).json({ error: "automation_iteration_retry_failed" });
     }
   });
 }
 
+async function automationFolderOwned(folderId, companyId, db = ctx.pool) {
+  if (typeof folderId !== "string" || !folderId.trim()) return false;
+  const { rowCount } = await db.query(`SELECT 1 FROM automation_folders WHERE id::text = $1 AND company_id = $2`, [folderId, companyId]);
+  return rowCount > 0;
+}
+
 async function loadAutomationDetail(id, companyId) {
-  const { rows } = await ctx.pool.query(`SELECT * FROM automation_definitions WHERE id = $1 AND company_id = $2`, [id, companyId]);
+  const { rows } = await ctx.pool.query(
+    `SELECT d.*, c.timezone AS company_timezone, c.automations_enabled, c.automation_emergency_stopped_at
+       FROM automation_definitions d JOIN companies c ON c.id = d.company_id
+      WHERE d.id = $1 AND d.company_id = $2`, [id, companyId]);
   if (!rows.length) return null;
   const draft = rows[0].draft_version_id ? await loadVersionGraph(rows[0].draft_version_id, companyId) : null;
   const active = rows[0].active_version_id ? await loadVersionGraph(rows[0].active_version_id, companyId) : null;
-  return { ...rows[0], draft, active };
+  return { ...rows[0], status: effectiveAutomationStatus(rows[0]), activation_schedule: rows[0].metadata?.activation_schedule || null,
+    eligible_now: automationAdmissionAllowed(rows[0]), draft, active };
+}
+
+function effectiveAutomationStatus(automation, at = new Date()) {
+  if (automation.status === "published" && automation.pause_until && new Date(automation.pause_until) > at) return "paused";
+  if (automation.status === "paused" && automation.pause_until && new Date(automation.pause_until) <= at) {
+    return automation.active_version_id ? "published" : "draft";
+  }
+  return automation.status;
+}
+
+function automationAdmissionAllowed(automation, at = new Date()) {
+  if (!automation?.active_version_id || effectiveAutomationStatus(automation, at) !== "published") return false;
+  if (automation.automations_enabled === false || automation.automation_emergency_stopped_at) return false;
+  return activationScheduleAllows(automation.metadata?.activation_schedule, automation.company_timezone, at);
+}
+
+async function assertRecoveryAdmission(run) {
+  if (run.dry_run) return;
+  const automation = (await ctx.pool.query(
+    `SELECT d.*, c.timezone AS company_timezone, c.automations_enabled, c.automation_emergency_stopped_at
+       FROM automation_definitions d JOIN companies c ON c.id = d.company_id
+      WHERE d.id = $1 AND d.company_id = $2`, [run.automation_id, run.company_id]
+  )).rows[0];
+  if (!automationAdmissionAllowed(automation)) throw new AutomationError("automation_not_active", "Turn this automation on and choose a time inside its activation windows before retrying live.");
 }
 
 async function loadVersionGraph(versionId, companyId) {
@@ -3610,8 +3695,9 @@ async function publishAutomation(automationId, companyId, userId) {
     )).rows[0];
     await copyGraph(db, published.id, newDraft.id, companyId);
     await db.query(
-      `UPDATE automation_definitions SET active_version_id = $2, draft_version_id = $3, status = 'published',
-          pause_until = NULL, updated_by_user_id = $4, updated_at = now()
+      `UPDATE automation_definitions SET active_version_id = $2, draft_version_id = $3,
+          status = CASE WHEN status IN ('paused','off') THEN status ELSE 'published' END,
+          updated_by_user_id = $4, updated_at = now()
         WHERE id = $1`,
       [automationId, published.id, newDraft.id, userId]
     );
@@ -3728,7 +3814,8 @@ async function processAutomationEvents() {
 
 async function startRunsForEvent(event) {
   const { rows } = await ctx.pool.query(
-    `SELECT DISTINCT d.*, v.id AS version_id
+    `SELECT DISTINCT d.*, v.id AS version_id, c.timezone AS company_timezone,
+            c.automations_enabled, c.automation_emergency_stopped_at
        FROM automation_definitions d
        JOIN automation_versions v ON v.id = d.active_version_id AND v.status = 'published'
        JOIN automation_nodes n ON n.version_id = v.id AND n.node_type = 'trigger'
@@ -3736,7 +3823,7 @@ async function startRunsForEvent(event) {
       WHERE d.company_id = $1
         AND c.automations_enabled = true
         AND c.automation_emergency_stopped_at IS NULL
-        AND d.status = 'published'
+        AND (d.status = 'published' OR (d.status = 'paused' AND d.pause_until <= now()))
         AND (d.pause_until IS NULL OR d.pause_until <= now())
         AND (
           n.config->>'trigger_key' = $2
@@ -3744,13 +3831,18 @@ async function startRunsForEvent(event) {
         )`,
     [event.company_id, event.event_type]
   );
-  if (!(await companyRunQuotaAllows(event.company_id))) throw new AutomationError("rate_limited", "Company automation start quota reached", { retryable: true });
+  let quotaChecked = false;
   for (const automation of rows) {
+    if (!automationAdmissionAllowed(automation)) continue;
     const triggers = (await ctx.pool.query(
       `SELECT * FROM automation_nodes WHERE version_id = $1 AND company_id = $2 AND node_type = 'trigger'`,
       [automation.version_id, event.company_id]
     )).rows;
     if (!triggers.some((node) => triggerMatchesEvent(node, event))) continue;
+    if (!quotaChecked) {
+      if (!(await companyRunQuotaAllows(event.company_id))) throw new AutomationError("rate_limited", "Company automation start quota reached", { retryable: true });
+      quotaChecked = true;
+    }
     const priorWebhookRun = event.source === "incoming_webhook" && ctx.app?.locals?.webhooks ? (await ctx.pool.query("SELECT r.* FROM wolf_webhook_run_identity i JOIN automation_runs r ON r.id=i.run_id WHERE i.event_id=$1 AND i.automation_id=$2",[event.id,automation.id])).rows[0] : null;
     if(priorWebhookRun){await ctx.app.locals.webhooks.receiptGuard(ctx.pool,event.id);await runAutomation(priorWebhookRun.id);continue;}
     const startDecision = await canStartRun(automation, event);
@@ -3927,11 +4019,15 @@ function monitorEventSubjectMatches(monitor, event) {
 
 async function startManualRun(automationId, companyId, userId, body) {
   const automation = (await ctx.pool.query(
-    `SELECT d.*, v.id AS version_id FROM automation_definitions d JOIN automation_versions v ON v.id = d.active_version_id
+    `SELECT d.*, v.id AS version_id, c.timezone AS company_timezone,
+            c.automations_enabled, c.automation_emergency_stopped_at
+       FROM automation_definitions d JOIN automation_versions v ON v.id = d.active_version_id
+       JOIN companies c ON c.id = d.company_id
       WHERE d.id = $1 AND d.company_id = $2 AND v.status = 'published'`,
     [automationId, companyId]
   )).rows[0];
   if (!automation || !automation.allow_manual_trigger) return null;
+  if (!body.dry_run && !automationAdmissionAllowed(automation)) throw new AutomationError("automation_not_active", "Turn this automation on and choose a time inside its activation windows before running live.");
   await validateSubject(companyId, body.subject_type || "generic", body.subject_id || null);
   const eventId = await recordProcessedAutomationEvent({
     companyId,
@@ -4679,7 +4775,6 @@ async function emergencyStopCompanyAutomations(companyId, userId) {
     const result = await cancelAutomationRun(row.id, companyId, "emergency_stop", "Company emergency automation stop", { user_id: userId });
     if (result.run) canceled += 1;
   }
-  await ctx.pool.query(`UPDATE automation_definitions SET status = 'paused', updated_at = now() WHERE company_id = $1 AND status = 'published'`, [companyId]);
   return { ok: true, canceled_runs: canceled };
 }
 
@@ -6995,8 +7090,9 @@ function normalizePhone(value) {
 }
 
 async function resolveSmsTarget(run, context, config) {
-  if (config.conversation_id || config.target_mode === "current_conversation") {
-    const conversationId = resolveTemplate(config.conversation_id || context.sms?.conversation_id || "", context);
+  const mode = config.target_mode || (config.conversation_id ? "legacy_conversation" : (config.phone || config.to_phone || config.to_number ? "phone_number" : "current_contact"));
+  if (mode === "legacy_conversation" || mode === "current_conversation") {
+    const conversationId = resolveTemplate(mode === "current_conversation" ? (config.conversation_id || context.sms?.conversation_id || "") : config.conversation_id, context);
     const row = (await ctx.pool.query(
       `SELECT sc.id, sc.external_phone_number, sc.contact_id
          FROM sms_conversations sc
@@ -7008,19 +7104,23 @@ async function resolveSmsTarget(run, context, config) {
     if (!row) throw new Error("sms_conversation_not_found");
     return { conversation_id: row.id, contact_id: row.contact_id, phone: row.external_phone_number };
   }
-  if (config.target_mode === "phone_number" || config.target_mode === "phone_template" || config.phone || config.to_phone || config.to_number) {
+  if (mode === "phone_number" || mode === "phone_template") {
     if (isBracedNumericLiteral(config.phone || config.to_phone || config.to_number)) throw new Error("sms_phone_number_wrapped_as_template");
     return { contact_id: null, phone: resolveTemplate(config.phone || config.to_phone || config.to_number, context) };
   }
-  const contactId = await resolveContactId(run, context, config);
+  const selectedValue = mode === "current_contact" ? null : resolveTemplate(config.contact_id || "", context);
+  const selectedContactId = typeof selectedValue === "string" ? selectedValue.trim() : null;
+  if (["specific_contact", "contact_template"].includes(mode) && !selectedContactId) throw new Error("contact_id_required");
+  const contactId = await resolveContactId(run, context, { ...config, contact_id: selectedContactId });
   const contact = (await ctx.pool.query(`SELECT id, phone FROM contacts WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL`, [contactId, run.company_id])).rows[0];
   if (!contact) throw new Error("contact_not_found");
   return { contact_id: contact.id, phone: contact.phone };
 }
 
 async function resolveIMessageTarget(run, context, config) {
-  if (config.conversation_id || config.target_mode === "current_conversation") {
-    const conversationId = resolveTemplate(config.conversation_id || context.imessage?.conversation_id || "", context);
+  const mode = config.target_mode || (config.conversation_id ? "legacy_conversation" : (config.phone || config.to_phone || config.to_number ? "phone_number" : "current_contact"));
+  if (mode === "legacy_conversation" || mode === "current_conversation") {
+    const conversationId = resolveTemplate(mode === "current_conversation" ? (config.conversation_id || context.imessage?.conversation_id || "") : config.conversation_id, context);
     const row = (await ctx.pool.query(
       `SELECT id, external_phone_number, contact_id
          FROM imessage_conversations
@@ -7031,11 +7131,14 @@ async function resolveIMessageTarget(run, context, config) {
     if (!row) throw new Error("imessage_conversation_not_found");
     return { conversation_id: row.id, contact_id: row.contact_id, phone: row.external_phone_number };
   }
-  if (config.target_mode === "phone_number" || config.target_mode === "phone_template" || config.phone || config.to_phone || config.to_number) {
+  if (mode === "phone_number" || mode === "phone_template") {
     if (isBracedNumericLiteral(config.phone || config.to_phone || config.to_number)) throw new Error("sms_phone_number_wrapped_as_template");
     return { contact_id: null, phone: resolveTemplate(config.phone || config.to_phone || config.to_number, context) };
   }
-  const contactId = await resolveContactId(run, context, config);
+  const selectedValue = mode === "current_contact" ? null : resolveTemplate(config.contact_id || "", context);
+  const selectedContactId = typeof selectedValue === "string" ? selectedValue.trim() : null;
+  if (["specific_contact", "contact_template"].includes(mode) && !selectedContactId) throw new Error("contact_id_required");
+  const contactId = await resolveContactId(run, context, { ...config, contact_id: selectedContactId });
   const contact = (await ctx.pool.query(`SELECT id, phone FROM contacts WHERE id::text = $1 AND company_id = $2 AND deleted_at IS NULL`, [contactId, run.company_id])).rows[0];
   if (!contact) throw new Error("contact_not_found");
   return { contact_id: contact.id, phone: contact.phone };
@@ -8936,11 +9039,15 @@ function safeResponseHeaders(headers) {
 async function executeAutomationStart(run, node, config) {
   const automationId = config.automation_id;
   const automation = (await ctx.pool.query(
-    `SELECT d.*, v.id AS version_id FROM automation_definitions d JOIN automation_versions v ON v.id = d.active_version_id
-      WHERE d.id = $1 AND d.company_id = $2 AND d.status = 'published' AND v.status = 'published'`,
+    `SELECT d.*, v.id AS version_id, c.timezone AS company_timezone,
+            c.automations_enabled, c.automation_emergency_stopped_at
+       FROM automation_definitions d JOIN automation_versions v ON v.id = d.active_version_id
+       JOIN companies c ON c.id = d.company_id
+      WHERE d.id = $1 AND d.company_id = $2 AND v.status = 'published'`,
     [automationId, run.company_id]
   )).rows[0];
   if (!automation) throw new Error("child_automation_not_found");
+  if (!run.dry_run && !automationAdmissionAllowed(automation)) throw new AutomationError("child_automation_not_active", "Child automation is off, paused, or outside its activation windows.");
   if (run.depth >= AUTOMATION_LIMITS.maxChildDepth) throw new Error("child_depth_limit");
   const child = await createRun({
     companyId: run.company_id,
@@ -9126,6 +9233,7 @@ async function automationHealth(companyId) {
 async function retryAutomationRun(runId, companyId, userId) {
   const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1 AND company_id = $2 AND status IN ('failed','stopped','canceled')`, [runId, companyId])).rows[0];
   if (!run) return null;
+  await assertRecoveryAdmission(run);
   const recovery = await createRun({
     companyId,
     automationId: run.automation_id,
@@ -9150,6 +9258,7 @@ async function retryAutomationRunNode(runId, runNodeId, companyId, userId) {
   const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1 AND company_id = $2 AND status IN ('failed','stopped')`, [runId, companyId])).rows[0];
   const failedNode = (await ctx.pool.query(`SELECT * FROM automation_run_nodes WHERE id = $1 AND run_id = $2 AND status = 'failed'`, [runNodeId, runId])).rows[0];
   if (!run || !failedNode?.node_id) return null;
+  await assertRecoveryAdmission(run);
   const recovery = await createRun({
     companyId,
     automationId: run.automation_id,
@@ -9177,6 +9286,7 @@ async function retryAutomationIteration(runId, iterationId, companyId, userId) {
   const run = (await ctx.pool.query(`SELECT * FROM automation_runs WHERE id = $1 AND company_id = $2`, [runId, companyId])).rows[0];
   const iteration = (await ctx.pool.query(`SELECT * FROM automation_run_iterations WHERE id = $1 AND run_id = $2 AND status = 'failed'`, [iterationId, runId])).rows[0];
   if (!run || !iteration) return null;
+  await assertRecoveryAdmission(run);
   const node = (await ctx.pool.query(`SELECT * FROM automation_nodes WHERE id = $1`, [iteration.foreach_node_id])).rows[0];
   if (!node) return null;
   const recovery = await createRun({
@@ -9322,6 +9432,8 @@ export const automationTestHooks = {
   processAutomationEvents,
   processDueWaits,
   processScheduledAutomationEvents,
+  resolveSmsTarget,
+  resolveIMessageTarget,
   publishAutomation,
   retryAutomationRun,
   retryAutomationRunNode,
