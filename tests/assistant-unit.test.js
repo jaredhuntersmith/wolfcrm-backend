@@ -6,10 +6,26 @@ import {compactHistory,evidenceHash} from '../assistant/context.js';
 import {validFieldPath,restrictFields} from '../mcp/field-policy.js';
 import {aiTaskConfig} from '../assistant/automation.js';
 import {createProvider,estimateMicros} from '../assistant/models.js';
+import {comparableReadEvidence,retireReadEvidence} from '../assistant/reliability.js';
 
 test('JSONB key order cannot change new receipt/evidence identity',()=>{
  assert.equal(evidenceHash({b:{z:2,a:1},a:[{y:2,x:1}]}),evidenceHash({a:[{x:1,y:2}],b:{a:1,z:2}}));
  assert.notEqual(evidenceHash({items:[1,2]}),evidenceHash({items:[2,1]}));
+});
+test('sales report revalidation ignores only volatile generation time',()=>{
+ const report={report:{generated_at:'2026-10-20T01:00:00Z',summary:{revenue_sold_cents:1000},partial:false,failed_sources:[]},currency:'USD'};
+ const reread={...report,report:{...report.report,generated_at:'2026-10-20T01:00:01Z'}};
+ assert.equal(evidenceHash(comparableReadEvidence('sales_report',report)),evidenceHash(comparableReadEvidence('sales_report',reread)));
+ assert.notEqual(evidenceHash(comparableReadEvidence('sales_report',report)),evidenceHash(comparableReadEvidence('sales_report',{...reread,report:{...reread.report,summary:{revenue_sold_cents:999}}})));
+ assert.notEqual(evidenceHash(comparableReadEvidence('sales_report',report)),evidenceHash(comparableReadEvidence('sales_report',{...reread,report:{...reread.report,partial:true}})));
+ assert.notEqual(evidenceHash(comparableReadEvidence('finance_profit_loss',report)),evidenceHash(comparableReadEvidence('finance_profit_loss',reread)));
+});
+test('confirmed write retires prior read values without discarding their receipts',()=>{
+ const history=[{type:'function_call_output',call_id:'read',output:JSON.stringify({page:{revision:2,private:true}})},{type:'function_call_output',call_id:'other',output:JSON.stringify({ok:true})}];
+ const retired=retireReadEvidence(history,[{call_id:'read',tool:'notes_page'}]);
+ assert.deepEqual(JSON.parse(retired[0].output),{evidence_retired:true,capability:'notes_page',note:'A confirmed change superseded this read. Retrieve fresh authorized data before relying on it.'});
+ assert.deepEqual(retired[1],history[1]);
+ assert.equal(JSON.parse(history[0].output).page.revision,2);
 });
 test('compaction preserves call receipts and the current request',()=>{
  const history=[{role:'user',content:'Goal'},...Array.from({length:12},(_,i)=>({type:'function_call_output',call_id:String(i),output:'x'.repeat(20000)})),{role:'user',content:'Current request'}];

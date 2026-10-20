@@ -25,10 +25,18 @@ export function businessOutcome(result){
  return {status:'succeeded',reason:null};
 }
 
-// After a confirmed owner job write, earlier reads are no longer current. Keep
-// original step receipts intact, but remove their values from provider context.
-// A subsequent use must perform a fresh authorized read, not bypass comparison.
+// Ignore only presentation metadata that changes on every canonical read.
+// All business values, coverage, and warning fields remain part of the check.
+export function comparableReadEvidence(tool,result){
+ if(tool!=='sales_report'||!result?.report||!Object.hasOwn(result.report,'generated_at'))return result;
+ const {generated_at,...report}=result.report;
+ return {...result,report};
+}
+
+// A confirmed write can invalidate earlier reads in this run. Keep original
+// step receipts intact, but remove those values from provider context. The
+// assistant must retrieve fresh authorized data before relying on them again.
 export function retireReadEvidence(history,steps){
  const reads=new Map(steps.map(s=>[s.call_id,s]));
- return history.map(item=>item.type==='function_call_output'&&reads.has(item.call_id)?{...item,output:JSON.stringify({evidence_retired:true,capability:reads.get(item.call_id).tool,note:'A confirmed job change superseded this read. Retrieve fresh authorized data before relying on it.'})}:item);
+ return history.map(item=>item.type==='function_call_output'&&reads.has(item.call_id)?{...item,output:JSON.stringify({evidence_retired:true,capability:reads.get(item.call_id).tool,note:'A confirmed change superseded this read. Retrieve fresh authorized data before relying on it.'})}:item);
 }
