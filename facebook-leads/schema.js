@@ -32,6 +32,9 @@ export async function installFacebookLeadSchema(db) {
       FOREIGN KEY(company_id,page_id) REFERENCES facebook_lead_pages(company_id,page_id) ON DELETE CASCADE
     );
     ALTER TABLE facebook_lead_forms ADD COLUMN IF NOT EXISTS import_since TIMESTAMPTZ NOT NULL DEFAULT now();
+    -- Existing forms remain discoverable, but no old automatic mapping is treated as configured.
+    ALTER TABLE facebook_lead_forms ADD COLUMN IF NOT EXISTS destination JSONB;
+    ALTER TABLE facebook_lead_forms ADD COLUMN IF NOT EXISTS mapping_ready BOOLEAN NOT NULL DEFAULT false;
     CREATE UNIQUE INDEX IF NOT EXISTS facebook_lead_forms_route_idx ON facebook_lead_forms(form_id) WHERE routed;
     CREATE INDEX IF NOT EXISTS facebook_lead_forms_page_idx ON facebook_lead_forms(company_id,page_id);
     CREATE TABLE IF NOT EXISTS facebook_lead_oauth_states (
@@ -52,6 +55,12 @@ export async function installFacebookLeadSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS facebook_lead_jobs_ready_idx ON facebook_lead_jobs(available_at) WHERE status IN ('pending','retry','processing');
     CREATE INDEX IF NOT EXISTS facebook_lead_jobs_company_idx ON facebook_lead_jobs(company_id,created_at DESC);
+    ALTER TABLE facebook_lead_jobs ADD COLUMN IF NOT EXISTS campaign_id TEXT;
+    ALTER TABLE facebook_lead_jobs ADD COLUMN IF NOT EXISTS adset_id TEXT;
+    ALTER TABLE facebook_lead_jobs ADD COLUMN IF NOT EXISTS ad_id TEXT;
+    CREATE INDEX IF NOT EXISTS facebook_lead_jobs_campaign_idx ON facebook_lead_jobs(company_id,campaign_id,created_at DESC) WHERE status='succeeded' AND campaign_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS facebook_lead_jobs_adset_idx ON facebook_lead_jobs(company_id,adset_id,created_at DESC) WHERE status='succeeded' AND adset_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS facebook_lead_jobs_ad_idx ON facebook_lead_jobs(company_id,ad_id,created_at DESC) WHERE status='succeeded' AND ad_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS facebook_lead_scans (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(), company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
       form_id TEXT NOT NULL, from_time TIMESTAMPTZ NOT NULL, to_time TIMESTAMPTZ NOT NULL,

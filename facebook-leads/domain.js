@@ -97,38 +97,22 @@ const addresses = [
   "postal_code",
   "country",
 ];
-export function autoMapping(source, unknownPolicy = "lead_info") {
-  const key = source.key.replace(/^field:/, "");
-  if (source.key === "meta:created_time")
-    return { destination: "lead_submitted_at", origin: "automatic" };
-  if (source.key.startsWith("meta:"))
-    return { destination: "ignore", origin: "automatic" };
-  // A discard policy applies to newly encountered custom questions, not known standard fields.
-  if (source.key.startsWith("field:")) {
-    if (names.includes(key))
-      return { destination: "name", rule: "name", origin: "automatic" };
-    if (key === "email") return { destination: "email", origin: "automatic" };
-    if (["phone_number", "phone"].includes(key))
-      return {
-        destination: "phone",
-        origin: "automatic",
-        rule: "priority",
-        priority: key === "phone_number" ? 0 : 1,
-      };
-    if (addresses.includes(key) || key === "address")
-      return { destination: "address", rule: "address", origin: "automatic" };
-  }
-  return {
-    destination: unknownPolicy === "ignore" ? "ignore" : "lead_info",
-    origin: "automatic",
-  };
-}
 export function effectiveMapping(source, settings, overrides = {}) {
-  return (
-    overrides[source.key] ||
-    settings.mappings?.[source.key] ||
-    autoMapping(source, settings.unknown_policy)
+  // Company defaults and guessed field names must never route a form answer.
+  return overrides[source.key] || null;
+}
+export function mappingReadiness(sources = [], mappings = {}, destination = null) {
+  const required = sources.filter((s) =>
+    /^(field|consent):.{1,250}$/u.test(s.key),
   );
+  const missing_sources = required
+    .filter((s) => mappings[s.key]?.origin !== "manual" || !allowed.has(mappings[s.key]?.destination))
+    .map((s) => s.key);
+  return {
+    ready: required.length > 0 && missing_sources.length === 0 && destination?.type === "contacts" &&
+      (destination.stage_id === null || typeof destination.stage_id === "string"),
+    missing_sources,
+  };
 }
 export function validateMappings(
   mappings,
@@ -146,6 +130,7 @@ export function validateMappings(
   for (const [key, row] of Object.entries(mappings)) {
     if (
       !/^(field|consent|meta):.{1,250}$/u.test(key) ||
+      !sources.some((source) => source.key === key) ||
       !row ||
       !allowed.has(row.destination)
     )
@@ -185,7 +170,7 @@ export function validateMappings(
       fail("invalid_mapping_priority");
     clean[key] = {
       destination: row.destination,
-      origin: row.origin === "automatic" ? "automatic" : "manual",
+      origin: "manual",
       ...(row.rule ? { rule: row.rule } : {}),
       ...(row.rule === "priority" ? { priority: row.priority } : {}),
     };
@@ -193,6 +178,7 @@ export function validateMappings(
   const groups = new Map();
   for (const source of sources) {
     const row = effectiveMapping(source, settings, clean);
+    if (!row) continue;
     if (row.destination === "ignore" || row.destination.startsWith("lead_info"))
       continue;
     const group = groups.get(row.destination) || [];
@@ -317,6 +303,16 @@ export function mapLead(lead, form, settings = DEFAULT_SETTINGS) {
     });
   for (const source of leadSources(lead, form)) {
     const mapping = effectiveMapping(source, settings, form.mappings || {});
+    if (!mapping) {
+      if (source.key.startsWith("meta:")) {
+        ignored.push(source.key);
+        continue;
+      }
+      discovered.push({ key: source.key, label: source.label, type: source.type, review: true });
+      issues.push({ key: source.key, code: "facebook_form_field_mapping_required" });
+      rows.push({ key: source.key, label: source.label, mapping: null, unmapped: true });
+      continue;
+    }
     // Drop values before constructing any output/diagnostic/discovery structure.
     if (mapping.destination === "ignore") {
       if (source.review)

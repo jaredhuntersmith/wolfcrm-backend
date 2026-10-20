@@ -90,6 +90,7 @@ test(
                       questions: [
                         { key: "full_name", label: "Name" },
                         { key: "email", label: "Email" },
+                        { key: "phone_number", label: "Phone" },
                         { key: "services", label: "Services?" },
                         { key: "private", label: "Do not retain" },
                       ],
@@ -203,6 +204,9 @@ test(
             ).label,
             "Services?",
           );
+          const notReady = (await store.status(company)).forms[0];
+          assert.equal(notReady.mapping_ready, false);
+          assert.equal((await request(base + "/forms/20", { enabled: true, revision: notReady.revision }, "PUT")).body.error, "facebook_form_mapping_required");
           assert.equal(
             (
               await request(
@@ -210,11 +214,16 @@ test(
                 {
                   revision: m.revision,
                   mappings: {
+                    "field:full_name": { destination: "name", origin: "manual" },
+                    "field:email": { destination: "email", origin: "manual" },
+                    "field:phone_number": { destination: "phone", origin: "manual" },
+                    "field:services": { destination: "lead_info", origin: "manual" },
                     "field:private": {
                       destination: "ignore",
                       origin: "manual",
                     },
                   },
+                  destination: { type: "contacts", stage_id: null },
                 },
                 "PUT",
               )
@@ -237,6 +246,7 @@ test(
             404,
           );
           const f = (await store.status(company)).forms[0];
+          assert.equal(f.mapping_ready, true);
           assert.equal(
             (
               await request(
@@ -367,6 +377,74 @@ test(
             ).rows;
             assert.ok(!JSON.stringify(rows).includes("IGNORED_"), table);
           }
+        },
+      );
+      await t.test(
+        "chosen stage creates a scoped opportunity and attributed lead list links to the saved contact",
+        async () => {
+          const stageID = randomUUID();
+          await pool.query(
+            "INSERT INTO stages(id,user_id,company_id,name) VALUES($1,$2,$3,'New Facebook leads')",
+            [stageID, owner, company],
+          );
+          const before = await store.mapping(company, "20");
+          await store.saveMapping(company, "20", {
+            revision: before.revision,
+            mappings: before.mappings,
+            destination: { type: "contacts", stage_id: stageID },
+          });
+          assert.ok((await request(base + "/stages")).body.items.some((stage) => stage.id === stageID));
+          makeLead("105");
+          leads.set("105", { ...leads.get("105"), campaign_id: "901", adset_id: "902", ad_id: "903" });
+          await webhook(["105"]);
+          await worker.processJob(await worker.claim("facebook_lead_jobs"));
+          const receipt = (await pool.query("SELECT * FROM facebook_lead_jobs WHERE company_id=$1 AND lead_id='105'", [company])).rows[0];
+          assert.equal(receipt.status, "succeeded");
+          assert.equal(receipt.campaign_id, "901");
+          const opportunity = (await pool.query("SELECT * FROM opportunities WHERE company_id=$1 AND contact_id=$2", [company, receipt.contact_id])).rows[0];
+          assert.equal(opportunity.stage_id, stageID);
+          const list = await request(base + "/leads?campaign_id=901");
+          assert.equal(list.status, 200);
+          assert.equal(list.body.items[0].contact_id, receipt.contact_id);
+          assert.equal(list.body.items[0].contact_name, "Synthetic Facebook Customer");
+          assert.equal((await request(base + "/leads?adset_id=902")).body.items[0].lead_id, "105");
+          assert.equal((await request(base + "/leads?ad_id=903")).body.items[0].lead_id, "105");
+          assert.equal((await request(base + "/leads?campaign_id=901", undefined, "GET", otherOwner)).body.items.length, 0);
+          assert.equal((await request(base + "/leads?campaign_id=901&ad_id=903")).status, 400);
+          const latest = await store.mapping(company, "20");
+          await store.saveMapping(company, "20", {
+            revision: latest.revision,
+            mappings: latest.mappings,
+            destination: { type: "contacts", stage_id: null },
+          });
+        },
+      );
+      await t.test(
+        "a new provider question holds the lead ID without importing answers until explicitly mapped",
+        async () => {
+          makeLead("106", [{ name: "new_question", values: ["SENSITIVE_NEW_ANSWER"] }]);
+          await webhook(["106"]);
+          await worker.processJob(await worker.claim("facebook_lead_jobs"));
+          const receipt = (await pool.query("SELECT id,status,contact_id,error_code FROM facebook_lead_jobs WHERE company_id=$1 AND lead_id='106'", [company])).rows[0];
+          assert.equal(receipt.status, "review");
+          assert.equal(receipt.contact_id, null);
+          assert.equal(receipt.error_code, "facebook_form_field_mapping_required");
+          assert.equal((await store.status(company)).forms[0].mapping_ready, false);
+          assert.equal(await worker.claim("facebook_lead_jobs"), undefined);
+          assert.ok(!JSON.stringify((await pool.query("SELECT * FROM facebook_lead_jobs WHERE id=$1", [receipt.id])).rows).includes("SENSITIVE_NEW_ANSWER"));
+          const current = await store.mapping(company, "20");
+          assert.ok(current.missing_sources.includes("field:new_question"));
+          await store.saveMapping(company, "20", {
+            revision: current.revision,
+            mappings: { ...current.mappings, "field:new_question": { destination: "lead_info:3", origin: "manual" } },
+            destination: { type: "contacts", stage_id: null },
+          });
+          assert.equal((await request(base + "/jobs/" + receipt.id + "/retry", {}, "POST")).status, 200);
+          await worker.processJob(await worker.claim("facebook_lead_jobs"));
+          const completed = (await pool.query("SELECT status,contact_id FROM facebook_lead_jobs WHERE id=$1", [receipt.id])).rows[0];
+          assert.equal(completed.status, "succeeded");
+          const saved = (await pool.query("SELECT lead_info FROM contacts WHERE id=$1", [completed.contact_id])).rows[0];
+          assert.match(saved.lead_info.join(""), /SENSITIVE_NEW_ANSWER/);
         },
       );
       await t.test(
@@ -724,19 +802,19 @@ test(
           );
           leads.set("201", oldLead);
           const defaults = await store.mapping(company, "defaults");
-          await store.saveMapping(company, "defaults", {
+          await assert.rejects(store.saveMapping(company, "defaults", {
             revision: defaults.revision,
             mappings: {
               "field:email": { destination: "lead_info:4", origin: "manual" },
             },
             unknown_policy: "ignore",
             overwrite: false,
-          });
+          }), /facebook_company_defaults_retired/);
           assert.equal(
             (await store.mapping(company, "20")).sources.find(
               (s) => s.key === "field:email",
             ).mapping.destination,
-            "lead_info:4",
+            "email",
           );
           const current = await store.mapping(company, "20");
           await pool.query(
@@ -763,7 +841,7 @@ test(
           assert.equal(
             copied.sources.find((s) => s.key === "field:email").mapping
               .destination,
-            "lead_info:4",
+            "email",
           );
           assert.equal(
             (
@@ -796,26 +874,13 @@ test(
             ).status,
             200,
           );
-          assert.equal(
-            (await store.mapping(company, "20")).sources.find(
-              (s) => s.key === "field:email",
-            ).mapping.destination,
-            "lead_info:4",
-          );
-          // Restore the original retention mapping for the disconnect race test.
-          const d = await store.mapping(company, "defaults");
-          await store.saveMapping(company, "defaults", {
-            revision: d.revision,
-            mappings: {},
-            unknown_policy: "lead_info",
-            overwrite: false,
-          });
+          assert.equal((await store.mapping(company, "20")).ready, false);
+          // Restore the explicit retention mapping for the disconnect race test.
           const m = await store.mapping(company, "20");
           await store.saveMapping(company, "20", {
             revision: m.revision,
-            mappings: {
-              "field:private": { destination: "ignore", origin: "manual" },
-            },
+            mappings: current.mappings,
+            destination: { type: "contacts", stage_id: null },
           });
         },
       );

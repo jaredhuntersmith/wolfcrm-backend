@@ -8,6 +8,7 @@ import {
   DEFAULT_SETTINGS,
   definitionSources,
   normalizePhone,
+  mappingReadiness,
 } from "../facebook-leads/domain.js";
 import {
   encrypt,
@@ -26,7 +27,12 @@ const form = {
     { key: "full_name", label: "Full name" },
     { key: "private", label: "Private" },
   ]),
-  mappings: { "field:private": { destination: "ignore", origin: "manual" } },
+  mappings: {
+    "field:services": { destination: "lead_info", origin: "manual" },
+    "field:email": { destination: "email", origin: "manual" },
+    "field:full_name": { destination: "name", origin: "manual" },
+    "field:private": { destination: "ignore", origin: "manual" },
+  },
 };
 const lead = {
   id: "30",
@@ -54,7 +60,7 @@ test("all custom answers survive and ignored values are absent from every mappin
   assert.match(contact.lead_info.join(""), /Which services\?/);
   assert.match(contact.lead_info.join(""), /你好/);
 });
-test("manual overrides beat defaults; unknown discard never leaks values", () => {
+test("explicit form mapping ignores company defaults; unknown answers never leak values", () => {
   const result = mapLead(
     {
       ...lead,
@@ -74,6 +80,7 @@ test("manual overrides beat defaults; unknown discard never leaks values", () =>
   );
   assert.equal(result.contact.email, undefined);
   assert.ok(!JSON.stringify(result).includes("SECRET_UNKNOWN"));
+  assert.ok(result.issues.some((issue) => issue.code === "facebook_form_field_mapping_required"));
   assert.equal(
     result.entries.find((e) => e.key === "field:email").destination,
     "lead_info:2",
@@ -90,7 +97,7 @@ test("invalid/deleted targets and optional invalid email preserve Q&A; multiple 
     },
     {
       ...form,
-      mappings: { "field:services": { destination: "deleted_custom_field" } },
+      mappings: { ...form.mappings, "field:services": { destination: "deleted_custom_field" } },
     },
   );
   assert.equal(result.contact.email, undefined);
@@ -113,7 +120,13 @@ test("components compose actual fields, priorities are explicit and scalar confl
         values: [s.key.slice(6)],
       })),
     },
-    { ...form, sources, mappings: {} },
+    { ...form, sources, mappings: {
+      "field:first_name": { destination: "name", rule: "name" },
+      "field:last_name": { destination: "name", rule: "name" },
+      "field:street_address": { destination: "address", rule: "address" },
+      "field:city": { destination: "address", rule: "address" },
+      "field:country": { destination: "address", rule: "address" },
+    } },
   );
   assert.equal(result.contact.name, "first_name last_name");
   assert.equal(result.contact.address, "street_address, city, country");
@@ -171,7 +184,11 @@ test("consent is data only; missing and unchecked are not consent grants", () =>
         { checkbox_key: "email", is_checked: "0" },
       ],
     },
-    form,
+    { ...form, mappings: {
+      ...form.mappings,
+      "consent:sms": { destination: "lead_info", origin: "manual" },
+      "consent:email": { destination: "lead_info", origin: "manual" },
+    } },
   );
   assert.equal(Object.keys(result.contact).length, 0);
   assert.match(result.entries[0].value, /Not checked/);
@@ -219,7 +236,9 @@ test("conditional questions and consent definitions keep stable keys and labels 
         { checkbox_key: "contact_permission", is_checked: false },
       ],
     },
-    { ...form, sources },
+    { ...form, sources, mappings: {
+      "consent:contact_permission": { destination: "lead_info", origin: "manual" },
+    } },
   );
   assert.equal(
     mapped.entries.find(
@@ -228,6 +247,15 @@ test("conditional questions and consent definitions keep stable keys and labels 
     "false",
   );
   assert.ok(!JSON.stringify(sources).includes("is_checked_by_default"));
+});
+test("form readiness requires an explicit decision for every discovered answer and destination", () => {
+  assert.deepEqual(mappingReadiness(form.sources, form.mappings, null), {
+    ready: false, missing_sources: [],
+  });
+  assert.equal(mappingReadiness(form.sources, form.mappings, { type: "contacts", stage_id: null }).ready, true);
+  const incomplete = mappingReadiness(form.sources, { "field:email": form.mappings["field:email"] }, { type: "contacts", stage_id: null });
+  assert.deepEqual(incomplete.missing_sources, ["field:services", "field:full_name", "field:private"]);
+  assert.throws(() => validateMappings({ "field:unknown": { destination: "email" } }, form.sources), /destination/);
 });
 test("optional Meta errors preserve core answers and expose availability without echoing provider data", async () => {
   const graph = new FacebookGraph(

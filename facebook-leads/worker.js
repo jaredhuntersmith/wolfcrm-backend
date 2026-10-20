@@ -18,7 +18,7 @@ export function createFacebookLeadWorker({
     const scan = table === "facebook_lead_scans";
     return one(
       pool,
-      `UPDATE ${table} j SET status='processing',lease=$1,lease_until=now()+interval '5 minutes',attempts=attempts+1 WHERE j.id=(SELECT q.id FROM ${table} q JOIN facebook_lead_forms f ON f.company_id=q.company_id AND f.form_id=q.form_id JOIN facebook_lead_pages p ON p.company_id=f.company_id AND p.page_id=f.page_id JOIN facebook_lead_connections c ON c.company_id=f.company_id WHERE (q.status IN ('pending','retry') AND q.available_at<=now() OR q.status='processing' AND q.lease_until<now()) AND q.attempts<8 AND p.selected AND p.token IS NOT NULL AND c.token IS NOT NULL AND NOT c.importing_paused AND (c.expires_at IS NULL OR c.expires_at>now()) AND (NOT c.unified OR (c.status='authorized' AND c.permissions ? 'leads_retrieval')) ${scan ? "" : "AND f.enabled"} ORDER BY q.available_at,q.id FOR UPDATE OF q SKIP LOCKED LIMIT 1) RETURNING j.*`,
+      `UPDATE ${table} j SET status='processing',lease=$1,lease_until=now()+interval '5 minutes',attempts=attempts+1 WHERE j.id=(SELECT q.id FROM ${table} q JOIN facebook_lead_forms f ON f.company_id=q.company_id AND f.form_id=q.form_id JOIN facebook_lead_pages p ON p.company_id=f.company_id AND p.page_id=f.page_id JOIN facebook_lead_connections c ON c.company_id=f.company_id WHERE (q.status IN ('pending','retry') AND q.available_at<=now() OR q.status='processing' AND q.lease_until<now()) AND q.attempts<8 AND p.selected AND p.token IS NOT NULL AND c.token IS NOT NULL AND NOT c.importing_paused AND (c.expires_at IS NULL OR c.expires_at>now()) AND (NOT c.unified OR (c.status='authorized' AND c.permissions ? 'leads_retrieval')) ${scan ? "AND (q.preview OR f.mapping_ready)" : "AND f.enabled AND f.mapping_ready"} ORDER BY q.available_at,q.id FOR UPDATE OF q SKIP LOCKED LIMIT 1) RETURNING j.*`,
       [randomUUID()],
     );
   }
@@ -102,7 +102,8 @@ export function createFacebookLeadWorker({
               !c.permissions.includes("leads_retrieval"))) ||
           !f.token ||
           !f.selected ||
-          !f.enabled
+          !f.enabled ||
+          !f.mapping_ready
         ) {
           await db.query(
             "UPDATE facebook_lead_jobs SET status='pending',lease=NULL,lease_until=NULL,attempts=GREATEST(0,attempts-1) WHERE id=$1",
@@ -118,6 +119,25 @@ export function createFacebookLeadWorker({
           "UPDATE facebook_lead_forms SET sources=$3::jsonb,revision=revision+CASE WHEN sources<>$3::jsonb THEN 1 ELSE 0 END WHERE company_id=$1 AND form_id=$2",
           [job.company_id, job.form_id, JSON.stringify([...known.values()])],
         );
+        if (mapped.issues.some((issue) => issue.code === "facebook_form_field_mapping_required")) {
+          await db.query(
+            "UPDATE facebook_lead_forms SET mapping_ready=false,error_code='facebook_form_field_mapping_required' WHERE company_id=$1 AND form_id=$2",
+            [job.company_id, job.form_id],
+          );
+          await db.query(
+            "UPDATE facebook_lead_jobs SET status='review',error_code='facebook_form_field_mapping_required',lease=NULL,lease_until=NULL,updated_at=now() WHERE id=$1",
+            [job.id],
+          );
+          return;
+        }
+        let targetStage = null;
+        if (f.destination?.stage_id) {
+          targetStage = await one(db,
+            `SELECT s.id,s.pipeline_id FROM stages s
+             WHERE s.id=$1 AND (s.company_id=$2 OR (s.company_id IS NULL AND s.user_id=$3))`,
+            [f.destination.stage_id, job.company_id, c.user_id]);
+          if (!targetStage) fail("facebook_lead_stage_unavailable", 409);
+        }
         const prior = (
           await db.query(
             "SELECT * FROM contacts WHERE company_id=$1 AND external_lead_id=$2 AND source IN ('facebook_zapier','facebook_direct') ORDER BY id LIMIT 2",
@@ -125,7 +145,7 @@ export function createFacebookLeadWorker({
           )
         ).rows;
         if (prior.length === 1) {
-          await finish(db, job, prior[0].id, "already_imported", []);
+          await finish(db, job, prior[0].id, "already_imported", [], fetched.lead);
           return;
         }
         const matches =
@@ -198,6 +218,32 @@ export function createFacebookLeadWorker({
             ],
           );
         }
+        if (targetStage) {
+          const priorOpportunity = await one(db,
+            `SELECT id FROM opportunities WHERE contact_id=$1 AND
+             (company_id=$2 OR (company_id IS NULL AND user_id=$3))
+             ORDER BY updated_at DESC LIMIT 1 FOR UPDATE`,
+            [id, job.company_id, c.user_id]);
+          if (!priorOpportunity) {
+            const opportunityID = randomUUID();
+            await db.query(
+              `INSERT INTO opportunities(id,user_id,company_id,contact_id,state,stage_id,pipeline_id)
+               VALUES($1,$2,$3,$4,'stage',$5,$6)`,
+              [opportunityID, c.user_id, job.company_id, id, targetStage.id, targetStage.pipeline_id],
+            );
+            for (const eventType of ["pipeline.opportunity_created", "pipeline.stage_entered"])
+              await emitAutomationEvent({
+                companyId: job.company_id,
+                eventType,
+                subjectType: "opportunity",
+                subjectId: opportunityID,
+                actorUserId: c.user_id,
+                source: "facebook_direct",
+                dedupeKey: `${eventType}:facebook_direct:${job.lead_id}`,
+                payload: { opportunity_id: opportunityID, contact_id: id, stage_id: targetStage.id, source: "facebook_direct" },
+              }, { db });
+          }
+        }
         // Use existing event writer against this transaction. Payload is identifiers only.
         for (const eventType of [
           existing ? "contact.updated" : "contact.created",
@@ -240,7 +286,7 @@ export function createFacebookLeadWorker({
         await finish(db, job, id, existing ? "matched" : "created", [
           ...mapped.issues,
           ...fetched.issues,
-        ]);
+        ], fetched.lead);
         await db.query(
           "INSERT INTO facebook_lead_outbox(job_id) VALUES($1) ON CONFLICT DO NOTHING",
           [job.id],
@@ -250,10 +296,11 @@ export function createFacebookLeadWorker({
       await failed("facebook_lead_jobs", job, e, credential);
     }
   }
-  async function finish(db, job, contactID, outcome, issues) {
+  async function finish(db, job, contactID, outcome, issues, lead) {
+    const metaID = (value) => /^\d{1,100}$/.test(String(value || "")) ? String(value) : null;
     await db.query(
-      "UPDATE facebook_lead_jobs SET status='succeeded',contact_id=$2,outcome=$3,issues=$4::jsonb,error_code=NULL,lease=NULL,lease_until=NULL,updated_at=now() WHERE id=$1",
-      [job.id, contactID, outcome, JSON.stringify(issues)],
+      "UPDATE facebook_lead_jobs SET status='succeeded',contact_id=$2,outcome=$3,issues=$4::jsonb,campaign_id=$5,adset_id=$6,ad_id=$7,error_code=NULL,lease=NULL,lease_until=NULL,updated_at=now() WHERE id=$1",
+      [job.id, contactID, outcome, JSON.stringify(issues), metaID(lead?.campaign_id), metaID(lead?.adset_id), metaID(lead?.ad_id)],
     );
     await db.query(
       "UPDATE facebook_lead_forms SET last_success_at=now(),error_code=NULL WHERE company_id=$1 AND form_id=$2",
@@ -311,6 +358,13 @@ export function createFacebookLeadWorker({
           );
           return;
         }
+        if (!job.preview && !active.mapping_ready) {
+          await db.query(
+            "UPDATE facebook_lead_scans SET status='pending',lease=NULL,lease_until=NULL,attempts=GREATEST(0,attempts-1) WHERE id=$1",
+            [job.id],
+          );
+          return;
+        }
         // No lead answers are fetched or cached by a scan, even in count preview mode.
         const ids = result.data.filter(
           (r) =>
@@ -350,7 +404,7 @@ export function createFacebookLeadWorker({
     await transaction(pool, async (db) => {
       const forms = (
         await db.query(
-          "SELECT f.* FROM facebook_lead_forms f JOIN facebook_lead_pages p USING(company_id,page_id) JOIN facebook_lead_connections c ON c.company_id=f.company_id WHERE NOT c.importing_paused AND c.token IS NOT NULL AND (c.expires_at IS NULL OR c.expires_at>now()) AND (NOT c.unified OR (c.status='authorized' AND c.permissions ? 'leads_retrieval')) AND f.enabled AND f.routed AND p.selected AND p.token IS NOT NULL AND f.recovery_at<now()-interval '15 minutes' ORDER BY f.recovery_at FOR UPDATE OF f SKIP LOCKED LIMIT 10",
+          "SELECT f.* FROM facebook_lead_forms f JOIN facebook_lead_pages p USING(company_id,page_id) JOIN facebook_lead_connections c ON c.company_id=f.company_id WHERE NOT c.importing_paused AND c.token IS NOT NULL AND (c.expires_at IS NULL OR c.expires_at>now()) AND (NOT c.unified OR (c.status='authorized' AND c.permissions ? 'leads_retrieval')) AND f.enabled AND f.mapping_ready AND f.routed AND p.selected AND p.token IS NOT NULL AND f.recovery_at<now()-interval '15 minutes' ORDER BY f.recovery_at FOR UPDATE OF f SKIP LOCKED LIMIT 10",
         )
       ).rows;
       for (const f of forms) {

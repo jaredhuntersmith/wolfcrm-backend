@@ -37,6 +37,16 @@ const messages = {
     "Choose a past range of at most 90 days. Meta may retain less history.",
   facebook_enable_form_before_backfill:
     "Enable this form for your company before importing its history.",
+  facebook_form_mapping_required:
+    "Map every question on this lead form and choose where new leads go before enabling imports.",
+  facebook_company_defaults_retired:
+    "Open a discovered lead form and map its fields there. Company-wide default mappings are no longer used.",
+  facebook_form_field_mapping_required:
+    "A new field appeared on this form. Review its mapping before importing queued leads.",
+  facebook_lead_stage_unavailable:
+    "The selected stage is no longer available. Choose a current stage in this form's settings.",
+  invalid_lead_destination: "Choose Contacts, optionally with a stage from this company.",
+  facebook_lead_attribution_filter_required: "Choose one campaign, ad set, or ad to view its imported leads.",
   lead_form_mismatch: "That lead does not belong to this form.",
   facebook_processing_failed:
     "The operation could not finish. Refresh and retry; import failures are visible in activity.",
@@ -272,12 +282,13 @@ export async function installFacebookLeads({
       );
     // Copy stable keys only; require target optimistic revision from the caller.
     const mappings = Object.fromEntries(
-      source.sources.map((s) => [s.key, s.mapping]),
+      target.sources.filter((s) => source.mappings[s.key]).map((s) => [s.key, source.mappings[s.key]]),
     );
     res.json(
       await store.saveMapping(req.companyId, target.form_id, {
         revision: req.body.target_revision,
         mappings,
+        destination: source.destination,
         unknown_policy: target.settings.unknown_policy,
         overwrite: target.settings.overwrite,
       }),
@@ -292,6 +303,8 @@ export async function installFacebookLeads({
         fail("configuration_changed_reload", 409);
       if (req.body.enabled && (!f.selected || !f.token))
         fail("facebook_select_page_first", 409);
+      if (req.body.enabled && !f.mapping_ready)
+        fail("facebook_form_mapping_required", 409);
       // An explicit form enable claims the sole company route. Pause retains that route.
       try {
         await db.query(
@@ -334,6 +347,12 @@ export async function installFacebookLeads({
   );
   scoped("get", "/activity", async (req, res) =>
     res.json(await store.activity(req.companyId, req.query.before)),
+  );
+  scoped("get", "/stages", async (req, res) =>
+    res.json(await store.stages(req.companyId)),
+  );
+  scoped("get", "/leads", async (req, res) =>
+    res.json(await store.leads(req.companyId, req.query)),
   );
   scoped("post", "/jobs/:id/retry", async (req, res) => {
     const row = (

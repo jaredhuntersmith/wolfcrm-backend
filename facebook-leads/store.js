@@ -17,6 +17,7 @@ import {
   normalizeEmail,
   normalizePhone,
   dateRange,
+  mappingReadiness,
 } from "./domain.js";
 import { encrypt, decrypt, PERMISSIONS } from "./provider.js";
 export async function transaction(pool, work) {
@@ -83,7 +84,7 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
     ).rows;
     const forms = (
       await pool.query(
-        "SELECT form_id,page_id,name,enabled,routed,revision,last_success_at,error_code,sources FROM facebook_lead_forms WHERE company_id=$1 ORDER BY name,form_id",
+        "SELECT form_id,page_id,name,enabled,routed,revision,last_success_at,error_code,sources,mappings,destination,mapping_ready FROM facebook_lead_forms WHERE company_id=$1 ORDER BY name,form_id",
         [company],
       )
     ).rows;
@@ -93,7 +94,10 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
       company_id: company,
       connection: connection || { status: "disconnected", permissions: [] },
       pages,
-      forms,
+      forms: forms.map(({ mappings, ...form }) => ({
+        ...form,
+        ...mappingReadiness(form.sources, mappings, form.destination),
+      })),
       settings: s.configuration,
       revision: s.revision,
       destinations: DESTINATIONS,
@@ -106,6 +110,7 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
         "Lead/Page/form IDs and processing status are retained for routing and duplicate prevention, even when their optional contact mappings are ignored.",
         "Ignore applies to future processing. It does not erase existing contacts or old Zapier archives.",
         "Pause holds queued leads. Resume catches up within Meta availability; old leads may expire.",
+        "Each form question and consent field needs an explicit mapping before imports run. Existing lead receipts remain intact.",
       ],
     };
   }
@@ -239,7 +244,7 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
         for (const f of forms) {
           const old = await one(
             db,
-            "SELECT sources FROM facebook_lead_forms WHERE company_id=$1 AND form_id=$2",
+            "SELECT sources,mappings,destination FROM facebook_lead_forms WHERE company_id=$1 AND form_id=$2",
             [company, String(f.id)],
           );
           const defs = definitionSources(f.questions, f.legal_content),
@@ -255,14 +260,17 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
             );
           for (const s of old?.sources || [])
             if (!known.has(s.key)) known.set(s.key, s);
+          const nextSources = [...known.values()];
+          const readiness = mappingReadiness(nextSources, old?.mappings, old?.destination);
           await db.query(
-            `INSERT INTO facebook_lead_forms(company_id,page_id,form_id,name,sources) VALUES($1,$2,$3,$4,$5::jsonb) ON CONFLICT(company_id,form_id) DO UPDATE SET name=EXCLUDED.name,sources=EXCLUDED.sources`,
+            `INSERT INTO facebook_lead_forms(company_id,page_id,form_id,name,sources,mapping_ready) VALUES($1,$2,$3,$4,$5::jsonb,$6) ON CONFLICT(company_id,form_id) DO UPDATE SET name=EXCLUDED.name,sources=EXCLUDED.sources,mapping_ready=EXCLUDED.mapping_ready`,
             [
               company,
               id,
               String(f.id),
               f.name || String(f.id),
-              JSON.stringify([...known.values()]),
+              JSON.stringify(nextSources),
+              readiness.ready,
             ],
           );
         }
@@ -352,10 +360,13 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
       })),
       mappings: f?.mappings || s.configuration.mappings,
       settings: s.configuration,
+      destination: f?.destination || null,
+      ...(f ? mappingReadiness(f.sources, f.mappings, f.destination) : { ready: false, missing_sources: [] }),
       destinations: DESTINATIONS,
     };
   }
   async function saveMapping(company, id, body) {
+    if (id === "defaults") fail("facebook_company_defaults_retired", 410);
     return transaction(pool, async (db) => {
       const s = await settings(db, company, true);
       const f =
@@ -380,13 +391,30 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
         config.overwrite = body.overwrite;
       }
       const sources = [...(f?.sources || []), ...METADATA];
-      for (const key of Object.keys(body.mappings || {}))
-        if (!sources.some((s) => s.key === key))
-          sources.push({ key, label: key, type: "text" });
       const clean = validateMappings(body.mappings, sources, config);
-      if (f)
+      let destination = f?.destination || null;
+      if (f && Object.hasOwn(body, "destination")) {
+        const requested = body.destination;
+        if (requested !== null && (
+          requested?.type !== "contacts" ||
+          !Object.hasOwn(requested, "stage_id") ||
+          (requested.stage_id !== null &&
+            (typeof requested.stage_id !== "string" || requested.stage_id.length > 100 || !requested.stage_id)) ||
+          Object.keys(requested).some((key) => !["type", "stage_id"].includes(key))
+        )) fail("invalid_lead_destination");
+        destination = requested;
+      }
+      if (f && destination?.stage_id) {
+        const stage = await one(db,
+          `SELECT s.id FROM stages s JOIN facebook_lead_connections c ON c.company_id=$1
+           WHERE s.id=$2 AND (s.company_id=$1 OR (s.company_id IS NULL AND s.user_id=c.user_id))`,
+          [company, destination.stage_id]);
+        if (!stage) fail("facebook_lead_stage_unavailable", 409);
+      }
+      if (f) {
+        const readiness = mappingReadiness(f.sources, clean, destination);
         await db.query(
-          "UPDATE facebook_lead_forms SET mappings=$3::jsonb,sources=$4::jsonb,revision=revision+1 WHERE company_id=$1 AND form_id=$2",
+          "UPDATE facebook_lead_forms SET mappings=$3::jsonb,sources=$4::jsonb,destination=$5::jsonb,mapping_ready=$6,revision=revision+1 WHERE company_id=$1 AND form_id=$2",
           [
             company,
             id,
@@ -396,9 +424,11 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
                 clean[source.key] ? { ...source, review: false } : source,
               ),
             ),
+            JSON.stringify(destination),
+            readiness.ready,
           ],
         );
-      else {
+      } else {
         config.mappings = clean;
         await db.query(
           "UPDATE facebook_lead_settings SET configuration=$2::jsonb,revision=revision+1 WHERE company_id=$1",
@@ -504,6 +534,8 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
       pageToken(f);
       if (!f.routed || !f.selected)
         fail("facebook_enable_form_before_backfill", 409);
+      if (body.preview !== true && !f.mapping_ready)
+        fail("facebook_form_mapping_required", 409);
       const row = await one(
         db,
         `INSERT INTO facebook_lead_scans(company_id,form_id,from_time,to_time,preview) VALUES($1,$2,$3,$4,$5) ON CONFLICT(company_id,form_id,preview) WHERE status IN ('pending','processing','retry') DO UPDATE SET company_id=EXCLUDED.company_id RETURNING *`,
@@ -560,6 +592,48 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
           : null,
     };
   }
+  async function stages(company) {
+    return {
+      items: (
+        await pool.query(
+          `SELECT s.id,s.name,s.pipeline_id FROM stages s
+           JOIN facebook_lead_connections c ON c.company_id=$1
+           WHERE s.company_id=$1 OR (s.company_id IS NULL AND s.user_id=c.user_id)
+           ORDER BY s.name,s.id`,
+          [company],
+        )
+      ).rows,
+    };
+  }
+  async function leads(company, query = {}) {
+    const keys = ["campaign_id", "adset_id", "ad_id"].filter((key) => query[key] !== undefined);
+    if (keys.length !== 1 || !/^\d{1,100}$/.test(String(query[keys[0]])))
+      fail("facebook_lead_attribution_filter_required");
+    let before = null;
+    if (query.before) {
+      try { before = JSON.parse(Buffer.from(String(query.before), "base64url").toString()); }
+      catch { fail("invalid_activity_cursor"); }
+      if (!Number.isFinite(Date.parse(before?.at)) || !/^[-a-f0-9]{36}$/.test(before?.id))
+        fail("invalid_activity_cursor");
+    }
+    const rows = (
+      await pool.query(
+        `SELECT j.id,j.lead_id,j.form_id,j.contact_id,j.created_at,j.created_at::text AS cursor_time,
+                c.name AS contact_name,c.email AS contact_email
+         FROM facebook_lead_jobs j JOIN contacts c ON c.id=j.contact_id AND c.company_id=j.company_id
+         WHERE j.company_id=$1 AND j.${keys[0]}=$2 AND j.status='succeeded' AND c.deleted_at IS NULL
+           AND (j.created_at,j.id)<($3::timestamptz,$4::uuid)
+         ORDER BY j.created_at DESC,j.id DESC LIMIT 51`,
+        [company, String(query[keys[0]]), before?.at || new Date(Date.now() + 1000), before?.id || "ffffffff-ffff-ffff-ffff-ffffffffffff"],
+      )
+    ).rows;
+    const page = rows.slice(0, 50);
+    return {
+      items: page.map(({ cursor_time, ...row }) => row),
+      next_before: rows.length > 50 ? Buffer.from(JSON.stringify({ at: page.at(-1).cursor_time, id: page.at(-1).id })).toString("base64url") : null,
+      attribution: keys[0],
+    };
+  }
   return {
     settings,
     page,
@@ -576,6 +650,8 @@ export function createFacebookLeadStore({ pool, graph, env = process.env }) {
     preview,
     scan,
     activity,
+    stages,
+    leads,
   };
 }
 export function safeError(error) {
