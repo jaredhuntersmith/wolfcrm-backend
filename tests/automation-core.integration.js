@@ -444,6 +444,41 @@ async function testStageEnteredSmsDryRunTemplateAndRecipient() {
   assert.equal((await scalar(`SELECT COUNT(*)::int AS count FROM sms_messages WHERE conversation_id IN (SELECT id FROM sms_conversations WHERE contact_id = $1)`, [eventContactId])).count, 0);
 }
 
+async function testStageAmountConditions() {
+  const seed = await seedCompany();
+  const contactId = await createContact(seed, { name: "Amount Test" });
+  const opportunityId = randomUUID();
+  await pool.query(`INSERT INTO opportunities(id,user_id,company_id,contact_id,state,stage_id) VALUES($1,$2,$3,$4,'stage',$5)`,
+    [opportunityId, seed.userId, seed.companyId, contactId, seed.stageId]);
+  for (const [cents, field, expected] of [[30000,"pipeline.opportunity_value",true], [20000,"pipeline.opportunity_value",false], [15000,"pipeline.opportunity_value",false], [30000,"quote.total_cents",false]]) {
+    await pool.query(`UPDATE contacts SET value_cents=$1 WHERE id=$2`, [cents, contactId]);
+    const trigger = node("stage", "trigger", { trigger_key: "pipeline.stage_entered", stage_id: seed.stageId });
+    const condition = node("amount", "condition", { condition: { field, operator: "greater_than", value: "200" } });
+    const sms = node("sms", "action", { action_key: "sms.send", target_mode: "phone_number", phone: "+15550001234", body: "{{contact.name}} entered the stage" });
+    const no = node("no", "action", { action_key: "contact.add_tag", target_mode: "current_contact", tags: ["below threshold"] });
+    const created = await createAutomation(seed, graphFrom([trigger,condition,sms,no], [edge(trigger,condition),edge(condition,sms,"true"),edge(condition,no,"false")]));
+    state.smsCalls = [];
+    const run = await automationTestHooks.startDraftTestRun(created.automationId, seed.companyId, seed.userId, {
+      subject_type: "opportunity", subject_id: opportunityId, trigger_key: "pipeline.stage_entered",
+      payload: { opportunity_id: opportunityId, contact_id: contactId, stage_id: seed.stageId }
+    });
+    await automationTestHooks.runAutomation(run.id);
+    await assertRunCompleted(run.id);
+    const output = (await scalar(`SELECT output_snapshot FROM automation_run_nodes WHERE run_id=$1 AND node_key='amount'`, [run.id])).output_snapshot;
+    assert.equal(output.result, expected, `${field} at ${cents} cents`);
+    assert.equal(output.checks[0].missing, field.startsWith("quote."));
+    assert.equal(output.checks[0].actual, field.startsWith("quote.") ? null : cents / 100);
+    const smsNodes = await rows(`SELECT output_snapshot FROM automation_run_nodes WHERE run_id=$1 AND node_key='sms'`, [run.id]);
+    assert.equal(smsNodes.length, expected ? 1 : 0);
+    if (expected) assert.equal(smsNodes[0].output_snapshot.would_execute, "sms.send");
+    assert.equal(state.smsCalls.length, 0, "preview must never send a real SMS");
+    if (field.startsWith("quote.")) {
+      const detail = await automationTestHooks.loadRunDetail(run.id, seed.companyId);
+      assert.ok(detail.logs.some((log) => log.message.includes("No value was available for quote.total_cents")));
+    }
+  }
+}
+
 async function testContactToTag() {
   const seed = await seedCompany();
   const t = node("trigger_1", "trigger", { trigger_key: "contact.created" });
@@ -988,6 +1023,7 @@ const tests = [
   ["Draft-not-live", testDraftDoesNotRun],
   ["Draft Test", testDraftRunSafety],
   ["Stage entered -> fixed phone SMS dry-run", testStageEnteredSmsDryRunTemplateAndRecipient],
+  ["Stage amounts, branch choice, and missing quote diagnostics", testStageAmountConditions],
   ["Contact -> Tag", testContactToTag],
   ["Contact -> Pipeline", testContactToPipeline],
   ["Contact -> SMS", testContactToSms],

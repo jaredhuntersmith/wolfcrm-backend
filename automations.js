@@ -1448,7 +1448,7 @@ function conditionFieldCatalog() {
     ["pipeline.stage_name", "Stage Name", "Pipeline", "text", textOps],
     ["pipeline.is_won", "Is Won", "Pipeline", "boolean", boolOps],
     ["pipeline.is_lost", "Is Lost", "Pipeline", "boolean", boolOps],
-    ["pipeline.opportunity_value", "Opportunity Value", "Pipeline", "number", numberOps],
+    ["pipeline.opportunity_value", "Stage card value ($)", "Pipeline", "number", numberOps],
     ["pipeline.salesperson_id", "Salesperson ID", "Pipeline", "user", textOps],
     ["pipeline.salesperson_name", "Salesperson Name", "Pipeline", "text", textOps],
     ["pipeline.days_in_stage", "Days in Stage", "Pipeline", "number", numberOps],
@@ -4415,9 +4415,13 @@ async function executeNode(run, node, runNode, scopeKey = "root", arrival = null
   }
   if (node.node_type === "condition") {
     const context = await buildRunContext(run, { scopeKey });
-    const result = evaluateCondition(node.config?.condition || node.config, context);
-    await logRun(run, node, "info", result ? "condition.true" : "condition.false", `Condition evaluated ${result ? "true" : "false"}`, {});
-    return { port: result ? "true" : "false", output: { result } };
+    const condition = node.config?.condition || node.config;
+    const result = evaluateCondition(condition, context);
+    const checks = conditionChecks(condition, context);
+    const missing = checks.filter((check) => check.missing).map((check) => check.field);
+    const explanation = missing.length ? ` No value was available for ${missing.join(", ")}.${missing.some((field) => field.startsWith("quote.")) ? " Quote details require a quote event; the amount on a stage card is Pipeline > Stage card value (dollars)." : ""}` : "";
+    await logRun(run, node, "info", result ? "condition.true" : "condition.false", `Condition evaluated ${result ? "true" : "false"}.${explanation}`, { checks });
+    return { port: result ? "true" : "false", output: { result, checks } };
   }
   if (node.node_type === "branch") {
     const context = await buildRunContext(run, { scopeKey });
@@ -5823,6 +5827,20 @@ function parseJsonObject(value) {
     }
   }
   return {};
+}
+
+// Keep the data source visible in run history without changing existing rule semantics.
+function conditionChecks(config, context, checks = []) {
+  if (!config || typeof config !== "object" || checks.length >= 50) return checks;
+  if (Array.isArray(config.conditions)) {
+    for (const child of config.conditions) conditionChecks(child, context, checks);
+  } else if (config.field) {
+    const actual = getPath(context, config.field);
+    const expected = typeof config.value === "string" ? resolveTemplate(config.value, context) : config.value;
+    checks.push({ field: config.field, operator: config.operator || "equals", missing: actual == null,
+      actual: actual == null ? null : safeJsonLimited(actual), expected: expected == null ? null : safeJsonLimited(expected) });
+  }
+  return checks;
 }
 
 function evaluateCondition(config, context) {
