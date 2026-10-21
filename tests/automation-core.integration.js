@@ -328,6 +328,7 @@ async function testPublishAndRepublish() {
   const a = node("tag_1", "action", { action_key: "contact.add_tag", target_mode: "current_contact", tags: ["Automation Test"] });
   const created = await createAutomation(seed, graphFrom([t, a], [edge(t, a)]));
   const first = await publish(seed, created.automationId);
+  assert.deepEqual(first.errors, [], "a successful publish must satisfy the validation response contract");
   assert.equal(first.published_version.version_number, 2);
   assert.equal(first.draft_version.version_number, 3);
   let def = await scalar(`SELECT active_version_id, draft_version_id, status FROM automation_definitions WHERE id = $1`, [created.automationId]);

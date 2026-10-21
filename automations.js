@@ -3720,7 +3720,7 @@ async function publishAutomation(automationId, companyId, userId) {
       [automationId, published.id, newDraft.id, userId]
     );
     await db.query("COMMIT");
-    return { valid: true, published_version: published, draft_version: newDraft, warnings: validation.warnings };
+    return { valid: true, errors: [], published_version: published, draft_version: newDraft, warnings: validation.warnings };
   } catch (e) {
     await db.query("ROLLBACK").catch(() => {});
     throw e;
