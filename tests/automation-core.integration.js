@@ -342,6 +342,34 @@ async function testPublishAndRepublish() {
   assert.equal(second.draft_version.version_number, 5);
 }
 
+async function testSaveStalePublishedIdsIntoNewDraft() {
+  const seed = await seedCompany();
+  const trigger = node("trigger_1", "trigger", { trigger_key: "contact.created" });
+  const firstAction = node("tag_1", "action", { action_key: "contact.add_tag", target_mode: "current_contact", tags: ["First"] });
+  const firstEdge = edge(trigger, firstAction);
+  const created = await createAutomation(seed, graphFrom([trigger, firstAction], [firstEdge]));
+  const firstPublish = await publish(seed, created.automationId);
+  const secondAction = node("tag_2", "action", { action_key: "contact.add_tag", target_mode: "current_contact", tags: ["Second"] });
+  const thirdAction = node("tag_3", "action", { action_key: "contact.add_tag", target_mode: "current_contact", tags: ["Third"] });
+  const end = node("end_1", "end", {});
+  const fiveNodeGraph = graphFrom(
+    [trigger, firstAction, secondAction, thirdAction, end],
+    [firstEdge, edge(firstAction, secondAction), edge(secondAction, thirdAction), edge(thirdAction, end)]
+  );
+  await automationTestHooks.saveDraftGraph(firstPublish.draft_version.id, seed.companyId, fiveNodeGraph);
+  const saved = await automationTestHooks.loadVersionGraph(firstPublish.draft_version.id, seed.companyId);
+  const original = await automationTestHooks.loadVersionGraph(firstPublish.published_version.id, seed.companyId);
+  assert.equal(saved.nodes.length, 5);
+  assert.equal(saved.edges.length, 4);
+  assert.equal(original.nodes.length, 2, "a failed draft edit must not change the live version");
+  assert.notEqual(saved.nodes.find((item) => item.node_key === trigger.node_key).id, trigger.id);
+  assert.equal(saved.edges.find((item) => item.source_node_id === saved.nodes.find((n) => n.node_key === trigger.node_key).id).target_node_id,
+    saved.nodes.find((n) => n.node_key === firstAction.node_key).id, "remapped edge still connects the same steps");
+  const secondPublish = await publish(seed, created.automationId);
+  const active = await automationTestHooks.loadVersionGraph(secondPublish.published_version.id, seed.companyId);
+  assert.equal(active.nodes.length, 5, "the five-node draft becomes the live version only after publishing");
+}
+
 async function testDraftDoesNotRun() {
   const seed = await seedCompany();
   const t = node("trigger_1", "trigger", { trigger_key: "contact.created" });
@@ -955,6 +983,7 @@ async function testValidationCatalogScopeAndDryRunExternalSafety() {
 
 const tests = [
   ["Publish", testPublishAndRepublish],
+  ["Save stale published IDs into new draft", testSaveStalePublishedIdsIntoNewDraft],
   ["Draft-not-live", testDraftDoesNotRun],
   ["Draft Test", testDraftRunSafety],
   ["Stage entered -> fixed phone SMS dry-run", testStageEnteredSmsDryRunTemplateAndRecipient],

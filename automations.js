@@ -3617,23 +3617,41 @@ async function saveDraftGraph(versionId, companyId, payload) {
     await db.query(`SELECT id FROM automation_versions WHERE id=$1 AND company_id=$2 FOR UPDATE`, [versionId, companyId]);
     await db.query(`DELETE FROM automation_edges WHERE version_id = $1 AND company_id = $2`, [versionId, companyId]);
     await db.query(`DELETE FROM automation_nodes WHERE version_id = $1 AND company_id = $2`, [versionId, companyId]);
+    // A client can still hold IDs from the version it just published. Published
+    // versions remain in the database, and node/edge IDs are global primary keys.
+    // Preserve draft IDs where possible and remap only IDs owned by another version.
+    const canonicalId = (id) => String(id || "").toLowerCase();
+    const nodeIds = (payload.nodes || []).map((node) => canonicalId(node.id));
+    const edgeIds = (payload.edges || []).map((edge) => canonicalId(edge.id)).filter(Boolean);
+    const occupiedNodeIds = new Set((await db.query(
+      `SELECT id::text AS id FROM automation_nodes WHERE id = ANY($1::uuid[])`, [nodeIds]
+    )).rows.map((row) => row.id));
+    const occupiedEdgeIds = new Set((await db.query(
+      `SELECT id::text AS id FROM automation_edges WHERE id = ANY($1::uuid[])`, [edgeIds]
+    )).rows.map((row) => row.id));
+    const nodeIdMap = new Map();
     for (const node of payload.nodes || []) {
+      const savedId = occupiedNodeIds.has(canonicalId(node.id)) ? randomUUID() : node.id;
+      nodeIdMap.set(canonicalId(node.id), savedId);
       await db.query(
         `INSERT INTO automation_nodes(id, version_id, company_id, node_key, node_type, category, title, config, position_x, position_y)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)`,
         [
-          node.id, versionId, companyId, node.node_key || node.nodeKey, node.node_type || node.nodeType,
+          savedId, versionId, companyId, node.node_key || node.nodeKey, node.node_type || node.nodeType,
           node.category || null, node.title || node.name || null, JSON.stringify(node.config || {}),
           Number(node.position_x ?? node.positionX ?? 0), Number(node.position_y ?? node.positionY ?? 0)
         ]
       );
     }
     for (const edge of payload.edges || []) {
+      const sourceId = edge.source_node_id || edge.sourceNodeId;
+      const targetId = edge.target_node_id || edge.targetNodeId;
       await db.query(
         `INSERT INTO automation_edges(id, version_id, company_id, source_node_id, target_node_id, source_port, target_port, label, priority, config)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`,
         [
-          edge.id || randomUUID(), versionId, companyId, edge.source_node_id || edge.sourceNodeId, edge.target_node_id || edge.targetNodeId,
+          !edge.id || occupiedEdgeIds.has(canonicalId(edge.id)) ? randomUUID() : edge.id,
+          versionId, companyId, nodeIdMap.get(canonicalId(sourceId)), nodeIdMap.get(canonicalId(targetId)),
           edge.source_port || edge.sourcePort || null, edge.target_port || edge.targetPort || null, edge.label || null,
           Number(edge.priority || 0), JSON.stringify(edge.config || {})
         ]
