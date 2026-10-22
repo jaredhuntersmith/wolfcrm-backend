@@ -1200,7 +1200,7 @@ async function loadEvaluationEvidence(client, companyId, range, context, { lock 
   for (const event of commissionEvents) if (event.job_id) jobIds.add(String(event.job_id));
   const jobResult = jobIds.size
     ? await client.query(
-      `SELECT id, title, price_cents, material_cost_cents, services, service_items
+      `SELECT id, title, price_cents, COALESCE(material_cost_cents,quote_material_estimate_cents) AS material_cost_cents, services, service_items
          FROM schedule_events WHERE company_id = $1 AND id = ANY($2::text[])${lock ? " FOR SHARE" : ""}`,
       [companyId, [...jobIds]]
     )

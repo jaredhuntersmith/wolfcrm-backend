@@ -16,6 +16,9 @@ export function createStorageBucket(env = process.env) {
   const args = file => ({ Bucket: file.storage_provider==='legacy_media'?legacyBucket:bucket, Key: file.object_key });
   let orphanMarker;
   return {
+    async open(file,range,signal) {
+      return deliveryClient(file).send(new GetObjectCommand({...args(file),...(range?{Range:range}:{})}),{abortSignal:signal});
+    },
     async readBytes(file,maxBytes=8388608) {
       const response=await deliveryClient(file).send(new GetObjectCommand(args(file)),{abortSignal:AbortSignal.timeout(10000)});
       let size=0;const chunks=[];

@@ -1,3 +1,4 @@
+import {createStorageDelivery} from '../media-storage/delivery.js';
 import test from 'node:test';import assert from 'node:assert/strict';import {randomUUID} from 'node:crypto';
 import {createCommsFixture} from './helpers/comms-fixture.js';import {installNotesSchema} from '../notes/schema.js';import {createNotesWorkspace} from '../notes/pages.js';import {createNotesAudio} from '../notes/audio.js';import {createNotesCollections} from '../notes/collections.js';
 test('note-owned voice uploads: immutable retries, page ACL, template copies, no Media Storage',{timeout:120000},async()=>{
@@ -7,7 +8,10 @@ test('note-owned voice uploads: immutable retries, page ACL, template copies, no
   let page=await notes.create(owner,{id:randomUUID(),title:'Voice'});const other=await notes.create(owner,{id:randomUUID(),title:'Other'});
   const objects=new Map(),uploads=new Map();let begins=0,completes=0;
   const bucket={begin:async row=>{begins++;uploads.set(row.id,[{PartNumber:1,Size:Number(row.byte_size),ETag:'test'}]);return row.id;},part:async()=> 'https://example.invalid/part',parts:async row=>{if(!uploads.has(row.id)){const error=new Error('expired upload');error.name='NoSuchUpload';throw error;}return uploads.get(row.id);},head:async row=>objects.get(row.object_key),complete:async row=>{completes++;objects.set(row.object_key,{ContentLength:Number(row.byte_size)});},access:async()=> 'https://example.invalid/voice'};
-  const audio=createNotesAudio({pool:f.pool,bucket}),id=randomUUID(),body={id,byte_size:400,duration:2,sha256:'a'.repeat(64)};
+  owner.sessionToken='notes-test-session';
+  const delivery=createStorageDelivery({pool:f.pool,bucket,env:{NODE_ENV:'test',PUBLIC_BACKEND_URL:'http://127.0.0.1:18661'}});
+  const storage={registerDeliverySource:delivery.registerSource,issueSourceDelivery:delivery.issueSource};
+  const audio=createNotesAudio({pool:f.pool,bucket,storage}),id=randomUUID(),body={id,byte_size:400,duration:2,sha256:'a'.repeat(64)};
   assert.equal((await audio.reserve(owner,page.page.id,body)).ready,false);await audio.reserve(owner,page.page.id,body);assert.equal(begins,1);
   uploads.delete(id);await audio.reserve(owner,page.page.id,body);assert.equal(begins,2,'expired multipart upload restarts under the same recording identity');
   await assert.rejects(audio.reserve(owner,page.page.id,{...body,sha256:'b'.repeat(64)}),e=>e.status===409);

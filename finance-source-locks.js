@@ -23,7 +23,7 @@ export async function installFinanceSourceLocks(db) {
       actor_id := nullif(current_setting('wolf.finance_actor', true), '')::uuid;
       scope_company := nullif(current_setting('wolf.finance_company', true), '')::uuid;
       IF actor_id IS NULL OR scope_company IS NULL OR expected_company IS DISTINCT FROM scope_company
-        OR NOT EXISTS(SELECT 1 FROM public.users WHERE id=actor_id AND company_id=scope_company AND deleted_at IS NULL)
+        OR NOT EXISTS(SELECT 1 FROM public.users u WHERE id=actor_id AND company_id=scope_company AND deleted_at IS NULL AND (to_jsonb(u)->>'locked_at') IS NULL)
       THEN RAISE EXCEPTION 'finance_source_lock_scope_invalid' USING ERRCODE='42501'; END IF;
       IF source_ids IS NULL OR cardinality(source_ids)>1000 THEN
         RAISE EXCEPTION 'finance_source_lock_ids_invalid' USING ERRCODE='22023'; END IF;

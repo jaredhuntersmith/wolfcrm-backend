@@ -1,6 +1,7 @@
 import {randomUUID,createHash} from 'node:crypto';
 import {loadActor,can,requireCapability,conversationJoins,conversationAccessSQL,mutate,publish,fail,id,text,cursor,encodeCursor,pageLimit} from './access.js';
 import {sourceAccessSQL} from './sources.js';
+import {assignmentReminderStillCurrent} from './training-events.js';
 export async function installNotificationsSchema(db){
  await db.query(`
  ALTER TABLE notifications ADD COLUMN IF NOT EXISTS requirements jsonb NOT NULL DEFAULT '[]';
@@ -90,15 +91,36 @@ export function createNotifications({pool,sendPush}){
   const assignment=remove?'deleted_at=now()':body.read===false?'read_at=NULL':'read_at=COALESCE(read_at,now())';const result=await db.query(`UPDATE notifications SET ${assignment} WHERE user_id=$1 AND company_id=$2 AND deleted_at IS NULL AND ${where}`,params);await db.query(`INSERT INTO comms_events(company_id,recipient_id,event_type,entity_id) VALUES($1,$2::uuid,'notification.changed',$2::text)`,[actor.companyId,actor.userId]);return {ok:true,changed:result.rowCount};});}
  async function preferences(input,body){return mutate(pool,input,async(db,actor)=>{requireCapability(actor,'notifications.view');try{new Intl.DateTimeFormat('en',{timeZone:body.timezone||'UTC'}).format();}catch{fail(400,'invalid_timezone');}for(const key of ['quiet_start','quiet_end'])if(body[key]!=null&&(!Number.isInteger(body[key])||body[key]<0||body[key]>1439))fail(400,'invalid_quiet_hours');return (await db.query(`INSERT INTO notification_preferences(user_id,company_id,muted,quiet_start,quiet_end,timezone) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(user_id) DO UPDATE SET muted=$3,quiet_start=$4,quiet_end=$5,timezone=$6 RETURNING *`,[actor.userId,actor.companyId,body.muted===true,body.quiet_start??null,body.quiet_end??null,body.timezone||'UTC'])).rows[0];});}
  async function deliver(){
-  if(!sendPush)return;const db=await pool.connect();try{await db.query('BEGIN');const rows=(await db.query(`SELECT o.*,n.user_id,n.company_id,n.conversation_id,n.kind,n.deleted_at FROM notification_delivery_outbox o JOIN notifications n ON n.id=o.notification_id WHERE o.delivered_at IS NULL AND o.next_attempt_at<=now() ORDER BY o.next_attempt_at LIMIT 20 FOR UPDATE OF o SKIP LOCKED`)).rows;
+  if(!sendPush)return;const db=await pool.connect();try{await db.query('BEGIN');const rows=(await db.query(`SELECT o.*,n.user_id,n.company_id,n.conversation_id,n.kind,n.data,n.deleted_at FROM notification_delivery_outbox o JOIN notifications n ON n.id=o.notification_id WHERE o.delivered_at IS NULL AND o.next_attempt_at<=now() ORDER BY o.next_attempt_at LIMIT 20 FOR UPDATE OF o SKIP LOCKED`)).rows;
    for(const row of rows){await db.query('SAVEPOINT notification_attempt');try{
+    const assignmentReminder=['training.assignment_due_soon','training.assignment_overdue'].includes(row.kind);
+    if(row.kind==='training.certificate_expiring'||assignmentReminder)
+      await db.query('SELECT id FROM companies WHERE id=$1 FOR KEY SHARE',[row.company_id]);
     let permitted=false,actor;try{actor=await loadActor(db,{userId:row.user_id,companyId:row.company_id});permitted=can(actor,'notifications.view')&&!row.deleted_at&&(await db.query(`SELECT 1 FROM notifications n WHERE n.id=$3 AND ${notificationAccessSQL(actor)}`,[row.user_id,row.company_id,row.notification_id])).rowCount>0;}catch(e){if(!e.status)throw e;}
+    let staleCertificate=false;
+    if(permitted&&row.kind==='training.certificate_expiring'){
+      const current=await db.query(`SELECT c.id FROM training_certificates c
+        JOIN training_course_enrollments e ON e.company_id=c.company_id AND e.id=c.enrollment_id
+        WHERE c.company_id=$1 AND c.id=$2 AND c.enrollment_id=$3 AND c.employee_id=$4
+          AND date_trunc('milliseconds',c.expires_at)=$5::timestamptz AND c.revoked_at IS NULL AND c.expires_at>now()
+        FOR SHARE OF c`,[row.company_id,row.data?.certificate_id,row.data?.enrollment_id,row.user_id,row.data?.expires_at]);
+      staleCertificate=!current.rowCount; if(staleCertificate)permitted=false;
+    }
+    let staleReminder=false;
+    if(permitted&&assignmentReminder){
+      const current=await assignmentReminderStillCurrent(db,{companyId:row.company_id,
+        recipientId:row.data?.recipient_id,assignmentId:row.data?.assignment_id,
+        definitionId:row.data?.definition_id,versionId:row.data?.version_id,
+        employeeId:row.user_id,dueAt:row.data?.due_at,
+        effectiveDueAt:row.data?.effective_due_at,kind:row.kind});
+      staleReminder=!current;if(staleReminder)permitted=false;
+    }
     const prefs=(await db.query('SELECT * FROM notification_preferences WHERE user_id=$1',[row.user_id])).rows[0];let quiet=prefs?.muted;if(row.kind.startsWith('comms.'))quiet||=(await db.query("SELECT 1 FROM comms_presence WHERE user_id=$1 AND availability='dnd' AND expires_at>now()",[row.user_id])).rowCount>0;
     if(actor?.notesReady&&['notes.comment','notes.mention'].includes(row.kind)){const setting=row.kind==='notes.mention'?'mention_push':'comment_push';const notePrefs=(await db.query('SELECT settings FROM notes_preferences WHERE user_id=$1',[row.user_id])).rows[0]?.settings;quiet ||= notePrefs?.[setting]===false;}
     if(prefs?.quiet_start!=null&&prefs.quiet_end!=null){const parts=new Intl.DateTimeFormat('en-GB',{timeZone:prefs.timezone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts();const minute=Number(parts.find(x=>x.type==='hour')?.value)*60+Number(parts.find(x=>x.type==='minute')?.value);quiet ||= prefs.quiet_start<=prefs.quiet_end?minute>=prefs.quiet_start&&minute<prefs.quiet_end:minute>=prefs.quiet_start||minute<prefs.quiet_end;}
     if(row.conversation_id){const muted=(await db.query(`SELECT 1 FROM comms_preferences p WHERE p.user_id=$1 AND p.muted AND (p.subject_type='conversation' AND p.subject_id=$2 OR p.subject_type IN ('group','section','thread') AND EXISTS(SELECT 1 FROM comms_threads t WHERE t.conversation_id=$2 AND CASE p.subject_type WHEN 'group' THEN t.group_id::text WHEN 'section' THEN t.section_id::text ELSE t.id::text END=p.subject_id))`,[row.user_id,row.conversation_id])).rowCount;quiet ||= muted>0;}
     if(permitted&&!quiet){const result=await sendPush([row.user_id],row.kind,{title:'WolfCRM notification',body:'Open your notification inbox to read this update.',payload:{type:'notification',notification_id:row.notification_id},threadId:'wolf-inbox',collapseId:row.notification_id,inboxDelivery:true});if(result?.failed>0||result?.skipped&&['not_configured','provider_unavailable'].includes(result.reason))throw new Error('push_pending');}
-    await db.query(`UPDATE notification_delivery_outbox SET delivered_at=now(),last_error=$2 WHERE notification_id=$1`,[row.notification_id,!permitted?'access_unavailable':quiet?'delivery_muted':null]);
+    await db.query(`UPDATE notification_delivery_outbox SET delivered_at=now(),last_error=$2 WHERE notification_id=$1`,[row.notification_id,staleCertificate?'stale_training_certificate':staleReminder?'stale_training_reminder':!permitted?'access_unavailable':quiet?'delivery_muted':null]);
    }catch(e){await db.query('ROLLBACK TO SAVEPOINT notification_attempt');await db.query(`UPDATE notification_delivery_outbox SET attempts=attempts+1,next_attempt_at=now()+least(3600,power(2,least(attempts+1,12))) * interval '1 second',last_error='delivery_retry' WHERE notification_id=$1`,[row.notification_id]);}finally{await db.query('RELEASE SAVEPOINT notification_attempt');}}
    await db.query('COMMIT');
   }catch(e){await db.query('ROLLBACK');throw e;}finally{db.release();}

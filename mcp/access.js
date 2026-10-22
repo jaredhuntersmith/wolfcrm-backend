@@ -20,10 +20,10 @@ export async function loadPrincipal(pool,userId,companyId,{enforceOAuthRolePolic
  FROM users u JOIN companies c ON c.id=u.company_id
  LEFT JOIN employee_permissions p ON p.user_id=u.id AND p.company_id=u.company_id
  ${enforceOAuthRolePolicy ? 'LEFT JOIN mcp_company_policy policy ON policy.company_id=u.company_id' : ''}
- WHERE u.id=$1 AND u.deleted_at IS NULL AND ($2::uuid IS NULL OR u.company_id=$2)`,[userId,companyId||null])).rows[0];
+ WHERE u.id=$1 AND u.deleted_at IS NULL AND to_jsonb(u)->>'locked_at' IS NULL AND ($2::uuid IS NULL OR u.company_id=$2)`,[userId,companyId||null])).rows[0];
  if(!row)throw fault(401,'membership_inactive');
  const owner=row.owner_user_id===row.id;
- const access=resolveAccess({role:owner?'employer':'employee',isOwner:owner,preset:row.legacy?.permission_preset,overrides:row.legacy?.permission_overrides,legacy:row.legacy||{}});
+ const access=resolveAccess({role:owner?'employer':'employee',isOwner:owner,preset:row.legacy?.permission_preset,overrides:row.legacy?.permission_overrides,legacy:row.legacy||{},timeZone:row.timezone});
  const role=owner?'owner':access.preset;
  if(enforceOAuthRolePolicy&&!row.allowed_roles.includes(role))throw fault(403,'connection_role_disabled','Your company owner has not enabled AI connections for this role.');
  return {userId:row.id,companyId:row.company_id,userEmail:row.email,displayName:row.display_name,companyName:row.company_name,

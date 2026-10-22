@@ -14,7 +14,7 @@ const allCapabilities = Object.fromEntries(TAB_CATALOG.flatMap((tab) => tab.any_
 
 test("tab catalog and built-in role defaults remain valid", () => {
   const catalog = tabCatalogPayload();
-  assert.equal(catalog.version, 5);
+  assert.equal(catalog.version, 6);
   assert.equal(catalog.max_primary_tabs, 5);
   assert.equal(new Set(catalog.tabs.map((tab) => tab.id)).size, catalog.tabs.length);
   for (const preset of ["admin", "manager", "sales", "technician", "office", "legacy_employee"]) {
@@ -32,8 +32,8 @@ test("layout validation rejects system IDs, duplicates, unknown fields, and too 
 
 test("partial orders append new catalog IDs and normalize hidden ordering", () => {
   const result = validateTabLayout({ order: ["messages", "dashboard"], hidden: ["map", "stages"] });
-  assert.deepEqual(result.order, ["messages", "dashboard", "contacts", "stages", "schedule", "map", "company_comms", "browser", "notes", "ads"]);
-  assert.deepEqual(result.hidden, ["stages", "map", "browser", "notes", "ads"]);
+  assert.deepEqual(result.order, ["messages", "dashboard", "contacts", "stages", "schedule", "map", "company_comms", "browser", "notes", "ads", "accounting"]);
+  assert.deepEqual(result.hidden, ["stages", "map", "browser", "notes", "ads", "accounting"]);
 });
 
 test("individual locked policy takes precedence over role policy and user preference", () => {
@@ -76,13 +76,20 @@ test("permissions separate customer Messages from Company Comms", () => {
   assert.deepEqual(response.effective.overflow, []);
 });
 
+test("Accounting is an owner destination with no employee access shortcut", () => {
+  const owner = resolveTabNavigation({role:"employer"});
+  assert.ok(owner.effective.overflow.includes("accounting"));
+  const employee = resolveTabNavigation({role:"employee",preset:"manager",capabilities:allCapabilities});
+  assert.ok(!employee.effective.order.includes("accounting"));
+});
+
 test("the direct tab cap moves remaining permitted destinations into overflow", () => {
   const response = resolveTabNavigation({
     role: "employer",
-    userPreferences: { order: TAB_CATALOG.map((tab) => tab.id), hidden: ["map", "messages", "browser", "notes", "ads"] }
+    userPreferences: { order: TAB_CATALOG.map((tab) => tab.id), hidden: ["map", "messages", "browser", "notes", "ads", "accounting"] }
   });
   assert.equal(response.effective.primary.length, MAX_PRIMARY_TABS);
-  assert.deepEqual(response.effective.overflow, ["map", "browser", "messages", "notes", "ads"]);
+  assert.deepEqual(response.effective.overflow, ["map", "browser", "messages", "notes", "ads", "accounting"]);
 });
 
 test("invalid persisted documents safely fall back to the built-in role layout", () => {
@@ -107,19 +114,20 @@ test("no permitted core destination leaves More as the safe fallback", () => {
  test("old preferences add Company Comms once and preserve all old destinations",()=>{
  const old={order:["dashboard","contacts","stages","schedule","map","messages"],hidden:["messages"]};
  const one=sanitizePersistedTabLayout(old);assert.deepEqual(one.order.slice(0,5),["dashboard","contacts","stages","schedule","company_comms"]);
- assert.deepEqual(one.hidden,["map","messages","browser","notes","ads"]);assert.deepEqual(sanitizePersistedTabLayout(one),one);
+ assert.deepEqual(one.hidden,["map","messages","browser","notes","ads","accounting"]);assert.deepEqual(sanitizePersistedTabLayout(one),one);
  const noComms=resolveTabNavigation({role:"employee",preset:"technician",capabilities:{"messaging.customer.view":true},userPreferences:old});
  assert.deepEqual(noComms.effective.order,["messages"]);
  });
 
-test("Notes appends without changing a complete Browser-era primary selection",()=>{const prior={order:["schedule","contacts","dashboard","stages","company_comms","map","messages","browser"],hidden:["map","messages","browser"]};const result=resolveTabNavigation({role:"employer",userPreferences:prior});assert.deepEqual(result.effective.primary,prior.order.slice(0,5));assert.deepEqual(result.effective.overflow,[...prior.hidden,"notes","ads"]);assert.equal(result.source,"user");});
+test("Notes and Accounting append without changing a complete Browser-era primary selection",()=>{const prior={order:["schedule","contacts","dashboard","stages","company_comms","map","messages","browser"],hidden:["map","messages","browser"]};const result=resolveTabNavigation({role:"employer",userPreferences:prior});assert.deepEqual(result.effective.primary,prior.order.slice(0,5));assert.deepEqual(result.effective.overflow,[...prior.hidden,"notes","ads","accounting"]);assert.equal(result.source,"user");});
 
  test("Ads defaults to More without moving a customized existing layout", () => {
  const old={order:["contacts","schedule","dashboard","stages","company_comms","map","browser","messages","notes"],hidden:["map","browser","messages","notes"]};
  const next=validateTabLayout(old);
- assert.deepEqual(next.order.slice(0,-1),old.order);
- assert.equal(next.order.at(-1),"ads");
+ assert.deepEqual(next.order.slice(0,-2),old.order);
+ assert.deepEqual(next.order.slice(-2),["ads","accounting"]);
  assert(next.hidden.includes("ads"));
+ assert(next.hidden.includes("accounting"));
  const pinned=validateTabLayout({order:["ads",...old.order],hidden:[...old.hidden,"stages"]});
  assert(!pinned.hidden.includes("ads"));
  });

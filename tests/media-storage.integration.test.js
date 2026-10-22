@@ -16,8 +16,8 @@ test('storage privacy and lifecycle against PostgreSQL', {timeout:120000}, async
   await pool.query('CREATE TABLE companies(id uuid PRIMARY KEY); CREATE TABLE users(id uuid PRIMARY KEY,email text,display_name text,role text,company_id uuid REFERENCES companies(id),deleted_at timestamptz)');
   await pool.query('INSERT INTO companies VALUES($1),($2)',[company,otherCompany]);
   for(const [key,a] of Object.entries(actors))await pool.query('INSERT INTO users(id,email,display_name,role,company_id) VALUES($1,$2,$2,$3,$4)',[a.userId,key,a.role,a.companyId]);
-  const app=express();app.use(express.json());const auth=(req,res,next)=>{const actor=actors[req.headers.authorization];if(!actor)return res.sendStatus(401);Object.assign(req,actor);next();};
-  const service=await installMediaStorage({app,pool,authRequired:auth,bucket,env:{STORAGE_DEFAULT_QUOTA_BYTES:String(3*PART_SIZE)},startWorker:false});
+  const app=express();app.use(express.json());const auth=(req,res,next)=>{const actor=actors[req.headers.authorization];if(!actor)return res.sendStatus(401);Object.assign(req,actor,{sessionToken:req.headers.authorization});next();};
+  const service=await installMediaStorage({app,pool,authRequired:auth,bucket,env:{PUBLIC_BACKEND_URL:'https://storage.example.invalid',STORAGE_DEFAULT_QUOTA_BYTES:String(3*PART_SIZE)},startWorker:false});
   server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});const base=`http://127.0.0.1:${server.address().port}/api/storage`;
   const req=async(path,method='GET',body,actor='a')=>{const r=await fetch(base+path,{method,headers:{Authorization:actor,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,data:await r.json()};};
   const upload=async(size=100,filename='Private.mp3')=>{const id=randomUUID();assert.equal((await req('/uploads','POST',{id,byte_size:size,original_filename:filename,mime_type:'audio/mpeg'})).status,200);for(let n=1;n<=Math.max(1,Math.ceil(size/PART_SIZE));n++)assert.equal((await req(`/files/${id}/parts`,'POST',{part_number:n})).status,200);const r=await req(`/files/${id}/complete`,'POST',{});assert.equal(r.status,200,JSON.stringify(r));return r.data;};
@@ -39,9 +39,9 @@ test('storage privacy and lifecycle against PostgreSQL', {timeout:120000}, async
    for(let i=0;i<2;i++)await req(`/files/${f.id}/download-complete`,'POST',{receipt_id:receipt},'b');
    const events=(await req('/activity?action=download','GET',undefined,'owner')).data.events;assert.equal(events.length,1);assert.equal(events[0].actor_user_id,actors.b.userId);assert.equal((await req('/activity','GET',undefined,'b')).status,403);
   });
-  await t.test('user favorites/progress isolated; removed owner public files disappear',async()=>{
+  await t.test('user favorites/progress isolated; disabled uploader retains company-shared access and other users’ state',async()=>{
    await req(`/files/${f.id}/state`,'PUT',{favorite:true,position_seconds:14.5,playback_rate:1.5},'b');assert.equal((await req('/files?scope=favorites','GET',undefined,'b')).data.files.length,1);assert.equal((await req('/files?scope=favorites')).data.files.length,0);
-   await pool.query('UPDATE users SET deleted_at=now() WHERE id=$1',[actors.a.userId]);assert.equal((await req(`/files/${f.id}`,'GET',undefined,'owner')).status,404);assert.equal((await req('/files?scope=favorites','GET',undefined,'b')).data.files.length,0);await pool.query('UPDATE users SET deleted_at=NULL WHERE id=$1',[actors.a.userId]);
+   await pool.query('UPDATE users SET deleted_at=now() WHERE id=$1',[actors.a.userId]);assert.equal((await req(`/files/${f.id}`,'GET',undefined,'owner')).status,200);assert.equal((await req('/files?scope=favorites','GET',undefined,'b')).data.files.length,1);await pool.query('UPDATE users SET deleted_at=NULL WHERE id=$1',[actors.a.userId]);
   });
   await t.test('folders reject cycles/nonempty; private folder search; stable keyset pages',async()=>{
    const folder=(await req('/folders','POST',{name:'Training'})).data,child=(await req('/folders','POST',{name:'Child',parent_folder_id:folder.id})).data;
@@ -52,12 +52,12 @@ test('storage privacy and lifecycle against PostgreSQL', {timeout:120000}, async
    const payload=()=>({id:randomUUID(),original_filename:'Large.mp4',byte_size:2*PART_SIZE,mime_type:'video/mp4'});const attempts=await Promise.all([req('/uploads','POST',payload()),req('/uploads','POST',payload())]);assert.deepEqual(attempts.map(r=>r.status).sort(),[200,413]);const id=attempts.find(r=>r.status===200).data.file.id;
    await req(`/files/${id}/parts`,'POST',{part_number:1});assert.equal((await req(`/files/${id}/complete`,'POST',{})).status,409);await req(`/files/${id}`,'DELETE');assert.equal((await req('/usage')).data.reserved_bytes,0);
   });
-  await t.test('company departure hides previous public sharing and never leaks subsequent private activity',async()=>{
+  await t.test('company departure retains company property and denies former uploader access',async()=>{
    const before=(await req('/activity','GET',undefined,'owner')).data.events.length;
    const originalCompany=actors.a.companyId;actors.a.companyId=otherCompany;await pool.query('UPDATE users SET company_id=$2 WHERE id=$1',[actors.a.userId,otherCompany]);
-   assert.equal((await req(`/files/${f.id}`)).data.visibility,'private');
-   f=(await req(`/files/${f.id}`,'PATCH',{expected_version:f.version,display_name:'Private after departure'})).data;
-   const receipt=(await req(`/files/${f.id}/access`,'POST',{purpose:'download'})).data.receipt_id;await req(`/files/${f.id}/download-complete`,'POST',{receipt_id:receipt});
+   assert.equal((await req(`/files/${f.id}`)).status,404);
+   assert.equal((await req(`/files/${f.id}`,'PATCH',{expected_version:f.version,display_name:'Not allowed'})).status,404);
+   assert.equal((await req(`/files/${f.id}`,'GET',undefined,'owner')).data.visibility,'company');
    assert.equal((await req('/activity','GET',undefined,'owner')).data.events.length,before);assert.equal((await req('/activity','GET',undefined,'foreign')).data.events.length,0);
    actors.a.companyId=originalCompany;await pool.query('UPDATE users SET company_id=$2 WHERE id=$1',[actors.a.userId,originalCompany]);
   });

@@ -53,7 +53,13 @@ test('contact membership owns full completed-job collection across real booking 
    if(activate)await activatePlan(item);return item;
   }
   async function activatePlan(item){await billing.begin(item.token,item.enrollment.id,{request_id:randomUUID()});const setup=(await pool.query('SELECT session_id FROM agreement_plan_setups WHERE enrollment_id=$1',[item.enrollment.id])).rows[0];stripe.completeSetup(setup.session_id);await billing.begin(item.token,item.enrollment.id,{request_id:randomUUID()});}
-  async function staffJob(item,{items=item.items,quote=false,start=new Date(Date.now()+86400000+number*7200000)}={}){const id=randomUUID();const result=await request(`/api/schedule/${id}`,{title:'Customer job',contact_id:item.contact,quote_id:quote?item.quote:null,start:start.toISOString(),end:new Date(+start+3600000).toISOString(),service_items:items,services:items.map(l=>l.name),price_cents:items.reduce((n,l)=>n+l.price_cents*(l.qty||1),0),worker_user_ids:[]},'PUT');assert.equal(result.status,200,JSON.stringify(result));return result.body;}
+  async function staffJob(item,{items=item.items,quote=false,start=new Date(Date.now()+86400000+number*7200000)}={}){
+   const id=randomUUID(),selectedQuoteID=quote?item.quote:randomUUID();
+   const workerID=randomUUID();
+   await pool.query("INSERT INTO users(id,email,role,company_id) VALUES($1,$2,'employee',$3)",[workerID,`job-worker-${workerID}@example.invalid`,company]);
+   if(!quote){const scope=items.length?items:[{id:randomUUID(),name:'Plan visit',qty:1,price_cents:0}];await pool.query('INSERT INTO quotes(id,user_id,company_id,contact_id,line_items,total_cents,quote_options) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7::jsonb)',[selectedQuoteID,owner,company,item.contact,JSON.stringify(scope),scope.reduce((n,l)=>n+l.price_cents*(l.qty||1),0),JSON.stringify({duration_minutes:60})]);}
+   const result=await request(`/api/schedule/${id}`,{title:'Customer job',contact_id:item.contact,quote_id:selectedQuoteID,start:start.toISOString(),end:new Date(+start+3600000).toISOString(),service_items:items,services:items.map(l=>l.name),price_cents:items.reduce((n,l)=>n+l.price_cents*(l.qty||1),0),sales_user_ids:[owner],worker_user_ids:[workerID]},'PUT');assert.equal(result.status,200,JSON.stringify(result));return result.body;
+  }
   const complete=job=>request(`/api/jobs/${job}/workflow/complete`,{snapshot:[]});
   const owed=async item=>(await pool.query('SELECT * FROM agreement_plan_billing_obligations WHERE enrollment_id=$1',[item.enrollment.id])).rows;
   await t.test('ten-minute service plan collects each completed job once, including replay',async()=>{

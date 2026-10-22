@@ -1,3 +1,5 @@
+import {installPrivatePurge} from './employee-access/purge.js';
+import {installCompanyStorage} from './employee-access/storage-usage.js';
 import {installFacebookConnection} from './facebook-connection/index.js';
 import {installFacebookAds} from './facebook-ads/index.js';
 import {installWebhooks} from './webhooks/service.js';
@@ -5,6 +7,7 @@ import {webhookEventCatalog} from './automations.js';
 import {installAssistant} from './assistant/index.js';
 import {installCalculatorSchema,installCalculatorRoutes} from './quote-calculator/index.js';
 import { acceptedQuoteValueSQL, outboundContactActivitySQL } from "./sales-analytics.js";
+import { buildWeeklySalesReport } from "./weekly-sales-report.js";
 import {installMCP} from './mcp/index.js';
 import {transactionalPool,internalActor} from './mcp/context.js';
 import { installWidgetDashboard } from "./widget-dashboard.js";
@@ -18,6 +21,9 @@ import {installCollaboration} from './company-comms/collaboration.js';
 import {takeRateLimit} from './company-comms/rate-limits.js';
 import {taskAccessSQL,validateTaskAudience} from './company-comms/tasks.js';
 import { installPermissionGovernanceSchema, installPermissionGovernanceRoutes, ownerIdentity } from "./permission-governance.js";
+import { installEmployeeAccountSchema } from "./employee-access/schema.js";
+import { accountDenial, deniedSession } from "./employee-access/auth.js";
+import { installEmployeeAccountRoutes } from "./employee-access/routes.js";
 import { enforceSensitiveRoute } from "./permission-routes.js";
 import { installStripeAccountManagementSchema, installStripeAccountManagement, stripeConnectionOptions } from "./stripe-account-management.js";
 import { priceQuoteForPlan } from "./plan-quote-publication.js";
@@ -57,6 +63,9 @@ import {
 import { installFinanceSystem, loadProjection } from "./finance.js";
 import { normalizeQuoteLines, normalizeQuoteOptions, validateQuoteAddonScope, calculateQuotePricing, QuoteContractError } from "./quote-contract-domain.js";
 import { installServiceCatalogSchema, installServiceCatalogRoutes, assertQuoteReferences, ServiceCatalogError } from "./services-catalog.js";
+import { mergeHistoricalQuoteCatalog } from "./quote-reuse.js";
+import { installQuoteMaterialsSchema, installQuoteMaterialCatalogRoutes, normalizeQuoteMaterialLines,
+  materialChargeLines, materialCostCents, publicMaterialPricing, assertMaterialReferences, QuoteMaterialError } from "./quote-materials.js";
 import { installAgreementSchema, installAgreementSystem } from "./quote-agreements.js";
 import { resolveQuoteTemplateOptions } from "./quote-templates.js";
 import { removeQuote } from "./quote-removal.js";
@@ -68,6 +77,7 @@ import { installAgreementPlans } from "./agreement-plans.js";
 import { installAgreementArchive } from "./agreement-archive.js";
 import { installAgreementPlanBilling } from "./agreement-plan-billing.js";
 import { lockCompanySchedule, scheduleConflict } from "./schedule-booking-guard.js";
+import { installScheduleDraftSchema, installScheduleDraftRoutes, clearScheduleDraftsForContact } from "./schedule-drafts.js";
 import { installAgreementNotifications } from "./agreement-notifications.js";
 import { installPayStructureSystem } from "./pay-structures.js";
 import {
@@ -124,10 +134,12 @@ import {
 import {
   ScheduleTeamError,
   requiredScheduleWriteCapability,
+  requireNewJobAssignments,
   summarizeScheduleTeam,
   validateAssignments,
   validateAvailability
 } from "./schedule-team.js";
+import { installScheduleBlockRoutes, installScheduleBlockSchema } from "./schedule-blocks.js";
 import {
   InventoryCountInputError,
   countAdjustment,
@@ -198,6 +210,7 @@ import {
   validateSalesAnalyticsQuery
 } from "./sales-analytics.js";
 import { contactRequestChangedFields } from "./contact-update-events.js";
+import { LeadSourceError, ensureLeadSource, installLeadSourcesSchema, selectedLeadSource } from "./lead-sources.js";
 import { buildDesktopContactSearchPredicate } from "./contact-search.js";
 import { buildDesktopContactListFilters } from "./contact-list-filters.js";
 import { buildContactExportCSV, defaultContactExportFilename } from "./contact-export.js";
@@ -219,6 +232,7 @@ import {
 import { installWebsiteBuilderSystem } from "./website-builder.js";
 import { installRoutineGroupSystem } from "./routine-groups.js";
 import { installMediaStorage } from "./media-storage/index.js";
+import { installTraining, enrollNewTrainingEmployee, reconcileTrainingOnboarding, runTrainingRecurrences } from "./training/index.js";
 import { installCommsCompatibility } from "./company-comms/compatibility.js";
 import { installCommsAudit } from "./company-comms/audit.js";
 import { installCommsQuoteExports } from "./company-comms/quote-exports.js";
@@ -1064,6 +1078,8 @@ async function bootstrap() {
       last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
+    CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+
     CREATE TABLE IF NOT EXISTS contacts (
       id UUID PRIMARY KEY,
       -- We'll add user_id below if missing
@@ -1825,6 +1841,8 @@ async function bootstrap() {
     CREATE TABLE IF NOT EXISTS measurements (
       id TEXT PRIMARY KEY,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID,
+      scope_verified BOOLEAN NOT NULL DEFAULT false,
       name TEXT NOT NULL DEFAULT '',
       points JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -2548,6 +2566,11 @@ async function bootstrap() {
     ALTER TABLE measurements ADD COLUMN IF NOT EXISTS linked_contact_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE measurements ADD COLUMN IF NOT EXISTS units TEXT NOT NULL DEFAULT 'feet';
     ALTER TABLE measurements ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    -- Existing measurements have no trustworthy company-at-creation value.
+    -- Leave them scope_verified=false for explicit recovery, never backfill from users.company_id.
+    ALTER TABLE measurements ADD COLUMN IF NOT EXISTS company_id UUID;
+    ALTER TABLE measurements ADD COLUMN IF NOT EXISTS scope_verified BOOLEAN NOT NULL DEFAULT false;
+    CREATE INDEX IF NOT EXISTS measurements_scope_idx ON measurements(user_id, scope_verified, company_id);
   `);
 
   // Ensure user_id column exists
@@ -2740,16 +2763,36 @@ async function bootstrap() {
   `);
 
   await installPermissionGovernanceSchema(pool);
+  await installEmployeeAccountSchema(pool);
   await installStripeAccountManagementSchema(pool);
   await installServiceCatalogSchema(pool);
   await installCalculatorSchema(pool);
+  await installQuoteMaterialsSchema(pool);
+  await installScheduleDraftSchema(pool);
+  await installScheduleBlockSchema(pool);
+  await pool.query(`CREATE TABLE IF NOT EXISTS quote_reuse_requests (
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    actor_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    request_key TEXT NOT NULL,
+    source_quote_id UUID NOT NULL,
+    new_quote_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY(company_id, actor_id, request_key)
+  )`);
   await installAgreementSchema(pool);
+  await installLeadSourcesSchema(pool);
   console.log(`[bootstrap] DB ready @ ${nowIso()}`);
 }
 
 // ---------- auth middleware ----------
 async function authRequired(req, res, next) {
-  if (req[internalActor]) { Object.assign(req, req[internalActor]); if (enforceSensitiveRoute(req,res)) next(); return; }
+  if (req[internalActor]) {
+    Object.assign(req, req[internalActor]);
+    const current=(await pool.query('SELECT deleted_at,locked_at FROM users WHERE id=$1 AND company_id=$2',[req.userId,req.companyId])).rows[0];
+    const denial=accountDenial(current);
+    if(!current||denial)return res.status(401).json(denial||{error:'unauthorized'});
+    if (enforceSensitiveRoute(req,res)) next(); return;
+  }
   const token = bearer(req);
   if (!token) return res.status(401).json({ error: "unauthorized" });
   const { rows } = await pool.query(
@@ -2758,8 +2801,8 @@ async function authRequired(req, res, next) {
        FROM users u
        LEFT JOIN companies c ON c.id=u.company_id
        LEFT JOIN employee_permissions p ON p.user_id = u.id AND p.company_id=u.company_id
-      WHERE s.token = $1 AND u.id = s.user_id AND u.deleted_at IS NULL
-      RETURNING s.user_id, u.email, u.role, u.company_id, c.owner_user_id, COALESCE(p.permission_revision,0) AS permission_revision,
+      WHERE s.token = $1 AND u.id = s.user_id AND u.deleted_at IS NULL AND u.locked_at IS NULL
+      RETURNING s.user_id, u.email, u.role, u.company_id, c.owner_user_id, c.timezone AS company_timezone, p.permission_windows, COALESCE(p.permission_revision,0) AS permission_revision,
                 COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts,
                 COALESCE(p.can_view_finance, u.role = 'employer') AS can_view_finance,
                 COALESCE(p.can_use_finance_ai, u.role = 'employer') AS can_use_finance_ai,
@@ -2785,7 +2828,7 @@ async function authRequired(req, res, next) {
                 p.permission_preset, p.permission_overrides`,
     [token]
   );
-  if (!rows.length) return res.status(401).json({ error: "unauthorized" });
+  if (!rows.length) return res.status(401).json(await deniedSession(pool,token)||{ error: "unauthorized" });
   req.userId = rows[0].user_id;
   req.userEmail = rows[0].email;
   req.isCompanyOwner = ownerIdentity(rows[0]);
@@ -3537,7 +3580,8 @@ app.post("/auth/signup", async (req, res) => {
     if (!email || !email.includes("@")) return res.status(400).json({ error: "invalid_email" });
     if (!passwordIsValid(password)) return res.status(400).json({ error: "weak_password" });
 
-    const existing = await pool.query(`SELECT id, password_hash FROM users WHERE email = $1`, [email]);
+    const existing = await pool.query(`SELECT id, password_hash,deleted_at,locked_at FROM users WHERE email = $1`, [email]);
+    if(accountDenial(existing.rows[0]))return res.status(403).json(accountDenial(existing.rows[0]));
     if (existing.rows.length && existing.rows[0].password_hash) {
       return res.status(409).json({ error: "email_exists" });
     }
@@ -3599,6 +3643,17 @@ app.post("/auth/signup", async (req, res) => {
     } catch (automationErr) {
       console.warn("[automations] employee signup hook failed", automationErr?.message || automationErr);
     }
+    if (role === "employee" && app.locals.training) {
+      try {
+        await enrollNewTrainingEmployee(pool, {
+          companyId: company.id,
+          userId: user.id,
+          ...(existing.rows.length ? { eligibleAt: new Date().toISOString() } : {})
+        });
+      } catch (trainingErr) {
+        console.warn("[training] employee onboarding deferred", trainingErr?.code || trainingErr?.message || trainingErr);
+      }
+    }
 
     const token = randomUUID();
     await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, user.id]);
@@ -3622,7 +3677,7 @@ app.post("/auth/login", async (req, res) => {
     const email = normalizeEmail(req.body.email);
     const password = (req.body.password || "").toString();
     const { rows } = await pool.query(
-      `SELECT u.*, c.owner_user_id, c.name AS company_name, c.join_code, to_jsonb(p) AS permission_record
+      `SELECT u.*, c.owner_user_id, c.timezone AS company_timezone, c.name AS company_name, c.join_code, to_jsonb(p) AS permission_record
          FROM users u
          LEFT JOIN companies c ON c.id = u.company_id
          LEFT JOIN employee_permissions p ON p.user_id = u.id
@@ -3632,13 +3687,12 @@ app.post("/auth/login", async (req, res) => {
     if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
       return res.status(401).json({ error: "invalid_login" });
     }
-    if (rows[0].deleted_at) {
-      // Account was revoked by the employer.
-      return res.status(403).json({ error: "account_disabled", message: "This account has been removed. Contact your employer to restore access." });
-    }
+    if(accountDenial(rows[0]))return res.status(403).json(accountDenial(rows[0]));
     const u = { ...rows[0], ...(rows[0].permission_record || {}) };
     const token = randomUUID();
-    await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, u.id]);
+    const issued=await pool.query(`INSERT INTO sessions(token,user_id)
+      SELECT $1,id FROM users WHERE id=$2 AND deleted_at IS NULL AND locked_at IS NULL FOR SHARE`,[token,u.id]);
+    if(!issued.rowCount)return res.status(403).json(accountDenial((await pool.query('SELECT deleted_at,locked_at FROM users WHERE id=$1',[u.id])).rows[0])||{error:'unauthorized'});
     res.json({
       token,
       user: userPayload(
@@ -3691,7 +3745,7 @@ app.post("/auth/password/reset", async (req, res) => {
 
     await pool.query(`UPDATE password_reset_codes SET used_at = now() WHERE id = $1`, [reset.id]);
     const r = await pool.query(
-      `UPDATE users SET password_hash = $1 WHERE email = $2 RETURNING id`,
+      `UPDATE users SET password_hash = $1 WHERE email = $2 AND deleted_at IS NULL AND locked_at IS NULL RETURNING id`,
       [hashPassword(password), email]
     );
     if (!r.rowCount) return res.status(404).json({ error: "user_not_found" });
@@ -3757,9 +3811,12 @@ app.post("/auth/verify", async (req, res) => {
     const { rows: users } = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
     if (!users.length) return res.status(400).json({ error: "user_missing" });
     const user = users[0];
+    if(accountDenial(user))return res.status(403).json(accountDenial(user));
 
     const token = randomUUID();
-    await pool.query(`INSERT INTO sessions(token, user_id) VALUES($1,$2)`, [token, user.id]);
+    const issued=await pool.query(`INSERT INTO sessions(token,user_id)
+      SELECT $1,id FROM users WHERE id=$2 AND deleted_at IS NULL AND locked_at IS NULL FOR SHARE`,[token,user.id]);
+    if(!issued.rowCount)return res.status(403).json(accountDenial((await pool.query('SELECT deleted_at,locked_at FROM users WHERE id=$1',[user.id])).rows[0])||{error:'unauthorized'});
 
     res.json({ token, user: { id: user.id, email: user.email } });
   } catch (e) {
@@ -3782,7 +3839,7 @@ app.get("/me", authRequired, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT u.id, u.email, u.role, u.company_id, u.created_at,
             u.display_name, u.photo_url,
-            c.owner_user_id, COALESCE(p.permission_revision,0) AS permission_revision, c.name AS company_name, c.join_code,
+            c.owner_user_id, c.timezone AS company_timezone, p.permission_windows, COALESCE(p.permission_revision,0) AS permission_revision, c.name AS company_name, c.join_code,
             COALESCE(p.can_delete_contacts, u.role = 'employer') AS can_delete_contacts,
             COALESCE(p.can_view_finance, u.role = 'employer') AS can_view_finance,
             COALESCE(p.can_use_finance_ai, u.role = 'employer') AS can_use_finance_ai,
@@ -6672,134 +6729,8 @@ app.put("/api/company/join-code", authRequired, requireCapability("settings.mana
   }
 });
 
-// Soft-delete an employee: revoke login access and scrub credentials/photo,
-// but keep the row + display_name intact so historical records still resolve.
-// Restore is always available via /api/company/employees/:id/restore.
-app.delete("/api/company/employees/:id", authRequired, requireEmployer, async (req, res) => {
-  const targetId = req.params.id;
-  if (!targetId) return res.status(400).json({ error: "bad_id" });
-  if (targetId === req.userId) {
-    return res.status(400).json({ error: "cannot_delete_self", message: "You cannot remove your own account here." });
-  }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('comms-permissions:' || $1,0))",[targetId]);
-    // Verify target is an employee in this company and is not an employer.
-    const check = await client.query(
-      `SELECT id, role, deleted_at FROM users WHERE id = $1 AND company_id = $2 FOR UPDATE`,
-      [targetId, req.companyId]
-    );
-    if (!check.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "employee_not_found" });
-    }
-    if (targetId === req.ownerUserId || check.rows[0].role === "employer") {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "cannot_delete_employer", message: "The employer/owner account cannot be removed." });
-    }
-    if (check.rows[0].deleted_at) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "already_deleted", message: "This employee has already been removed." });
-    }
-    // Scrub credentials/PII; preserve original email so restore can put it back.
-    await client.query(
-      `UPDATE users SET
-         pre_delete_email = COALESCE(pre_delete_email, email),
-         email = 'deleted+' || id::text || '@wolfcrm.deleted',
-         password_hash = NULL,
-         photo_url = NULL,
-         deleted_at = now(),
-         deleted_by = $2
-       WHERE id = $1`,
-      [targetId, req.userId]
-    );
-    // Kill all their sessions / recovery tokens / device tokens.
-    await client.query(`DELETE FROM sessions WHERE user_id = $1`, [targetId]);
-    await client.query(`DELETE FROM password_reset_codes WHERE email IN (SELECT pre_delete_email FROM users WHERE id = $1)`, [targetId]);
-    await client.query(`DELETE FROM magic_tokens WHERE email IN (SELECT pre_delete_email FROM users WHERE id = $1)`, [targetId]);
-    await client.query(`DELETE FROM device_tokens WHERE user_id = $1`, [targetId]);
-    await client.query(`INSERT INTO permission_change_outbox(id,company_id,user_id,permission_revision,reason)
-      VALUES($1,$2,$3,(SELECT COALESCE(MAX(permission_revision),0)+1 FROM employee_permissions WHERE user_id=$3),'account_deactivated')`,[randomUUID(),req.companyId,targetId]);
-    await client.query(`DELETE FROM employee_access_delegations WHERE user_id=$1`,[targetId]);
-    await client.query(`DELETE FROM employee_permissions WHERE user_id = $1`, [targetId]);
-    await client.query("COMMIT");
-    try {
-      await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.deactivated", subjectType: "employee", subjectId: targetId, actorUserId: req.userId, source: "ios", payload: { employee_id: targetId, active: false } });
-      await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.removed", subjectType: "employee", subjectId: targetId, actorUserId: req.userId, source: "ios", payload: { employee_id: targetId, active: false } });
-    } catch (automationErr) {
-      console.warn("[automations] employee delete hook failed", automationErr?.message || automationErr);
-    }
-    console.log("[employees] removed", { targetId, by: req.userId, company: req.companyId });
-    res.json({ success: true });
-  } catch (e) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("[employees] delete failed:", e && e.message ? e.message : e);
-    res.status(500).json({ error: "delete_failed", message: "Could not remove that employee." });
-  } finally {
-    client.release();
-  }
-});
-
-// Restore a previously removed employee. Their old email is put back, but
-// password_hash stays NULL — they'll need to request a password reset to
-// regain access.
-app.post("/api/company/employees/:id/restore", authRequired, requireEmployer, async (req, res) => {
-  const targetId = req.params.id;
-  if (targetId === req.ownerUserId) return res.status(403).json({error:"owner_protected"});
-  if (!targetId) return res.status(400).json({ error: "bad_id" });
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('comms-permissions:' || $1,0))",[targetId]);
-    const check = await client.query(
-      `SELECT id, deleted_at, pre_delete_email FROM users WHERE id = $1 AND company_id = $2 FOR UPDATE`,
-      [targetId, req.companyId]
-    );
-    if (!check.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "employee_not_found" }); }
-    if (!check.rows[0].deleted_at) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "not_deleted", message: "This employee is already active." });
-    }
-    const originalEmail = check.rows[0].pre_delete_email;
-    // Check the original email isn't now taken by someone else.
-    if (originalEmail) {
-      const collision = await client.query(
-        `SELECT id FROM users WHERE email = $1 AND id <> $2 LIMIT 1`,
-        [originalEmail, targetId]
-      );
-      if (collision.rowCount) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ error: "email_taken", message: "The original email is already in use by another account. Update the employee's email after restoring." });
-      }
-    }
-    await client.query(
-      `UPDATE users SET
-         email = COALESCE(pre_delete_email, email),
-         pre_delete_email = NULL,
-         deleted_at = NULL,
-         deleted_by = NULL
-       WHERE id = $1`,
-      [targetId]
-    );
-    const restoredPermission = await client.query(`INSERT INTO employee_permissions(user_id,company_id,permission_preset,permission_revision)
-      VALUES($1,$2,'technician',(SELECT COALESCE(MAX(permission_revision),0)+1 FROM permission_change_outbox WHERE user_id=$1))
-      ON CONFLICT(user_id) DO UPDATE SET permission_preset='technician',permission_overrides='{}'::jsonb,permission_revision=employee_permissions.permission_revision+1 RETURNING permission_revision`,[targetId,req.companyId]);
-    await client.query(`INSERT INTO permission_change_outbox(id,company_id,user_id,permission_revision,reason) VALUES($1,$2,$3,$4,'account_restored')`,[randomUUID(),req.companyId,targetId,restoredPermission.rows[0].permission_revision]);
-    await client.query("COMMIT");
-    try {
-      await emitAutomationEvent({ companyId: req.companyId, eventType: "employee.reactivated", subjectType: "employee", subjectId: targetId, actorUserId: req.userId, source: "ios", payload: { employee_id: targetId, active: true } });
-    } catch (automationErr) {
-      console.warn("[automations] employee restore hook failed", automationErr?.message || automationErr);
-    }
-    console.log("[employees] restored", { targetId, by: req.userId, company: req.companyId });
-    res.json({ success: true });
-  } catch (e) {
-    await client.query("ROLLBACK").catch(()=>{});
-    console.error("[employees] restore failed:", e && e.message ? e.message : e);
-    res.status(500).json({ error: "restore_failed", message: "Could not restore that employee." });
-  } finally { client.release(); }
-});
+// Account lifecycle routes are installed by employee-access/routes.js. The user
+// identity, historical photo and existing grants survive disabling/restoration.
 
 // Employee permission routes are installed by permission-governance.js.
 // Legacy /permissions shares the same owner boundary, transaction and audit.
@@ -7266,6 +7197,10 @@ function contactTagsArray(value) {
   return text.split(/[;,]/).map((t) => t.trim()).filter(Boolean);
 }
 
+function contactJSON(row) {
+  return row ? { ...row, tags: contactTagsArray(row.tags) } : row;
+}
+
 function contactTagsForDatabase(value, fallback = "lead") {
   const tags = contactTagsArray(value);
   const finalTags = !tags.length && fallback ? [fallback] : tags;
@@ -7369,6 +7304,96 @@ async function emitJobServiceRouteEvents(companyId, actorUserId, jobId, before, 
   if (added.length || removed.length) await emitAutomationEvent({ companyId, eventType: "job.services_changed", subjectType: "job", subjectId: jobId, actorUserId, source, payload: { ...base, added_services: added, removed_services: removed } });
 }
 
+// ---------- company lead sources ----------
+app.get("/api/lead-sources", authRequired, requireCapability("contacts.view"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const includeArchived = req.query.include_archived === "true";
+    const { rows } = await pool.query(
+      `SELECT ls.id, ls.name, ls.system_key, ls.created_at, ls.updated_at, ls.archived_at,
+              COUNT(c.id)::int AS contact_count
+         FROM lead_sources ls LEFT JOIN contacts c
+           ON c.company_id=ls.company_id AND c.lead_source_id=ls.id AND c.deleted_at IS NULL
+        WHERE ls.company_id=$1 AND ($2::boolean OR ls.archived_at IS NULL)
+        GROUP BY ls.id ORDER BY ls.archived_at NULLS FIRST, lower(ls.name), ls.id`,
+      [req.companyId, includeArchived]
+    );
+    res.json(rows);
+  } catch (error) { console.error(error); res.status(500).json({ error: "failed_list_lead_sources" }); }
+});
+
+app.post("/api/lead-sources", authRequired, requireCapability("contacts.edit"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+  if (!name || name.length > 100) return res.status(400).json({ error: "lead_source_name_invalid" });
+  try {
+    const row = (await pool.query(
+      `INSERT INTO lead_sources(id,company_id,name) VALUES($1,$2,$3) RETURNING *`,
+      [randomUUID(), req.companyId, name]
+    )).rows[0];
+    res.status(201).json(row);
+  } catch (error) {
+    if (error.code === "23505") return res.status(409).json({ error: "lead_source_name_exists" });
+    console.error(error); res.status(500).json({ error: "failed_create_lead_source" });
+  }
+});
+
+app.put("/api/lead-sources/:id", authRequired, requireCapability("contacts.edit"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+  if (!name || name.length > 100) return res.status(400).json({ error: "lead_source_name_invalid" });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const old = (await client.query(
+      `SELECT * FROM lead_sources WHERE id=$1 AND company_id=$2 AND archived_at IS NULL FOR UPDATE`,
+      [req.params.id, req.companyId]
+    )).rows[0];
+    if (!old) { await client.query("ROLLBACK"); return res.status(404).json({ error: "lead_source_not_found" }); }
+    const row = (await client.query(
+      `UPDATE lead_sources SET name=$3, updated_at=now() WHERE id=$1 AND company_id=$2 RETURNING *`,
+      [old.id, req.companyId, name]
+    )).rows[0];
+    await client.query(
+      `UPDATE contacts SET source=$2, updated_at=now() WHERE company_id=$1 AND lead_source_id=$3`,
+      [req.companyId, name, old.id]
+    );
+    // Dynamic source lists store name keys for older clients. Rewrite those keys
+    // with the rename so membership remains stable after the label changes.
+    await client.query(
+      `UPDATE smart_contact_lists sl SET
+         filters=jsonb_set(sl.filters,'{sources}',(
+           SELECT COALESCE(jsonb_agg(to_jsonb(CASE WHEN lower(value)=lower($2) THEN lower($3) ELSE value END)), '[]'::jsonb)
+           FROM jsonb_array_elements_text(sl.filters->'sources') AS source(value)
+         )), updated_at=now()
+       WHERE sl.company_id=$1 AND sl.mode='dynamic' AND sl.archived_at IS NULL
+         AND jsonb_typeof(sl.filters->'sources')='array'
+         AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(sl.filters->'sources') AS source(value)
+                      WHERE lower(value)=lower($2))`,
+      [req.companyId, old.name, name]
+    );
+    await client.query("COMMIT");
+    res.json(row);
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.code === "23505") return res.status(409).json({ error: "lead_source_name_exists" });
+    console.error(error); res.status(500).json({ error: "failed_update_lead_source" });
+  } finally { client.release(); }
+});
+
+app.delete("/api/lead-sources/:id", authRequired, requireCapability("contacts.edit"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE lead_sources SET archived_at=now(), updated_at=now()
+        WHERE id=$1 AND company_id=$2 AND archived_at IS NULL`,
+      [req.params.id, req.companyId]
+    );
+    if (!rowCount) return res.status(404).json({ error: "lead_source_not_found" });
+    res.status(204).end();
+  } catch (error) { console.error(error); res.status(500).json({ error: "failed_delete_lead_source" }); }
+});
+
 // ---------- contacts (AUTH REQUIRED + COMPANY-SCOPED) ----------
 app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async (req, res) => {
   const q = (req.query.q || "").toString().trim();
@@ -7455,7 +7480,7 @@ app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async
       )).rows;
       const total = Number(countResult.rows[0]?.total || 0);
       return res.json({
-        items: rows,
+        items: rows.map(contactJSON),
         total,
         limit,
         offset,
@@ -7491,7 +7516,7 @@ app.get("/api/contacts", authRequired, requireCapability("contacts.view"), async
         )
       ).rows;
     }
-    res.json(rows);
+    res.json(rows.map(contactJSON));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "failed_list" });
@@ -7524,7 +7549,7 @@ app.get("/api/contacts/export.csv", authRequired, requireCapability("contacts.ex
     }
 
     let completedJobs = [];
-    if (contactIDs.length && (hasCapability(req, "schedule.view") || hasCapability(req, "jobs.view"))) {
+    if (contactIDs.length && hasCapability(req, "schedule.view") && hasCapability(req, "jobs.view")) {
       const tenantColumn = req.companyId ? "company_id" : "user_id";
       const tenantValue = req.companyId || req.userId;
       completedJobs = (await pool.query(
@@ -7533,8 +7558,9 @@ app.get("/api/contacts/export.csv", authRequired, requireCapability("contacts.ex
           WHERE ${tenantColumn} = $1
             AND finished_at IS NOT NULL
             AND contact_id = ANY($2::text[])
+            AND ($3::boolean OR worker_user_ids ? $4::text OR sales_user_ids ? $4::text)
           ORDER BY start_at ASC, id ASC`,
-        [tenantValue, contactIDs]
+        [tenantValue, contactIDs, canSeeTeamSchedule(req), req.userId]
       )).rows;
     }
 
@@ -7557,7 +7583,7 @@ app.get("/api/contacts/:id", authRequired, requireCapability("contacts.view"), a
       [req.params.id, ...scope.values]
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
-    res.json(rows[0]);
+    res.json(contactJSON(rows[0]));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "failed_get" });
@@ -7578,7 +7604,7 @@ app.get("/api/contacts/:id/workspace", authRequired, requireCapability("contacts
 
     const access = {
       pipeline: hasCapability(req, "pipeline.view"),
-      jobs: hasCapability(req, "schedule.view") || hasCapability(req, "jobs.view"),
+      jobs: hasCapability(req, "schedule.view") && hasCapability(req, "jobs.view"),
       tasks: hasCapability(req, "tasks.view"),
       quotes: hasCapability(req, "quotes.view"),
       messages: hasCapability(req, "messaging.customer.view"),
@@ -7606,8 +7632,9 @@ app.get("/api/contacts/:id/workspace", authRequired, requireCapability("contacts
                     services, service_items, price_cents, material_cost_cents, started_at, finished_at, weather_exposure, updated_at
                FROM schedule_events
               WHERE ${tenantColumn} = $1 AND contact_id = $2
+                AND ($3::boolean OR worker_user_ids ? $4::text OR sales_user_ids ? $4::text)
               ORDER BY start_at DESC LIMIT 50`,
-            [tenantValue, req.params.id]
+            [tenantValue, req.params.id, canSeeTeamSchedule(req), req.userId]
           )
         : Promise.resolve({ rows: [] }),
       access.tasks
@@ -7669,7 +7696,7 @@ app.get("/api/contacts/:id/workspace", authRequired, requireCapability("contacts
     ]);
 
     res.json({
-      contact: contactRows[0],
+      contact: contactJSON(contactRows[0]),
       access,
       pipeline: pipelineResult.rows[0] || null,
       jobs: jobsResult.rows,
@@ -7733,17 +7760,19 @@ function contactInsertStatements(req, body) {
       name: "full_csv_payload",
       sql: `
         INSERT INTO contacts (
-          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info, source, lead_submitted_at, created_at
+          id, user_id, company_id, name, phone, email, address, value_cents, lat, lng, tags, job_type, u1, u2, u3, u4, u5, lead_info, source, lead_submitted_at, created_at, lead_source_id, source_raw
         ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, COALESCE($21, now())
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, COALESCE($21, now()), $22, $23
         ) RETURNING *;
       `,
       values: [
         ...baseValues,
         Array.isArray(body?.lead_info) ? JSON.stringify(body.lead_info) : null,
-        body?.source || "manual",
+        body?._leadSourceName || body?.source || "manual",
         leadSubmittedAt,
-        createdAt
+        createdAt,
+        body?._leadSourceID || null,
+        body?.source || "manual"
       ]
     },
     {
@@ -8030,7 +8059,10 @@ app.post("/api/contact-imports", authRequired, requireCapability("contacts.creat
       const contactId = randomUUID();
       await client.query(`SAVEPOINT ${savepoint}`);
       try {
-        const statement = contactInsertStatements(req, importRow.contact)[0];
+        const leadSource = await ensureLeadSource(client, req.companyId, importRow.contact.source || "csv");
+        const statement = contactInsertStatements(req, {
+          ...importRow.contact, _leadSourceID: leadSource?.id, _leadSourceName: leadSource?.name
+        })[0];
         statement.values[0] = contactId;
         const inserted = (await client.query(statement.sql, statement.values)).rows[0];
         await client.query(
@@ -8216,7 +8248,13 @@ app.post("/api/contacts", authRequired, requireCapability("contacts.create"), as
 
   const id = randomUUID();
   try {
-    const statements = contactInsertStatements(req, req.body || {});
+    const body = req.body || {};
+    const leadSource = Object.prototype.hasOwnProperty.call(body, "lead_source_id")
+      ? await selectedLeadSource(pool, req.companyId, body.lead_source_id)
+      : await ensureLeadSource(pool, req.companyId, body.source || "manual");
+    const statements = contactInsertStatements(req, {
+      ...body, _leadSourceID: leadSource?.id, _leadSourceName: leadSource?.name
+    });
     statements[0].values[0] = id;
     statements[1].values[0] = id;
     let r;
@@ -8231,8 +8269,9 @@ app.post("/api/contacts", authRequired, requireCapability("contacts.create"), as
       r = await pool.query(statements[1].sql, statements[1].values);
     }
     await emitContactCreatedEffects(req, r.rows[0], source || "manual");
-    res.status(201).json(r.rows[0]);
+    res.status(201).json(contactJSON(r.rows[0]));
   } catch (e) {
+    if (e instanceof LeadSourceError) return res.status(e.statusCode).json({ error: e.code, message: e.message });
     const classified = classifyContactCreateError(e);
     console.error("contact_create_failed", {
       companyId: req.companyId,
@@ -8287,10 +8326,19 @@ app.put("/api/contacts/:id", authRequired, requireCapability("contacts.edit"), a
     if (has("u4")) addUpdate("u4", u4 || null);
     if (has("u5")) addUpdate("u5", u5 || null);
     if (has("lead_info")) addUpdate("lead_info", Array.isArray(lead_info) ? JSON.stringify(lead_info) : null, "::jsonb");
-    if (has("source")) addUpdate("source", source || null);
+    if (has("lead_source_id")) {
+      const leadSource = await selectedLeadSource(pool, req.companyId, body.lead_source_id);
+      addUpdate("lead_source_id", leadSource?.id || null);
+      addUpdate("source", leadSource?.name || null);
+    } else if (has("source")) {
+      const leadSource = await ensureLeadSource(pool, req.companyId, source);
+      addUpdate("lead_source_id", leadSource?.id || null);
+      addUpdate("source", leadSource?.name || source || null);
+      if (before && before.source_raw == null) addUpdate("source_raw", before.source || null);
+    }
     if (has("lead_submitted_at")) addUpdate("lead_submitted_at", parseOptionalContactDate(lead_submitted_at));
     if (has("created_at")) addUpdate("created_at", parseOptionalContactDate(created_at) || new Date());
-    if (!updates.length) return res.json(before);
+    if (!updates.length) return res.json(contactJSON(before));
     addUpdate("updated_at", new Date());
     values.push(...scope.values);
     const scopeSQL = scope.sql.replace("$1", `$${values.length - scope.values.length + 1}`);
@@ -8309,8 +8357,9 @@ app.put("/api/contacts/:id", authRequired, requireCapability("contacts.edit"), a
       }
       await markGoogleSheetsContactDirty(pool, req.companyId, r.rows[0].id, "contact.updated");
     }
-    res.json(r.rows[0]);
+    res.json(contactJSON(r.rows[0]));
   } catch (e) {
+    if (e instanceof LeadSourceError) return res.status(e.statusCode).json({ error: e.code, message: e.message });
     console.error(e);
     res.status(500).json({ error: "failed_update" });
   }
@@ -8890,6 +8939,10 @@ app.post("/api/smart-contact-lists/actions/tasks", authRequired, requireCapabili
   } catch (error) {
     return sendSmartContactError(res, error);
   }
+  if (action.assignee_ids.some((id) => id !== String(req.userId))) {
+    return res.status(400).json({ error: "personal_task_assignment_not_supported" });
+  }
+  action.assignee_ids = [];
 
   const requestSnapshot = {
     contact_ids: action.contact_ids,
@@ -10787,6 +10840,7 @@ app.post("/webhooks/leads/:token", async (req, res) => {
   const submittedAt = body.created_time || body.submitted_at || null;
 
   const source = externalLeadId ? "facebook_zapier" : "zapier";
+  const leadSource = await ensureLeadSource(pool, companyId, source);
 
   // Coerce submittedAt into either a valid ISO string or null. Postgres
   // otherwise rejects empty strings / numbers with an "invalid input syntax
@@ -10816,8 +10870,8 @@ app.post("/webhooks/leads/:token", async (req, res) => {
   if (externalLeadId) {
     try {
       const scopeSQL = companyId
-        ? `company_id = $1 AND source = $2 AND external_lead_id = $3`
-        : `user_id = $1 AND source = $2 AND external_lead_id = $3`;
+        ? `company_id = $1 AND (source_raw = $2 OR source = $2) AND external_lead_id = $3`
+        : `user_id = $1 AND (source_raw = $2 OR source = $2) AND external_lead_id = $3`;
       const scopeVal = companyId || userId;
       const dup = await pool.query(
         `SELECT id FROM contacts WHERE ${scopeSQL} LIMIT 1`,
@@ -10861,18 +10915,19 @@ app.post("/webhooks/leads/:token", async (req, res) => {
         id, user_id, company_id, name, phone, email, address,
         value_cents, lat, lng, tags, job_type,
         u1, u2, u3, u4, u5, lead_info,
-        source, external_lead_id, lead_form_id, lead_page_id, lead_submitted_at
+        source, source_raw, lead_source_id, external_lead_id, lead_form_id, lead_page_id, lead_submitted_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7,
         NULL, NULL, NULL, $8, NULL,
         NULL, NULL, NULL, NULL, NULL, $9,
-        $10, $11, $12, $13, $14
+        $10, $11, $12, $13, $14, $15, $16
       ) RETURNING *`,
       [
         contactId, userId, companyId, name, phone || "", email || "", address || "",
         tagsArray,
         JSON.stringify(leadInfo),
-        source, externalLeadId, formId, pageId, submittedAtSafe
+        leadSource?.name || source, source, leadSource?.id || null,
+        externalLeadId, formId, pageId, submittedAtSafe
       ]
     );
     contactRow = inserted.rows[0];
@@ -11134,10 +11189,11 @@ app.post("/webhooks/leads/:token", async (req, res) => {
 
 // ---------- QUOTES ----------
 installServiceCatalogRoutes({ app, pool, authRequired, requireCapability, requireAnyCapability });
+installQuoteMaterialCatalogRoutes({ app, pool, authRequired, requireCapability, requireAnyCapability });
 installCalculatorRoutes({app,pool,authRequired});
 
 function sendQuoteValidationError(res, error) {
-  if (!(error instanceof QuoteContractError) && !(error instanceof ServiceCatalogError)) return false;
+  if (!(error instanceof QuoteContractError) && !(error instanceof ServiceCatalogError) && !(error instanceof QuoteMaterialError)) return false;
   res.status(error.status || error.statusCode || 400).json({ error: error.code, message: error.message });
   return true;
 }
@@ -11147,18 +11203,22 @@ app.post("/api/quotes/pricing", authRequired, requireAnyCapability("quotes.creat
     const line_items = normalizeQuoteLines(req.body?.line_items ?? []);
     let previousOptions = null;
     let existing_lines = [];
+    let existingMaterials = [];
     if (req.body?.quote_id) {
       const scope = quoteScopeSQL(req);
-      const existing = (await pool.query(`SELECT line_items,quote_options FROM quotes q WHERE ${scope.sql} AND id::text = $${scope.values.length + 1}`, [...scope.values, req.body.quote_id])).rows[0];
+      const existing = (await pool.query(`SELECT line_items,quote_options,materials FROM quotes q WHERE ${scope.sql} AND id::text = $${scope.values.length + 1}`, [...scope.values, req.body.quote_id])).rows[0];
       if (!existing) return res.status(404).json({ error: "not_found" });
       previousOptions = existing.quote_options;
       existing_lines = [...existing.line_items, ...normalizeQuoteOptions(existing.quote_options || {}).optional_addons];
+      existingMaterials = existing.materials || [];
     }
+    const materials = normalizeQuoteMaterialLines(req.body?.materials ?? existingMaterials);
     const quote_options = await resolveQuoteTemplateOptions(pool, req, req.body?.quote_options ?? {}, {previous:previousOptions});
     validateQuoteAddonScope(line_items, quote_options);
     await assertQuoteReferences(pool, req, { line_items: [...line_items,...quote_options.optional_addons], existing_lines });
+    await assertMaterialReferences(pool, req.companyId, materials, existingMaterials);
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
-    res.json(await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items, deposit: quote_options.deposit, discount:quote_options.discount,tax_inclusive:settings.tax_inclusive??false,
+    res.json(await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: [...line_items,...materialChargeLines(materials)], deposit: quote_options.deposit, discount:quote_options.discount,tax_inclusive:settings.tax_inclusive??false,
       tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }),quote_options));
   } catch (error) {
     if (sendQuoteValidationError(res, error)) return;
@@ -11176,8 +11236,9 @@ app.get("/api/quotes/:id/pricing", authRequired, requireCapability("quotes.view"
     const options = normalizeQuoteOptions(quote.quote_options || {});
     validateQuoteAddonScope(quote.line_items, options);
     await assertQuoteReferences(pool, req, { line_items: [...quote.line_items,...options.optional_addons], existing_lines: [...quote.line_items,...options.optional_addons] });
+    const materials = normalizeQuoteMaterialLines(quote.materials || []);
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
-    res.json({ ...await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: quote.line_items, deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
+    res.json({ ...await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: [...quote.line_items,...materialChargeLines(materials)], deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
       tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }),options), quote_updated_at: quote.updated_at });
   } catch (error) {
     if (sendQuoteValidationError(res, error)) return;
@@ -11292,7 +11353,10 @@ app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (re
     let rows;
     if (contactID) {
       rows = (await pool.query(
-        `SELECT id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at, calculation_revision
+        `SELECT id, contact_id, title, line_items, materials, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at, calculation_revision,
+                (SELECT max(se.finished_at) FROM schedule_events se
+                  WHERE se.quote_id = q.id AND se.contact_id = q.contact_id
+                    AND se.company_id IS NOT DISTINCT FROM q.company_id AND se.finished_at IS NOT NULL) AS finished_job_at
          FROM quotes q
          WHERE ${scope.sql} AND contact_id = $${scope.values.length + 1}
          ORDER BY updated_at DESC`,
@@ -11300,7 +11364,10 @@ app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (re
       )).rows;
     } else {
       rows = (await pool.query(
-        `SELECT id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at, calculation_revision
+        `SELECT id, contact_id, title, line_items, materials, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at, calculation_revision,
+                (SELECT max(se.finished_at) FROM schedule_events se
+                  WHERE se.quote_id = q.id AND se.contact_id = q.contact_id
+                    AND se.company_id IS NOT DISTINCT FROM q.company_id AND se.finished_at IS NOT NULL) AS finished_job_at
          FROM quotes q
          WHERE ${scope.sql}
          ORDER BY updated_at DESC
@@ -11313,6 +11380,93 @@ app.get("/api/quotes", authRequired, requireCapability("quotes.view"), async (re
     console.error("[quotes] list failed:", e && e.message ? e.message : e);
     res.status(500).json({ error: "failed_list_quotes" });
   }
+});
+
+app.post("/api/quotes/:id/reuse", authRequired, requireCapability("quotes.create"), async (req, res) => {
+  if (!req.companyId) return res.status(403).json({ error: "company_required" });
+  const requestKey = req.body?.request_key;
+  if (typeof requestKey !== "string" || !requestKey.trim() || requestKey.length > 150) {
+    return res.status(400).json({ error: "request_key_required", message: "A retry key is required to reuse a quote." });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`quote-reuse:${req.companyId}:${req.userId}:${requestKey}`]);
+    const priorRequest = (await client.query(`SELECT source_quote_id,new_quote_id FROM quote_reuse_requests
+      WHERE company_id=$1 AND actor_id=$2 AND request_key=$3`, [req.companyId, req.userId, requestKey])).rows[0];
+    if (priorRequest && priorRequest.source_quote_id !== req.params.id) {
+      throw new QuoteContractError("quote_reuse_key_conflict", "This retry key belongs to another quote.", 409);
+    }
+    if (priorRequest) {
+      const quote = (await client.query(`SELECT id,contact_id,title,line_items,materials,total_cents,notes,quote_options,status,expires_at,
+        sent_at,accepted_at,declined_at,converted_job_id,created_at,updated_at,calculation_revision
+        FROM quotes WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL`, [priorRequest.new_quote_id, req.companyId])).rows[0];
+      if (!quote) throw new QuoteContractError("quote_reuse_unavailable", "The reused quote is no longer available.", 409);
+      await client.query("COMMIT");
+      return res.json({ quote, restored_services: 0, restored_line_items: 0, reused_request: true });
+    }
+    const scope = quoteScopeSQL(req);
+    const source = (await client.query(`SELECT q.* FROM quotes q WHERE ${scope.sql} AND q.id=$${scope.values.length + 1} FOR SHARE`,
+      [...scope.values, req.params.id])).rows[0];
+    if (!source) throw new QuoteContractError("quote_not_found", "The source quote was not found in this company.", 404);
+    const selected = [...new Set((source.line_items || []).map(item => item.service_id).filter(Boolean))];
+    const selectedMaterials = [...new Set((source.materials || []).map(item => item.material_id).filter(Boolean))];
+    let restoredServices = 0;
+    for (const serviceID of selected) {
+      const row = (await client.query("SELECT id,company_id,archived_at FROM saved_services WHERE id=$1 FOR UPDATE", [serviceID])).rows[0];
+      if (row && row.company_id !== req.companyId) throw new QuoteContractError("quote_service_foreign", "A historical service ID is unavailable in this company.", 409);
+      if (row?.archived_at) {
+        await client.query("UPDATE saved_services SET archived_at=NULL,version=version+1,updated_at=now(),updated_by=$3 WHERE id=$1 AND company_id=$2", [serviceID, req.companyId, req.userId]);
+        restoredServices++;
+      } else if (!row) {
+        const line = source.line_items.find(item => item.service_id === serviceID);
+        const snapshot = source.calculation?.service_snapshot?.find(item => item.id === serviceID);
+        const created = await client.query(`INSERT INTO saved_services(id,company_id,name,default_price_cents,default_description,estimated_duration_minutes,created_by,updated_by)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$7) ON CONFLICT(id) DO NOTHING RETURNING id`,
+        [serviceID, req.companyId, line.name, line.price_cents, line.description || "", snapshot?.estimated_duration_minutes ?? null, req.userId]);
+        if (!created.rowCount) throw new QuoteContractError("quote_service_id_conflict", "A historical service ID is unavailable.", 409);
+        restoredServices++;
+      }
+    }
+    for (const materialID of selectedMaterials) {
+      const row = (await client.query("SELECT id,company_id,archived_at FROM quote_material_catalog WHERE id=$1 FOR UPDATE", [materialID])).rows[0];
+      if (row && row.company_id !== req.companyId) throw new QuoteContractError("quote_material_foreign", "A historical material ID is unavailable in this company.", 409);
+      if (row?.archived_at) await client.query("UPDATE quote_material_catalog SET archived_at=NULL,version=version+1,updated_at=now(),updated_by=$3 WHERE id=$1 AND company_id=$2", [materialID, req.companyId, req.userId]);
+      else if (!row) {
+        const line = source.materials.find(item => item.material_id === materialID);
+        const created = await client.query(`INSERT INTO quote_material_catalog(id,company_id,name,unit,default_cost_per_unit_cents,default_charge_per_unit_cents,created_by,updated_by)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$7) ON CONFLICT(id) DO NOTHING RETURNING id`,
+        [materialID, req.companyId, line.name, line.unit, line.cost_unit_cents, line.charge_unit_cents, req.userId]);
+        if (!created.rowCount) throw new QuoteContractError("quote_material_id_conflict", "A historical material ID is unavailable.", 409);
+      }
+    }
+    let restoredLineItems = 0;
+    if (source.calculation?.catalog?.config && selected.length) {
+      const current = (await client.query("SELECT revision,config FROM quote_calculator_catalog WHERE company_id=$1 FOR UPDATE", [req.companyId])).rows[0];
+      const merged = mergeHistoricalQuoteCatalog(current?.config, source.calculation.catalog.config, selected);
+      restoredLineItems = merged.restored;
+      if (restoredLineItems) {
+        if (current) await client.query("UPDATE quote_calculator_catalog SET config=$2::jsonb,revision=revision+1,updated_by=$3,updated_at=now() WHERE company_id=$1", [req.companyId, JSON.stringify(merged.config), req.userId]);
+        else await client.query("INSERT INTO quote_calculator_catalog(company_id,config,updated_by) VALUES($1,$2::jsonb,$3)", [req.companyId, JSON.stringify(merged.config), req.userId]);
+      }
+    }
+    const newID = randomUUID();
+    const quote = (await client.query(`INSERT INTO quotes(id,user_id,company_id,contact_id,title,line_items,total_cents,notes,quote_options,status,calculation,calculation_revision,option_group_id,materials)
+      VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9::jsonb,'draft',$10::jsonb,$11,$12,$13::jsonb)
+      RETURNING id,contact_id,title,line_items,materials,total_cents,notes,quote_options,status,expires_at,sent_at,accepted_at,declined_at,converted_job_id,created_at,updated_at,calculation_revision`,
+    [newID, req.userId, req.companyId, source.contact_id, source.title, JSON.stringify(source.line_items), source.total_cents,
+      source.notes, JSON.stringify(source.quote_options), source.calculation ? JSON.stringify(source.calculation) : null,
+      source.calculation ? 1 : 0, source.calculation ? newID : null, JSON.stringify(source.materials || [])])).rows[0];
+    await client.query(`INSERT INTO quote_reuse_requests(company_id,actor_id,request_key,source_quote_id,new_quote_id)
+      VALUES($1,$2,$3,$4,$5)`, [req.companyId, req.userId, requestKey, source.id, newID]);
+    await client.query("COMMIT");
+    res.status(201).json({ quote, restored_services: restoredServices, restored_line_items: restoredLineItems, reused_request: false });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if (error instanceof QuoteContractError) return res.status(error.status).json({ error: error.code, message: error.message });
+    console.error("[quotes] reuse failed", { code: error?.code });
+    res.status(500).json({ error: "quote_reuse_failed", message: "The quote could not be reused. Try again." });
+  } finally { client.release(); }
 });
 
 app.get("/api/quotes/totals", authRequired, requireCapability("quotes.view"), async (req, res) => {
@@ -11335,25 +11489,27 @@ app.get("/api/quotes/totals", authRequired, requireCapability("quotes.view"), as
 app.post("/api/quotes", authRequired, requireCapability("quotes.create"), async (req, res) => {
   const { contact_id, title, line_items, notes, status, expires_at } = req.body || {};
   if (!contact_id) return res.status(400).json({ error: "contact_id_required" });
-  let items, options, total;
+  let items, options, materials, total;
   const initialStatus = ["draft","sent","accepted","declined","expired","converted"].includes(status) ? status : "draft";
   try {
     items = normalizeQuoteLines(line_items ?? []);
+    materials = normalizeQuoteMaterialLines(req.body?.materials ?? []);
     options = await resolveQuoteTemplateOptions(pool, req, req.body?.quote_options ?? {});
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
-    const pricing = await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: items, deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
+    const pricing = await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: [...items,...materialChargeLines(materials)], deposit: options.deposit, discount:options.discount,tax_inclusive:settings.tax_inclusive??false,
       tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }),options);
     total = pricing.subtotal_cents;
     validateQuoteAddonScope(items, options);
     await assertQuoteReferences(pool, req, { contact_id, line_items: [...items,...options.optional_addons] });
+    await assertMaterialReferences(pool, req.companyId, materials);
     const { rows } = await pool.query(
-      `INSERT INTO quotes (user_id, company_id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at)
+      `INSERT INTO quotes (user_id, company_id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, materials)
        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $10::jsonb, $8, $9,
          CASE WHEN $8 = 'sent' THEN now() END,
          CASE WHEN $8 = 'accepted' THEN now() END,
-         CASE WHEN $8 = 'declined' THEN now() END)
-       RETURNING id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
-      [req.userId, req.companyId || null, contact_id, title || null, JSON.stringify(items), total, notes || null, initialStatus, expires_at || null, JSON.stringify(options)]
+         CASE WHEN $8 = 'declined' THEN now() END,$11::jsonb)
+       RETURNING id, contact_id, title, line_items, materials, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
+      [req.userId, req.companyId || null, contact_id, title || null, JSON.stringify(items), total, notes || null, initialStatus, expires_at || null, JSON.stringify(options), JSON.stringify(materials)]
     );
     if (req.companyId) {
       await emitAutomationEvent({
@@ -11399,15 +11555,18 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
     const previous = before.rows[0];
     if (previous.calculation && !req[internalActor]?.calculatorWrite) return res.status(409).json({error:"use_calculator_editor",message:"Edit this calculated quote with its revision-aware calculator editor."});
     const items = line_items === undefined ? null : normalizeQuoteLines(line_items);
+    const materials = req.body.materials === undefined ? null : normalizeQuoteMaterialLines(req.body.materials);
+    const effectiveMaterials = materials ?? normalizeQuoteMaterialLines(previous.materials || []);
     if (req.body.quote_options !== undefined && (!req.body.quote_options || typeof req.body.quote_options !== "object" || Array.isArray(req.body.quote_options))) throw new QuoteContractError("quote_options_invalid","Quote options must be an object.");
     const options = req.body.quote_options === undefined ? null : await resolveQuoteTemplateOptions(pool, req, req.body.quote_options, { previous: previous.quote_options });
     const effectiveOptions = options || normalizeQuoteOptions(previous.quote_options || {});
     const settings = req.companyId ? await getQuoteSettings(pool, req.companyId) : {};
-    const pricing = await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: items || previous.line_items, deposit: effectiveOptions.deposit, discount:effectiveOptions.discount,tax_inclusive:settings.tax_inclusive??false,
+    const pricing = await priceQuoteForPlan(pool,req.companyId,calculateQuotePricing({ line_items: [...(items || previous.line_items),...materialChargeLines(effectiveMaterials)], deposit: effectiveOptions.deposit, discount:effectiveOptions.discount,tax_inclusive:settings.tax_inclusive??false,
       tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0 }),effectiveOptions);
-    const total = items ? pricing.subtotal_cents : null;
+    const total = items || materials ? pricing.subtotal_cents : null;
     validateQuoteAddonScope(items || previous.line_items, effectiveOptions);
     await assertQuoteReferences(pool, req, { contact_id: previous.contact_id, line_items: [...(items || previous.line_items),...effectiveOptions.optional_addons], existing_lines: [...previous.line_items,...normalizeQuoteOptions(previous.quote_options || {}).optional_addons] });
+    await assertMaterialReferences(pool, req.companyId, effectiveMaterials, previous.materials || []);
     // Mutable fields precede tenant filters. The separate read above binds only
     // its own parameters, avoiding PostgreSQL unknown-type gaps.
     const params = [
@@ -11418,7 +11577,8 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
       notes || null,
       ["draft","sent","accepted","declined","expired","converted"].includes(status) ? status : null,
       expires_at || null,
-      options ? JSON.stringify(options) : null
+      options ? JSON.stringify(options) : null,
+      materials ? JSON.stringify(materials) : null
     ];
     let whereScope;
     if (req.companyId) {
@@ -11437,18 +11597,19 @@ app.put("/api/quotes/:id", authRequired, requireCapability("quotes.edit"), async
          status = COALESCE($6, status),
          expires_at = COALESCE($7::timestamptz, expires_at),
          quote_options = COALESCE($8::jsonb, quote_options),
+         materials = COALESCE($9::jsonb, materials),
          sent_at = CASE WHEN $6 = 'sent' THEN COALESCE(sent_at, now()) ELSE sent_at END,
          accepted_at = CASE WHEN $6 = 'accepted' THEN COALESCE(accepted_at, now()) ELSE accepted_at END,
          declined_at = CASE WHEN $6 = 'declined' THEN COALESCE(declined_at, now()) ELSE declined_at END,
          updated_at = now()
        WHERE id = $1 AND q.deleted_at IS NULL AND ${whereScope}
-       RETURNING id, contact_id, title, line_items, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
+       RETURNING id, contact_id, title, line_items, materials, total_cents, notes, quote_options, status, expires_at, sent_at, accepted_at, declined_at, converted_job_id, created_at, updated_at`,
       params
     );
     if (!rows.length) return res.status(404).json({ error: "not_found" });
     if (req.companyId) {
       const prev = before.rows[0] || {};
-      const changed = ["title", "notes", "status", "total_cents", "expires_at", "quote_options"].filter((field) => JSON.stringify(prev[field] ?? null) !== JSON.stringify(rows[0][field] ?? null)).map((field) => ({ field, old_value: prev[field] ?? null, new_value: rows[0][field] ?? null }));
+      const changed = ["title", "notes", "status", "total_cents", "expires_at", "quote_options", "materials"].filter((field) => JSON.stringify(prev[field] ?? null) !== JSON.stringify(rows[0][field] ?? null)).map((field) => ({ field, old_value: prev[field] ?? null, new_value: rows[0][field] ?? null }));
       if (JSON.stringify(prev.line_items || []) !== JSON.stringify(rows[0].line_items || [])) changed.push({ field: "line_items", old_value: prev.line_items || [], new_value: rows[0].line_items || [] });
       if (changed.length) {
         const payload = { quote_id: rows[0].id, contact_id: rows[0].contact_id, status: rows[0].status, total_cents: rows[0].total_cents, line_item_count: Array.isArray(rows[0].line_items) ? rows[0].line_items.length : 0, changed_fields: changed };
@@ -12002,15 +12163,27 @@ app.delete("/api/opportunities/:id", authRequired, requireCapability("pipeline.m
 });
 
 // ---------- SCHEDULE EVENTS ----------
+installScheduleDraftRoutes({app,pool,authRequired,requireAllCapabilities,requireCapability,requireAnyCapability});
+installScheduleBlockRoutes({app,pool,authRequired,requireCapability,hasCapability});
+const canSeeTeamSchedule = req => !req.companyId || req.isCompanyOwner || hasCapability(req, "schedule.manage_team");
+async function requireVisibleJob(req,res,next) {
+  if (!req.companyId || canSeeTeamSchedule(req)) return next();
+  try {
+    const exists=await pool.query(`SELECT 1 FROM schedule_events WHERE id=$1 AND company_id=$2
+      AND (worker_user_ids ? $3::text OR sales_user_ids ? $3::text)`,[req.params.id,req.companyId,req.userId]);
+    if (!exists.rowCount) return res.status(404).json({error:"job_not_found"});
+    next();
+  } catch(error) { console.error("[schedule] job visibility failed",error?.code||error?.message);res.status(500).json({error:"job_access_failed"}); }
+}
 app.get("/api/schedule", authRequired, requireAllCapabilities("schedule.view", "jobs.view"), async (req, res) => {
   res.set("Cache-Control", "private, no-store");
   try {
     const where = req.companyId
-      ? { sql: `company_id = $1`, values: [req.companyId] }
+      ? { sql: `company_id = $1 AND ($2::boolean OR worker_user_ids ? $3::text OR sales_user_ids ? $3::text)`, values: [req.companyId, canSeeTeamSchedule(req), req.userId] }
       : { sql: `user_id = $1`, values: [req.userId] };
     const { rows } = await pool.query(
       `SELECT id, title, start_at AS start, end_at AS "end", color, notes,
-              contact_id, quote_id, to_jsonb(schedule_events)->>'service_plan_id' AS service_plan_id, customer_note_entries, reminder_minutes, services, service_items, price_cents, material_cost_cents,
+              contact_id, quote_id, to_jsonb(schedule_events)->>'service_plan_id' AS service_plan_id, customer_note_entries, reminder_minutes, services, service_items, price_cents, material_cost_cents, quote_material_estimate_cents,
               company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
               weather_exposure
        FROM schedule_events WHERE ${where.sql} ORDER BY start_at ASC`,
@@ -12029,6 +12202,7 @@ app.get("/api/schedule/team", authRequired, requireAllCapabilities("schedule.vie
     return res.status(400).json({ error: "invalid_schedule_range", message: "Choose a valid range of 62 days or fewer." });
   }
   try {
+    const broad = canSeeTeamSchedule(req);
     const [companyResult, membersResult, availabilityResult, eventsResult] = await Promise.all([
       pool.query(
         `SELECT timezone, business_days, business_open_time, business_close_time
@@ -12038,9 +12212,9 @@ app.get("/api/schedule/team", authRequired, requireAllCapabilities("schedule.vie
       pool.query(
         `SELECT id, role, COALESCE(NULLIF(BTRIM(display_name), ''), split_part(email, '@', 1), 'Team member') AS display_name
            FROM users
-          WHERE company_id = $1 AND deleted_at IS NULL
+          WHERE company_id = $1 AND deleted_at IS NULL AND ($2::boolean OR id=$3)
           ORDER BY role = 'employer' DESC, display_name ASC NULLS LAST, email ASC`,
-        [req.companyId]
+        [req.companyId,broad,req.userId]
       ),
       pool.query(
         `SELECT user_id, weekdays, start_time, end_time, timezone, enabled, updated_at
@@ -12048,10 +12222,13 @@ app.get("/api/schedule/team", authRequired, requireAllCapabilities("schedule.vie
         [req.companyId]
       ),
       pool.query(
-        `SELECT id, start_at, end_at, worker_user_ids, finished_at
+        `SELECT id, start_at, end_at,
+                CASE WHEN $4::boolean THEN worker_user_ids ELSE jsonb_build_array($5::text) END AS worker_user_ids,
+                finished_at
            FROM schedule_events
-          WHERE company_id = $1 AND start_at < $3 AND end_at > $2`,
-        [req.companyId, start, end]
+          WHERE company_id = $1 AND start_at < $3 AND end_at > $2
+            AND ($4::boolean OR worker_user_ids ? $5::text)`,
+        [req.companyId, start, end,broad,req.userId]
       )
     ]);
     if (!companyResult.rows.length) return res.status(404).json({ error: "company_not_found" });
@@ -12161,7 +12338,7 @@ app.delete("/api/schedule/team/:userId/availability", authRequired, requireAllCa
 app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requireAnyCapability("schedule.create", "schedule.edit"), async (req, res) => {
   const {
     title, start, end, color, notes, contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents,
-    sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by, weather_exposure
+    sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by, weather_exposure, scheduling_draft_id
   } = req.body || {};
   if (!title || !start || !end) return res.status(400).json({ error: "missing_params" });
   const startDate = new Date(start);
@@ -12173,11 +12350,16 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
   let committed = false;
   try {
     await db.query("BEGIN");
-    if (req.companyId) await lockCompanySchedule(db, req.companyId);
+    await lockCompanySchedule(db, req.companyId || req.userId);
     const previous = await db.query(
       `SELECT * FROM schedule_events WHERE id = $1 AND (($3::uuid IS NOT NULL AND company_id = $3) OR ($3::uuid IS NULL AND company_id IS NULL AND user_id = $2))`,
       [req.params.id, req.userId, req.companyId]
     );
+    if (previous.rowCount && !canSeeTeamSchedule(req) &&
+        !previous.rows[0].worker_user_ids?.includes(req.userId) &&
+        !previous.rows[0].sales_user_ids?.includes(req.userId)) {
+      await db.query("ROLLBACK"); return res.status(404).json({error:"job_not_found"});
+    }
     const requiredCapability = requiredScheduleWriteCapability(previous.rowCount > 0);
     if (!hasCapability(req, requiredCapability)) {
       await db.query("ROLLBACK");
@@ -12193,20 +12375,38 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
     if (contact_id && !(await db.query(`SELECT id FROM contacts WHERE id=$1 AND (${req.companyId ? "company_id=$2" : "user_id=$2"})`, [contact_id, req.companyId || req.userId])).rowCount) {
       await db.query("ROLLBACK"); return res.status(404).json({ error: "contact_not_found" });
     }
-    if (quote_id && !(await db.query(`SELECT id FROM quotes WHERE id=$1 AND (deleted_at IS NULL OR id::text=$4) AND (${req.companyId ? "company_id=$2" : "user_id=$2"}) AND ($3::text IS NULL OR contact_id=$3)`, [quote_id, req.companyId || req.userId, contact_id || null, previous.rows[0]?.quote_id || null])).rowCount) {
+    const selectedQuote = quote_id ? (await db.query(`SELECT id,contact_id,deleted_at,line_items,materials,quote_options FROM quotes WHERE id=$1 AND (deleted_at IS NULL OR id::text=$4) AND (${req.companyId ? "company_id=$2" : "user_id=$2"}) AND ($3::text IS NULL OR contact_id=$3)`, [quote_id, req.companyId || req.userId, contact_id || null, previous.rows[0]?.quote_id || null])).rows[0] : null;
+    if (quote_id && !selectedQuote) {
       await db.query("ROLLBACK"); return res.status(404).json({ error: "quote_not_found" });
     }
     if(finished_at && !previous.rows[0]?.finished_at && !hasCapability(req,"jobs.complete")) {
       await db.query("ROLLBACK"); return res.status(403).json({error:"permission_denied",required_capability:"jobs.complete"});
     }
     const selectedScope = await selectedQuoteScheduleScope(db,{companyId:req.companyId,quoteId:quote_id,previous:previous.rows[0],start,end,requestedServiceItems:service_items});
+    const effectiveQuoteID = selectedScope?.quote_id || quote_id || null;
+    let quoteMaterialEstimateCents = previous.rows[0]?.quote_material_estimate_cents ?? null;
+    if (effectiveQuoteID && (!previous.rowCount || effectiveQuoteID !== previous.rows[0]?.quote_id)) {
+      const quoteMaterials = (await db.query(`SELECT materials FROM quotes WHERE id=$1 AND company_id=$2`, [effectiveQuoteID, req.companyId])).rows[0]?.materials || [];
+      quoteMaterialEstimateCents = materialCostCents(normalizeQuoteMaterialLines(quoteMaterials));
+    }
     const assignments = validateAssignments({
-      salesIDs: Array.isArray(sales_user_ids) ? sales_user_ids : [req.userId],
-      workerIDs: Array.isArray(worker_user_ids) ? worker_user_ids : [],
+      salesIDs: Array.isArray(sales_user_ids) ? sales_user_ids : previous.rows[0]?.sales_user_ids || [],
+      workerIDs: Array.isArray(worker_user_ids) ? worker_user_ids : previous.rows[0]?.worker_user_ids || [],
       activeMemberIDs: activeMembers.rows.map((row) => row.id)
     });
     const salesIDs = assignments.sales_user_ids;
     const workerIDs = assignments.worker_user_ids;
+    if (!previous.rowCount) {
+      requireNewJobAssignments({ quoteID: quote_id, contactID: contact_id, salesIDs, workerIDs });
+      if (!selectedQuote || selectedQuote.deleted_at ||
+          !(selectedQuote.line_items?.length || selectedQuote.materials?.length)) {
+        throw new ScheduleTeamError("schedule_valid_quote_required", "Choose a current quote with service or material scope.");
+      }
+      const duration = Number(selectedScope?.duration_minutes ?? selectedQuote.quote_options?.duration_minutes);
+      if (!Number.isSafeInteger(duration) || duration < 1 || duration > 10080 || endDate - startDate < duration * 60000) {
+        throw new ScheduleTeamError("schedule_quote_duration_required", "Reserve at least the quote's saved estimated job duration.");
+      }
+    }
     const oldWorkerIDs = previous.rows.length && Array.isArray(previous.rows[0].worker_user_ids)
       ? previous.rows[0].worker_user_ids
       : [];
@@ -12218,8 +12418,8 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
       `INSERT INTO schedule_events
         (id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, quote_id,
          reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
-         weather_exposure)
-       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $16::jsonb, $17::jsonb, $18, $19, $20, $21, $22)
+         weather_exposure, quote_material_estimate_cents)
+       VALUES ($1, $2, $3, $2, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, $16::jsonb, $17::jsonb, $18, $19, $20, $21, $22, $23)
        ON CONFLICT (id) DO UPDATE
          SET title = EXCLUDED.title,
              start_at = EXCLUDED.start_at,
@@ -12233,6 +12433,7 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
              service_items = EXCLUDED.service_items,
              price_cents = EXCLUDED.price_cents,
              material_cost_cents = EXCLUDED.material_cost_cents,
+             quote_material_estimate_cents = EXCLUDED.quote_material_estimate_cents,
              company_id = EXCLUDED.company_id,
              sales_user_ids = EXCLUDED.sales_user_ids,
              worker_user_ids = EXCLUDED.worker_user_ids,
@@ -12244,7 +12445,7 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
              updated_at = now()
        WHERE ($3::uuid IS NOT NULL AND schedule_events.company_id = $3) OR ($3::uuid IS NULL AND schedule_events.company_id IS NULL AND schedule_events.user_id = $2)
        RETURNING id, title, start_at AS start, end_at AS "end", color, notes,
-                 contact_id, quote_id, reminder_minutes, services, price_cents, material_cost_cents,
+                 contact_id, quote_id, reminder_minutes, services, price_cents, material_cost_cents, quote_material_estimate_cents,
                  service_items, company_id, created_by, sales_user_ids, worker_user_ids, started_at, started_by, finished_at, finished_by,
                  weather_exposure`,
       [
@@ -12254,14 +12455,17 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
         JSON.stringify(selectedScope?.services || services || []),
         JSON.stringify(selectedScope?.service_items || (Array.isArray(service_items) ? service_items : [])),
         selectedScope ? selectedScope.price_cents : Number.isFinite(Number(price_cents)) ? Number(price_cents) : null,
-        Number.isFinite(Number(material_cost_cents)) ? Number(material_cost_cents) : null,
+        Number.isFinite(Number(material_cost_cents)) && material_cost_cents != null
+          ? Number(material_cost_cents)
+          : previous.rows[0]?.material_cost_cents ?? null,
         JSON.stringify(salesIDs),
         JSON.stringify(workerIDs),
         started_at || null,
         started_by || null,
         finished_at || null,
         finished_by || null,
-        weatherExposure
+        weatherExposure,
+        quoteMaterialEstimateCents
       ]
     );
     if (!r.rowCount) { await db.query("ROLLBACK"); return res.status(404).json({ error: "schedule_not_found" }); }
@@ -12276,6 +12480,7 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
     }
     const planJob=await app.locals.agreementPlans?.associateJob(db,req.companyId,req.params.id,{allowFinished:!!r.rows[0].finished_at});
     if(planJob){r.rows[0].price_cents=planJob.amount_cents;r.rows[0].service_plan_id=(await db.query('SELECT service_plan_id FROM schedule_events WHERE id=$1',[req.params.id])).rows[0].service_plan_id;}
+    if (isNewJob) await clearScheduleDraftsForContact(db,req.companyId || req.userId,r.rows[0].contact_id,scheduling_draft_id,req.userId);
     await db.query("COMMIT");
     committed = true;
     if (r.rows[0].finished_at) await app.locals.agreementPlans?.completeJob(req, req.params.id);
@@ -12337,7 +12542,7 @@ app.put("/api/schedule/:id", authRequired, requireCapability("jobs.view"), requi
   } finally { db.release(); }
 });
 
-app.delete("/api/schedule/:id", authRequired, requireAllCapabilities("schedule.delete", "jobs.view"), async (req, res) => {
+app.delete("/api/schedule/:id", authRequired, requireAllCapabilities("schedule.delete", "jobs.view"), requireVisibleJob, async (req, res) => {
   try {
     const before = req.companyId
       ? (await pool.query(`SELECT * FROM schedule_events WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId])).rows[0]
@@ -12678,177 +12883,18 @@ async function processWeatherBatchNotifications(companyId, actorUserId, batchId)
   await pool.query(`UPDATE weather_reschedule_batches SET status = $3, updated_at = now() WHERE company_id = $1 AND id = $2`, [companyId, batchId, status]);
 }
 
-app.get("/api/weather/status", authRequired, requireCapability("schedule.view"), async (req, res) => {
-  try {
-    const company = await loadWeatherCompany(pool, req.companyId);
-    res.json({ ...googleWeatherService.status(), monitoring_enabled: company.settings.enabled });
-  } catch (error) {
-    sendWeatherError(res, error, "weather_status_failed");
-  }
+// Retain historical settings/observations while preserving each old endpoint's
+// authorization boundary. Older clients receive an explicit retired response.
+const retiredWeatherRoute = (_req, res) => res.status(410).json({
+  error: "weather_feature_retired",
+  message: "Weather scheduling is currently unavailable. Existing schedule records are preserved."
 });
-
-app.get("/api/weather/settings", authRequired, requireCapability("schedule.view"), async (req, res) => {
-  try {
-    const company = await loadWeatherCompany(pool, req.companyId);
-    res.json(company.settings);
-  } catch (error) {
-    sendWeatherError(res, error, "weather_settings_load_failed");
-  }
-});
-
-app.put("/api/weather/settings", authRequired, requireCapability("schedule.manage_team"), async (req, res) => {
-  try {
-    const settings = validateWeatherSettings(req.body);
-    const saved = await pool.query(
-      `UPDATE companies SET weather_settings = $2::jsonb, updated_at = now() WHERE id = $1 RETURNING weather_settings`,
-      [req.companyId, JSON.stringify(settings)]
-    );
-    if (!saved.rowCount) return res.status(404).json({ error: "company_not_found" });
-    res.json(resolveWeatherSettings(saved.rows[0].weather_settings));
-  } catch (error) {
-    sendWeatherError(res, error, "weather_settings_update_failed");
-  }
-});
-
-app.get("/api/weather/risks", authRequired, requireAllCapabilities("schedule.view", "jobs.view"), async (req, res) => {
-  try {
-    const report = await createWeatherRiskReport(req.companyId);
-    await syncWeatherRiskObservations(req.companyId, report, { actorUserId: req.userId, source: "weather.ios_refresh" });
-    res.json(report);
-  } catch (error) {
-    sendWeatherError(res, error, "weather_risks_failed");
-  }
-});
-
-app.post("/api/weather/reschedule/preview", authRequired, requireAllCapabilities("schedule.edit", "jobs.view"), async (req, res) => {
-  try {
-    const ids = normalizeWeatherJobIDs(req.body?.job_ids);
-    const [company, jobs] = await Promise.all([
-      loadWeatherCompany(pool, req.companyId),
-      loadSelectedWeatherJobs(pool, req.companyId, ids)
-    ]);
-    const plan = planWeatherReschedule(jobs, req.body?.replacement_start_at);
-    const template = req.body?.notification_template == null
-      ? company.settings.notification_template
-      : validateWeatherNotificationTemplate(req.body.notification_template);
-    let items = await weatherNotificationPreviews(pool, company, jobs, plan, template);
-    const canNotifyCustomers = hasCapability(req, "messaging.customer.send");
-    if (!canNotifyCustomers) {
-      items = items.map((item) => ({
-        ...item,
-        recipient_phone: null,
-        notification_eligible: false,
-        notification_block_reason: "permission_denied"
-      }));
-    }
-    res.json({ ...plan, notification_template: template, can_notify_customers: canNotifyCustomers, items });
-  } catch (error) {
-    sendWeatherError(res, error, "weather_reschedule_preview_failed");
-  }
-});
-
-app.post("/api/weather/reschedule", authRequired, requireAllCapabilities("schedule.edit", "jobs.view"), async (req, res) => {
-  const idempotencyKey = String(req.body?.idempotency_key || "").trim().toLowerCase();
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) {
-    return res.status(400).json({ error: "weather_idempotency_key_required", message: "Reload the reschedule preview and try again." });
-  }
-  const notifyCustomers = req.body?.notify_customers === true;
-  if (notifyCustomers && !hasCapability(req, "messaging.customer.send")) {
-    return res.status(403).json({ error: "permission_denied", required_capability: "messaging.customer.send" });
-  }
-  let batchId;
-  let replayed = false;
-  let beforeJobs = [];
-  let updatedJobs = [];
-  const db = await pool.connect();
-  try {
-    const ids = normalizeWeatherJobIDs(req.body?.job_ids);
-    await db.query("BEGIN");
-    await lockCompanySchedule(db, req.companyId);
-    if (app.locals.agreementBooking) await db.query("SET CONSTRAINTS schedule_resource_no_overlap, schedule_resource_legacy_guard DEFERRED");
-    await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`weather-reschedule:${req.companyId}:${idempotencyKey}`]);
-    const existing = (await db.query(
-      `SELECT id FROM weather_reschedule_batches WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1`,
-      [req.companyId, idempotencyKey]
-    )).rows[0];
-    if (existing) {
-      batchId = existing.id;
-      replayed = true;
-      await db.query("COMMIT");
-    } else {
-      const company = await loadWeatherCompany(db, req.companyId);
-      beforeJobs = await loadSelectedWeatherJobs(db, req.companyId, ids, { forUpdate: true });
-      validateWeatherExpectedIntervals(beforeJobs, req.body?.expected_intervals);
-      const plan = planWeatherReschedule(beforeJobs, req.body?.replacement_start_at);
-      const template = req.body?.notification_template == null
-        ? company.settings.notification_template
-        : validateWeatherNotificationTemplate(req.body.notification_template);
-      const previews = await weatherNotificationPreviews(db, company, beforeJobs, plan, template);
-      batchId = randomUUID();
-      await db.query(
-        `INSERT INTO weather_reschedule_batches(
-           id, company_id, created_by, idempotency_key, replacement_start_at,
-           notify_customers, notification_template, status
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,'processing')`,
-        [batchId, req.companyId, req.userId, idempotencyKey, plan.replacement_start_at, notifyCustomers, template]
-      );
-      for (const item of previews) {
-        const notificationStatus = !notifyCustomers ? "not_requested" : item.notification_eligible ? "pending" : "failed";
-        await db.query(
-          `INSERT INTO weather_reschedule_items(
-             batch_id, company_id, job_id, contact_id, contact_name, recipient_phone, job_title,
-             old_start_at, old_end_at, new_start_at, new_end_at,
-             notification_status, notification_message, error_code, error_message
-           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-          [batchId, req.companyId, item.job_id, item.contact_id, item.contact_name, item.recipient_phone, item.title,
-            item.old_start_at, item.old_end_at, item.new_start_at, item.new_end_at,
-            notificationStatus, item.notification_message,
-            notifyCustomers && !item.notification_eligible ? item.notification_block_reason : null,
-            notifyCustomers && !item.notification_eligible ? "Customer notification was not eligible." : null]
-        );
-        const updated = (await db.query(
-          `UPDATE schedule_events
-              SET start_at = $3, end_at = $4, updated_at = now()
-            WHERE company_id = $1 AND id = $2
-            RETURNING *`,
-          [req.companyId, item.job_id, item.new_start_at, item.new_end_at]
-        )).rows[0];
-        if (!updated) throw new WeatherSchedulingError("weather_jobs_changed", "A selected job changed before the move completed.", { statusCode: 409 });
-        updatedJobs.push(updated);
-      }
-      await db.query("COMMIT");
-    }
-  } catch (error) {
-    await db.query("ROLLBACK").catch(() => {});
-    return sendWeatherError(res, error, "weather_reschedule_failed");
-  } finally {
-    db.release();
-  }
-
-  if (!replayed) {
-    for (let index = 0; index < updatedJobs.length; index += 1) {
-      const before = beforeJobs.find((job) => String(job.id) === String(updatedJobs[index].id));
-      const after = updatedJobs[index];
-      await emitJobRouteEvents(req.companyId, req.userId, before, after, "weather.reschedule").catch((error) => console.error("[weather] job event failed", error?.message || error));
-      await syncAutomationSchedulesForJob(req.companyId, after).catch((error) => console.error("[weather] job schedule sync failed", error?.message || error));
-      await markGoogleSheetsContactDirty(pool, req.companyId, after.contact_id, "job.weather_rescheduled").catch(() => {});
-    }
-    if (notifyCustomers) await processWeatherBatchNotifications(req.companyId, req.userId, batchId);
-    else await pool.query(`UPDATE weather_reschedule_batches SET status = 'complete', updated_at = now() WHERE company_id = $1 AND id = $2`, [req.companyId, batchId]);
-  } else {
-    await pool.query(
-      `UPDATE weather_reschedule_items
-          SET notification_status = 'delivery_unknown', error_code = 'interrupted_send',
-              error_message = 'A prior request ended while the provider result was unknown.', updated_at = now()
-        WHERE company_id = $1 AND batch_id = $2 AND notification_status IN ('sending','provider_accepted')`,
-      [req.companyId, batchId]
-    );
-    const existingBatch = await loadWeatherBatch(pool, req.companyId, batchId);
-    if (existingBatch?.notify_customers) await processWeatherBatchNotifications(req.companyId, req.userId, batchId);
-  }
-  const batch = await loadWeatherBatch(pool, req.companyId, batchId);
-  res.status(replayed ? 200 : 201).json({ batch, replayed });
-});
+app.get("/api/weather/status", authRequired, requireCapability("schedule.view"), retiredWeatherRoute);
+app.get("/api/weather/settings", authRequired, requireCapability("schedule.view"), retiredWeatherRoute);
+app.put("/api/weather/settings", authRequired, requireCapability("schedule.manage_team"), retiredWeatherRoute);
+app.get("/api/weather/risks", authRequired, requireAllCapabilities("schedule.view", "jobs.view"), retiredWeatherRoute);
+app.post("/api/weather/reschedule/preview", authRequired, requireAllCapabilities("schedule.edit", "jobs.view"), retiredWeatherRoute);
+app.post("/api/weather/reschedule", authRequired, requireAllCapabilities("schedule.edit", "jobs.view"), retiredWeatherRoute);
 
 let weatherScannerRunning = false;
 async function scanEnabledWeatherCompanies() {
@@ -13125,6 +13171,7 @@ async function mapAssignmentWorkers(items, work, concurrency = 3) {
   return output;
 }
 
+app.use("/api/jobs/:id", authRequired, requireVisibleJob);
 app.get("/api/jobs/:id/assignment-recommendations", authRequired, requireAllCapabilities("schedule.manage_team", "jobs.view"), async (req, res) => {
   if (!req.companyId) return res.status(403).json({ error: "company_required" });
   try {
@@ -15079,44 +15126,60 @@ app.post("/api/operations/mileage/logs/:id/review", authRequired, requireCapabil
   } catch (e) { console.error("[operations] mileage log review failed:", e); res.status(500).json({ error: "mileage_log_review_failed" }); }
 });
 
+app.get("/api/reports/weekly-sales/people", authRequired, requireCapability("sales.view_all"), async (req,res)=>{
+  if (!req.companyId) return res.status(403).json({error:"company_required"});
+  try {
+    const {rows}=await pool.query(`WITH participants AS (
+      SELECT u.id::text AS user_id FROM users u WHERE u.company_id=$1
+      UNION
+      SELECT salesperson.value AS user_id FROM schedule_events e
+        CROSS JOIN LATERAL jsonb_array_elements_text(e.sales_user_ids) AS salesperson(value)
+        WHERE e.company_id=$1
+      UNION
+      SELECT e.created_by::text AS user_id FROM schedule_events e
+        WHERE e.company_id=$1 AND jsonb_array_length(e.sales_user_ids)=0 AND e.created_by IS NOT NULL
+    ) SELECT p.user_id AS id,COALESCE(NULLIF(BTRIM(u.display_name),''),u.email) AS display_name,
+      u.role, u.deleted_at IS NOT NULL AS inactive, u.id IS NULL AS missing_identity
+      FROM participants p LEFT JOIN users u ON u.id::text=p.user_id AND u.company_id=$1
+      ORDER BY display_name NULLS LAST,p.user_id`,[req.companyId]);
+    res.set('Cache-Control','private, no-store');res.json(rows);
+  } catch(error) { console.error('[reports] sales people failed',error);res.status(500).json({error:'weekly_sales_people_failed'}); }
+});
+
 app.get("/api/reports/weekly-sales", authRequired, requireAnyCapability("sales.view_self", "sales.view_all"), async (req, res) => {
   try {
+    if (!req.companyId) return res.status(403).json({ error: "company_required" });
     const range = statsRange("week", req.query.date);
     if (!range) return res.status(400).json({ error: "invalid_range" });
     const requestedUser = (req.query.user_id || "").toString();
+    if (requestedUser && !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(requestedUser)) return res.status(400).json({error:"invalid_employee_id"});
     const canViewAllSales = hasCapability(req, "sales.view_all");
     const userID = canViewAllSales && requestedUser ? requestedUser : req.userId;
+    const identity = await pool.query(`SELECT id,COALESCE(NULLIF(BTRIM(display_name),''),email) AS display_name FROM users WHERE id=$1 AND company_id=$2`, [userID,req.companyId]);
     if (canViewAllSales) {
-      const allowed = await pool.query(`SELECT id FROM users WHERE id = $1 AND company_id = $2`, [userID, req.companyId]);
-      if (!allowed.rowCount) return res.status(404).json({ error: "employee_not_found" });
+      if (!identity.rowCount) {
+        const historical = await pool.query(`SELECT 1 FROM schedule_events WHERE company_id=$1 AND (sales_user_ids ? $2 OR created_by=$2::uuid) LIMIT 1`,[req.companyId,userID]);
+        if (!historical.rowCount) return res.status(404).json({ error: "employee_not_found" });
+      }
     }
-    const { rows } = await pool.query(
-      `SELECT id, title, start_at AS start, end_at AS "end", contact_id, price_cents,
-              material_cost_cents, finished_at, sales_user_ids
-         FROM schedule_events
-        WHERE company_id = $1
-          AND finished_at IS NOT NULL
-          AND start_at >= $2
-          AND start_at < $3
+    const [jobsResult,payResult] = await Promise.all([
+      pool.query(
+      `SELECT e.id,e.title,e.start_at AS start,e.end_at AS "end",e.contact_id,e.price_cents,
+              e.material_cost_cents,e.quote_material_estimate_cents,e.finished_at,e.sales_user_ids,e.created_by,
+              (e.finished_at AT TIME ZONE COALESCE(NULLIF(c.timezone,''),'America/New_York'))::date::text AS finished_company_date
+         FROM schedule_events e JOIN companies c ON c.id=e.company_id
+        WHERE e.company_id = $1
+          AND e.finished_at >= $2
+          AND e.finished_at < $3
           AND (
-            sales_user_ids ? $4
-            OR (jsonb_array_length(sales_user_ids) = 0 AND created_by = $5)
+            e.sales_user_ids ? $4
+            OR (jsonb_array_length(e.sales_user_ids) = 0 AND e.created_by = $5::uuid)
           )
-        ORDER BY start_at DESC`,
-      [req.companyId, range.start.toISOString(), range.end.toISOString(), userID, userID]
-    );
-    const jobs = rows.map((job) => {
-      const ids = Array.isArray(job.sales_user_ids) && job.sales_user_ids.length ? job.sales_user_ids : [userID];
-      const share = Math.round(Number(job.price_cents || 0) / Math.max(ids.length, 1));
-      return { ...job, credited_revenue_cents: share };
-    });
-    res.json({
-      user_id: userID,
-      start: range.start.toISOString(),
-      end: range.end.toISOString(),
-      total_revenue_cents: jobs.reduce((sum, job) => sum + Number(job.credited_revenue_cents || 0), 0),
-      jobs
-    });
+        ORDER BY e.finished_at DESC,e.id DESC`,
+      [req.companyId, range.start.toISOString(), range.end.toISOString(), userID, userID]),
+      pool.query(`SELECT effective_from::text,effective_to::text,commission_tiers FROM employee_pay_structures WHERE company_id=$1 AND employee_id=$2 ORDER BY effective_from`,[req.companyId,userID])
+    ]);
+    res.json(buildWeeklySalesReport({rows:jobsResult.rows,userID,payStructures:payResult.rows,range,employeeName:identity.rows[0]?.display_name || null}));
   } catch (e) { console.error(e); res.status(500).json({ error: "weekly_sales_report_failed" }); }
 });
 
@@ -15334,10 +15397,12 @@ async function loadSalesSourceBreakdown(companyId, employeeId, start, end, stric
   const { rows } = await pool.query(
     `WITH scoped_contacts AS (
        SELECT c.id, c.user_id,
-              COALESCE(NULLIF(lower(trim(c.source)), ''), 'unknown') AS source_key,
-              COALESCE(NULLIF(trim(c.source), ''), 'Unknown') AS source_label,
+              COALESCE(c.lead_source_id::text, 'legacy:' || NULLIF(lower(trim(c.source)), ''), 'unknown') AS source_key,
+              COALESCE(CASE WHEN ls.archived_at IS NOT NULL THEN ls.name || ' (archived)' ELSE ls.name END,
+                       NULLIF(trim(c.source), ''), 'Unknown') AS source_label,
               c.created_at, c.lead_submitted_at
          FROM contacts c
+         LEFT JOIN lead_sources ls ON ls.id=c.lead_source_id AND ls.company_id=c.company_id
         WHERE c.company_id = $1 AND c.deleted_at IS NULL AND ($4::uuid IS NULL OR c.user_id = $4)
      ), contact_facts AS (
        SELECT source_key, MIN(source_label) AS source_label,
@@ -16116,7 +16181,7 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
     const upcomingEnd = parseDashboardDate(req.query.upcoming_end, new Date(todayStart.getTime() + 8 * 86400000));
     const jobsPastStart = parseDashboardDate(req.query.jobs_past_start, new Date(currentAt.getTime() - 120 * 86400000));
     const jobsUpcomingEnd = parseDashboardDate(req.query.jobs_upcoming_end, new Date(currentAt.getTime() + 30 * 86400000));
-    const employer = req.isCompanyOwner;
+    const employer = canSeeTeamSchedule(req);
     const canJobs = hasCapability(req,"jobs.view") && hasCapability(req,"schedule.view");
     const canTasks = hasCapability(req,"tasks.view");
     const canContacts = hasCapability(req,"contacts.view");
@@ -16131,11 +16196,10 @@ app.get("/api/dashboard/summary", authRequired, requireCapability("dashboard.vie
       ? { sql: "se.company_id = $1", values: [req.companyId] }
       : {
           sql: `se.company_id = $1 AND (
-                  se.created_by = $2
-                  OR se.sales_user_ids ? $3
-                  OR se.worker_user_ids ? $3
+                  se.sales_user_ids ? $2::text
+                  OR se.worker_user_ids ? $2::text
                 )`,
-          values: [req.companyId, req.userId, String(req.userId)]
+          values: [req.companyId, req.userId]
         };
 
     const jobsSource = await dashboardSource(requestId, "jobs", () => canJobs && req.companyId ? pool.query(
@@ -16651,7 +16715,7 @@ app.put("/api/map-pins/:id", authRequired, requireCapability("operations.manage"
              status = EXCLUDED.status,
              phone = EXCLUDED.phone,
              email = EXCLUDED.email,
-             contact_id = EXCLUDED.contact_id,
+             contact_id = COALESCE(EXCLUDED.contact_id, map_pins.contact_id),
              updated_at = now()
        RETURNING id, user_id, latitude, longitude, name, address, notes, status, phone, email, contact_id, created_at, updated_at, list_id, source, last_visit_at, last_knock_at, visit_count, knock_count`,
       [
@@ -16773,9 +16837,12 @@ app.post("/api/map-pins/:id/contact", authRequired, requireCapability("operation
         lat: Number(previousPin.latitude),
         lng: Number(previousPin.longitude),
         tags: [intent === "schedule" ? "won" : previousPin.status || "lead"],
-        source: "map"
+        source: "Door-to-Door"
       };
-      const statements = contactInsertStatements(req, contactBody);
+      const leadSource = await ensureLeadSource(client, req.companyId, contactBody.source);
+      const statements = contactInsertStatements(req, {
+        ...contactBody, _leadSourceID: leadSource?.id, _leadSourceName: leadSource?.name
+      });
       const contactID = randomUUID();
       statements[0].values[0] = contactID;
       statements[1].values[0] = contactID;
@@ -16959,9 +17026,9 @@ app.get("/api/measurements", authRequired, requireCapability("operations.view"),
     const { rows } = await pool.query(
       `SELECT id, name, points, created_at, linked_contact_ids, units
        FROM measurements
-       WHERE user_id = $1
+       WHERE user_id = $1 AND scope_verified = true AND company_id IS NOT DISTINCT FROM $2::uuid
        ORDER BY updated_at DESC`,
-      [req.userId]
+      [req.userId, req.companyId || null]
     );
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_measurements" }); }
@@ -16982,8 +17049,10 @@ app.put("/api/measurements/:id", authRequired, requireCapability("operations.man
   try {
     const eventSource = req.get("x-wolfcrm-client") === "web" ? "web" : "ios";
     const before = (await pool.query(
-      `SELECT * FROM measurements WHERE id = $1 AND user_id = $2`,
-      [measurementID, req.userId]
+      `SELECT * FROM measurements
+       WHERE id = $1 AND user_id = $2 AND scope_verified = true
+         AND company_id IS NOT DISTINCT FROM $3::uuid`,
+      [measurementID, req.userId, req.companyId || null]
     )).rows[0] || null;
     const contactLinksChanged = !measurementContactLinksEqual(
       before?.linked_contact_ids,
@@ -17011,19 +17080,21 @@ app.put("/api/measurements/:id", authRequired, requireCapability("operations.man
       }
     }
     const r = await pool.query(
-      `INSERT INTO measurements (id, user_id, name, points, created_at, linked_contact_ids, units)
-       VALUES ($1, $2, $3, $4::jsonb, COALESCE($5::timestamptz, now()), $6::jsonb, $7)
+      `INSERT INTO measurements (id, user_id, company_id, scope_verified, name, points, created_at, linked_contact_ids, units)
+       VALUES ($1, $2, $3::uuid, true, $4, $5::jsonb, COALESCE($6::timestamptz, now()), $7::jsonb, $8)
        ON CONFLICT (id) DO UPDATE
          SET name = EXCLUDED.name,
              points = EXCLUDED.points,
              linked_contact_ids = EXCLUDED.linked_contact_ids,
              units = EXCLUDED.units,
              updated_at = now()
-       WHERE measurements.user_id = $2
+       WHERE measurements.user_id = $2 AND measurements.scope_verified = true
+         AND measurements.company_id IS NOT DISTINCT FROM $3::uuid
        RETURNING id, name, points, created_at, linked_contact_ids, units`,
       [
         measurementID,
         req.userId,
+        req.companyId || null,
         input.name,
         JSON.stringify(input.points),
         input.created_at,
@@ -17077,8 +17148,11 @@ app.delete("/api/measurements/:id", authRequired, requireCapability("operations.
   try {
     const measurementID = normalizeMeasurementID(req.params.id);
     const deleted = (await pool.query(
-      `DELETE FROM measurements WHERE id = $1 AND user_id = $2 RETURNING id`,
-      [measurementID, req.userId]
+      `DELETE FROM measurements
+       WHERE id = $1 AND user_id = $2 AND scope_verified = true
+         AND company_id IS NOT DISTINCT FROM $3::uuid
+       RETURNING id`,
+      [measurementID, req.userId, req.companyId || null]
     )).rows[0] || null;
     if (deleted) {
       try {
@@ -17101,21 +17175,16 @@ app.delete("/api/measurements/:id", authRequired, requireCapability("operations.
 // ---------- TO-DO: TASKS ----------
 app.get("/api/todo/tasks", authRequired, requireCapability("tasks.view"), async (req, res) => {
   try {
-    const companyUsers = req.companyId
-      ? (await pool.query(`SELECT id FROM users WHERE company_id = $1`, [req.companyId])).rows.map((r) => r.id)
-      : [req.userId];
     const { rows } = await pool.query(
       `SELECT id, title, detail, creator_id, assignee_ids, due_date, priority, status,
               linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
               reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex,
               EXISTS(SELECT 1 FROM comms_task_links protected_link WHERE protected_link.task_id=todo_tasks.id) AS comms_protected
        FROM todo_tasks
-       WHERE (user_id = $1
-          OR ($2::uuid IS NOT NULL AND user_id = ANY($3::uuid[]))
-          OR (assignee_ids ? $1::text))
+       WHERE user_id = $1
          AND ${taskAccessSQL(req,'todo_tasks','$1','$2')}
        ORDER BY due_date NULLS LAST, updated_at DESC`,
-      [req.userId, req.companyId, companyUsers]
+      [req.userId, req.companyId]
     );
     res.json(rows);
   } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_tasks" }); }
@@ -17128,16 +17197,21 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
     reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex
   } = req.body || {};
   if (!title) return res.status(400).json({ error: "title_required" });
-  const assignees = Array.isArray(assignee_ids) ? assignee_ids.filter((id) => typeof id === "string").slice(0, 20) : [];
   try {
     const previous = await pool.query(
-      `SELECT * FROM todo_tasks WHERE id = $1 AND (user_id = $2 OR ($3::uuid IS NOT NULL AND user_id IN (SELECT id FROM users WHERE company_id = $3)) OR assignee_ids ? $2::text) AND ${taskAccessSQL(req,'todo_tasks','$2','$3')}`,
+      `SELECT * FROM todo_tasks WHERE id = $1 AND user_id = $2 AND ${taskAccessSQL(req,'todo_tasks','$2','$3')}`,
       [req.params.id, req.userId, req.companyId]
     );
     if (!previous.rows[0] && (await pool.query('SELECT 1 FROM todo_tasks WHERE id=$1',[req.params.id])).rowCount) return res.status(403).json({error:'task_access_denied'});
+    // Existing assigned records stay intact for the Assignments migration. Personal To-Dos
+    // cannot create or alter a cross-account audience through this endpoint.
+    const assignees = previous.rows[0]?.assignee_ids || [];
+    if (assignee_ids !== undefined && JSON.stringify(assignee_ids) !== JSON.stringify(assignees)) {
+      return res.status(400).json({ error: "todo_assignment_not_supported" });
+    }
     const commsLink = (await pool.query('SELECT * FROM comms_task_links WHERE task_id=$1',[req.params.id])).rows[0];
     if (commsLink) await validateTaskAudience(pool,req,commsLink,assignees);
-    const ownerUserId = previous.rows[0]?.user_id || creator_id || req.userId;
+    const ownerUserId = req.userId;
     const operationalLinks = normalizeTaskOperationalLinks(
       req.body || {},
       previous.rows[0] || null
@@ -17153,7 +17227,6 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
          SET title = EXCLUDED.title,
              detail = EXCLUDED.detail,
              creator_id = COALESCE(todo_tasks.creator_id, EXCLUDED.creator_id),
-             assignee_ids = EXCLUDED.assignee_ids,
              due_date = EXCLUDED.due_date,
              priority = EXCLUDED.priority,
              status = EXCLUDED.status,
@@ -17171,15 +17244,13 @@ app.put("/api/todo/tasks/:id", authRequired, requireCapability("tasks.manage"), 
              completion_note_required = EXCLUDED.completion_note_required,
              color_hex = EXCLUDED.color_hex,
              updated_at = now()
-       WHERE (todo_tasks.user_id = $2
-          OR ($23::uuid IS NOT NULL AND todo_tasks.user_id IN (SELECT id FROM users WHERE company_id = $23))
-          OR todo_tasks.assignee_ids ? $24::text)
+       WHERE todo_tasks.user_id = $2
          AND ${taskAccessSQL(req,'todo_tasks','$24::uuid','$23')}
        RETURNING id, title, detail, creator_id, assignee_ids, due_date, priority, status,
                  linked_contact_id, linked_job_id, linked_equipment_id, linked_equipment_request_id, linked_inventory_count_id,
                  reminders, subtasks, completed, completed_at, completed_by, completion_note, completion_note_required, color_hex`,
       [
-        req.params.id, ownerUserId, title, detail || null, creator_id || req.userId, JSON.stringify(assignees), due_date || null,
+        req.params.id, ownerUserId, title, detail || null, previous.rows[0]?.creator_id || req.userId, JSON.stringify(assignees), due_date || null,
         priority || "normal", completed ? "completed" : (status || "open"),
         linked_contact_id || null, linked_job_id || null, operationalLinks.linked_equipment_id,
         operationalLinks.linked_equipment_request_id, operationalLinks.linked_inventory_count_id,
@@ -19275,8 +19346,27 @@ async function startServer() {
   serverStarted = true;
   await bootstrap();
   app.locals.permissionGovernance = installPermissionGovernanceRoutes({app,pool,authRequired});
-  app.locals.mediaStorage = await installMediaStorage({ app, pool, authRequired, accessPredicate: storagePredicate, onRequest:r=>takeRateLimit(pool,r), onAccess:(...args)=>app.locals.commsAudit?.record(...args) });
+  app.locals.mediaStorage = await installMediaStorage({ app, pool, authRequired, accessPredicate: storagePredicate,
+    onMaintenance:async()=>{
+      await app.locals.employeePrivateData?.tick();
+      if(app.locals.training)try{await reconcileTrainingOnboarding(pool,{limit:50});}
+      catch(error){console.warn("[training] onboarding reconciliation deferred",error?.code||error?.message||error);}
+      if(app.locals.training)try{await runTrainingRecurrences(pool,{limit:25});}
+      catch(error){console.warn("[training] recurrence dispatch deferred",error?.code||error?.message||error);}
+    }, onRequest:r=>takeRateLimit(pool,r), onAccess:(...args)=>app.locals.commsAudit?.record(...args) });
+  app.locals.training = await installTraining({ app, pool, authRequired, storage: app.locals.mediaStorage });
   app.locals.comms = await installCompanyComms({app,pool,authRequired,sendPush:sendPushToUsers});
+  app.locals.employeeAccounts = installEmployeeAccountRoutes({app,pool,authRequired,onChange:app.locals.comms.permissionChanged,
+    onTransition:async(db,{actor,target,action,eventID})=>{
+      const types=action==='disable'?['employee.deactivated','employee.removed']:action==='restore'?['employee.reactivated']:[];
+      for(const eventType of types)await emitAutomationEvent({companyId:actor.company_id,eventType,subjectType:'employee',subjectId:target.id,actorUserId:actor.id,source:'employee_access',dedupeKey:eventID+':'+eventType,payload:{employee_id:target.id,active:action==='restore'}},{db});
+      if(action==='review-eligibility'&&target.role==='employee'&&!target.operational_eligible){
+        await db.query(`INSERT INTO training_employee_eligibility(company_id,employee_id,eligible_at)
+          VALUES($1,$2,now()) ON CONFLICT(company_id,employee_id)
+          DO UPDATE SET eligible_at=GREATEST(training_employee_eligibility.eligible_at,EXCLUDED.eligible_at)`,
+          [actor.company_id,target.id]);
+      }
+    }});
   installWidgetDashboard({app,pool,authRequired,services:{
     getAgreementService:()=>app.locals.agreements,
     weatherService:googleWeatherService,
@@ -19416,15 +19506,17 @@ async function startServer() {
     requireIntegrationView: requireCapability("integrations.view")
   });
   startGoogleSheetsWorkers(pool);
-  startWeatherRiskWorkers();
+  // Weather risk workers remain stopped while this feature is retired.
   await installFacebookAds({app,pool:rawPool,authRequired,requireCapability,emitAutomationEvent});
   await installFacebookConnection({app,pool:rawPool,authRequired,requireCapability});
   await installMCP({app,pool,rawPool,authRequired,verifyIdentity:async(email,password)=>{
-    const row=(await pool.query('SELECT id,password_hash,deleted_at FROM users WHERE email=$1',[normalizeEmail(email)])).rows[0];
-    return row&&!row.deleted_at&&verifyPassword(password,row.password_hash)?{id:row.id}:null;
+    const row=(await pool.query('SELECT id,password_hash,deleted_at,locked_at FROM users WHERE email=$1',[normalizeEmail(email)])).rows[0];
+    return row&&!accountDenial(row)&&verifyPassword(password,row.password_hash)?{id:row.id}:null;
   }});
   await installWebhooks({app,pool,authRequired,emitEvent:emitAutomationEvent,catalog:webhookEventCatalog()});
   await installAssistant({app,pool,authRequired});
+  app.locals.employeePrivateData = await installPrivatePurge({app,pool,authRequired,storage:app.locals.mediaStorage,onChange:app.locals.comms.permissionChanged});
+  app.locals.companyStorage = installCompanyStorage({app,pool,authRequired,storage:app.locals.mediaStorage});
   installAPIFallback(app);
   app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 }

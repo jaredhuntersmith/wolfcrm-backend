@@ -46,8 +46,15 @@ export function normalizeSavedService(raw, { importing = false } = {}) {
   const default_preset_id = raw.default_preset_id == null ? null : serviceUUID(raw.default_preset_id);
   if (default_preset_id && !ids.has(default_preset_id)) throw new ServiceCatalogError("service_default_preset_invalid", "The default preset must belong to this service.");
   if (raw.plan_eligible !== undefined && typeof raw.plan_eligible !== "boolean") throw new ServiceCatalogError("service_eligibility_invalid", "Service plan eligibility must be on or off.");
+  if (raw.favorite !== undefined && typeof raw.favorite !== "boolean") throw new ServiceCatalogError("service_favorite_invalid", "Favorite must be on or off.");
+  const estimated_duration_minutes = raw.estimated_duration_minutes ?? null;
+  if (estimated_duration_minutes !== null && (!Number.isSafeInteger(estimated_duration_minutes) || estimated_duration_minutes < 1 || estimated_duration_minutes > 10080)) {
+    throw new ServiceCatalogError("service_duration_invalid", "Estimated service duration must be between 1 and 10080 minutes.");
+  }
   return {
     name, default_price_cents: price,
+    estimated_duration_minutes,
+    favorite: importing ? false : raw.favorite === true,
     default_description: text(raw.default_description, "Default description", 20000),
     description_presets, default_preset_id,
     // Local catalogs never contained an eligibility opt-in. Import cannot enable it.
@@ -66,6 +73,8 @@ export async function installServiceCatalogSchema(pool) {
       description_presets JSONB NOT NULL DEFAULT '[]'::jsonb,
       default_preset_id UUID,
       plan_eligible BOOLEAN NOT NULL DEFAULT false,
+      estimated_duration_minutes INTEGER CHECK (estimated_duration_minutes BETWEEN 1 AND 10080),
+      favorite BOOLEAN NOT NULL DEFAULT false,
       archived_at TIMESTAMPTZ,
       version INTEGER NOT NULL DEFAULT 1,
       created_by UUID,
@@ -74,13 +83,15 @@ export async function installServiceCatalogSchema(pool) {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS saved_services_company_name_idx ON saved_services(company_id, name, id) WHERE archived_at IS NULL;
+    ALTER TABLE saved_services ADD COLUMN IF NOT EXISTS estimated_duration_minutes INTEGER CHECK (estimated_duration_minutes BETWEEN 1 AND 10080);
+    ALTER TABLE saved_services ADD COLUMN IF NOT EXISTS favorite BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS quote_options JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS quotes_active_company_updated_idx ON quotes(company_id,updated_at DESC) WHERE deleted_at IS NULL;
   `);
 }
 
-const COLUMNS = "id, name, default_price_cents, default_description, description_presets, default_preset_id, plan_eligible, archived_at, version";
+const COLUMNS = "id, name, default_price_cents, default_description, description_presets, default_preset_id, plan_eligible, estimated_duration_minutes, favorite, archived_at, version";
 
 export async function assertQuoteReferences(pool, req, { contact_id, line_items = [], existing_lines = [] }) {
   if (contact_id !== undefined) {
@@ -122,15 +133,16 @@ export function installServiceCatalogRoutes({ app, pool, authRequired, requireCa
     const id = serviceUUID(req.params.id);
     const service = normalizeSavedService(req.body);
     if (req.body.expected_version !== undefined && (!Number.isSafeInteger(req.body.expected_version) || req.body.expected_version < 1)) throw new ServiceCatalogError("service_version_invalid", "Refresh this service before saving.");
-    const result = await pool.query(`INSERT INTO saved_services(id,company_id,name,default_price_cents,default_description,description_presets,default_preset_id,plan_eligible,created_by,updated_by)
-      VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$9)
+    const result = await pool.query(`INSERT INTO saved_services(id,company_id,name,default_price_cents,default_description,description_presets,default_preset_id,plan_eligible,estimated_duration_minutes,favorite,created_by,updated_by)
+      VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11,$11)
       ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, default_price_cents = EXCLUDED.default_price_cents,
         default_description = EXCLUDED.default_description, description_presets = EXCLUDED.description_presets,
         default_preset_id = EXCLUDED.default_preset_id, plan_eligible = EXCLUDED.plan_eligible,
+        estimated_duration_minutes = EXCLUDED.estimated_duration_minutes, favorite = EXCLUDED.favorite,
         updated_by = EXCLUDED.updated_by, updated_at = now(), version = saved_services.version + 1
       WHERE saved_services.company_id = $2 AND saved_services.archived_at IS NULL
-        AND ($10::integer IS NULL OR saved_services.version = $10)
-      RETURNING ${COLUMNS}`, [id, req.companyId, service.name, service.default_price_cents, service.default_description, JSON.stringify(service.description_presets), service.default_preset_id, service.plan_eligible, req.userId, req.body.expected_version ?? null]);
+        AND ($12::integer IS NULL OR saved_services.version = $12)
+      RETURNING ${COLUMNS}`, [id, req.companyId, service.name, service.default_price_cents, service.default_description, JSON.stringify(service.description_presets), service.default_preset_id, service.plan_eligible, service.estimated_duration_minutes, service.favorite, req.userId, req.body.expected_version ?? null]);
     if (!result.rowCount) throw new ServiceCatalogError("service_unavailable_or_changed", "The service is unavailable or has changed. Refresh before saving.", 409);
     res.json(result.rows[0]);
   }));
@@ -149,9 +161,9 @@ export function installServiceCatalogRoutes({ app, pool, authRequired, requireCa
       // Serialize catalog imports without conflating IDs or guessing from names.
       await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`services-import:${req.companyId}`]);
       for (const service of services) {
-        await db.query(`INSERT INTO saved_services(id,company_id,name,default_price_cents,default_description,description_presets,default_preset_id,created_by,updated_by)
-          VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$8) ON CONFLICT(id) DO NOTHING`,
-        [service.id, req.companyId, service.name, service.default_price_cents, service.default_description, JSON.stringify(service.description_presets), service.default_preset_id, req.userId]);
+        await db.query(`INSERT INTO saved_services(id,company_id,name,default_price_cents,default_description,description_presets,default_preset_id,estimated_duration_minutes,created_by,updated_by)
+          VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$9) ON CONFLICT(id) DO NOTHING`,
+        [service.id, req.companyId, service.name, service.default_price_cents, service.default_description, JSON.stringify(service.description_presets), service.default_preset_id, service.estimated_duration_minutes, req.userId]);
       }
       const owned = await db.query(`SELECT id FROM saved_services WHERE company_id = $1 AND id = ANY($2::uuid[])`, [req.companyId, services.map((service) => service.id)]);
       if (owned.rowCount !== services.length) throw new ServiceCatalogError("service_import_id_conflict", "An imported ID is unavailable. No services were imported.", 409);

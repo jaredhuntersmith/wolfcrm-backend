@@ -1,4 +1,5 @@
 import {createHash} from 'node:crypto';
+import {lockFinanceSpaceActor} from './finance-space-access.js';
 const roots={accounts:'finance_accounts','planned-items':'finance_planned_items',recurring:'finance_recurring_candidates',debts:'finance_debts',budgets:'finance_budgets',goals:'finance_goals',receipts:'finance_receipts'};
 const quote=s=>'"'+s.replaceAll('"','""')+'"';
 const fail=(status,message)=>{throw Object.assign(new Error(message),{status});};
@@ -20,6 +21,7 @@ export function installFinanceSpaceTransfers({app,pool,authRequired,requireEmplo
   const b=req.body,table=roots[b.kind];if(!table||!b.record_id||!b.source_space_id||!b.destination_space_id||b.source_space_id===b.destination_space_id)fail(400,'Choose a record and a different destination space.');
   const db=await pool.connect();try {
    await db.query('BEGIN');await db.query("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='30s'");
+   await lockFinanceSpaceActor(db,req.userId,req.companyId);
    const spaces=(await db.query('SELECT * FROM finance_spaces WHERE id::text=ANY($1::text[]) AND owner_id=$2 AND company_id=$3 ORDER BY id FOR UPDATE',[[b.source_space_id,b.destination_space_id],req.userId,req.companyId])).rows;
    if(spaces.length!==2)fail(404,'Both spaces must belong to you.');
    const source=spaces.find(s=>s.id===b.source_space_id),destination=spaces.find(s=>s.id===b.destination_space_id);if(!source||!destination)fail(404,'Space unavailable.');

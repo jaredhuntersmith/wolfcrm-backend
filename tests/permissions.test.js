@@ -20,7 +20,7 @@ function testCatalogIsUniqueAndComplete() {
   assert.ok(PERMISSION_CAPABILITIES.every((item) => groupIds.has(item.group_id)));
   assert.ok(PERMISSION_CAPABILITIES.every((item) => item.depends_on.every((dependency) => keys.includes(dependency))));
   const payload = permissionCatalogPayload();
-  assert.equal(payload.version, 6);
+  assert.equal(payload.version, 7);
   assert.equal(Object.keys(payload.presets.find((item) => item.id === "admin").capabilities).length, keys.length);
 }
 

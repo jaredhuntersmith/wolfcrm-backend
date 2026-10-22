@@ -18,6 +18,17 @@ export const ROUTINE_ENUMS = Object.freeze({
   stepStatuses: new Set(["upcoming", "active", "completed", "skipped"])
 });
 
+// These authenticated lists can have identical JSON for different accounts.
+// Avoid Express's automatic ETag/304 path so a prior account's URL cache cannot
+// satisfy a fresh account's request at the same origin.
+function sendPrivateList(res, items) {
+  res.status(200).set({
+    "Cache-Control": "private, no-store",
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Content-Type-Options": "nosniff"
+  }).end(JSON.stringify(items));
+}
+
 function cleanString(value, limit = 240) {
   if (value == null) return null;
   if (typeof value !== "string") throw new RoutineGroupError("invalid_string", "Expected a string value.");
@@ -444,6 +455,7 @@ export async function installRoutineGroupSystem({ app, pool, authRequired, requi
   `);
 
   app.get("/api/todo/routine-groups", authRequired, requireView, async (req, res) => {
+    res.set("Cache-Control", "private, no-store");
     try {
       const { rows } = await pool.query(
         `SELECT * FROM routine_groups
@@ -454,7 +466,7 @@ export async function installRoutineGroupSystem({ app, pool, authRequired, requi
       );
       const ids = rows.map((row) => row.id);
       const steps = ids.length ? (await pool.query(`SELECT * FROM routine_steps WHERE company_id = $1 AND routine_group_id = ANY($2::text[]) ORDER BY routine_group_id, position`, [req.companyId, ids])).rows : [];
-      res.json(rows.map((row) => ({ ...row, steps: steps.filter((step) => step.routine_group_id === row.id) })));
+      sendPrivateList(res, rows.map((row) => ({ ...row, steps: steps.filter((step) => step.routine_group_id === row.id) })));
     } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_routine_groups" }); }
   });
 
@@ -611,6 +623,7 @@ export async function installRoutineGroupSystem({ app, pool, authRequired, requi
   });
 
   app.get("/api/todo/routine-runs", authRequired, requireView, async (req, res) => {
+    res.set("Cache-Control", "private, no-store");
     try {
       const statuses = String(req.query.status || "active,scheduled").split(",").filter((status) => ROUTINE_ENUMS.runStatuses.has(status));
       const { rows } = await pool.query(
@@ -619,7 +632,7 @@ export async function installRoutineGroupSystem({ app, pool, authRequired, requi
       );
       const runIds = rows.map((row) => row.id);
       const steps = runIds.length ? (await pool.query(`SELECT * FROM routine_run_steps WHERE company_id = $1 AND run_id = ANY($2::text[]) ORDER BY run_id, position`, [req.companyId, runIds])).rows : [];
-      res.json(rows.map((row) => serializeRun(row, steps.filter((step) => step.run_id === row.id))));
+      sendPrivateList(res, rows.map((row) => serializeRun(row, steps.filter((step) => step.run_id === row.id))));
     } catch (e) { console.error(e); res.status(500).json({ error: "failed_list_routine_runs" }); }
   });
 

@@ -5,12 +5,19 @@ import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
 import {createProvider} from '../assistant/models.js';
 const repairLive=process.argv.includes('--repair-live-model');
+const nativePort = Number(process.argv.find(value => value.startsWith('--port='))?.split('=')[1] || 18658);
+assert.ok(Number.isInteger(nativePort) && nativePort >= 1024 && nativePort <= 65535, 'Invalid local fixture port');
 import {startLocalPostgres} from './helpers/local-postgres.js';
 import {randomUUID,randomBytes} from 'node:crypto';
 import {writeFile,chmod} from 'node:fs/promises';
 import {PDFDocument} from 'pdf-lib';
 import {installGoogleSheetsSchema} from '../google-sheets.js';
 import {installMediaStorage} from '../media-storage/index.js';
+import {Readable} from 'node:stream';
+import {installPrivatePurge} from '../employee-access/purge.js';
+import {installCompanyStorage} from '../employee-access/storage-usage.js';
+import {installEmployeeAccountRoutes} from '../employee-access/routes.js';
+import {installPermissionGovernanceRoutes} from '../permission-governance.js';
 import {installCompanyComms} from '../company-comms/index.js';
 import {installNotes} from '../notes/index.js';
 import {installBrowser} from '../browser.js';
@@ -57,11 +64,13 @@ try {
  const company=randomUUID(),user=randomUUID(),staff=randomUUID(),contact=randomUUID(),secondContact=randomUUID(),token='assistant-completion-native-fixture',staffToken='assistant-completion-staff-fixture';
  const note=randomUUID(),file=randomUUID(),browserLink=randomUUID(),ideaList=randomUUID(),idea=randomUUID(),task=randomUUID();
  const objects=new Map();let origin;
- const bucket={readBytes:async row=>objects.get(row.id),readText:async row=>objects.get(row.id)?.toString('utf8'),access:async row=>origin+'/__fixture/objects/'+row.id,head:async row=>({ContentLength:objects.get(row.id)?.length||0}),remove:async row=>objects.delete(row.id)};
- const env={NODE_ENV:'test',MCP_ENABLED:'true',ASSISTANT_ENABLED:'true',ASSISTANT_OWNER_FUNDING:'true',MCP_PUBLIC_ORIGIN:'http://127.0.0.1',MCP_WEB_ORIGIN:'http://127.0.0.1',RETELL_ENCRYPTION_KEY:randomBytes(32).toString('base64'),FACEBOOK_ADS_ENABLED:'true',FACEBOOK_ADS_WORKER_ENABLED:'false',QUOTE_LINK_SECRET:'synthetic-native-acceptance-secret-at-least-thirty-two-characters',QUOTE_PUBLIC_BASE_URL:'http://127.0.0.1:3000'};
+ const bucket={abort:async()=>{},open:async row=>({Body:Readable.from([objects.get(row.id)||Buffer.alloc(0)]),ContentLength:objects.get(row.id)?.length||0}),readBytes:async row=>objects.get(row.id),readText:async row=>objects.get(row.id)?.toString('utf8'),access:async row=>origin+'/__fixture/objects/'+row.id,head:async row=>({ContentLength:objects.get(row.id)?.length||0}),remove:async row=>objects.delete(row.id)};
+ const env={NODE_ENV:'test',MCP_ENABLED:'true',ASSISTANT_ENABLED:'true',ASSISTANT_OWNER_FUNDING:'true',PUBLIC_BACKEND_URL:`http://127.0.0.1:${nativePort}`,MCP_PUBLIC_ORIGIN:'http://127.0.0.1',MCP_WEB_ORIGIN:'http://127.0.0.1',RETELL_ENCRYPTION_KEY:randomBytes(32).toString('base64'),FACEBOOK_ADS_ENABLED:'true',FACEBOOK_ADS_WORKER_ENABLED:'false',QUOTE_LINK_SECRET:'synthetic-native-acceptance-secret-at-least-thirty-two-characters',QUOTE_PUBLIC_BASE_URL:'http://127.0.0.1:3000'};
  app.locals.mediaStorage=await installMediaStorage({app,pool,authRequired,bucket,env,startWorker:false});
  app.locals.comms=await installCompanyComms({app,pool,authRequired,startWorker:false});
- app.locals.notes=await installNotes({app,pool,authRequired,env,storage:app.locals.mediaStorage,notifications:app.locals.comms.notifications});
+ app.locals.permissionGovernance=installPermissionGovernanceRoutes({app,pool,authRequired,onChange:app.locals.comms.permissionChanged});
+ app.locals.employeeAccounts=installEmployeeAccountRoutes({app,pool,authRequired,onChange:app.locals.comms.permissionChanged});
+ app.locals.notes=await installNotes({app,pool,authRequired,env,storage:app.locals.mediaStorage,audioBucket:bucket,notifications:app.locals.comms.notifications});
  app.locals.browser=await installBrowser({app,pool,authRequired,env});
  await installIdeaParking({app,pool,authRequired});
  await installFocusSystem({app,pool,authRequired,requireCapability});
@@ -122,7 +131,14 @@ try {
   return {output:[{type:'message',role:'assistant',content:[{type:'output_text',text:response}]}],usage:{input_tokens:100,output_tokens:30}};
  }};
  assistant=await installAssistant({app,pool,authRequired,env,provider});
+ app.locals.employeePrivateData=await installPrivatePurge({app,pool,authRequired,storage:app.locals.mediaStorage,bucket,onChange:app.locals.comms.permissionChanged});
+ app.locals.companyStorage=installCompanyStorage({app,pool,authRequired,storage:app.locals.mediaStorage});
+ const purgeEmployee=randomUUID();await pool.query("INSERT INTO users(id,email,display_name,company_id,role) VALUES($1,'purge-fixture@example.invalid','Purge fixture',$2,'employee')",[purgeEmployee,company]);
+ await pool.query("INSERT INTO employee_permissions(user_id,company_id,permission_preset) VALUES($1,$2,'manager')",[purgeEmployee,company]);
+ for(const [name,visibility,size] of [['Private fixture file','private',512],['Company cleanup fixture','company',128]]){const id=randomUUID();objects.set(id,Buffer.alloc(size));await pool.query("INSERT INTO stored_files(id,owner_user_id,uploaded_by_user_id,company_id,display_name,original_filename,object_key,mime_type,category,byte_size,cloud_status,visibility) VALUES($1,$2,$2,$3,$4,$4,$5,'application/pdf','document',$6,'active',$7)",[id,purgeEmployee,company,name,'fixture/'+id,size,visibility]);}
+
  const control=(req,res,next)=>req.get('authorization')==='Bearer '+token?next():res.status(401).json({error:'fixture_owner_required'});
+ app.post('/__fixture/private-cleanup',control,async(_req,res)=>{await app.locals.employeePrivateData.tick();res.json({success:true});});
  app.get('/__fixture/repair',control,async(_req,res)=>{
   res.json({jobs:(await pool.query('SELECT id,title,start_at,end_at,service_items FROM schedule_events WHERE company_id=$1 AND contact_id=$2',[company,contact])).rows,
    steps:(await pool.query('SELECT s.tool,s.state,s.result,s.arguments FROM wolf_assistant_steps s JOIN wolf_assistant_runs r ON r.id=s.run_id WHERE r.company_id=$1 ORDER BY s.started_at',[company])).rows,
@@ -131,7 +147,7 @@ try {
  app.get('/__fixture/reference',(_req,res)=>res.type('html').send('<!doctype html><html><head><title>Fixture reference</title></head><body><h1>Fixture reference</h1><p>Synthetic gutter-cleaning reference for native Browser acceptance.</p></body></html>'));
  app.get('/__fixture/objects/:id',(req,res)=>{const bytes=objects.get(req.params.id);if(!bytes)return res.sendStatus(404);res.type('pdf').send(bytes);});
  app.get('/__fixture/state',control,async(_req,res)=>{try{res.json({external_attempts:externalAttempts,provider_calls:providerCalls,runs:(await pool.query('SELECT id,conversation_id,status,output,error_code,context FROM wolf_assistant_runs WHERE company_id=$1 ORDER BY created_at DESC LIMIT 50',[company])).rows,commands:(await pool.query('SELECT id,run_id,command,state,result FROM wolf_assistant_commands ORDER BY expires_at DESC,id DESC LIMIT 100')).rows});}catch(error){console.error('[fixture-state]',error.code||error.name);res.status(503).json({error:'fixture_state_unavailable'});}});
- server=await new Promise(resolve=>{const s=app.listen(18658,'127.0.0.1',()=>resolve(s));});origin='http://127.0.0.1:'+server.address().port;
+ server=await new Promise(resolve=>{const s=app.listen(nativePort,'127.0.0.1',()=>resolve(s));});origin='http://127.0.0.1:'+server.address().port;
  async function http(path,body,method=body===undefined?'GET':'POST',session=token){
   const response=await fetch(origin+path,{method,headers:{authorization:'Bearer '+session,'content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
   const data=response.status===204?null:await response.json();return {status:response.status,data};
@@ -157,7 +173,7 @@ try {
  await ok('/api/browser/records/contact/'+contact+'/links',{id:browserLink,url:origin+'/__fixture/reference',title:'Fixture reference'});
  await ok('/api/idea-parking/lists/'+ideaList,{name:'Fixture ideas',visibility:'private',member_ids:[]},'PUT');
  await ok('/api/idea-parking/ideas/'+idea,{text:'Explore a synthetic service package for autumn customers',list_id:ideaList},'PUT');
- await ok('/api/todo/tasks/'+task,{title:'Fixture native task',detail:'Synthetic editable task',priority:'normal',status:'open',completed:false,assignee_ids:[user],subtasks:[],reminders:[],completion_note_required:false},'PUT');
+ await ok('/api/todo/tasks/'+task,{title:'Fixture native task',detail:'Synthetic editable task',priority:'normal',status:'open',completed:false,subtasks:[],reminders:[],completion_note_required:false},'PUT');
  const document=await PDFDocument.create();document.addPage().drawText('Synthetic native acceptance file');objects.set(file,Buffer.from(await document.save()));
  await pool.query("INSERT INTO stored_files(id,owner_user_id,uploaded_by_user_id,company_id,display_name,original_filename,object_key,mime_type,category,byte_size,cloud_status) VALUES($1,$2,$2,$3,'Fixture acceptance PDF','fixture.pdf',$4,'application/pdf','document',$5,'active')",[file,user,company,'native-fixture/'+file,objects.get(file).length]);
  Object.assign(scenarios,{
@@ -176,8 +192,8 @@ try {
   'Open fixture task':{route:'todo',entity:'tasks',id:task},
  });
  const config={origin,token,company,user,staff,staffToken,pgSocket:pg.config.host,contact,secondContact,note,conversation:conversation.id,browserLink,browserCard:'contact:'+contact+':'+browserLink,file,quote:quote.id,route:route.id,task,ideaList,idea,scenarios};
- await writeFile('/tmp/wolf-assistant-fixture.json',JSON.stringify(config),{mode:0o600});
- await chmod('/tmp/wolf-assistant-fixture.json',0o600);
+ await writeFile(`/tmp/wolf-assistant-fixture-${nativePort}.json`,JSON.stringify(config),{mode:0o600});
+ await chmod(`/tmp/wolf-assistant-fixture-${nativePort}.json`,0o600);
  if(process.argv.includes('--self-check')){
   const controlReport=await ok('/__fixture/state');assert.equal(controlReport.external_attempts,0);assert.ok(Array.isArray(controlReport.commands));
   for(const path of ['/me','/api/comms/bootstrap','/api/comms/notifications','/api/notes/pages/'+note,'/api/browser/capabilities','/api/browser/records/contact/'+contact+'/links','/api/storage/files/'+file,'/api/focus/settings','/api/focus/capabilities','/api/focus/creators','/api/todo/tasks','/api/todo/routine-groups','/api/todo/routine-runs','/api/idea-parking/lists','/api/routes/'+route.id,'/api/quotes?contact_id='+contact,'/api/agreements/settings','/api/schedule/booking/settings','/api/facebook-ads','/api/facebook-ads/catalog','/api/webhook-connections','/api/assistant/funding/allocations'])await ok(path);
@@ -205,7 +221,7 @@ try {
   assert.equal(externalAttempts,0);
   console.log(JSON.stringify({self_check:'PASS',startup_and_acl_checks:true,simulated_acknowledgement_scenarios:Object.keys(scenarios).length+1,actual_native_ui_checked:false,external_attempts:externalAttempts,origin}));
  }
- console.log(JSON.stringify({fixture:'ready',origin,config:'/tmp/wolf-assistant-fixture.json',scenario_count:Object.keys(scenarios).length}));
+ console.log(JSON.stringify({fixture:'ready',origin,config:`/tmp/wolf-assistant-fixture-${nativePort}.json`,scenario_count:Object.keys(scenarios).length}));
  if(process.argv.includes('--exit-after-check'))await stop();
  setTimeout(()=>void stop(),45*60*1000).unref();
 }catch(error){console.error('[assistant-native-fixture]',error);await stop(1);}

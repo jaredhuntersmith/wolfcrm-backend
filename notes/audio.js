@@ -1,9 +1,9 @@
 import {createStorageBucket,PART_SIZE} from '../media-storage/bucket.js';
-import {mutate,uuid,fail} from '../company-comms/access.js';
+import {mutate,uuid,fail,requireCapability} from '../company-comms/access.js';
 import {authorizePage} from './access.js';
 
 // Immutable, page-owned recordings. They deliberately never enter stored_files.
-export function createNotesAudio({pool,bucket=createStorageBucket()}) {
+export function createNotesAudio({pool,bucket=createStorageBucket(),storage}) {
  const dto=row=>({id:row.id,page_id:row.page_id,duration:Number(row.duration),byte_size:Number(row.byte_size),ready:row.ready,part_size:PART_SIZE});
  const requireBucket=()=>{if(!bucket)fail(503,'notes_audio_unavailable');};
  async function authorized(db,input,pageId,id,write=false) {
@@ -66,7 +66,14 @@ export function createNotesAudio({pool,bucket=createStorageBucket()}) {
  }
  async function access(input,pageId,id) {
   requireBucket();const {row}=await authorized(pool,input,pageId,id);if(!row.ready)fail(409,'recording_upload_incomplete');
-  return {url:await bucket.access(row,false),expires_in:300,...dto(row)};
+  if(!storage?.issueSourceDelivery)fail(503,'notes_audio_delivery_unavailable','Recording playback is temporarily unavailable.');
+  return {url:await storage.issueSourceDelivery(input,'notes_audio',row.id,{purpose:'stream'}),expires_in:300,...dto(row)};
  }
+ if(storage?.registerDeliverySource)storage.registerDeliverySource('notes_audio',{bucket,authorize:async(actor,id)=>{
+  const row=(await pool.query('SELECT page_id FROM notes_audio WHERE id=$1 AND company_id=$2',[uuid(id),actor.companyId])).rows[0];
+  if(!row)fail(404,'recording_unavailable');
+  const result=await authorized(pool,actor,row.page_id,id);requireCapability(result.actor,'audio.play');if(!result.row.ready)fail(409,'recording_upload_incomplete');
+  return {...result.row,original_filename:'Voice Note.m4a',mime_type:'audio/mp4'};
+ }});
  return {reserve,part,complete,access};
 }

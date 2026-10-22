@@ -1,4 +1,5 @@
-export const PERMISSION_CATALOG_VERSION = 6;
+import { applyPermissionWindows } from './permission-windows.js';
+export const PERMISSION_CATALOG_VERSION = 7;
 
 export const PERMISSION_GROUPS = Object.freeze([
   group("dashboard", "Dashboard", "Command center and daily business overview."),
@@ -19,6 +20,7 @@ export const PERMISSION_GROUPS = Object.freeze([
   group("finance", "Finance & Accounting", "Company financial data, planning, accounting, receipts, and Finance AI."),
   group("pay", "Pay & Reports", "Personal/company pay, payroll inputs, and company sales reports."),
   group("team", "Employees & Team", "View the team and manage employee access."),
+  group("training", "Assignments & Training", "Assigned learning, authoring, reviews and certificates."),
   group("automations", "Automations", "View, edit, test, run, and stop company automations."),
   group("integrations", "Integrations", "View and manage external providers, tokens, and synchronization."),
   group("website", "Website, Landing Pages & Funnels", "Create structured company sites, funnels, forms, and publications."),
@@ -139,6 +141,17 @@ export const PERMISSION_CAPABILITIES = Object.freeze([
 
   capability("team.view", "team", "View team", "See active company employees."),
   capability("team.manage", "team", "Manage employees", "Change employee access, deactivate, and restore accounts.", true, ["team.view"]),
+  capability("team.manage_accounts", "team", "Lock, disable and restore employees", "Manage ordinary employee accounts within your company. Admin peers and the owner remain protected.", true, ["team.view"]),
+  capability("team.purge_private", "team", "Permanently delete disabled private data", "Confirm irreversible private-data deletion without gaining access to private content.", true, ["team.manage_accounts"]),
+  capability("training.view_self", "training", "View own assignments and training", "Read and complete your assigned work and view your own results and awards."),
+  capability("training.author", "training", "Author training", "Create and edit assignment, form, quiz and course drafts.", true, ["training.view_self"]),
+  capability("training.publish", "training", "Publish training versions", "Publish immutable versions for assignment.", true, ["training.author"]),
+  capability("training.assign", "training", "Assign employee training", "Assign published training to eligible employees.", true, ["training.view_self"]),
+  capability("training.review", "training", "Review assigned work", "View scoped submissions and grade or review employee work.", true, ["training.view_self"]),
+  capability("training.override", "training", "Override training completion", "Record an audited completion override with a reason.", true, ["training.review"]),
+  capability("training.analytics", "training", "View training analytics", "View company training progress and reports.", true, ["training.view_self"]),
+  capability("training.certificates", "training", "Manage certificates", "Issue or revoke company training certificates.", true, ["training.review"]),
+  capability("training.providers", "training", "Manage training providers", "Configure supported video/training provider settings.", true, ["training.author"]),
 
   capability("automations.view", "automations", "View automations", "See company automation definitions and runs."),
   capability("automations.manage", "automations", "Manage automations", "Create, publish, archive, and emergency-stop automations.", true, ["automations.view"]),
@@ -162,6 +175,8 @@ export const PERMISSION_CAPABILITIES = Object.freeze([
   capability("storage.share", "storage", "Share library files", "Share library files.", false, ["storage.view"]),
   capability("storage.download", "storage", "Download library files", "Download library files.", false, ["storage.view"]),
   capability("storage.manage", "storage", "Manage library files", "Manage library files.", true, ["storage.view"]),
+  capability("storage.view_usage", "storage", "View company storage usage", "View aggregate sizes and account attribution, never private filenames or content.", true),
+  capability("storage.cleanup_company", "storage", "Clean up company storage", "Review references and explicitly delete eligible company-owned files.", true, ["storage.view_usage", "storage.view"]),
   capability("audio.view", "storage", "View audio", "View audio.", false, ["storage.view"]),
   capability("audio.play", "storage", "Play audio", "Play audio.", false, ["audio.view"]),
   capability("media.view", "storage", "View media", "View media.", false, ["storage.view"]),
@@ -207,7 +222,8 @@ const ALL_KEYS = Object.freeze(PERMISSION_CAPABILITIES.map((item) => item.key));
 const KNOWN_KEYS = new Set(ALL_KEYS);
 const CAPABILITY_BY_KEY = new Map(PERMISSION_CAPABILITIES.map((item) => [item.key, item]));
 
-const legacyEmployee = new Set(ALL_KEYS.filter((key) => !key.startsWith("finance.") && !key.startsWith("accounting.") && !key.startsWith("website.") && !key.startsWith("focus.") && ![
+const explicitAdministration = new Set(['team.manage_accounts','team.purge_private','storage.view_usage','storage.cleanup_company',...ALL_KEYS.filter(key=>key.startsWith('training.')&&key!=='training.view_self')]);
+const legacyEmployee = new Set(ALL_KEYS.filter((key) => !explicitAdministration.has(key) && !key.startsWith("finance.") && !key.startsWith("accounting.") && !key.startsWith("website.") && !key.startsWith("focus.") && ![
   "dashboard.exceptions.view", "dashboard.exceptions.manage",
   "contacts.delete", "contacts.export", "sales.view_all", "sales.manage",
   "jobs.manage_templates", "routes.manage", "communications.manage", "communications.moderate", "communications.record", "communications.transcribe", "communications.ai", "communications.workflows", "communications.guests", "communications.audit", "team.manage_access", "storage.manage", "service_plans.approve", "service_plans.delete", "invoices.delete",
@@ -218,7 +234,7 @@ const legacyEmployee = new Set(ALL_KEYS.filter((key) => !key.startsWith("finance
 ].includes(key)));
 
 const PRESET_KEYS = Object.freeze({
-  admin: new Set(ALL_KEYS),
+  admin: new Set(ALL_KEYS.filter(key=>!explicitAdministration.has(key))),
   manager: keys(
     "dashboard.*", "tasks.*", "contacts.*", "pipeline.*", "quotes.*", "sales.*",
     "schedule.*", "jobs.*", "routes.*", "messaging.customer.*",
@@ -300,7 +316,7 @@ export function validateAccessUpdate(raw) {
   return { preset: presetId, overrides: sparse, capabilities: effective };
 }
 
-export function resolveAccess({ role, isOwner = false, isCompanyOwner = false, preset: rawPreset, overrides, legacy = {} } = {}) {
+export function resolveAccess({ role, isOwner = false, isCompanyOwner = false, preset: rawPreset, overrides, legacy = {}, permissionWindows = legacy.permission_windows, timeZone = legacy.company_timezone || 'UTC', now } = {}) {
   if (isOwner === true || isCompanyOwner === true) {
     return { preset: "owner", overrides: {}, capabilities: Object.fromEntries(ALL_KEYS.map((key) => [key, true])) };
   }
@@ -309,10 +325,13 @@ export function resolveAccess({ role, isOwner = false, isCompanyOwner = false, p
   let merged = { ...effectivePresetCapabilities(presetId) };
   if (presetId === "legacy_employee") merged = { ...merged, ...legacyCapabilityBridge(legacy) };
   merged = { ...merged, ...safeOverrides };
+  const granted = normalizeCapabilities(merged, safeOverrides);
+  const restricted = applyPermissionWindows(granted,permissionWindows,timeZone,now);
+  const denials = Object.fromEntries(Object.entries(restricted).filter(([key,value])=>!value&&granted[key]).map(([key])=>[key,false]));
   return {
     preset: presetId,
     overrides: safeOverrides,
-    capabilities: normalizeCapabilities(merged, safeOverrides)
+    capabilities: normalizeCapabilities(restricted, {...safeOverrides,...denials})
   };
 }
 
@@ -421,6 +440,7 @@ export function normalizeCapabilities(source, explicit = {}) {
 }
 
 const DEFAULT_ADDITIONS = Object.freeze([
+  "training.view_self",
   "storage.view", "storage.upload", "storage.edit", "storage.delete", "storage.share", "storage.download",
   "audio.view", "audio.play", "media.view", "media.play", "notifications.view", "notifications.share",
   "service_plans.view", "service_plans.create", "service_plans.edit", "invoices.view", "invoices.create", "invoices.edit",

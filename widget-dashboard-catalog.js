@@ -87,17 +87,7 @@ export async function readCatalogModule({pool,actor,slot,range,now,person,aggreg
   return {...base,...page(rows,offset,recordID),badge:rows.length,value:kind==='agreements'?String(rows.length):money(total),note:kind==='invoices'?'Actionable published agreement balances; no invoice due-date aging is available.':kind==='deposits'?'Payable deposits after signatures, adjustments and plan collection rules.':'Agreements awaiting signatures, changes, payment review/deposit or booking.'};
  }
  if(kind==='weather') {
-  if(!services.weatherService?.status().configured)return unavailable('Property weather is not configured. Open the appointment for available weather options.');
-  const job=(await pool.query(`SELECT se.id,se.start_at,c.name,c.lat,c.lng FROM schedule_events se JOIN contacts c ON c.id::text=se.contact_id AND c.company_id=se.company_id AND c.deleted_at IS NULL
-   WHERE se.company_id=$1 AND ($2::uuid IS NULL OR se.created_by=$2 OR se.sales_user_ids ? $2::text OR se.worker_user_ids ? $2::text)
-   AND se.finished_at IS NULL AND se.start_at>=GREATEST($3,$5::timestamptz) AND se.start_at<$4
-   AND ($6::text IS NULL OR EXISTS(SELECT 1 FROM jsonb_array_elements(se.service_items) si WHERE COALESCE(si->>'service_id',si->>'serviceId',si->>'id')=$6)) ORDER BY se.start_at,se.id LIMIT 1`,[actor.companyId,person,range.start_at,range.end_at,now,f.service||null])).rows[0];
-  if(!job)return {...base,value:'No appointment',note:'No upcoming property in this filter.'};
-  if(job.lat==null||job.lng==null)return unavailable('The next property needs a verified map location before a forecast can be shown.');
-  const forecast=await services.weatherService.lookup({latitude:Number(job.lat),longitude:Number(job.lng),hours:24});
-  const hour=forecast.hours.find(h=>new Date(h.start_at)<=new Date(job.start_at)&&new Date(h.end_at)>new Date(job.start_at));
-  if(!hour)return unavailable('The next appointment is outside the available forecast.');
-  return {...base,value:hour.temperature_f==null?'Forecast':`${Math.round(hour.temperature_f)}°F`,note:[hour.condition_description,hour.precipitation_probability_percent==null?null:`${hour.precipitation_probability_percent}% precipitation`,...(forecast.warnings||[]).map(w=>w.message)].filter(Boolean).join(' · '),nextTransitionAt:new Date(Math.min(new Date(forecast.fetched_at).getTime()+900000,new Date(hour.end_at).getTime())).toISOString(),rows:[{id:job.id,title:job.name,subtitle:hour.condition_description,date:job.start_at,destination:'schedule',reference:job.id}]};
+  return unavailable('Property weather is retired. Replace this saved module with a current dashboard module.');
  }
  if(kind==='activity') {
   if(!services.refreshActivity)return unavailable('Activity summaries are not available yet. Open the Command Center.');

@@ -234,15 +234,15 @@ test('agreement adapters reuse reconciled actions and exclude prior revisions; e
   const full=(await f.service.summary(owner,{slots:[slot('invoices')]})).modules[0];assert.equal(full.state,'unavailable');assert.equal(full.badge,undefined);
  }finally{await f.close();}
 });
-test('property weather uses authorized coordinates; clock status stays personal',{timeout:120000},async()=>{
- const now=new Date('2026-10-17T16:00:00Z');let coordinates;
- const f=await fixture({weatherService:{status:()=>({configured:true}),lookup:async input=>{coordinates=input;return {fetched_at:now.toISOString(),hours:[{start_at:'2026-10-17T16:00:00Z',end_at:'2026-10-17T17:00:00Z',temperature_f:62.4,condition_description:'Cloudy',precipitation_probability_percent:20}],warnings:[]};}}});try {
+test('saved weather module is explicitly retired without a provider call; clock status stays personal',{timeout:120000},async()=>{
+ const now=new Date('2026-10-17T16:00:00Z');let providerCalls=0;
+ const f=await fixture({weatherService:{status:()=>({configured:true}),lookup:async()=>{providerCalls++;throw Error('retired provider call');}}});try {
   const c=randomUUID(),owner=await f.actor('owner');
   await f.pool.query("INSERT INTO contacts(id,company_id,name,lat,lng) VALUES($1,$2,'Property',40,-75)",[c,f.companies.a]);
   await f.pool.query("INSERT INTO schedule_events(id,company_id,contact_id,start_at,title) VALUES('weather-job',$1,$2,'2026-10-17T16:30:00Z','Service')",[f.companies.a,c]);
   await f.pool.query("INSERT INTO time_clock_entries(id,company_id,user_id,start_at) VALUES($1,$2,$3,$4)",[randomUUID(),f.companies.a,f.ids.owner,now]);
   const result=await f.service.summary(owner,{slots:[slot('weather'),slot('crew'),slot('time_clock')]},now);
-  assert.deepEqual(f.failures,[]);assert.equal(result.modules[0].value,'62°F');assert.equal(result.modules[0].nextTransitionAt,'2026-10-17T16:15:00.000Z');assert.deepEqual(coordinates,{latitude:40,longitude:-75,hours:24});assert.equal(result.modules[1].count,1);assert.equal(result.modules[2].value,'Clocked in');
+  assert.deepEqual(f.failures,[]);assert.equal(result.modules[0].state,'unavailable');assert.match(result.modules[0].reason,/retired/);assert.equal(providerCalls,0);assert.equal(result.modules[1].count,1);assert.equal(result.modules[2].value,'Clocked in');
   assert.equal((await f.service.summary(await f.actor('alice'),{slots:[slot('time_clock')]},now)).modules[0].value,'Clocked out');
   await f.pool.query('UPDATE contacts SET lat=NULL WHERE id=$1',[c]);assert.equal((await f.service.summary(owner,{slots:[slot('weather')]},now)).modules[0].state,'unavailable');
  }finally{await f.close();}

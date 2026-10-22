@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { permissionWindowOpen } from './permission-windows.js';
 import { PERMISSION_CAPABILITIES, isKnownCapability, resolveAccess, validateAccessUpdate, legacyColumnsForCapabilities } from './permissions.js';
 
 export class PermissionGovernanceError extends Error {
@@ -33,7 +34,7 @@ export async function installPermissionGovernanceSchema(pool) {
     CREATE INDEX IF NOT EXISTS permission_change_outbox_pending ON permission_change_outbox(sequence) WHERE delivered_at IS NULL;
   `);
 }
-const rowSQL = `SELECT u.id,u.email,u.display_name,u.role,u.company_id,u.deleted_at,c.owner_user_id,
+const rowSQL = `SELECT u.id,u.email,u.display_name,u.role,u.company_id,u.deleted_at,to_jsonb(u)->>'locked_at' AS locked_at,c.owner_user_id,COALESCE(to_jsonb(c)->>'timezone','UTC') AS company_timezone,
   to_jsonb(p) AS permission_record,COALESCE(d.scope,'[]'::jsonb) AS delegation_scope,COALESCE(d.revision,0) AS delegation_revision
   FROM users u LEFT JOIN companies c ON c.id=u.company_id
   LEFT JOIN employee_permissions p ON p.user_id=u.id AND p.company_id=u.company_id
@@ -42,10 +43,11 @@ function decorate(row) {
   const p = row.permission_record || {};
   const isOwner = ownerIdentity(row);
   return { ...row, isOwner, isAdmin: !isOwner && p.permission_preset === 'admin',
-    access: resolveAccess({ role: row.role, isOwner, preset:p.permission_preset, overrides:p.permission_overrides, legacy:p }),
+    access: resolveAccess({ role: row.role, isOwner, preset:p.permission_preset, overrides:p.permission_overrides, legacy:p, permissionWindows:{},timeZone:row.company_timezone }),
     permission_revision:Number(p.permission_revision || 0), delegation_revision:Number(row.delegation_revision || 0) };
 }
-const canManage = actor => actor.isOwner || (actor.isAdmin && actor.delegation_scope.length > 0);
+const canManage = actor => actor.isOwner || (actor.isAdmin && actor.delegation_scope.length > 0 &&
+  (!actor.permission_record?.permission_windows?.['team.manage_access'] || permissionWindowOpen(actor.permission_record.permission_windows['team.manage_access'],actor.company_timezone)));
 function assertTarget(actor, target, next) {
   if (target.company_id !== actor.company_id || !actor.company_id) reject(404,'employee_not_found','Employee not found.');
   if (target.isOwner || target.id === actor.owner_user_id) reject(403,'owner_protected','The company owner cannot be modified through employee administration.');
@@ -72,7 +74,7 @@ export function createPermissionGovernance({pool,onChange}) {
   }
   async function actorFor(db,context) {
     const actor=await load(db,context.userId);
-    if(actor.deleted_at || actor.company_id!==context.companyId) reject(403,'account_inactive','Account access changed. Sign in again.');
+    if(actor.deleted_at || actor.locked_at || actor.company_id!==context.companyId) reject(403,'account_inactive','Account access changed. Sign in again.');
     return actor;
   }
   async function record(db,actor,target,action,previous,current,newRevision) {
@@ -154,11 +156,34 @@ export function createPermissionGovernance({pool,onChange}) {
       return {value:{id,delegation:{scope:row.scope,revision:Number(row.revision)}},events:[event]};
     });
   }
-  async function effective(context){const actor=await actorFor(pool,context);return {is_company_owner:actor.isOwner,owner_user_id:actor.owner_user_id,permission_revision:actor.permission_revision,access:actor.access,can_manage_access:canManage(actor),delegation_scope:actor.isOwner?PERMISSION_CAPABILITIES.map(x=>x.key):actor.delegation_scope};}
+  async function applyRolePreset(context,id,input) {
+    const expected=revision(input.expected_revision);
+    if(!uuid(input.role_id)||!Number.isSafeInteger(input.role_revision))reject(400,'role_revision_required','Refresh the selected company role before applying it.');
+    return transaction(context,async(db,actor)=>{
+      await db.query("SELECT pg_advisory_xact_lock(hashtextextended('comms-permissions:' || $1,0))",[id]);
+      await db.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[id]);
+      const target=await load(db,id);
+      const role=(await db.query('SELECT * FROM employee_role_presets WHERE id=$1 AND company_id=$2 FOR SHARE',[input.role_id,actor.company_id])).rows[0];
+      if(!role)reject(404,'role_not_found','Company role is unavailable.');
+      if(role.revision!==input.role_revision)reject(409,'role_changed','Company role changed. Refresh before applying it.');
+      const next=validateAccessUpdate({preset:role.base_preset,overrides:role.overrides});
+      assertTarget(actor,target,next);
+      if(target.permission_revision!==expected)reject(409,'permissions_changed','Employee access changed. Refresh before saving.');
+      const previousWindows=target.permission_record?.permission_windows||{},windows=role.permission_windows||{};
+      if(!actor.isOwner)for(const key of new Set([...Object.keys(previousWindows),...Object.keys(windows)])){
+        if(JSON.stringify(previousWindows[key])!==JSON.stringify(windows[key])&&!actor.delegation_scope.includes(key))reject(403,'delegation_scope_exceeded','This role changes a window outside your delegated scope.');
+      }
+      const saved=await persist(db,actor,target,next);
+      await db.query('UPDATE employee_permissions SET permission_windows=$2 WHERE user_id=$1',[id,JSON.stringify(windows)]);
+      await db.query('INSERT INTO permission_governance_audit(id,company_id,actor_user_id,target_user_id,action,previous,current) VALUES($1,$2,$3,$4,$5,$6,$7)',[randomUUID(),actor.company_id,actor.id,id,'company_role_applied',JSON.stringify({windows:previousWindows}),JSON.stringify({role_id:role.id,role_revision:role.revision,windows})]);
+      return {value:{...saved.value,permission_windows:windows},events:[saved.event]};
+    });
+  }
+  async function effective(context){const actor=await actorFor(pool,context),p=actor.permission_record||{};const access=resolveAccess({isOwner:actor.isOwner,preset:p.permission_preset,overrides:p.permission_overrides,legacy:p,timeZone:actor.company_timezone});return {company_timezone:actor.company_timezone,permission_windows:p.permission_windows||{},is_company_owner:actor.isOwner,owner_user_id:actor.owner_user_id,permission_revision:actor.permission_revision,access,can_manage_access:canManage(actor),delegation_scope:actor.isOwner?PERMISSION_CAPABILITIES.map(x=>x.key):actor.delegation_scope};}
   async function employees(context){
     const actor=await actorFor(pool,context);if(!canManage(actor))reject(403,'access_administration_denied','Employee access administration is unavailable.');
-    const all=(await pool.query(rowSQL+' WHERE u.company_id=$1 AND u.id<>$2 ORDER BY COALESCE(u.display_name,u.email),u.id',[actor.company_id,actor.owner_user_id||actor.id])).rows.map(decorate);
-    return {...await effective(context),employees:all.filter(row=>actor.isOwner||(!row.isAdmin&&row.id!==actor.id)).map(row=>({id:row.id,email:row.email,display_name:row.display_name,role:row.isOwner?'employer':'employee',deleted_at:row.deleted_at,is_admin:row.isAdmin,access:row.access,permission_revision:row.permission_revision,delegation:{scope:row.delegation_scope,revision:row.delegation_revision}}))};
+    const all=(await pool.query(rowSQL+' WHERE u.company_id=$1 AND u.id<>$2 AND u.deleted_at IS NULL ORDER BY COALESCE(u.display_name,u.email),u.id',[actor.company_id,actor.owner_user_id||actor.id])).rows.map(decorate);
+    return {...await effective(context),employees:all.filter(row=>actor.isOwner||(!row.isAdmin&&row.id!==actor.id)).map(row=>({id:row.id,email:row.email,display_name:row.display_name,role:row.isOwner?'employer':'employee',deleted_at:row.deleted_at,is_admin:row.isAdmin,access:row.access,permission_windows:row.permission_record?.permission_windows||{},permission_revision:row.permission_revision,delegation:{scope:row.delegation_scope,revision:row.delegation_revision}}))};
   }
   async function audit(context,id){
     const actor=await actorFor(pool,context),target=await load(pool,id);
@@ -172,7 +197,7 @@ export function createPermissionGovernance({pool,onChange}) {
   }
 
   async function drainInvalidations(callback=onChange,limit=100){if(!callback)return 0;const events=(await pool.query('SELECT * FROM permission_change_outbox WHERE delivered_at IS NULL ORDER BY sequence LIMIT $1',[Math.max(1,Math.min(limit,500))])).rows;for(const e of events){await callback({id:e.id,companyId:e.company_id,userId:e.user_id,revision:Number(e.permission_revision),reason:e.reason});await pool.query('UPDATE permission_change_outbox SET delivered_at=now() WHERE id=$1',[e.id]);}return events.length;}
-  return {update,legacyUpdate,delegation,effective,employees,audit,drainInvalidations};
+  return {update,legacyUpdate,delegation,applyRolePreset,effective,employees,audit,drainInvalidations};
 }
 export function installPermissionGovernanceRoutes({app,pool,authRequired,onChange}) {
   const service=createPermissionGovernance({pool,onChange});

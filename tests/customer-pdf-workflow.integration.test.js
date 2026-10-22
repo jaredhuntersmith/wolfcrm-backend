@@ -71,6 +71,30 @@ test('customer PDF workflow preserves drafts, exact exports, signer evidence and
       const next=await publish(await makeQuote());assert.equal(next.snapshot.business.name,'Renamed Window Company');
       expectStatus(await rename('PDF Company'),200);
     });
+    await t.test('material visibility reaches customer preview and PDF without internal costs', async () => {
+      for (const visibility of ['detailed', 'summary', 'hidden']) {
+        const quote = await makeQuote();
+        const material = { id: randomUUID(), name: 'Private granite slab', quantity: 2, unit: 'sheets',
+          cost_mode: 'unit', cost_unit_cents: 1234, charge_mode: 'unit', charge_unit_cents: 3000 };
+        const updated = expectStatus(await request(`/api/quotes/${quote.id}`, { method: 'PUT', body: {
+          materials: [material], quote_options: { material_visibility: visibility }
+        } }), 200);
+        assert.equal(updated.materials[0].cost_cents, 2468);
+        const preview = expectStatus(await post(`/api/quotes/${quote.id}/preview`, { content: baseContent }), 200);
+        assert.equal(preview.snapshot.pricing.subtotal_cents, 26000);
+        assert.equal(preview.snapshot.pricing.total_cents, 26000);
+        assert.ok(!JSON.stringify(preview.snapshot).includes('cost_cents'));
+        assert.ok(!JSON.stringify(preview.quote_export_payload).includes('cost_cents'));
+        assert.equal(preview.quote_export_payload.quote.materials, undefined);
+        const names = preview.snapshot.pricing.line_items.map(row => row.name);
+        assert.equal(names.includes('Private granite slab'), visibility === 'detailed');
+        assert.equal(names.includes('Materials'), visibility === 'summary');
+        const packet = await publish(updated);
+        assert.equal(packet.snapshot.pricing.subtotal_cents, 26000);
+        assert.ok(!JSON.stringify(packet.snapshot).includes('cost_cents'));
+        assert.equal(packet.snapshot.quote_pdf_source, undefined);
+      }
+    });
     await t.test('branded signed download appends completed PDFs and leaves archived signing evidence unchanged',async()=>{
       const packet=await publish(await makeQuote(),pdfContent);
       expectStatus(await request(`${publicPath(packet)}/documents/signed`,{token:null}),409);

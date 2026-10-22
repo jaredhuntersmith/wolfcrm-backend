@@ -30,6 +30,16 @@ test("default descriptions reference a unique preset on the same service", () =>
   assert.throws(() => serviceUUID("starter-windows"), { code: "service_id_invalid" });
 });
 
+test("favorites and explicit service durations are validated without inventing legacy time", () => {
+  assert.equal(normalizeSavedService({ name: "Older service" }).estimated_duration_minutes, null);
+  assert.equal(normalizeSavedService({ name: "Windows", favorite: true, estimated_duration_minutes: 90 }).favorite, true);
+  assert.equal(normalizeSavedService({ name: "Windows", favorite: true, estimated_duration_minutes: 90 }, { importing: true }).favorite, false);
+  for (const value of [0, -1, 10081, 1.5, "90"]) {
+    assert.throws(() => normalizeSavedService({ name: "Windows", estimated_duration_minutes: value }), { code: "service_duration_invalid" });
+  }
+  assert.throws(() => normalizeSavedService({ name: "Windows", favorite: "yes" }), { code: "service_favorite_invalid" });
+});
+
 test("quote contact and service ownership is always checked against the active company", async () => {
   const req = { companyId: "company-a", userId: "employee-a" };
   let statements = [];

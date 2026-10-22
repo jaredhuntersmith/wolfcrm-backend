@@ -77,6 +77,16 @@ test("real PostgreSQL calendar guard and public booking",{timeout:90000},async t
       const available=await slots(item);assert.ok(available.slots.length);assert.equal(available.suggested_days.length,4);
       assert.ok(!JSON.stringify(available).includes(worker));assert.ok(!JSON.stringify(available).includes("Private customer"));assert.ok(!JSON.stringify(available).includes("duration"));
     });
+    await t.test("approved technician time off removes a public slot and rejects an old token",async()=>{
+      const item=await agreement(),available=await slots(item),slot=available.slots[0],blockID=randomUUID();
+      await pool.query(`INSERT INTO schedule_blocks(id,company_id,user_id,kind,title,start_at,end_at,status,affects_availability,created_by)
+        VALUES($1,$2,$3,'time_off','Approved time off',$4,$5,'approved',true,$6)`,
+        [blockID,company,worker,slot.start_at,new Date(new Date(slot.start_at).getTime()+3600000),owner]);
+      const revised=await slots(item);
+      assert.equal(revised.slots.some(candidate=>candidate.start_at===slot.start_at),false);
+      assert.equal((await book(item,slot)).status,409);
+      await pool.query('UPDATE schedule_blocks SET deleted_at=now(),affects_availability=false WHERE id=$1',[blockID]);
+    });
     await t.test("concurrent tabs create one actual job and replay across adapter restart",async()=>{
       const item=await agreement(),available=await slots(item),slot=available.slots[0],requestID=randomUUID();
       const results=await Promise.all(Array.from({length:8},()=>book(item,slot,requestID)));
@@ -90,7 +100,7 @@ test("real PostgreSQL calendar guard and public booking",{timeout:90000},async t
     });
     await t.test("actual staff route and public request racing the same worker admit exactly one",async()=>{
       const item=await agreement(),slot=(await slots(item)).slots.find(s=>s.date==="2030-01-03");
-      const staff=request(`/api/schedule/${randomUUID()}`,{method:"PUT",staff:true,body:{title:"Staff appointment",start:slot.start_at,end:new Date(new Date(slot.start_at).getTime()+3600000).toISOString(),worker_user_ids:[worker],sales_user_ids:[]}});
+      const staff=request(`/api/schedule/${randomUUID()}`,{method:"PUT",staff:true,body:{title:"Staff appointment",start:slot.start_at,end:new Date(new Date(slot.start_at).getTime()+3600000).toISOString(),contact_id:contact,quote_id:item.row.quote_id,worker_user_ids:[worker],sales_user_ids:[owner]}});
       const results=await Promise.all([staff,book(item,slot)]);assert.deepEqual(results.map(r=>r.status).sort(),[200,409],JSON.stringify(results));
     });
     await t.test("automation-shaped direct SQL and multi-worker changes cannot bypass exclusion",async()=>{

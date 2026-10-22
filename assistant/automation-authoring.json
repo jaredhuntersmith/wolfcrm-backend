@@ -6576,8 +6576,8 @@
     },
     {
       "id": "weather.job_at_risk",
-      "status": "supported",
-      "reason": "Canonical trigger configuration; published engine event matching applies.",
+      "status": "unsupported",
+      "reason": "Weather scheduling is retired. Existing weather automation configurations are paused and must be revised before resuming.",
       "fields": [
         {
           "key": "allow_automation_origin",

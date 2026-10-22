@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { QuoteContractError, calculateQuotePricing, normalizeQuoteLines, quoteContentHash, quoteInteger } from "./quote-contract-domain.js";
 import { resolveAgreementText, generateQuoteAgreementPDF, combineAgreementPDFs } from "./quote-agreement-documents.js";
 import { assertQuoteReferences } from "./services-catalog.js";
+import { publicMaterialPricing } from "./quote-materials.js";
 
 const fail = (code, message, status = 409) => { throw new QuoteContractError(code, message, status); };
 const uuid = value => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
@@ -26,7 +27,7 @@ export async function selectedQuoteScheduleScope(db,{companyId,quoteId,previous,
   const row = previous?.agreement_id
     ? (await db.query("SELECT * FROM quote_agreements WHERE id=$1 AND company_id=$2",[previous.agreement_id,companyId])).rows[0]
     : (await db.query("SELECT * FROM quote_agreements WHERE quote_id=$1 AND company_id=$2 ORDER BY revision DESC LIMIT 1",[quoteId,companyId])).rows[0];
-  if (!row?.snapshot.pricing || row.snapshot.kind!=="quote") return null;
+  if (!row?.quote_id || !row.snapshot.pricing || (row.snapshot.kind && row.snapshot.kind!=="quote")) return null;
   if (previous?.agreement_id && quoteId !== row.quote_id) fail("quote_job_scope_locked","Keep this appointment linked to its accepted estimate. Issue an amendment to change its scope.");
   if (row.snapshot.optional_addons?.length && row.snapshot.addon_selection_finalized !== true) fail("quote_addon_selection_required","Finalize the optional services on the customer estimate before scheduling its scope.");
   if (!previous && (row.revoked_at || ["declined","superseded"].includes(row.decision))) fail("quote_job_scope_unavailable","Issue a current estimate before scheduling this selected scope.");
@@ -38,7 +39,8 @@ export async function selectedQuoteScheduleScope(db,{companyId,quoteId,previous,
     if(items.some(line=>!requested.some(candidate=>candidate.id===line.id && candidate.qty===line.qty && candidate.service_id===line.service_id))) fail('quote_job_scope_locked','Keep the accepted quote services and quantities. Add extra services to this job, or issue an amendment to replace the original scope.');
     const ids=new Set(items.map(line=>line.id));items=[...items,...requested.filter(line=>!ids.has(line.id))];
   }
-  return {agreement_id:row.id,quote_id:row.quote_id,contact_id:row.contact_id,service_items:items,services:items.map(line=>line.name),price_cents:previous?.agreement_id?previous.price_cents:row.snapshot.pricing.total_cents};
+  return {agreement_id:row.id,quote_id:row.quote_id,contact_id:row.contact_id,service_items:items,services:items.map(line=>line.name),
+    duration_minutes:row.snapshot.duration_minutes,price_cents:previous?.agreement_id?previous.price_cents:row.snapshot.pricing.total_cents};
 }
 
 // Issued alternatives and their raw merge sources are frozen in the original
@@ -83,6 +85,7 @@ export function createQuoteAddonSelection({ pool, service }) {
       const lines = [...source.base_line_items,...chosen];
       await assertQuoteReferences(db, { companyId: row.company_id, userId: row.created_by }, { contact_id: row.contact_id, line_items: lines, existing_lines: [...source.base_line_items,...row.snapshot.optional_addons] });
       const pricing = calculateQuotePricing({ ...source.pricing_inputs, line_items: lines });
+      const publicPricing = publicMaterialPricing(pricing, (source.material_line_ids || []).map(id => ({id})), source.material_visibility || 'detailed');
       const duration = quoteInteger(source.base_duration_minutes + chosen.reduce((sum,item) => sum+item.duration_minutes,0), "Selected job duration in minutes", 10080, 1);
       if (pricing.deposit_cents > 0) {
         if (!service.paymentReady) fail("agreement_payment_not_ready", "Payment setup is unavailable. Contact the business.");
@@ -93,11 +96,11 @@ export function createQuoteAddonSelection({ pool, service }) {
         await service.validateBookingReadiness(db,row.company_id,{quote_id:row.quote_id,duration_minutes:duration,line_items:pricing.line_items});
       }
       const id = randomUUID(), issuedAt = new Date().toISOString();
-      const values = { ...source.merge_values, issue_date: issuedAt, services: pricing.line_items.map(line => `${line.name}\n${line.description}`).join("\n\n"), subtotal: money(pricing.subtotal_cents), tax: money(pricing.tax_cents), total: money(pricing.total_cents), deposit: money(pricing.deposit_cents), balance: money(pricing.balance_after_deposit_cents) };
-      const snapshot = { ...row.snapshot, revision: row.revision+1, issued_at: issuedAt, pricing, duration_minutes: duration, selected_addon_ids: selected, addon_selection_finalized: true,
+      const values = { ...source.merge_values, issue_date: issuedAt, services: publicPricing.line_items.map(line => `${line.name}\n${line.description}`).join("\n\n"), subtotal: money(publicPricing.subtotal_cents), tax: money(publicPricing.tax_cents), total: money(publicPricing.total_cents), deposit: money(publicPricing.deposit_cents), balance: money(publicPricing.balance_after_deposit_cents) };
+      const snapshot = { ...row.snapshot, revision: row.revision+1, issued_at: issuedAt, pricing: publicPricing, duration_minutes: duration, selected_addon_ids: selected, addon_selection_finalized: true,
         agreement_text: resolveAgreementText(source.content.agreement_text,values), terms_text: resolveAgreementText(source.content.terms_text,values), consent_text: resolveAgreementText(source.content.consent_text,values), documents: await service.validateDocuments(db,row.company_id,source.content,values) };
       if (snapshot.documents.some((document,index) => document.sha256 !== row.snapshot.documents[index]?.sha256)) fail("agreement_asset_changed", "A document changed. Ask the business for a fresh estimate.");
-      if (snapshot.quote_position === "excluded") snapshot.scope_reference_hash = quoteContentHash({number:row.number,revision:snapshot.revision,pricing,public_notes:snapshot.public_notes,scope_exclusions:snapshot.scope_exclusions});
+      if (snapshot.quote_position === "excluded") snapshot.scope_reference_hash = quoteContentHash({number:row.number,revision:snapshot.revision,pricing:publicPricing,public_notes:snapshot.public_notes,scope_exclusions:snapshot.scope_exclusions});
       const conflictingRequest = (await db.query("SELECT 1 FROM quote_agreements WHERE company_id=$1 AND request_id=$2", [row.company_id,raw.request_id])).rowCount;
       if (conflictingRequest) fail("agreement_request_conflict", "This request ID was already used for another publication.");
       const created = (await db.query(`INSERT INTO quote_agreements(id,company_id,quote_id,contact_id,created_by,number,revision,predecessor_id,request_id,title,snapshot,packet_hash,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13) RETURNING *`, [id,row.company_id,row.quote_id,row.contact_id,row.created_by,row.number,snapshot.revision,row.id,raw.request_id,row.title,JSON.stringify(snapshot),quoteContentHash(snapshot),row.expires_at])).rows[0];

@@ -1,4 +1,6 @@
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import {loadActor,requireCapability,fail,uuid} from './company-comms/access.js';
+import {withFinanceSpace} from './finance-spaces.js';
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createHash } from "node:crypto";
 import { chooseReceiptMatch, findReceiptCandidates, normalizeMerchantName } from "./finance-receipt-matching.js";
@@ -1001,7 +1003,20 @@ export async function installReceiptSchema(pool) {
   `);
 }
 
-export async function installReceiptRoutes({ app, pool, authRequired, requireEmployer }) {
+export async function installReceiptRoutes({ app, pool, backgroundPool, authRequired, requireEmployer }) {
+  const storage=app.locals?.mediaStorage;
+  if(storage?.registerDeliverySource&&backgroundPool)storage.registerDeliverySource('finance_receipt',{authorize:async(input,id,variant)=>{
+    const actor=await loadActor(backgroundPool,input);requireCapability(actor,'finance.receipts.view');
+    if(!['original','thumbnail'].includes(variant))fail(404,'finance_receipt_image_not_found');
+    const target=(await backgroundPool.query('SELECT finance_space_id FROM finance_receipts WHERE id=$1 AND company_id=$2',[uuid(id),actor.companyId])).rows[0];
+    if(!target?.finance_space_id)fail(404,'finance_receipt_image_not_found');
+    return withFinanceSpace(backgroundPool,actor.userId,actor.companyId,target.finance_space_id,async db=>{
+      const row=(await db.query('SELECT object_key,thumbnail_object_key,mime_type FROM finance_receipts WHERE id=$1 AND company_id=$2',[id,actor.companyId])).rows[0];
+      const key=variant==='thumbnail'?row?.thumbnail_object_key:row?.object_key;
+      if(!key||!key.startsWith(receiptObjectPrefix(actor.companyId,id)))fail(404,'finance_receipt_image_not_found');
+      return {object_key:key,storage_provider:'legacy_media',mime_type:row.mime_type||'image/jpeg',original_filename:variant==='thumbnail'?'Receipt preview.jpg':'Receipt.jpg'};
+    });
+  }});
   app.get("/api/finance/receipts", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
@@ -1115,15 +1130,13 @@ export async function installReceiptRoutes({ app, pool, authRequired, requireEmp
   app.get("/api/finance/receipts/:id/download-url", authRequired, requireEmployer, async (req, res) => {
     if (!requireCompany(req, res)) return;
     try {
-      const cfg = mediaBucketConfig();
-      const s3 = getMediaS3Client();
-      if (!cfg || !s3) return res.status(503).json({ error: "media_bucket_not_configured", message: "Receipt storage is not configured." });
       const field = req.query.thumbnail === "true" ? "thumbnail_object_key" : "object_key";
       const { rows } = await pool.query(`SELECT ${field} AS object_key FROM finance_receipts WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
       if (!rows.length || !rows[0].object_key) return res.status(404).json({ error: "finance_receipt_image_not_found", message: "Receipt image was not found." });
       const objectKey = rows[0].object_key;
       if (!objectKey.startsWith(receiptObjectPrefix(req.companyId, req.params.id))) return res.status(403).json({ error: "media_forbidden", message: "Receipt image is not available." });
-      const downloadUrl = await getSignedUrl(s3, new GetObjectCommand({ Bucket: cfg.bucket, Key: objectKey }), { expiresIn: 900 });
+      if(!storage?.issueSourceDelivery)return res.status(503).json({error:'receipt_delivery_unavailable',message:'Receipt delivery is temporarily unavailable.'});
+      const downloadUrl = await storage.issueSourceDelivery(req,'finance_receipt',req.params.id,{variant:field==='thumbnail_object_key'?'thumbnail':'original'});
       res.json({ download_url: downloadUrl });
     } catch (error) {
       handleReceiptError(res, error, "finance_receipt_download_url_failed");

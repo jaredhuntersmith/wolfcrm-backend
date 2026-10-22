@@ -1,8 +1,9 @@
 import {readableSQL,publicFile} from '../media-storage/domain.js';
 import {can,loadActor,conversationJoins,conversationAccessSQL,requireCapability,fail,uuid,authorizeConversation} from './access.js';
 import {SOURCE_CAPABILITIES,sourceAccessSQL} from './sources.js';
+import {protectedStoragePredicate} from '../media-storage/protected-scopes.js';
 export async function storagePredicate(db,input){
- const actor=await loadActor(db,input);if(!can(actor,'storage.view'))return 'false';
+ const actor=await loadActor(db,input);if(!can(actor,'storage.view'))return '(false AND $1::uuid IS NOT NULL AND $2::uuid IS NOT NULL)';
  const provenance=`NOT EXISTS(SELECT 1 FROM comms_asset_provenance p WHERE p.asset_id=f.id AND (p.company_id IS DISTINCT FROM $2 OR NOT ${sourceAccessSQL(actor,'p')}))`;
  const allowedCapabilities=Object.entries(actor.permissions.capabilities).filter(([,value])=>value===true).map(([key])=>"'"+key.replaceAll("'","''")+"'").join(',');
  const conversationSource=`NOT EXISTS(SELECT 1 FROM comms_asset_conversation_sources src WHERE src.asset_id=f.id AND (src.company_id IS DISTINCT FROM $2 OR NOT src.capability=ANY(ARRAY[${allowedCapabilities}]::text[]) OR NOT EXISTS(SELECT 1 FROM conversations c ${conversationJoins} WHERE c.id=src.conversation_id AND ${conversationAccessSQL(actor)})))`;
@@ -12,7 +13,8 @@ export async function storagePredicate(db,input){
  ) allowed JOIN conversations c ON c.id=allowed.conversation_id ${conversationJoins} WHERE ${conversationAccessSQL(actor)})`:'false';
  const category=`(f.category<>'audio' OR ${can(actor,'audio.view')?'true':'false'}) AND (f.category NOT IN ('image','video') OR ${can(actor,'media.view')?'true':'false'})`;
  const protectedSource=`(NOT f.source_protected OR EXISTS(SELECT 1 FROM comms_asset_provenance p WHERE p.asset_id=f.id) OR EXISTS(SELECT 1 FROM comms_asset_conversation_sources s WHERE s.asset_id=f.id))`;
- return `((${readableSQL}) OR (${grant})) AND (${protectedSource}) AND (${provenance}) AND (${conversationSource}) AND (${category})`;
+ const domainScope=await protectedStoragePredicate(db,actor);
+ return `((f.source_scope IS NULL AND ((${readableSQL}) OR (${grant})) AND (${protectedSource}) AND (${provenance}) AND (${conversationSource})) OR (${domainScope})) AND (${category})`;
 }
 export async function authorizeAssets(db,actor,assetIds){
  if(!Array.isArray(assetIds)||assetIds.length>20)fail(400,'invalid_attachments');const unique=[...new Set(assetIds.map(uuid))];if(!unique.length)return [];

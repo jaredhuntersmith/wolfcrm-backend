@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   normalizeAssignmentIDs,
   requiredScheduleWriteCapability,
+  requireNewJobAssignments,
   summarizeScheduleTeam,
   validateAssignments,
   validateAvailability
@@ -22,6 +23,14 @@ test("assignment IDs are unique, bounded, and active-company scoped", () => {
     () => validateAssignments({ salesIDs: [], workerIDs: [outsider], activeMemberIDs: [owner, worker] }),
     (error) => error.code === "invalid_assignment_users" && error.details.user_ids[0] === outsider
   );
+});
+
+test("new jobs require a quote, salesperson, and technician while one person may fill both roles", () => {
+  const complete = { quoteID: "quote", contactID: "contact", salesIDs: [owner], workerIDs: [owner] };
+  assert.doesNotThrow(() => requireNewJobAssignments(complete));
+  for (const [field, code] of [["quoteID", "schedule_quote_required"], ["salesIDs", "schedule_salesperson_required"], ["workerIDs", "schedule_technician_required"]]) {
+    assert.throws(() => requireNewJobAssignments({ ...complete, [field]: field === "quoteID" ? null : [] }), error => error.code === code);
+  }
 });
 
 test("availability requires ISO weekdays and a non-overnight HH:mm interval", () => {

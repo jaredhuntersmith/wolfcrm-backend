@@ -341,6 +341,9 @@ test(
             ])
           ).rows[0];
           assert.match(c.lead_info.join(""), /Windows\nGutters\n完整/);
+          assert.equal(c.source, "Facebook Lead");
+          assert.equal(c.source_raw, "facebook_direct");
+          assert.ok(c.lead_source_id);
           assert.equal(
             (
               await pool.query(

@@ -9,10 +9,10 @@ export function ids(value,max=100){if(!Array.isArray(value)||value.length>max)fa
 export function can(actor,key){return actor.permissions?.capabilities?.[key]===true;}
 export function requireCapability(actor,key){if(!can(actor,key))fail(403,'permission_denied','This action is not allowed.');}
 export async function loadActor(db, actor) {
- const row=(await db.query(`SELECT u.*,c.owner_user_id,row_to_json(p) AS permission_record,to_regclass('public.notes_members') IS NOT NULL AS notes_ready FROM users u JOIN companies c ON c.id=u.company_id LEFT JOIN employee_permissions p ON p.user_id=u.id AND p.company_id=u.company_id WHERE u.id=$1 AND u.company_id=$2 AND u.deleted_at IS NULL`,[actor.userId,actor.companyId])).rows[0];
+ const row=(await db.query(`SELECT u.*,c.owner_user_id,COALESCE(to_jsonb(c)->>'timezone','UTC') AS company_timezone,row_to_json(p) AS permission_record,to_regclass('public.notes_members') IS NOT NULL AS notes_ready FROM users u JOIN companies c ON c.id=u.company_id LEFT JOIN employee_permissions p ON p.user_id=u.id AND p.company_id=u.company_id WHERE u.id=$1 AND u.company_id=$2 AND u.deleted_at IS NULL AND to_jsonb(u)->>'locked_at' IS NULL`,[actor.userId,actor.companyId])).rows[0];
  if(!row)fail(403,'account_unavailable');
  const owner=row.owner_user_id===row.id, p=row.permission_record||{};
- const access=resolveAccess({role:owner?'employer':'employee',isCompanyOwner:owner,userId:row.id,ownerUserId:row.owner_user_id,preset:p.permission_preset,overrides:p.permission_overrides,legacy:p});
+ const access=resolveAccess({role:owner?'employer':'employee',isCompanyOwner:owner,userId:row.id,ownerUserId:row.owner_user_id,preset:p.permission_preset,overrides:p.permission_overrides,legacy:p,timeZone:row.company_timezone});
  return {...actor,userId:row.id,companyId:row.company_id,notesReady:row.notes_ready,role:owner?'employer':'employee',isCompanyOwner:owner,displayName:row.display_name||'Team member',permissions:{...p,capabilities:access.capabilities,preset:access.preset}};
 }
 // Parameters $1=current user, $2=current company. Apply before snippets, counts and joins.
@@ -46,7 +46,7 @@ export function conversationAccessSQL(actor) {
    OR (ancestry.source_kind IS NOT NULL AND ancestry.source_kind NOT IN('conversation','job','independent'))
    OR (ancestry.source_kind='independent' AND ancestry.source_id IS NOT NULL)
    OR (ancestry.source_kind='conversation' AND (ancestry.depth>=8 OR ancestry.source_id IS NULL OR NOT EXISTS(SELECT 1 FROM conversations parent WHERE parent.id=ancestry.source_id AND parent.company_id=$2 AND parent.deleted_at IS NULL)))
-   OR (ancestry.source_kind='job' AND (NOT ${jobsAllowed?'true':'false'} OR ancestry.source_id IS NULL OR NOT EXISTS(SELECT 1 FROM schedule_events source_job WHERE source_job.id=ancestry.source_id AND source_job.company_id=$2 AND to_jsonb(source_job)->>'deleted_at' IS NULL)))
+   OR (ancestry.source_kind='job' AND (NOT ${jobsAllowed?'true':'false'} OR ancestry.source_id IS NULL OR NOT EXISTS(SELECT 1 FROM schedule_events source_job WHERE source_job.id=ancestry.source_id AND source_job.company_id=$2 AND to_jsonb(source_job)->>'deleted_at' IS NULL AND (${actor.isCompanyOwner||can(actor,'schedule.manage_team')?'true':'false'} OR to_jsonb(source_job)->'worker_user_ids' ? $1::text OR to_jsonb(source_job)->'sales_user_ids' ? $1::text))))
  )`;
 }
 export async function authorizeConversation(db,actor,conversationId,{write=false,capability='communications.view'}={}){
@@ -63,7 +63,7 @@ export async function authorizeGroup(db,actor,groupId,{owner=false,allowInvited=
 }
 export async function eligibleMembers(db,actor,userIds){
  const unique=ids(userIds);
- const rows=(await db.query(`SELECT u.id FROM users u WHERE u.id=ANY($1::uuid[]) AND u.company_id=$2 AND u.deleted_at IS NULL`,[unique,actor.companyId])).rows;
+ const rows=(await db.query(`SELECT u.id FROM users u WHERE u.id=ANY($1::uuid[]) AND u.company_id=$2 AND u.deleted_at IS NULL AND COALESCE((to_jsonb(u)->>'operational_eligible')::boolean,true)`,[unique,actor.companyId])).rows;
  if(rows.length!==unique.length)fail(400,'invalid_members');
  for(const row of rows){const member=await loadActor(db,{userId:row.id,companyId:actor.companyId});requireCapability(member,'communications.view');}
  return unique;
@@ -75,4 +75,13 @@ export function checkRevision(row,expected){if(!Number.isInteger(expected)||row.
 export function pageLimit(value){return Math.max(1,Math.min(100,Number(value)||50));}
 export function cursor(value){if(!value)return null;try{const v=JSON.parse(Buffer.from(value,'base64url').toString());if(!v.at||!v.id||!Number.isFinite(Date.parse(v.at)))throw Error();return v;}catch{fail(400,'invalid_cursor');}}
 export function encodeCursor(row){return Buffer.from(JSON.stringify({at:row.cursor_created_at||row.created_at,id:row.id})).toString('base64url');}
-export async function mutate(pool,actor,fn){return transact(pool,async db=>{await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,['comms-permissions:'+actor.userId]);const current=await loadActor(db,actor);return fn(db,current);});}
+// Company cleanup/purge takes FOR UPDATE before permission/domain/file locks.
+// Take the compatible reader lock first so attachment validation and insertion
+// are one boundary: cleanup either sees the committed reference or wins first,
+// after which the writer observes the file's unavailable state. Ordinary writers
+// do not block each other. Never acquire this lock after a domain/file lock.
+export async function mutate(pool,actor,fn){return transact(pool,async db=>{
+ await db.query('SELECT id FROM companies WHERE id=$1 FOR KEY SHARE',[actor.companyId]);
+ await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,['comms-permissions:'+actor.userId]);
+ const current=await loadActor(db,actor);return fn(db,current);
+});}

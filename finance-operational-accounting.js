@@ -768,6 +768,7 @@ function contributionJobPayload(row) {
     finished_at: row.finished_at,
     price_cents: nullableDbInteger(row.price_cents, "price_cents"),
     material_cost_cents: nullableDbInteger(row.material_cost_cents, "material_cost_cents"),
+    material_cost_source: row.material_cost_source || "unknown",
     direct_contribution_cents: nullableDbInteger(row.direct_contribution_cents, "direct_contribution_cents"),
     has_price: row.has_price === true,
     has_material_cost: row.has_material_cost === true,
@@ -783,7 +784,7 @@ async function loadJobContributionReport(pool, companyId, range, limit) {
   const [summaryResult, jobResult, mileageResult, clockResult] = await Promise.all([
     pool.query(
       `WITH company AS (${companyContext}), jobs AS (
-         SELECT se.id, se.price_cents, se.material_cost_cents
+         SELECT se.id, se.price_cents, COALESCE(se.material_cost_cents,se.quote_material_estimate_cents) AS material_cost_cents
            FROM schedule_events se CROSS JOIN company
           WHERE se.company_id = $1 AND se.finished_at IS NOT NULL AND ${jobRange}
        )
@@ -808,17 +809,20 @@ async function loadJobContributionReport(pool, companyId, range, limit) {
       `WITH company AS (${companyContext})
        SELECT se.id AS job_id, se.contact_id, c.name AS contact_name, se.title, se.finished_at,
               CASE WHEN se.price_cents >= 0 THEN se.price_cents ELSE NULL END AS price_cents,
-              CASE WHEN se.material_cost_cents >= 0 THEN se.material_cost_cents ELSE NULL END AS material_cost_cents,
+              CASE WHEN COALESCE(se.material_cost_cents,se.quote_material_estimate_cents) >= 0
+                   THEN COALESCE(se.material_cost_cents,se.quote_material_estimate_cents) ELSE NULL END AS material_cost_cents,
+              CASE WHEN se.material_cost_cents IS NOT NULL THEN 'actual_or_legacy'
+                   WHEN se.quote_material_estimate_cents IS NOT NULL THEN 'quote_estimate' ELSE 'unknown' END AS material_cost_source,
               se.price_cents IS NOT NULL AND se.price_cents >= 0 AS has_price,
-              se.material_cost_cents IS NOT NULL AND se.material_cost_cents >= 0 AS has_material_cost,
-              CASE WHEN se.price_cents >= 0 AND se.material_cost_cents >= 0
-                   THEN se.price_cents::bigint - se.material_cost_cents::bigint ELSE NULL END AS direct_contribution_cents,
+              COALESCE(se.material_cost_cents,se.quote_material_estimate_cents) >= 0 AS has_material_cost,
+              CASE WHEN se.price_cents >= 0 AND COALESCE(se.material_cost_cents,se.quote_material_estimate_cents) >= 0
+                   THEN se.price_cents::bigint - COALESCE(se.material_cost_cents,se.quote_material_estimate_cents)::bigint ELSE NULL END AS direct_contribution_cents,
               CASE WHEN jsonb_typeof(se.worker_user_ids) = 'array' THEN jsonb_array_length(se.worker_user_ids) ELSE 0 END AS worker_count
          FROM schedule_events se
          CROSS JOIN company
          LEFT JOIN contacts c ON c.company_id = se.company_id AND c.id::text = se.contact_id
         WHERE se.company_id = $1 AND se.finished_at IS NOT NULL AND ${jobRange}
-        ORDER BY CASE WHEN se.price_cents >= 0 AND se.material_cost_cents >= 0 THEN 1 ELSE 0 END,
+        ORDER BY CASE WHEN se.price_cents >= 0 AND COALESCE(se.material_cost_cents,se.quote_material_estimate_cents) >= 0 THEN 1 ELSE 0 END,
                  se.finished_at DESC, se.id
         LIMIT $4`,
       [companyId, range.start_date, range.end_date, limit]

@@ -3,6 +3,7 @@ import { generateServiceAgreementPDF, SIGNED_PRESENTATION_KIND } from "./service
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { QuoteContractError, calculateQuotePricing, normalizeQuoteOptions, validateQuoteAddonScope, quoteText, quoteInteger, quoteContentHash, deriveAgreementState } from "./quote-contract-domain.js";
 import { AGREEMENT_MERGE_FIELDS, resolveAgreementText, validateAndNormalizeAgreementPDF, normalizeAgreementFields, validateAgreementSignature, validateAgreementSubmission, generateQuoteAgreementPDF, populateAgreementPDF, agreementBytesHash, combineAgreementPDFs, qualifyAgreementDocumentLinks, validateAgreementSignerText } from "./quote-agreement-documents.js";
+import { normalizeQuoteMaterialLines, materialChargeLines, publicMaterialPricing } from "./quote-materials.js";
 import { streamAgreementEvidence, agreementEvidenceMetadata } from "./agreement-evidence-export.js";
 import { lockCompanySchedule } from "./schedule-booking-guard.js";
 import { assertQuoteReferences, ServiceCatalogError } from "./services-catalog.js";
@@ -329,12 +330,14 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       delete options.template; // The issued packet carries only the immutable id/version below.
 
       validateQuoteAddonScope(quote.line_items, options);
+      const materials = normalizeQuoteMaterialLines(quote.materials || []);
       await assertQuoteReferences(db,req,{contact_id:quote.contact_id,line_items:[...quote.line_items,...options.optional_addons],existing_lines:[...quote.line_items,...options.optional_addons]});
       if (quoteId && !options.duration_minutes) problem("quote_duration_required", "Enter the estimated job duration before publishing this quote.");
-      let pricing = calculateQuotePricing({ line_items: quote.line_items, tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0, tax_inclusive:settings.tax_inclusive??false,discount:options.discount,deposit: options.deposit });
+      let pricing = calculateQuotePricing({ line_items: [...quote.line_items,...materialChargeLines(materials)], tax_rate_basis_points: settings.tax_enabled ? settings.tax_rate_basis_points : 0, tax_inclusive:settings.tax_inclusive??false,discount:options.discount,deposit: options.deposit });
       const planQuote = content.plan_tier_id && service.preparePlanQuote ? await service.preparePlanQuote(db, req, {quote,content,pricing,options,settings}) : null;
       if (planQuote) { pricing=planQuote.pricing; content=planQuote.content; }
-      if (options.optional_addons.length) calculateQuotePricing({line_items:[...quote.line_items,...options.optional_addons],tax_rate_basis_points:pricing.tax_rate_basis_points,tax_inclusive:pricing.tax_inclusive,discount:options.discount,deposit:options.deposit});
+      if (options.optional_addons.length) calculateQuotePricing({line_items:[...quote.line_items,...materialChargeLines(materials),...options.optional_addons],tax_rate_basis_points:pricing.tax_rate_basis_points,tax_inclusive:pricing.tax_inclusive,discount:options.discount,deposit:options.deposit});
+      const publicPricing = publicMaterialPricing(pricing, materials, options.material_visibility);
       if (quoteId && !pricing.line_items.length) problem("quote_lines_required", "Add the actual service scope before publishing.");
       // Publication of dependent features is gated by implementation readiness,
       // not a cosmetic option. Follow-on adapters lift these checks when wired.
@@ -365,7 +368,9 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         if (payments?.active_checkout) problem("agreement_checkout_pending", "Resolve or cancel the current checkout before revising this quote. Its payment result must be preserved.", 409);
       }
       let suppliedQuotePDF = null;
-      if (!preview && quote.id && raw.quote_pdf_base64 != null) {
+      // A material quote is rendered from the server's public projection. An
+      // opaque client PDF cannot prove that private internal costs were omitted.
+      if (!preview && quote.id && raw.quote_pdf_base64 != null && materials.length === 0) {
         if (typeof raw.quote_pdf_base64 !== "string" || raw.quote_pdf_base64.length > 14000000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw.quote_pdf_base64)) problem("quote_pdf_invalid", "The quote PDF could not be prepared. Try creating the link again.");
         suppliedQuotePDF = Buffer.from(raw.quote_pdf_base64, "base64");
         await validateAndNormalizeAgreementPDF(suppliedQuotePDF, { allowSanitize: false });
@@ -374,7 +379,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       if (!number) number = String((await db.query(`INSERT INTO agreement_number_sequences(company_id,last_number) VALUES($1,1) ON CONFLICT(company_id) DO UPDATE SET last_number=agreement_number_sequences.last_number+1 RETURNING last_number`, [req.companyId])).rows[0].last_number);
       const id = randomUUID(), issuedAt = new Date().toISOString();
       const expires = content.validity_days!==null?new Date(Date.now()+content.validity_days*86400000).toISOString():quote.expires_at || new Date(Date.now() + settings.valid_for_days * 86400000).toISOString();
-      const values = { customer_name: contact.name, service_address: contact.address, billing_address: contact.address, customer_phone: contact.phone, customer_email: contact.email, business_name: settings.company_name, business_address: settings.company_address, business_phone: settings.phone || settings.company_phone, business_email: settings.email || settings.company_email, quote_number: number, issue_date: issuedAt, expires_at: new Date(expires).toISOString(), services: pricing.line_items.map((li) => `${li.name}\n${li.description}`).join("\n\n"), subtotal: money(pricing.subtotal_cents), tax: money(pricing.tax_cents), total: money(pricing.total_cents), deposit: money(pricing.deposit_cents), deposit_percentage: options.deposit.type === "percent" ? `${options.deposit.value / 100}%` : "", balance: money(pricing.balance_after_deposit_cents) };
+      const values = { customer_name: contact.name, service_address: contact.address, billing_address: contact.address, customer_phone: contact.phone, customer_email: contact.email, business_name: settings.company_name, business_address: settings.company_address, business_phone: settings.phone || settings.company_phone, business_email: settings.email || settings.company_email, quote_number: number, issue_date: issuedAt, expires_at: new Date(expires).toISOString(), services: publicPricing.line_items.map((li) => `${li.name}\n${li.description}`).join("\n\n"), subtotal: money(publicPricing.subtotal_cents), tax: money(publicPricing.tax_cents), total: money(publicPricing.total_cents), deposit: money(publicPricing.deposit_cents), deposit_percentage: options.deposit.type === "percent" ? `${options.deposit.value / 100}%` : "", balance: money(publicPricing.balance_after_deposit_cents) };
       if(planQuote) Object.assign(values,{plan_name:planQuote.offer.configuration.name,service_frequency:`Every ${planQuote.offer.configuration.service_interval.count} ${planQuote.offer.configuration.service_interval.unit}`,contract_term:planQuote.offer.configuration.term.kind === "finite" ? `${planQuote.offer.configuration.term.visit_count} visits` : "Ongoing",plan_price:money(planQuote.offer.future_visit.total_cents),billing_information:planQuote.offer.financial_text});
       values.business_name=content.branding.display_name||settings.company_name;
       values.billing_address=options.billing_address||contact.address;
@@ -384,7 +389,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
         title: quote.title || "Quote", number, revision: (predecessor?.revision || 0) + 1, issued_at: issuedAt, expires_at: new Date(expires).toISOString(),
         business: { name: values.business_name || "", website: settings.website || settings.company_website || "", address: settings.company_address || "", phone: settings.phone || settings.company_phone || "", email: settings.email || settings.company_email || "", logo_data_url: content.branding.show_logo ? settings.company_logo_data_url || "" : "" },
         customer: { name: contact.name || "", address: contact.address || "", billing_address:values.billing_address||"", phone: content.show_customer_phone ? contact.phone : null, email: content.show_customer_email ? contact.email : null },
-        pricing: quoteId ? pricing : null, ...options, ...content, template: templateRef,
+        pricing: quoteId ? publicPricing : null, ...options, ...content, template: templateRef,
         ...(planQuote ? {plan_quote:planQuote.offer,financial_text:planQuote.offer.financial_text} : {}),
         discount_stacking_policy:settings.discount_stacking_policy||"best_price",tax_provenance:{source:"business_settings",settings_updated_at:settings.updated_at??null,tax_rate_basis_points:pricing.tax_rate_basis_points,tax_inclusive:pricing.tax_inclusive},
         allow_customer_booking:bookingEnabled,offer_service_plans:planQuote ? false : plansEnabled,
@@ -395,7 +400,7 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
       };
       snapshot.selected_addon_ids = [];
       snapshot.addon_selection_finalized = options.optional_addons.length === 0;
-      if (options.optional_addons.length) snapshot.addon_source = { base_line_items: pricing.line_items, base_duration_minutes: options.duration_minutes, pricing_inputs: {tax_rate_basis_points:pricing.tax_rate_basis_points,tax_inclusive:pricing.tax_inclusive,discount:options.discount,deposit:options.deposit}, merge_values:values, content:{...content,documents:snapshot.documents.map(document=>({asset_id:document.asset_id,fields:document.fields}))} };
+      if (options.optional_addons.length) snapshot.addon_source = { base_line_items: pricing.line_items, material_line_ids: materials.map(item=>item.id), material_visibility: options.material_visibility, base_duration_minutes: options.duration_minutes, pricing_inputs: {tax_rate_basis_points:pricing.tax_rate_basis_points,tax_inclusive:pricing.tax_inclusive,discount:options.discount,deposit:options.deposit}, merge_values:values, content:{...content,documents:snapshot.documents.map(document=>({asset_id:document.asset_id,fields:document.fields}))} };
       const fieldIDs = snapshot.documents.flatMap((doc) => doc.fields.map((field) => field.id));
       if (new Set(fieldIDs).size !== fieldIDs.length) problem("agreement_field_id_collision", "Use unique field IDs across the entire document packet.");
       if (snapshot.quote_position === "excluded") snapshot.scope_reference_hash = quoteContentHash({ number, revision: snapshot.revision, pricing: snapshot.pricing, public_notes: snapshot.public_notes, scope_exclusions: snapshot.scope_exclusions });
@@ -426,7 +431,8 @@ export function createAgreementService({ pool, getQuoteSettings, getStripe, env 
           settings: { ...settings, company_name: snapshot.business.name, company_logo_data_url: snapshot.business.logo_data_url,
             phone: snapshot.business.phone, email: snapshot.business.email, notes: "", valid_for_days: content.validity_days || settings.valid_for_days },
           contact: { id: quote.contact_id, name: snapshot.customer.name, address: snapshot.customer.address, phone: snapshot.customer.phone || "", email: snapshot.customer.email || "" },
-          quote: { ...quote, quote_options: options, notes: "", expires_at: snapshot.expires_at }, pricing,
+          quote: { id: quote.id, contact_id: quote.contact_id, title: quote.title, line_items: publicPricing.line_items,
+            total_cents: publicPricing.subtotal_cents, quote_options: options, notes: "", expires_at: snapshot.expires_at }, pricing: publicPricing,
         } : null;
         return { quote_export_payload: exportPayload, snapshot: safeSnapshot, packet_hash: quoteContentHash(snapshot), preview_hash: previewHash, quote_updated_at: quote.updated_at, pdf_base64: pdf.toString("base64"), validation: { ready: true, number_is_preview: true } };
       }

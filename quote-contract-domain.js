@@ -98,7 +98,7 @@ export function normalizeQuoteDiscount(raw = { type: "none", value: 0 }) {
 
 export const QUOTE_TEMPLATE_OPTION_KEYS = [
   "deposit", "discount", "allow_customer_booking", "offer_service_plans", "customer_notes_enabled",
-  "customer_notes_label", "customer_notes_help", "customer_notes_limit", "balance_payment_timing", "balance_due_days_after_service",
+  "customer_notes_label", "customer_notes_help", "customer_notes_limit", "balance_payment_timing", "balance_due_days_after_service", "material_visibility",
 ];
 
 export function normalizeQuoteTemplateDefaults(raw = {}) {
@@ -124,13 +124,18 @@ export function normalizeQuoteOptions(raw = {}) {
     return raw[key] ?? false;
   };
   const duration = raw.duration_minutes == null ? null : quoteInteger(raw.duration_minutes, "Job duration in minutes", 10080, 1);
+  const durationOverride = raw.duration_override_minutes == null ? null : quoteInteger(raw.duration_override_minutes, "Manual job duration in minutes", 10080, 1);
   const booking = bool("allow_customer_booking");
+  const materialVisibility = raw.material_visibility ?? 'detailed';
+  if (!['detailed', 'summary', 'hidden'].includes(materialVisibility)) fail('material_visibility_invalid', 'Choose detailed, summary, or hidden materials.');
   const balanceTiming=raw.balance_payment_timing??"after_signing";
   if(!["after_signing","after_service"].includes(balanceTiming))fail("quote_balance_timing_invalid","Choose balance collection after signing or after completed service.");
   if (booking && duration === null) fail("quote_duration_required", "Enter the estimated job duration before enabling customer booking.");
   return {
     template: normalizeQuoteTemplateSelection(raw.template),
     duration_minutes: duration,
+    duration_override_minutes: durationOverride,
+    material_visibility: materialVisibility,
     deposit: normalizeDeposit(raw.deposit),
     discount: normalizeQuoteDiscount(raw.discount),
     allow_customer_booking: booking,

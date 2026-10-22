@@ -309,7 +309,8 @@ async function waitForRuns(seed, automationId, expected, label) {
 async function assertRunCompleted(runId) {
   await processAll();
   const run = await scalar(`SELECT status FROM automation_runs WHERE id = $1`, [runId]);
-  assert.equal(run.status, "completed");
+  const failures = run.status === "completed" ? [] : await rows(`SELECT node_key, status, error_code, error_message FROM automation_run_nodes WHERE run_id = $1 AND status = 'failed'`, [runId]);
+  assert.equal(run.status, "completed", JSON.stringify(failures));
 }
 
 async function runEventAutomation(seed, graph, contactId = null) {
@@ -609,9 +610,18 @@ async function testPipelineIdempotency() {
 async function testTaskAndJobCore() {
   const seed = await seedCompany();
   const contactId = await createContact(seed);
+  const quoteId = randomUUID();
+  await pool.query(
+    `INSERT INTO quotes(id,user_id,company_id,contact_id,title,line_items,total_cents,quote_options)
+     VALUES($1,$2,$3,$4,'Install quote',$5::jsonb,1000,$6::jsonb)`,
+    [quoteId, seed.userId, seed.companyId, contactId,
+      JSON.stringify([{id:randomUUID(),name:'Install',qty:1,price_cents:1000}]),
+      JSON.stringify({duration_minutes:60})]
+  );
   const t = node("trigger_1", "trigger", { trigger_key: "manual" });
   const task = node("task_1", "action", { action_key: "task.create", title: "Call {{contact.name}}", due_date: "1 hour" });
-  const job = node("job_1", "action", { action_key: "job.create", title: "Install", start_at: "1 hour", end_at: "2 hours" });
+  const job = node("job_1", "action", { action_key: "job.create", title: "Install", quote_id: quoteId,
+    worker_user_ids:[seed.userId], sales_user_ids:[seed.userId], start_at: "1 hour", end_at: "2 hours" });
   const created = await createAutomation(seed, graphFrom([t, task, job], [edge(t, task), edge(task, job)]));
   await publish(seed, created.automationId);
   const run = await automationTestHooks.startManualRun(created.automationId, seed.companyId, seed.userId, { subject_type: "contact", subject_id: contactId });
@@ -1017,6 +1027,35 @@ async function testValidationCatalogScopeAndDryRunExternalSafety() {
   assert.equal(state.stripeCalls.length, 0);
 }
 
+async function testMeasurementStoredScope() {
+  const seed = await seedCompany();
+  const trigger = node("measure_trigger", "trigger", { trigger_key: "manual" });
+  const create = node("measure_create", "action", {
+    action_key: "measurement.create_record",
+    name: "Scoped roof",
+    points: [{ lat: 39, lng: -98 }, { lat: 39.001, lng: -98.001 }]
+  });
+  const automation = await createAutomation(seed, graphFrom([trigger, create], [edge(trigger, create)]));
+  await publish(seed, automation.automationId);
+  const run = await automationTestHooks.startManualRun(automation.automationId, seed.companyId, seed.userId, { subject_type: "generic" });
+  await automationTestHooks.runAutomation(run.id);
+  assert.equal((await scalar("SELECT status FROM automation_runs WHERE id = $1", [run.id])).status, "completed");
+  const measurement = await scalar("SELECT id, user_id, company_id, scope_verified FROM measurements WHERE name = 'Scoped roof'");
+  assert.equal(measurement.user_id, seed.userId);
+  assert.equal(measurement.company_id, seed.companyId);
+  assert.equal(measurement.scope_verified, true);
+
+  const legacyID = randomUUID();
+  await pool.query("INSERT INTO measurements(id, user_id, name, points) VALUES ($1, $2, 'Unattributed', '[]'::jsonb)", [legacyID, seed.userId]);
+  const update = automationTestHooks.actionExecutors()["measurement.update_label"];
+  await assert.rejects(update({ company_id: seed.companyId }, { id: randomUUID() }, { measurement_id: legacyID, name: "Claimed" }), /measurement_not_found/);
+
+  const next = await seedCompany();
+  await pool.query("UPDATE users SET company_id = $2 WHERE id = $1", [seed.userId, next.companyId]);
+  await assert.rejects(update({ company_id: next.companyId }, { id: randomUUID() }, { measurement_id: measurement.id, name: "Cross-company" }), /measurement_not_found/);
+  assert.equal((await scalar("SELECT name FROM measurements WHERE id = $1", [measurement.id])).name, "Scoped roof");
+}
+
 const tests = [
   ["Publish", testPublishAndRepublish],
   ["Save stale published IDs into new draft", testSaveStalePublishedIdsIntoNewDraft],
@@ -1040,6 +1079,7 @@ const tests = [
   ["Activation lifecycle", testActivationLifecycle],
   ["SMS target mode precedence", testSmsTargetModePrecedence],
   ["Map pin, service due, payment dedupe", testMapServicePaymentAndDedupe],
+  ["Measurement automation stored scope", testMeasurementStoredScope],
   ["Foreach, Merge ALL, Re-entry, Run completion", testForeachMergeReentryAndRunCompletion],
   ["Validation, catalog, scope, dry-run external safety", testValidationCatalogScopeAndDryRunExternalSafety]
 ];

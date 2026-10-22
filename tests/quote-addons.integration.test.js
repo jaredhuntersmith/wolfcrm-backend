@@ -136,7 +136,7 @@ test("optional services produce immutable exact revisions before every signer",{
     await t.test("staff scheduling uses selected issued scope rather than an older client's draft",async()=>{
       const source=await packet(),chosen=await select(source),job=randomUUID(),start=new Date(Date.now()+86400000),shortEnd=new Date(start.getTime()+90*60000),end=new Date(start.getTime()+120*60000);
       await service.event(pool,source.published.id,"customer_note",{actor_type:"customer",actor_id:"customer",payload:{message:"Gate code supplied separately"}});
-      const body={title:"Selected work",start:start.toISOString(),end:shortEnd.toISOString(),contact_id:contact,quote_id:source.quote,service_items:[source.line],services:[source.line.name],price_cents:20000,worker_user_ids:[]};
+      const body={title:"Selected work",start:start.toISOString(),end:shortEnd.toISOString(),contact_id:contact,quote_id:source.quote,service_items:[source.line],services:[source.line.name],price_cents:20000,sales_user_ids:[user],worker_user_ids:[user]};
       const blocked=await request(`/api/schedule/${job}`,body,"PUT");assert.equal(blocked.status,409,JSON.stringify(blocked.body));assert.equal(blocked.body.error,"quote_job_duration_required");
       const result=await request(`/api/schedule/${job}`,{...body,end:end.toISOString()},"PUT");assert.equal(result.status,200,JSON.stringify(result.body));assert.equal(result.body.service_items.length,2);assert.equal(result.body.price_cents,23000);assert.equal(result.body.agreement_id,chosen.agreement.id);
       assert.equal(result.body.customer_note_entries[0].message,"Gate code supplied separately");
@@ -152,7 +152,7 @@ test("optional services produce immutable exact revisions before every signer",{
     });
     await t.test("staff jobs for an issued quote without options retain its authoritative one-time discount",async()=>{
       const item=await packet({noAddons:true,discount:{type:'fixed',value:2500}}),start=new Date(Date.now()+7*86400000),end=new Date(start.getTime()+90*60000);
-      const result=await request(`/api/schedule/${randomUUID()}`,{title:'Issued discounted work',start:start.toISOString(),end:end.toISOString(),contact_id:contact,quote_id:item.quote,service_items:[item.line],services:[item.line.name],price_cents:20000,worker_user_ids:[]},'PUT');assert.equal(result.status,200,JSON.stringify(result.body));assert.equal(result.body.price_cents,17500);assert.equal(result.body.agreement_id,item.published.id);
+      const result=await request(`/api/schedule/${randomUUID()}`,{title:'Issued discounted work',start:start.toISOString(),end:end.toISOString(),contact_id:contact,quote_id:item.quote,service_items:[item.line],services:[item.line.name],price_cents:20000,sales_user_ids:[user],worker_user_ids:[user]},'PUT');assert.equal(result.status,200,JSON.stringify(result.body));assert.equal(result.body.price_cents,17500);assert.equal(result.body.agreement_id,item.published.id);
     });
   }finally{if(server)await new Promise(resolve=>server.close(resolve));if(pool)await pool.end();postgres.stop();}
 });

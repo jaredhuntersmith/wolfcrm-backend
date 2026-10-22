@@ -28,6 +28,7 @@ export async function installStorageSchema(db) {
     );
     ALTER TABLE stored_files ADD COLUMN IF NOT EXISTS thumbnail_id uuid;
     ALTER TABLE stored_files ADD COLUMN IF NOT EXISTS source_protected boolean NOT NULL DEFAULT false;
+    ALTER TABLE stored_files ADD COLUMN IF NOT EXISTS source_scope text;
     ALTER TABLE stored_files ADD COLUMN IF NOT EXISTS delete_everywhere boolean NOT NULL DEFAULT false;
     CREATE TABLE IF NOT EXISTS storage_thumbnails (
       id uuid PRIMARY KEY, file_id uuid NOT NULL REFERENCES stored_files(id), owner_user_id uuid NOT NULL REFERENCES users(id),
@@ -59,5 +60,24 @@ export async function installStorageSchema(db) {
       created_at timestamptz NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS storage_activity_company_time ON storage_activity(company_id,created_at DESC,id) WHERE was_public;
+    CREATE TABLE IF NOT EXISTS storage_delivery_tickets (
+      token_hash text PRIMARY KEY, user_id uuid NOT NULL REFERENCES users(id), company_id uuid REFERENCES companies(id),
+      session_hash text NOT NULL, file_id uuid NOT NULL REFERENCES stored_files(id), thumbnail_id uuid,
+      purpose text NOT NULL CHECK(purpose IN ('preview','stream','download')), conversation_id text,
+      expires_at timestamptz NOT NULL DEFAULT now()+interval '5 minutes'
+    );
+    CREATE INDEX IF NOT EXISTS storage_delivery_tickets_expiry ON storage_delivery_tickets(expires_at);
+    CREATE INDEX IF NOT EXISTS storage_delivery_tickets_user ON storage_delivery_tickets(user_id);
+    ALTER TABLE storage_delivery_tickets ALTER COLUMN file_id DROP NOT NULL;
+    ALTER TABLE storage_delivery_tickets ADD COLUMN IF NOT EXISTS source_kind text;
+    ALTER TABLE storage_delivery_tickets ADD COLUMN IF NOT EXISTS source_id uuid;
+    ALTER TABLE storage_delivery_tickets ADD COLUMN IF NOT EXISTS source_variant text;
+    DO $$ BEGIN
+      IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='storage_delivery_tickets'::regclass AND conname='storage_delivery_source') THEN
+        ALTER TABLE storage_delivery_tickets ADD CONSTRAINT storage_delivery_source CHECK (
+          (file_id IS NOT NULL AND source_kind IS NULL AND source_id IS NULL) OR
+          (file_id IS NULL AND thumbnail_id IS NULL AND source_kind IS NOT NULL AND source_id IS NOT NULL));
+      END IF;
+    END $$;
   `);
 }

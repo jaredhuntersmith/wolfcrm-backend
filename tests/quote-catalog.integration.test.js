@@ -86,6 +86,18 @@ test("real PostgreSQL quote and service routes preserve ownership, history, opti
       assert.equal(legacy.status, 200, JSON.stringify(legacy.body));
       assert.deepEqual(legacy.body.line_items, historicalLines);
     });
+    await t.test("only a quote linked to a completed job is marked finished", async () => {
+      const first = await request(`/api/quotes?contact_id=${contactA}`);
+      assert.equal(first.status, 200);
+      assert.equal(first.body.find((row) => row.id === quote.id).finished_job_at, null);
+      await pool.query(`INSERT INTO schedule_events(id,user_id,company_id,title,start_at,end_at,contact_id,quote_id,finished_at)
+        VALUES($1,$2,$3,'Completed windows',now()-interval '2 hours',now()-interval '1 hour',$4,$5,now())`,
+      [randomUUID(), ownerA, companyA, contactA, quote.id]);
+      const linked = await request(`/api/quotes?contact_id=${contactA}`);
+      assert.equal(linked.status, 200);
+      assert.ok(linked.body.find((row) => row.id === quote.id).finished_job_at);
+      assert.equal(linked.body.find((row) => row.id === historicalQuote).finished_job_at, null);
+    });
     await t.test("preview uses server tax settings and rejects invalid money and foreign services", async () => {
       await pool.query("INSERT INTO quote_settings(company_id,tax_enabled,tax_rate_basis_points) VALUES($1,true,1000)", [companyA]);
       const preview = await request("/api/quotes/pricing", { method: "POST", body: { line_items: [line], quote_options: options, tax_rate_basis_points: 0 } });
@@ -109,6 +121,76 @@ test("real PostgreSQL quote and service routes preserve ownership, history, opti
       assert.equal((await request(`/api/quotes/${quote.id}/pricing`, { token: "owner-b" })).status, 404);
       assert.equal((await request("/api/quotes", { method: "POST", body: { contact_id: contactA, line_items: [line] } })).status, 409);
       assert.equal((await request(`/api/quotes/${quote.id}`, { method: "PUT", body: { line_items: [line, { ...line, id: randomUUID() }] } })).status, 409);
+    });
+    await t.test("Use Again keeps the finished source and restores only its archived service", async () => {
+      const requestKey = randomUUID();
+      const created = await request(`/api/quotes/${quote.id}/reuse`, { method: "POST", body: { request_key: requestKey } });
+      assert.equal(created.status, 201, JSON.stringify(created.body));
+      assert.notEqual(created.body.quote.id, quote.id);
+      assert.equal(created.body.quote.status, "draft");
+      assert.deepEqual(created.body.quote.line_items, quote.line_items);
+      assert.equal(created.body.restored_services, 1);
+      assert.equal((await request(`/api/quotes/${quote.id}/reuse`, { method: "POST", body: { request_key: requestKey } })).body.quote.id, created.body.quote.id);
+      assert.equal((await request(`/api/quotes/${historicalQuote}/reuse`, { method: "POST", body: { request_key: requestKey } })).status, 409);
+      assert.equal((await request(`/api/quotes/${quote.id}/reuse`, { token: "owner-b", method: "POST", body: { request_key: randomUUID() } })).status, 404);
+      assert.ok((await request("/api/services")).body.some(row => row.id === serviceID));
+      const listed = (await request(`/api/quotes?contact_id=${contactA}`)).body;
+      assert.ok(listed.find(row => row.id === quote.id).finished_job_at);
+      assert.equal(listed.find(row => row.id === created.body.quote.id).finished_job_at, null);
+    });
+    await t.test("materials snapshot internal cost separately from customer charge and survive catalog archive", async () => {
+      const materialID = randomUUID(), materialLineID = randomUUID();
+      const catalog = await request(`/api/quote-materials/${materialID}`, { method: "PUT", body: {
+        name: "Stone", unit: "bags", default_cost_per_unit_cents: 1000, default_charge_per_unit_cents: 2500
+      } });
+      assert.equal(catalog.status, 200, JSON.stringify(catalog.body));
+      assert.equal((await request(`/api/quote-materials/${materialID}`, { token: "owner-b", method: "PUT", body: { name: "Foreign" } })).status, 409);
+      const materials = [{ id: materialLineID, material_id: materialID, name: "Stone", quantity: 2, unit: "bags",
+        cost_mode: "unit", cost_unit_cents: 1000, charge_mode: "unit", charge_unit_cents: 2500 }];
+      const created = await request('/api/quotes', { method: 'POST', body: { contact_id: contactA,
+        line_items: [{ id: randomUUID(), name: 'Installation', qty: 1, price_cents: 10000 }], materials,
+        quote_options: { duration_minutes: 90, material_visibility: 'hidden' } } });
+      assert.equal(created.status, 201, JSON.stringify(created.body));
+      assert.equal(created.body.total_cents, 15000);
+      assert.equal(created.body.materials[0].cost_cents, 2000);
+      assert.equal(created.body.materials[0].charge_cents, 5000);
+      const priced = await request(`/api/quotes/${created.body.id}/pricing`);
+      assert.equal(priced.body.total_cents, 16500);
+      assert.ok(!JSON.stringify(priced.body).includes('cost_cents'));
+      const jobID = randomUUID();
+      const scheduleBody = { title: 'Stone installation', start: '2026-10-22T15:00:00.000Z', end: '2026-10-22T17:00:00.000Z',
+        contact_id: contactA, quote_id: created.body.id, sales_user_ids: [ownerA], worker_user_ids: [ownerA] };
+      const withoutQuote = await request(`/api/schedule/${randomUUID()}`, { method: 'PUT', body: { ...scheduleBody, quote_id: null } });
+      assert.equal(withoutQuote.body.error, 'schedule_quote_required');
+      const withoutSales = await request(`/api/schedule/${randomUUID()}`, { method: 'PUT', body: { ...scheduleBody, sales_user_ids: [] } });
+      assert.equal(withoutSales.body.error, 'schedule_salesperson_required');
+      const omittedSales = await request(`/api/schedule/${randomUUID()}`, { method: 'PUT', body: { ...scheduleBody, sales_user_ids: undefined } });
+      assert.equal(omittedSales.body.error, 'schedule_salesperson_required');
+      const withoutTechnician = await request(`/api/schedule/${randomUUID()}`, { method: 'PUT', body: { ...scheduleBody, worker_user_ids: [] } });
+      assert.equal(withoutTechnician.body.error, 'schedule_technician_required');
+      const shortDuration = await request(`/api/schedule/${randomUUID()}`, { method: 'PUT', body: { ...scheduleBody, end: '2026-10-22T15:30:00.000Z' } });
+      assert.equal(shortDuration.body.error, 'schedule_quote_duration_required');
+      const scheduled = await request(`/api/schedule/${jobID}`, { method: 'PUT', body: scheduleBody });
+      assert.equal(scheduled.status, 200, JSON.stringify(scheduled.body));
+      assert.equal(scheduled.body.quote_material_estimate_cents, 2000);
+      assert.equal(scheduled.body.material_cost_cents, null);
+      await pool.query('UPDATE schedule_events SET finished_at=now() WHERE id=$1', [jobID]);
+      const estimatedRow = (await pool.query('SELECT COALESCE(material_cost_cents,quote_material_estimate_cents) AS cost FROM schedule_events WHERE id=$1', [jobID])).rows[0];
+      assert.equal(estimatedRow.cost, 2000);
+      await pool.query('UPDATE schedule_events SET material_cost_cents=900 WHERE id=$1', [jobID]);
+      const updatedJob = await request(`/api/schedule/${jobID}`, { method: 'PUT', body: scheduleBody });
+      assert.equal(updatedJob.status, 200, JSON.stringify(updatedJob.body));
+      assert.equal(updatedJob.body.quote_material_estimate_cents, 2000);
+      assert.equal(updatedJob.body.material_cost_cents, 900);
+      const actualRow = (await pool.query('SELECT COALESCE(material_cost_cents,quote_material_estimate_cents) AS cost FROM schedule_events WHERE id=$1', [jobID])).rows[0];
+      assert.equal(actualRow.cost, 900);
+      assert.equal((await request(`/api/quote-materials/${materialID}`, { method: 'DELETE' })).status, 200);
+      assert.equal((await request('/api/quote-materials')).body.some(row => row.id === materialID), false);
+      assert.equal((await request('/api/quotes', { method: 'POST', body: { contact_id: contactA, line_items: [], materials } })).status, 409);
+      const saved = await request(`/api/quotes/${created.body.id}`, { method: 'PUT', body: { materials } });
+      assert.equal(saved.status, 200, JSON.stringify(saved.body));
+      assert.equal(saved.body.materials[0].cost_cents, 2000);
+      assert.equal((await request(`/api/quote-materials?include_archived=true`, { token: "owner-b" })).body.length, 0);
     });
     await t.test("company inclusive tax and one-time discount flow through saved pricing while partial patches preserve new fields",async()=>{
       const settings=await request('/api/quotes/settings',{method:'PATCH',body:{tax_inclusive:true,discount_stacking_policy:'quote_then_plan'}});assert.equal(settings.status,200,JSON.stringify(settings.body));assert.equal(settings.body.tax_enabled,true);assert.equal(settings.body.tax_rate_basis_points,1000);assert.equal(settings.body.tax_inclusive,true);assert.ok(settings.body.updated_at);

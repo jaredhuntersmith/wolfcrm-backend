@@ -22,6 +22,8 @@ import {digest,transaction,afterCommit} from '../mcp/context.js';
 import {installTaskTenancy} from '../mcp/task-tenancy.js';
 import {cleanupMCP} from '../mcp/maintenance.js';
 import {rateLimit} from '../mcp/access.js';
+import {actions} from '../mcp/actions.js';
+import {registerNotesDatabaseTools} from '../mcp/notes-database-tools.js';
 
 test('MCP real PostgreSQL, OAuth browser flow, SDK transport and canonical workflows',{timeout:180000},async t=>{
  const pg=startLocalPostgres();pg.configureEnvironment();let backend,server;const clients=[];
@@ -179,11 +181,17 @@ test('MCP real PostgreSQL, OAuth browser flow, SDK transport and canonical workf
    assert.equal((await call(c,'quote_draft',{request_id:randomUUID(),contact_id:foreign,title:'Denied',line_items:[{id:randomUUID(),name:'Test',qty:1,price_cents:1000}]})).error,'record_not_found');
   });
   await t.test('task create/complete preserves detail and rejects foreign linked records/assignees',async()=>{
-   task=await call(c,'task_create',{request_id:randomUUID(),title:'Follow up',detail:'Keep this',linked_contact_id:contact.id,assignee_ids:[owner]});assert.ok(task.id,JSON.stringify(task));
+   task=await call(c,'task_create',{request_id:randomUUID(),title:'Follow up',detail:'Keep this',linked_contact_id:contact.id});assert.ok(task.id,JSON.stringify(task));
    const current=await call(c,'crm_get',{entity:'tasks',id:task.id});const completed=await call(c,'task_complete',{request_id:randomUUID(),id:task.id,expected_version:current.version});assert.ok(completed.id,JSON.stringify(completed));
    const final=await call(c,'crm_get',{entity:'tasks',id:task.id});assert.equal(final.data.completed,true);assert.equal(final.data.detail,'Keep this');
    assert.equal((await call(c,'task_create',{request_id:randomUUID(),title:'Bad',linked_contact_id:foreign})).error,'record_not_found');
-   assert.equal((await call(c,'task_create',{request_id:randomUUID(),title:'Bad',assignee_ids:[other]})).error,'team_member_unavailable');
+   assert.throws(()=>actions.task_create.schema.parse({request_id:randomUUID(),title:'Bad',assignee_ids:[other]}),'personal task creation rejects an assignee');
+   assert.throws(()=>actions.task_update.schema.parse({request_id:randomUUID(),id:task.id,expected_version:final.version,changes:{assignee_ids:[other]}}),'personal task update rejects reassignment');
+   let checklistSchema;
+   registerNotesDatabaseTools({read:()=>{},write:(name,_description,schema)=>{if(name==='notes_checklist_to_task')checklistSchema=schema;},app:null,actor:null});
+   const checklistArgs={id:randomUUID(),block_id:randomUUID(),expected_revision:1,title:'Follow up',detail:'',due_date:null,priority:'normal'};
+   assert.ok(checklistSchema.safeParse(checklistArgs).success);
+   assert.equal(checklistSchema.safeParse({...checklistArgs,assignee_ids:[other]}).success,false);
   });
   await t.test('unchanged Notes and Comms task writers capture durable company ownership',async()=>{
    const actor={userId:owner,companyId:a};const note=await app.locals.notes.create(actor,{title:'Task conversion'});const first=note.blocks[0];
@@ -198,12 +206,12 @@ test('MCP real PostgreSQL, OAuth browser flow, SDK transport and canonical workf
    assert.equal((await pool.query('SELECT company_id FROM todo_tasks WHERE id=$1',[task.id])).rows[0].company_id,a);
   });
   await t.test('appointment validation, same-worker conflict, stale edit and draft quote pricing',async()=>{
-   const appointment={title:'Estimate',start:'2030-01-02T15:00:00Z',end:'2030-01-02T16:00:00Z',contact_id:contact.id,worker_user_ids:[owner]};
+   const quote=await call(c,'quote_draft',{request_id:randomUUID(),contact_id:contact.id,title:'Draft estimate',duration_minutes:60,line_items:[{id:randomUUID(),name:'Windows',qty:2,price_cents:1250}]});assert.ok(quote.id,JSON.stringify(quote));
+   const appointment={title:'Estimate',start:'2030-01-02T15:00:00Z',end:'2030-01-02T16:00:00Z',contact_id:contact.id,quote_id:quote.id,worker_user_ids:[owner],sales_user_ids:[owner]};
    job=await call(c,'appointment_create',{request_id:randomUUID(),appointment});assert.ok(job.id,JSON.stringify(job));
    const conflict=await call(c,'appointment_create',{request_id:randomUUID(),appointment});assert.match(conflict.error||'',/conflict|overlap|unavailable/,JSON.stringify(conflict));
    const old=await call(c,'crm_get',{entity:'jobs',id:job.id});const edited=await call(c,'appointment_update',{request_id:randomUUID(),id:job.id,expected_version:old.version,changes:{title:'Updated estimate'}});assert.ok(edited.id,JSON.stringify(edited));
    assert.equal((await call(c,'crm_get',{entity:'jobs',id:job.id})).data.contact_id,contact.id);
-   const quote=await call(c,'quote_draft',{request_id:randomUUID(),contact_id:contact.id,title:'Draft estimate',line_items:[{id:randomUUID(),name:'Windows',qty:2,price_cents:1250}]});assert.ok(quote.id,JSON.stringify(quote));
    const q=await call(c,'crm_get',{entity:'quotes',id:quote.id});assert.equal(q.data.status,'draft');assert.equal(q.data.total_cents,2500);
   });
   await t.test('note content creation and private/file tenant access',async()=>{

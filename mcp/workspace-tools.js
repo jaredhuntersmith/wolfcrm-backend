@@ -8,6 +8,7 @@ import {registerAutomationGraphTools,redactAutomation} from './automation-graph-
 import {registerExpandedTools} from './expanded-tools.js';
 import {registerOperationsTools} from './operations-tools.js';
 import {registerNotesDatabaseTools} from './notes-database-tools.js';
+import {registerTrainingTools} from './training-tools.js';
 import {registerProductTools} from './product-tools.js';
 import {z} from 'zod';
 import {digest,dispatch,fault,transaction} from './context.js';
@@ -44,6 +45,7 @@ export function registerWorkspaceTools(tool,{actor,pool,app}){
  registerSchedulingTools({read,write,actor,app,pool});
  registerCompanySettingsTools({read,write,actor,app,pool});
  registerNotesDatabaseTools({read,write,actor,app,pool});
+ registerTrainingTools({read,write});
  read('notes_search_filtered','Search authorized Notes titles, full text and permitted reference text. Supports archive/private/shared/tag/date filters. Follow next_offset; private notes remain owner/member scoped.',z.object({search:z.string().max(200).default(''),scope:z.enum(['all','private','company','shared','favorites','pinned','archive','trash','databases']).default('all'),tag:z.string().max(60).optional(),updated_days:z.number().int().min(1).max(3650).optional(),...page}).strict(),'notes:read',['notes.view'],i=>'/api/notes/pages?'+query(i));
  read('notes_page','Read one authorized Note and its blocks, reference cards, revision, statistics and pagination. Hidden embedded records remain hidden.',z.object({id:uuid,...page}).strict(),'notes:read',['notes.view'],i=>`/api/notes/pages/${i.id}?${query({limit:i.limit,offset:i.offset})}`);
  write('notes_metadata','Rename, move, tag, archive, trash/restore, or change a Note’s supported metadata. Sharing and parent validation use the Notes service.',z.object({id:uuid,expected_revision:z.number().int().positive(),title:title.max(150).optional(),parent_id:uuid.nullable().optional(),visibility:z.enum(['private','company','shared']).optional(),inherit_access:z.boolean().optional(),tags:z.array(z.string().max(60)).max(30).optional(),icon:z.string().max(32).optional(),cover_id:uuid.nullable().optional(),position:z.number().min(-1e9).max(1e9).optional(),archived:z.boolean().optional(),trashed:z.boolean().optional()}).strict(),'notes:write',['notes.view'],'PATCH',i=>'/api/notes/pages/'+i.id,({id,...i})=>i);

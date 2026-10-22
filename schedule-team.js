@@ -43,6 +43,18 @@ export function validateAssignments({ salesIDs, workerIDs, activeMemberIDs }) {
   return { sales_user_ids, worker_user_ids };
 }
 
+export function requireNewJobAssignments({ quoteID, contactID, salesIDs, workerIDs }) {
+  if (!contactID || !quoteID) {
+    throw new ScheduleTeamError("schedule_quote_required", "Choose a contact and saved quote before scheduling a new job.");
+  }
+  if (!salesIDs?.length) {
+    throw new ScheduleTeamError("schedule_salesperson_required", "Assign at least one salesperson to the new job.");
+  }
+  if (!workerIDs?.length) {
+    throw new ScheduleTeamError("schedule_technician_required", "Assign at least one technician to the new job.");
+  }
+}
+
 export function requiredScheduleWriteCapability(eventExists) {
   return eventExists ? "schedule.edit" : "schedule.create";
 }

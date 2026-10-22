@@ -23,11 +23,10 @@ export function fileInput(body, maxSize) {
   return {id:uuid(body.id),original_filename:original,display_name:name(body.display_name||original),mime_type:mime,extension:ext,category,byte_size:integer(body.byte_size,0,maxSize),audio_subtype:body.audio_subtype||(ext==='m4b'?'audiobook':'music'),metadata_json:metadata(body.metadata_json),type_identifier:typeof body.type_identifier==='string'?body.type_identifier.slice(0,150):null};
 }
 // Used identically for browse, direct access, progress, downloads and every mutation.
-export const readableSQL = `(f.owner_user_id=$1 OR (f.visibility='company' AND f.company_id=$2 AND $2::uuid IS NOT NULL AND EXISTS(SELECT 1 FROM users owner WHERE owner.id=f.owner_user_id AND owner.company_id=f.company_id AND owner.deleted_at IS NULL)))`;
+export const readableSQL = `((f.owner_user_id=$1 AND (f.visibility='private' OR f.company_id=$2)) OR (f.visibility='company' AND f.company_id=$2 AND $2::uuid IS NOT NULL))`;
 export function canDelete(file, actor) { return file.owner_user_id===actor.userId || (actor.role==='employer' && file.visibility==='company' && actor.companyId && file.company_id===actor.companyId); }
 export function publicFile(file, actor) {
   const {object_key,upload_id,upload_expires_at,cleanup_after,sharing_active,storage_provider,...safe}=file;
-  if(sharing_active===false)safe.visibility='private';
   safe.byte_size=Number(file.byte_size); safe.can_edit=file.owner_user_id===actor.userId; safe.can_delete=Boolean(canDelete(file,actor));
   return safe;
 }

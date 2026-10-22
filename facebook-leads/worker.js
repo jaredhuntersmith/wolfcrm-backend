@@ -5,6 +5,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { mapLead, mergeContact, fail, FacebookLeadError } from "./domain.js";
 import { transaction, findMatches, safeError } from "./store.js";
+import { ensureLeadSource } from "../lead-sources.js";
 const one = async (db, sql, args) => (await db.query(sql, args)).rows[0];
 export function createFacebookLeadWorker({
   pool,
@@ -140,7 +141,7 @@ export function createFacebookLeadWorker({
         }
         const prior = (
           await db.query(
-            "SELECT * FROM contacts WHERE company_id=$1 AND external_lead_id=$2 AND source IN ('facebook_zapier','facebook_direct') ORDER BY id LIMIT 2",
+            "SELECT * FROM contacts WHERE company_id=$1 AND external_lead_id=$2 AND (source_raw IN ('facebook_zapier','facebook_direct') OR source IN ('facebook_zapier','facebook_direct')) ORDER BY id LIMIT 2",
             [job.company_id, job.lead_id],
           )
         ).rows;
@@ -173,9 +174,12 @@ export function createFacebookLeadWorker({
             job.lead_id,
           ),
           id = existing?.id || randomUUID();
+        const leadSource = existing?.lead_source_id
+          ? null
+          : await ensureLeadSource(db, job.company_id, existing?.source || "facebook_direct");
         if (existing) {
           await db.query(
-            `UPDATE contacts SET name=$3,email=$4,phone=$5,address=$6,job_type=$7,source=$8,lead_submitted_at=$9,lead_info=$10::jsonb,value_cents=$11,lat=$12,lng=$13,tags=$14,updated_at=now() WHERE company_id=$1 AND id=$2`,
+            `UPDATE contacts SET name=$3,email=$4,phone=$5,address=$6,job_type=$7,source=$8,lead_submitted_at=$9,lead_info=$10::jsonb,value_cents=$11,lat=$12,lng=$13,tags=$14,lead_source_id=COALESCE(lead_source_id,$15),source_raw=COALESCE(source_raw,source),updated_at=now() WHERE company_id=$1 AND id=$2`,
             [
               job.company_id,
               id,
@@ -184,18 +188,19 @@ export function createFacebookLeadWorker({
               contact.phone || null,
               contact.address || null,
               contact.job_type || null,
-              contact.source || existing.source,
+              existing.lead_source_id ? existing.source : (leadSource?.name || contact.source || existing.source),
               contact.lead_submitted_at || null,
               JSON.stringify(contact.lead_info),
               contact.value_cents ?? null,
               contact.lat ?? null,
               contact.lng ?? null,
               contact.tags ?? [],
+              leadSource?.id || null,
             ],
           );
         } else {
           await db.query(
-            `INSERT INTO contacts(id,user_id,company_id,name,email,phone,address,job_type,source,lead_submitted_at,lead_info,external_lead_id,lead_form_id,lead_page_id,tags,value_cents,lat,lng) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18)`,
+            `INSERT INTO contacts(id,user_id,company_id,name,email,phone,address,job_type,source,lead_submitted_at,lead_info,external_lead_id,lead_form_id,lead_page_id,tags,value_cents,lat,lng,lead_source_id,source_raw) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
             [
               id,
               c.user_id,
@@ -205,7 +210,7 @@ export function createFacebookLeadWorker({
               contact.phone || null,
               contact.address || null,
               contact.job_type || null,
-              contact.source || "facebook_direct",
+              leadSource?.name || "Facebook Lead",
               contact.lead_submitted_at || null,
               JSON.stringify(contact.lead_info),
               job.lead_id,
@@ -215,6 +220,8 @@ export function createFacebookLeadWorker({
               contact.value_cents ?? null,
               contact.lat ?? null,
               contact.lng ?? null,
+              leadSource?.id || null,
+              "facebook_direct",
             ],
           );
         }

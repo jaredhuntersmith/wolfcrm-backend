@@ -16,6 +16,7 @@ import {
 } from "./finance-plaid-helpers.js";
 import { matchUnmatchedReceiptsForTransactions } from "./finance-receipt-matching.js";
 import { applyReceiptLifecycleTransitionInClient } from "./finance-receipt-lifecycle.js";
+import { lockPlaidBackgroundItem, withPlaidBackgroundItem } from "./finance-plaid-lifecycle.js";
 
 const SANDBOX_INSTITUTION_IDS = new Set([
   "ins_109508",
@@ -1036,9 +1037,14 @@ async function markRemovedTransaction(client, companyId, providerTransactionId) 
   await client.query(`UPDATE finance_transaction_provider_refs SET is_current = false WHERE id = $1`, [ref.rows[0].id]);
 }
 
-export async function syncPlaidTransactions({ pool, plaid, item }) {
+export async function syncPlaidTransactions({ pool, plaid, item, background = false }) {
   if (item.status === "disconnected" || item.disconnected_at) {
     return { skipped: true, reason: "disconnected", added: 0, modified: 0, removed: 0, next_cursor: item.transactions_cursor || null };
+  }
+  if (background) {
+    const current = await withPlaidBackgroundItem(pool, item, (_db, live) => live);
+    if (current.skipped) return { ...current, added: 0, modified: 0, removed: 0, next_cursor: item.transactions_cursor || null };
+    item = current.value;
   }
   const plaidForItem = plaid || await plaidClientForItem(item);
   const accessToken = await decryptItemToken(item);
@@ -1062,6 +1068,14 @@ export async function syncPlaidTransactions({ pool, plaid, item }) {
   const changedTransactions = [];
   try {
     await client.query("BEGIN");
+    if (background) {
+      const current = await lockPlaidBackgroundItem(client, item);
+      if (!current.item) {
+        await client.query("ROLLBACK");
+        return { skipped: true, reason: current.reason, added: 0, modified: 0, removed: 0, next_cursor: item.transactions_cursor || null };
+      }
+      item = current.item;
+    }
     await client.query(`UPDATE finance_plaid_items SET last_attempted_sync_at = now(), status = 'syncing', updated_at = now() WHERE id = $1`, [item.id]);
     for (const tx of collected.added) {
       const row = await applyPlaidTransaction(client, item.company_id, item, tx);
@@ -1092,7 +1106,10 @@ export async function syncPlaidTransactions({ pool, plaid, item }) {
     client.release();
   }
   if (changedTransactions.length) {
-    await matchUnmatchedReceiptsForTransactions(pool, item.company_id, changedTransactions)
+    const matching = background
+      ? withPlaidBackgroundItem(pool, item, (db, live) => matchUnmatchedReceiptsForTransactions(db, live.company_id, changedTransactions, { financeSpaceID: live.finance_space_id, inTransaction: true }))
+      : matchUnmatchedReceiptsForTransactions(pool, item.company_id, changedTransactions);
+    await matching
       .catch((error) => console.error("[finance-receipts] rematch after plaid sync failed", { company_id: item.company_id, message: error?.message }));
   }
   return { added: collected.added.length, modified: collected.modified.length, removed: collected.removed.length, next_cursor: collected.next_cursor };
@@ -1120,9 +1137,14 @@ async function refreshBalances(pool, plaid, item) {
   }
 }
 
-async function syncRecurring(pool, plaid, item) {
+export async function syncRecurring(pool, plaid, item, { background = false } = {}) {
   if (item.status === "disconnected" || item.disconnected_at) {
     return 0;
+  }
+  if (background) {
+    const current = await withPlaidBackgroundItem(pool, item, (_db, live) => live);
+    if (current.skipped) return 0;
+    item = current.value;
   }
   const plaidForItem = plaid || await plaidClientForItem(item);
   const accessToken = await decryptItemToken(item);
@@ -1131,48 +1153,53 @@ async function syncRecurring(pool, plaid, item) {
     ...(response.data.inflow_streams || []).map((stream) => ({ ...stream, wolf_direction: "income" })),
     ...(response.data.outflow_streams || []).map((stream) => ({ ...stream, wolf_direction: "expense" }))
   ];
-  for (const stream of streams) {
-    const amount = stream.last_amount === null || stream.last_amount === undefined ? null : providerAmountToCents(Math.abs(stream.last_amount.amount || stream.last_amount));
-    const average = stream.average_amount === null || stream.average_amount === undefined ? null : providerAmountToCents(Math.abs(stream.average_amount.amount || stream.average_amount));
-    await pool.query(
-      `INSERT INTO finance_plaid_recurring_streams (
-         company_id, plaid_item_internal_id, plaid_stream_id, direction, merchant_name,
-         description, category, frequency, last_amount_cents, average_amount_cents,
-         first_date, last_date, is_active, status, confidence_level
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-       ON CONFLICT (plaid_item_internal_id, plaid_stream_id)
-       DO UPDATE SET merchant_name = EXCLUDED.merchant_name,
-                     description = EXCLUDED.description,
-                     category = EXCLUDED.category,
-                     frequency = EXCLUDED.frequency,
-                     last_amount_cents = EXCLUDED.last_amount_cents,
-                     average_amount_cents = EXCLUDED.average_amount_cents,
-                     first_date = EXCLUDED.first_date,
-                     last_date = EXCLUDED.last_date,
-                     is_active = EXCLUDED.is_active,
-                     status = EXCLUDED.status,
-                     confidence_level = EXCLUDED.confidence_level,
-                     updated_at = now()`,
-      [
-        item.company_id,
-        item.id,
-        stream.stream_id,
-        stream.wolf_direction,
-        stream.merchant_name || null,
-        stream.description || stream.name || null,
-        stream.personal_finance_category?.primary || null,
-        stream.frequency || null,
-        amount,
-        average,
-        stream.first_date || null,
-        stream.last_date || null,
-        stream.is_active !== false,
-        stream.status || null,
-        stream.confidence_level || null
-      ]
-    );
-  }
-  return streams.length;
+  const save = async (db, live) => {
+    for (const stream of streams) {
+      const amount = stream.last_amount === null || stream.last_amount === undefined ? null : providerAmountToCents(Math.abs(stream.last_amount.amount || stream.last_amount));
+      const average = stream.average_amount === null || stream.average_amount === undefined ? null : providerAmountToCents(Math.abs(stream.average_amount.amount || stream.average_amount));
+      await db.query(
+        `INSERT INTO finance_plaid_recurring_streams (
+           company_id, plaid_item_internal_id, plaid_stream_id, direction, merchant_name,
+           description, category, frequency, last_amount_cents, average_amount_cents,
+           first_date, last_date, is_active, status, confidence_level
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ON CONFLICT (plaid_item_internal_id, plaid_stream_id)
+         DO UPDATE SET merchant_name = EXCLUDED.merchant_name,
+                       description = EXCLUDED.description,
+                       category = EXCLUDED.category,
+                       frequency = EXCLUDED.frequency,
+                       last_amount_cents = EXCLUDED.last_amount_cents,
+                       average_amount_cents = EXCLUDED.average_amount_cents,
+                       first_date = EXCLUDED.first_date,
+                       last_date = EXCLUDED.last_date,
+                       is_active = EXCLUDED.is_active,
+                       status = EXCLUDED.status,
+                       confidence_level = EXCLUDED.confidence_level,
+                       updated_at = now()`,
+        [
+          live.company_id,
+          live.id,
+          stream.stream_id,
+          stream.wolf_direction,
+          stream.merchant_name || null,
+          stream.description || stream.name || null,
+          stream.personal_finance_category?.primary || null,
+          stream.frequency || null,
+          amount,
+          average,
+          stream.first_date || null,
+          stream.last_date || null,
+          stream.is_active !== false,
+          stream.status || null,
+          stream.confidence_level || null
+        ]
+      );
+    }
+    return streams.length;
+  };
+  if (!background) return save(pool, item);
+  const saved = await withPlaidBackgroundItem(pool, item, save);
+  return saved.skipped ? 0 : saved.value;
 }
 
 export function installPlaidRoutes({ app, pool, backgroundPool = pool, authRequired, requireEmployer }) {
@@ -1998,14 +2025,15 @@ export function installPlaidRoutes({ app, pool, backgroundPool = pool, authRequi
       const { rows } = await pool.query(`SELECT * FROM finance_plaid_items WHERE plaid_item_id = $1 AND disconnected_at IS NULL LIMIT 1`, [itemId]);
       if (!rows.length) return res.json({ ok: true });
       const item = rows[0];
-      await pool.query(`UPDATE finance_plaid_items SET last_webhook_at = now(), updated_at = now() WHERE id = $1`, [item.id]);
+      const active = await withPlaidBackgroundItem(pool, item, db => db.query(`UPDATE finance_plaid_items SET last_webhook_at = now(), updated_at = now() WHERE id = $1`, [item.id]));
       res.json({ ok: true });
+      if (active.skipped) return;
       if (webhookCode === "SYNC_UPDATES_AVAILABLE") {
-        await syncPlaidTransactions({ pool, plaid: await plaidClientForItem(item), item }).catch((error) => console.error("[finance-plaid] webhook sync failed", { item_id: item.id, environment: item.environment || null, message: error?.message }));
+        await syncPlaidTransactions({ pool, item, background: true }).catch((error) => console.error("[finance-plaid] webhook sync failed", { item_id: item.id, environment: item.environment || null, message: error?.message }));
       } else if (webhookCode === "RECURRING_TRANSACTIONS_UPDATE") {
-        await syncRecurring(pool, await plaidClientForItem(item), item).catch((error) => console.error("[finance-plaid] recurring sync failed", { item_id: item.id, environment: item.environment || null, message: error?.message }));
+        await syncRecurring(pool, null, item, { background: true }).catch((error) => console.error("[finance-plaid] recurring sync failed", { item_id: item.id, environment: item.environment || null, message: error?.message }));
       } else if (webhookCode === "ITEM_LOGIN_REQUIRED" || req.body?.error?.error_code === "ITEM_LOGIN_REQUIRED") {
-        await pool.query(`UPDATE finance_plaid_items SET status = 'login_required', error_code = 'ITEM_LOGIN_REQUIRED', updated_at = now() WHERE id = $1`, [item.id]);
+        await withPlaidBackgroundItem(pool, item, db => db.query(`UPDATE finance_plaid_items SET status = 'login_required', error_code = 'ITEM_LOGIN_REQUIRED', updated_at = now() WHERE id = $1`, [item.id]));
       }
     } catch (error) {
       console.error("[finance-plaid] webhook failed", { message: error?.message, webhook_code: webhookCode });

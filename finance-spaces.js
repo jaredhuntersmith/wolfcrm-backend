@@ -1,6 +1,7 @@
 import {installFinanceSourceLocks} from "./finance-source-locks.js";
+import {lockFinanceSpaceActor,installFinanceTransactionAccess,checkFinanceTransactionActor} from './finance-space-access.js';
 import {hasCapability} from './permissions.js';
-import {trackRequestCleanup} from './mcp/context.js';
+import {trackRequestCleanup,hasActiveBusinessTransaction,serializeBusinessTransactionBlock} from './mcp/context.js';
 import {installFinanceSpaceTransfers} from './finance-space-transfers.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
 
@@ -100,7 +101,7 @@ export async function installFinanceSpacesSchema(pool) {
    await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS ${quote(table+'_space_natural_key')} ON ${quote(table)}(${keys.map(quote).join(',')},finance_space_id)`);
   }
   await db.query(`CREATE OR REPLACE FUNCTION wolf_finance_visible_spaces() RETURNS uuid[] LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public AS $$
-   SELECT coalesce(array_agg(s.id),'{}'::uuid[]) FROM public.finance_spaces s JOIN public.users u ON u.id=nullif(current_setting('wolf.finance_actor',true),'')::uuid AND u.company_id=s.company_id AND u.deleted_at IS NULL
+   SELECT coalesce(array_agg(s.id),'{}'::uuid[]) FROM public.finance_spaces s JOIN public.users u ON u.id=nullif(current_setting('wolf.finance_actor',true),'')::uuid AND u.company_id=s.company_id AND u.deleted_at IS NULL AND (to_jsonb(u)->>'locked_at') IS NULL
    WHERE s.company_id=nullif(current_setting('wolf.finance_company',true),'')::uuid
     AND (s.owner_id=u.id OR s.audience='company' OR (s.audience='selected' AND EXISTS(SELECT 1 FROM public.finance_space_members m WHERE m.space_id=s.id AND m.user_id=u.id)))
     AND (current_setting('wolf.finance_space',true)='combined' OR s.id=CASE WHEN current_setting('wolf.finance_space',true)<>'combined' THEN nullif(current_setting('wolf.finance_space',true),'')::uuid END)
@@ -147,6 +148,7 @@ export async function installFinanceSpacesSchema(pool) {
   }
   await db.query(`GRANT UPDATE(job_id,accounting_link_version,accounting_linked_at,accounting_linked_by,updated_at) ON payment_records TO ${role}; GRANT UPDATE(id) ON schedule_events TO ${role};`);
   await installFinanceSourceLocks(db);
+  await installFinanceTransactionAccess(db);
   await db.query('COMMIT');
   return {tables:tables.length};
  } catch(error) {await db.query('ROLLBACK');throw error;} finally {db.release();}
@@ -156,13 +158,47 @@ export function financeScopedPool(pool) {
  async function connect() {
   const scope=context.getStore();if(!scope)fail(403,'Select a finance space first.');
   const client=await pool.connect();
-  try {
+  const borrowed=hasActiveBusinessTransaction();
+  async function applyScope() {
    await client.query(`SELECT set_config('wolf.finance_actor',$1,false),set_config('wolf.finance_company',$2,false),set_config('wolf.finance_space',$3,false)`,[scope.userId,scope.companyId,scope.spaceId]);
    await client.query(`SET ROLE ${role}`);
-  } catch(error) {client.release(true);throw error;}
-  let released=false, pending=Promise.resolve(), cleanup=null;
-  return {query:(...args)=>{if(released)throw new Error('finance_connection_released');const next=pending.then(()=>client.query(...args));pending=next.catch(()=>{});return next;},
-   release:()=>{if(cleanup)return cleanup;released=true;cleanup=(async()=>{try {await pending;await client.query('ROLLBACK');await client.query('RESET ROLE; RESET ALL');client.release();}catch(error){client.release(true);throw error;}})();
+  }
+  try {if(!borrowed)await applyScope();}catch(error){client.release(true);throw error;}
+  let released=false, pending=Promise.resolve(), cleanup=null, inTransaction=false;
+  const boundary=()=>checkFinanceTransactionActor(client);
+  async function query(...args) {
+   const command=String(typeof args[0]==='string'?args[0]:args[0]?.text||'').trim().replace(/;\s*$/,'').toUpperCase();
+   if(/^(BEGIN|START\s+TRANSACTION)\b/.test(command)) {
+    const result=await client.query(...args);inTransaction=true;
+    try {await boundary();return result;}
+    catch(error){await client.query('ROLLBACK');inTransaction=false;throw error;}
+   }
+   if(/^(COMMIT|END|ROLLBACK)(?:\s+(?:WORK|TRANSACTION))?$/.test(command)) {
+    const result=await client.query(...args);inTransaction=false;return result;
+   }
+   if(inTransaction)return client.query(...args);
+   // MCP already owns the atomic unit. Borrowed connections may run parallel
+   // reads; interleaving new savepoints would roll back another lease's work.
+   if(hasActiveBusinessTransaction()){await boundary();return client.query(...args);}
+   // Match normal autocommit behavior while keeping the access check and the
+   // statement in one atomic unit. MCP's pool maps these to its savepoints.
+   await client.query('BEGIN');
+   try {await boundary();const result=await client.query(...args);await client.query('COMMIT');return result;}
+   catch(error){await client.query('ROLLBACK');throw error;}
+  }
+  async function runQuery(...args) {
+   if(!borrowed)return query(...args);
+   return serializeBusinessTransactionBlock(async()=>{
+    // An aborted transaction must reach ROLLBACK before scope setup can run.
+    const rollback=/^\s*ROLLBACK\b/i.test(typeof args[0]==='string'?args[0]:args[0]?.text||'');
+    let primaryError;
+    try {if(!rollback)await applyScope();return await query(...args);}
+    catch(error){primaryError=error;throw error;}
+    finally {try{await client.query('RESET ROLE');}catch(error){if(!primaryError)throw error;}}
+   });
+  }
+  return {query:(...args)=>{if(released)throw new Error('finance_connection_released');const next=pending.then(()=>runQuery(...args));pending=next.catch(()=>{});return next;},
+   release:()=>{if(cleanup)return cleanup;released=true;cleanup=(async()=>{try {await pending;await serializeBusinessTransactionBlock(async()=>{await client.query('ROLLBACK');await client.query(borrowed?'RESET ROLE; RESET wolf.finance_actor; RESET wolf.finance_company; RESET wolf.finance_space':'RESET ROLE; RESET ALL');client.release();});}catch(error){client.release(true);throw error;}})();
     // Register synchronously: canonical handlers may send their response before
     // their finally block awaits cleanup. Internal callers must not commit an
     // MCP receipt until the scoped role/GUCs have been restored. Ordinary HTTP
@@ -174,12 +210,18 @@ export function financeScopedPool(pool) {
 
 export async function personalFinanceSpace(pool,userId,companyId) {
  if(!uuid(userId)||!uuid(companyId))fail(403,'Company membership required.');
- await pool.query(`INSERT INTO finance_spaces(company_id,owner_id,name,kind,default_key)
+ const db=await pool.connect();
+ try {
+ await db.query('BEGIN');
+ await lockFinanceSpaceActor(db,userId,companyId);
+ await db.query(`INSERT INTO finance_spaces(company_id,owner_id,name,kind,default_key)
  SELECT company_id,id,'Business','business','business' FROM users WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL
  ON CONFLICT(company_id,owner_id,default_key) WHERE default_key IS NOT NULL DO NOTHING`,[userId,companyId]);
- return (await pool.query(`INSERT INTO finance_spaces(company_id,owner_id,name,kind,is_default)
+ const personal=(await db.query(`INSERT INTO finance_spaces(company_id,owner_id,name,kind,is_default)
  SELECT company_id,id,'Personal','personal',true FROM users WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL
  ON CONFLICT(company_id,owner_id) WHERE is_default DO UPDATE SET owner_id=EXCLUDED.owner_id RETURNING *`,[userId,companyId])).rows[0];
+ await db.query('COMMIT');return personal;
+ }catch(error){await db.query('ROLLBACK');throw error;}finally{db.release();}
 }
 export async function withFinanceSpace(pool,userId,companyId,spaceId,work) {
  const personal=await personalFinanceSpace(pool,userId,companyId);if(!personal)fail(403,'Company membership required.');
@@ -210,7 +252,8 @@ export function installFinanceSpaceRoutes({app,pool,authRequired,requireEmployer
   const members=audience==='selected'?[...new Set(b.member_ids)].filter(id=>id!==req.userId):[];
   if(audience==='selected'&&!members.length)fail(400,'Choose at least one person to share with.');
   const db=await pool.connect();try {
-   await db.query('BEGIN');await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",['finance-space:'+req.params.id]);await db.query('SELECT id FROM users WHERE id=$1 AND company_id=$2 FOR UPDATE',[req.userId,req.companyId]);await db.query('SELECT id FROM companies WHERE id=$1 FOR UPDATE',[req.companyId]);
+   await db.query('BEGIN');await lockFinanceSpaceActor(db,req.userId,req.companyId,{exclusiveCompany:true});
+   await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",['finance-space:'+req.params.id]);await db.query('SELECT id FROM users WHERE id=$1 AND company_id=$2 FOR UPDATE',[req.userId,req.companyId]);
    const old=(await db.query('SELECT * FROM finance_spaces WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];
    if(old&&(old.owner_id!==req.userId||old.company_id!==req.companyId))fail(404,'This space is unavailable.');
    if(old&&b.expected_revision!==old.revision)fail(409,'Sharing changed. Refresh and try again.');

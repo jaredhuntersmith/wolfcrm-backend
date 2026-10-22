@@ -7,6 +7,7 @@ import {acceptedQuoteValueSQL} from './sales-analytics.js';
 import {monthlyPlanRevenueCents} from './service-plan-metrics.js';
 import {paymentRecordCollection, stripePaymentMode} from './agreement-payments.js';
 import {readCatalogModule} from './widget-dashboard-catalog.js';
+import {readTrainingWidget,TRAINING_WIDGET_KINDS} from './training/dashboard.js';
 
 // Public keys are stable and shared with DashboardModuleKind in the native client.
 const definitions = {
@@ -21,7 +22,12 @@ const definitions = {
  payments: ['payments.view'], invoices: ['payments.view','quotes.view'], deposits: ['payments.view','quotes.view'], booked_sales: ['sales.view_self','quotes.view','contacts.view'],
  plans: ['payments.view','contacts.view'], goals: ['finance.view'], weather: ['schedule.view','jobs.view','contacts.view'], crew: ['schedule.view','jobs.view'],
  unscheduled_jobs: ['jobs.view'], quote_visits: ['schedule.view'], service_jobs: ['schedule.view'],
- directions: ['schedule.view','jobs.view'], activity: ['dashboard.exceptions.view'], agreements: ['quotes.view','contacts.view'], time_clock: ['time.view_self'], log_expense: ['finance.view','finance.manage']
+ directions: ['schedule.view','jobs.view'], activity: ['dashboard.exceptions.view'], agreements: ['quotes.view','contacts.view'], time_clock: ['time.view_self'], log_expense: ['finance.view','finance.manage'],
+ training_my_assignments: ['training.view_self'], training_due_today: ['training.view_self'],
+ training_overdue: ['training.view_self'], training_pending_reviews: ['training.review'],
+ training_progress: ['training.view_self'], training_course_completion: ['training.view_self'],
+ training_recent_grades: ['training.view_self'], training_certifications: ['training.view_self'],
+ training_team_performance: ['training.analytics']
 };
 const unsupported = {
  unscheduled_jobs: 'The current schedule requires start/end times; there is no canonical unscheduled-job queue.',
@@ -124,6 +130,10 @@ export function createWidgetDashboard({pool,env=process.env,services={}}) {
    // Team filtering never widens existing non-owner schedule/contact scope.
    if(!actor.isCompanyOwner && person!==actor.userId) return unavailable('Only your own work is available for this module.');
    if(person && !(await pool.query('SELECT 1 FROM users WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL',[person,actor.companyId])).rowCount) return unavailable('This team member is no longer available.');
+   if(TRAINING_WIDGET_KINDS.includes(kind)) {
+    const training=await readTrainingWidget({pool,actor,kind,offset,recordID,now});
+    return {...resultBase,...training};
+   }
    const catalog=await readCatalogModule({pool,actor,slot,range,now,person,aggregate,services,memo});
    if(catalog)return catalog;
    if(scheduleKinds.has(kind)) {

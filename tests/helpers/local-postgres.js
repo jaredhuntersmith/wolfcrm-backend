@@ -33,6 +33,10 @@ export function startLocalPostgres() {
       process.env.OWNER_EMAIL = "";
       process.env.WOLFCRM_SKIP_SERVER_START = "true";
     },
+    restart() {
+      run("pg_ctl", ["-D", data, "-m", "fast", "-w", "stop"]);
+      run("pg_ctl", ["-D", data, "-l", join(root, "postgres.log"), "-o", `-k ${socket} -h '' -F`, "-w", "start"]);
+    },
     stop() {
       run("pg_ctl", ["-D", data, "-m", "immediate", "-w", "stop"]);
       rmSync(root, { recursive: true, force: true });

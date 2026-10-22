@@ -2028,7 +2028,7 @@ export async function installFinanceSystem({ app, pool, authRequired, requireEmp
   });
 
   installPlaidRoutes({ app, pool, backgroundPool, authRequired, requireEmployer });
-  installReceiptRoutes({ app, pool, authRequired, requireEmployer });
+  installReceiptRoutes({ app, pool, backgroundPool, authRequired, requireEmployer });
   installFinanceAIRoutes({ app, pool, authRequired, requireEmployer });
   installFinanceAccountingRoutes({ app, pool, authRequired, requireEmployer, getStripe });
 }

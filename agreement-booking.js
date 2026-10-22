@@ -2,6 +2,8 @@ import { installBookingReview } from './agreement-booking-review.js';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { QuoteContractError } from "./quote-contract-domain.js";
 import { installScheduleBookingGuard, lockCompanySchedule, scheduleConflict } from "./schedule-booking-guard.js";
+import { normalizeQuoteMaterialLines, materialCostCents } from "./quote-materials.js";
+import { clearScheduleDraftsForContact } from "./schedule-drafts.js";
 const fail=(code,message,status=409)=>{throw new QuoteContractError(code,message,status);};
 const uuid=(value)=>{if(typeof value!=="string"||! /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value))fail("booking_id_invalid","Use a valid request or resource ID.",400);return value.toLowerCase();};
 const hash=(value)=>createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -92,10 +94,13 @@ export function createAgreementBooking({pool,service,env=service.env,now=()=>new
     const company=(await db.query("SELECT * FROM companies WHERE id=$1",[companyID])).rows[0];if(!company)fail("company_not_found","The business was not found.",404);
     const settings=normalizeBookingSettings(company.customer_booking_settings),zone=company.timezone||"America/New_York";
     try{parts(now(),zone);}catch{fail("booking_timezone_invalid","The business must configure a valid schedule timezone.");}
-    const members=await db.query("SELECT id FROM users WHERE company_id=$1 AND deleted_at IS NULL",[companyID]);
+    const members=await db.query("SELECT u.id FROM users u WHERE u.company_id=$1 AND wolf_employee_operational(u)",[companyID]);
     const overrides=await db.query("SELECT * FROM employee_schedule_availability WHERE company_id=$1",[companyID]);
     const events=await db.query("SELECT id,start_at,end_at,worker_user_ids,booking_buffer_before_minutes,booking_buffer_after_minutes FROM schedule_events WHERE company_id=$1 AND end_at >= $2 AND start_at <= $3",[companyID,new Date(now().getTime()-86400000),new Date(now().getTime()+(settings.horizon_days+2)*86400000)]);
-    return{company,settings,zone,version:company.customer_booking_version,activeIDs:new Set(members.rows.map(m=>m.id)),availability:Object.fromEntries(overrides.rows.map(v=>[v.user_id,v])),events:events.rows.map(e=>({...e,worker_user_ids:Array.isArray(e.worker_user_ids)&&e.worker_user_ids.every(id=>typeof id==="string")?e.worker_user_ids:[]})),
+    const blocks=await db.query(`SELECT id,user_id,start_at,end_at FROM schedule_blocks
+      WHERE company_id=$1 AND deleted_at IS NULL AND status='approved' AND affects_availability=true
+        AND end_at >= $2 AND start_at <= $3`,[companyID,new Date(now().getTime()-86400000),new Date(now().getTime()+(settings.horizon_days+2)*86400000)]);
+    return{company,settings,zone,version:company.customer_booking_version,activeIDs:new Set(members.rows.map(m=>m.id)),availability:Object.fromEntries(overrides.rows.map(v=>[v.user_id,v])),events:[...events.rows.map(e=>({...e,worker_user_ids:Array.isArray(e.worker_user_ids)&&e.worker_user_ids.every(id=>typeof id==="string")?e.worker_user_ids:[]})),...blocks.rows.map(b=>({id:`block:${b.id}`,start_at:b.start_at,end_at:b.end_at,worker_user_ids:[b.user_id],booking_buffer_before_minutes:0,booking_buffer_after_minutes:0}))],
       companyAvailability:{weekdays:company.business_days??[1,2,3,4,5],start_time:company.business_open_time||"09:00",end_time:company.business_close_time||"17:00"}};
   }
   async function readiness(db,companyID,{duration_minutes,line_items,quote_id}={}){
@@ -168,8 +173,10 @@ export function createAgreementBooking({pool,service,env=service.env,now=()=>new
       const ctx=await readiness(db,row.company_id,{duration_minutes:row.snapshot.duration_minutes,line_items:row.snapshot.pricing.line_items}),slot=resolveSlot(row,ctx,raw.slot_token);
       const bookingID=randomUUID(),jobID=randomUUID();
       const contact=(await db.query("SELECT id FROM contacts WHERE id=$1 AND company_id=$2",[row.contact_id,row.company_id])).rows[0];if(!contact)fail("booking_contact_unavailable","Contact the business to arrange this appointment.");
-      const job=(await db.query(`INSERT INTO schedule_events(id,user_id,company_id,created_by,title,start_at,end_at,contact_id,quote_id,agreement_id,services,service_items,price_cents,sales_user_ids,worker_user_ids,booking_buffer_before_minutes,booking_buffer_after_minutes)
-        VALUES($1,$2,$3,$2,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,'[]',$13::jsonb,$14,$15) RETURNING *`,[jobID,row.created_by,row.company_id,row.title,slot.start,slot.end,row.contact_id,row.quote_id,row.id,JSON.stringify(row.snapshot.pricing.line_items.map(l=>l.name)),JSON.stringify(row.snapshot.pricing.line_items),row.snapshot.pricing.total_cents,JSON.stringify(slot.bundle.worker_user_ids),ctx.settings.buffer_before_minutes,ctx.settings.buffer_after_minutes])).rows[0];
+      const quoteMaterials=(await db.query('SELECT materials FROM quotes WHERE id=$1 AND company_id=$2',[row.quote_id,row.company_id])).rows[0]?.materials||[];
+      const materialEstimate=materialCostCents(normalizeQuoteMaterialLines(quoteMaterials));
+      const job=(await db.query(`INSERT INTO schedule_events(id,user_id,company_id,created_by,title,start_at,end_at,contact_id,quote_id,agreement_id,services,service_items,price_cents,sales_user_ids,worker_user_ids,booking_buffer_before_minutes,booking_buffer_after_minutes,quote_material_estimate_cents)
+        VALUES($1,$2,$3,$2,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13::jsonb,$14::jsonb,$15,$16,$17) RETURNING *`,[jobID,row.created_by,row.company_id,row.title,slot.start,slot.end,row.contact_id,row.quote_id,row.id,JSON.stringify(row.snapshot.pricing.line_items.map(l=>l.name)),JSON.stringify(row.snapshot.pricing.line_items),row.snapshot.pricing.total_cents,JSON.stringify([row.created_by]),JSON.stringify(slot.bundle.worker_user_ids),ctx.settings.buffer_before_minutes,ctx.settings.buffer_after_minutes,materialEstimate])).rows[0];
       const planJob=await service.associatePlanJob?.(db,row.company_id,jobID);
       if(planJob){job.service_plan_id=(await db.query('SELECT service_plan_id FROM agreement_plan_enrollments WHERE id=$1',[planJob.enrollment_id])).rows[0].service_plan_id;job.price_cents=planJob.amount_cents;}
       job.customer_note_entries=(await db.query(`SELECT e.id,e.created_at,e.actor_id AS signer_role,e.payload->>'message' AS message FROM agreement_events e JOIN quote_agreements a ON a.id=e.agreement_id WHERE a.company_id=$1 AND a.quote_id=$2 AND e.type='customer_note' ORDER BY e.created_at,e.id`,[row.company_id,row.quote_id])).rows;
@@ -178,6 +185,7 @@ export function createAgreementBooking({pool,service,env=service.env,now=()=>new
       await service.event(db,row.id,"booking_created",{actor_type:"customer",payload:{booking_id:bookingID,job_id:jobID,start_at:slot.start.toISOString()}});
       await db.query("INSERT INTO agreement_booking_outbox(id,company_id,agreement_id,job_id,operation,job_snapshot) VALUES($1,$2,$3,$4,'booking_created',$5::jsonb)",[randomUUID(),row.company_id,row.id,jobID,JSON.stringify(job)]);
       await db.query("UPDATE payment_records SET job_id=$3 WHERE company_id=$1 AND quote_id=$2 AND job_id IS NULL AND service_plan_id IS NULL",[row.company_id,row.quote_id,jobID]);
+      await clearScheduleDraftsForContact(db,row.company_id,row.contact_id);
       return record(db,row,requestID,requestHash,{booking:await summary(db,row),replayed:false});
     });
   }

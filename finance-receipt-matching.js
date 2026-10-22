@@ -1,4 +1,4 @@
-import { executeReceiptLifecycleTransition } from "./finance-receipt-lifecycle.js";
+import { executeReceiptLifecycleTransition, applyReceiptLifecycleTransitionInClient } from "./finance-receipt-lifecycle.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -105,9 +105,13 @@ export function chooseReceiptMatch(receipt, transactions, { autoThreshold = 92, 
   return { autoMatch, best, candidates };
 }
 
-export async function findReceiptCandidates(poolOrClient, companyId, receipt, { limit = 10 } = {}) {
+export async function findReceiptCandidates(poolOrClient, companyId, receipt, { limit = 10, financeSpaceID = null } = {}) {
   const values = [companyId];
   const conditions = ["t.company_id = $1", "t.removed_at IS NULL", "t.direction = 'expense'"];
+  if (financeSpaceID) {
+    values.push(financeSpaceID);
+    conditions.push(`t.finance_space_id = $${values.length}`);
+  }
   if (receipt.amount_cents !== null && receipt.amount_cents !== undefined) {
     values.push(Math.max(0, Number(receipt.amount_cents) - 500), Number(receipt.amount_cents) + 500);
     conditions.push(`t.amount_cents BETWEEN $${values.length - 1} AND $${values.length}`);
@@ -128,7 +132,7 @@ export async function findReceiptCandidates(poolOrClient, companyId, receipt, { 
   return chooseReceiptMatch(receipt, rows).candidates.slice(0, limit);
 }
 
-export async function matchUnmatchedReceiptsForTransactions(pool, companyId, transactions = []) {
+export async function matchUnmatchedReceiptsForTransactions(pool, companyId, transactions = [], { financeSpaceID = null, inTransaction = false } = {}) {
   if (!transactions.length) return { checked: 0, matched: 0 };
   const dates = transactions.map((tx) => dateOnly(tx.transaction_date)).filter(Boolean).sort();
   if (!dates.length) return { checked: 0, matched: 0 };
@@ -139,15 +143,17 @@ export async function matchUnmatchedReceiptsForTransactions(pool, companyId, tra
         AND archived_at IS NULL
         AND transaction_id IS NULL
         AND status IN ('unmatched','possible_match','processing')
-        AND purchase_date BETWEEN ($2::date - INTERVAL '7 days') AND ($3::date + INTERVAL '7 days')`,
-    [companyId, dates[0], dates[dates.length - 1]]
+        AND purchase_date BETWEEN ($2::date - INTERVAL '7 days') AND ($3::date + INTERVAL '7 days')
+        ${financeSpaceID ? 'AND finance_space_id = $4' : ''}`,
+    [companyId, dates[0], dates[dates.length - 1], ...(financeSpaceID ? [financeSpaceID] : [])]
   );
   let matched = 0;
   for (const receipt of receipts) {
-    const candidates = await findReceiptCandidates(pool, companyId, receipt, { limit: 5 });
+    const candidates = await findReceiptCandidates(pool, companyId, receipt, { limit: 5, financeSpaceID });
     const decision = chooseReceiptMatch(receipt, candidates.map((candidate) => candidate.transaction));
     if (decision.autoMatch) {
-      const result = await executeReceiptLifecycleTransition(pool, {
+      const transition = inTransaction ? applyReceiptLifecycleTransitionInClient : executeReceiptLifecycleTransition;
+      const result = await transition(pool, {
         companyID: companyId,
         actorUserID: null,
         auditAction: "auto_matched",

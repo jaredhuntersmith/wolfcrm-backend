@@ -4,6 +4,7 @@ import {Socket} from 'node:net';
 import {randomUUID,createHash} from 'node:crypto';
 export const internalActor=Symbol('wolf.mcp.actor');
 const storage=new AsyncLocalStorage();
+const businessBlockStorage=new AsyncLocalStorage();
 const requestCleanupStorage=new AsyncLocalStorage();
 // Canonical services may release an async scoped database lease after res.json.
 // An internal dispatch must await that cleanup before its MCP receipt can use
@@ -16,25 +17,38 @@ export function trackRequestCleanup(work){
 
 export const digest=value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex');
 export function fault(status,code,message=code){return Object.assign(new Error(message),{status,code});}
+// A scoped service may share the outer business transaction instead of opening
+// per-statement savepoints. Never treat an inherited closed context as active.
+export function hasActiveBusinessTransaction(){const ctx=storage.getStore();if(!ctx?.db)return false;if(!ctx.active)throw fault(500,'transaction_closed');return true;}
+// Finance temporarily applies a restricted role/scope to the borrowed physical
+// connection. Keep setup, caller SQL and cleanup indivisible to other borrowers.
+// Ordinary MCP SQL joins this queue; calls inside the owning block are reentrant.
+export function serializeBusinessTransactionBlock(work){
+ const ctx=storage.getStore();if(!ctx?.db)return work();if(!ctx.active)throw fault(500,'transaction_closed');
+ const queue=ctx.businessBlockQueue;
+ if(businessBlockStorage.getStore()===queue)return work();
+ const next=queue.pending.then(()=>{if(!ctx.active)throw fault(500,'transaction_closed');return businessBlockStorage.run(queue,work);});
+ queue.pending=next.catch(()=>{});return next;
+}
 // Only in-process MCP operations enter this context. Ordinary requests use the pool unchanged.
 export function transactionalPool(raw){
   return new Proxy(raw,{get(target,key){
     if(key==='query')return async(...args)=>{
-      const ctx=storage.getStore();if(ctx?.db){if(!ctx.active)throw fault(500,'transaction_closed');return ctx.db.query(...args);}
+      const ctx=storage.getStore();if(ctx?.db){if(!ctx.active)throw fault(500,'transaction_closed');return serializeBusinessTransactionBlock(()=>ctx.db.query(...args));}
       if(!ctx?.boundedRead)return target.query(...args);
       const db=await target.connect();try{await db.query("SET statement_timeout='15s'");return await db.query(...args);}finally{try{await db.query('RESET statement_timeout');}finally{db.release();}}
     };
     if(key==='connect')return async()=>{
       const ctx=storage.getStore();if(!ctx?.db)return target.connect();if(!ctx.active)throw fault(500,'transaction_closed');
       const name='mcp_'+randomUUID().replaceAll('-','');let active=false,released=false;
-      return {query:async(sql,...args)=>{
+      return {query:(sql,...args)=>serializeBusinessTransactionBlock(async()=>{
         if(!ctx.active||released)throw fault(500,'transaction_closed');
         const command=typeof sql==='string'?sql.trim().toUpperCase():'';
         if(command==='BEGIN'){if(active)throw fault(500,'nested_transaction');active=true;return ctx.db.query(`SAVEPOINT ${name}`);}
         if(command==='COMMIT'){if(!active)throw fault(500,'transaction_missing');active=false;return ctx.db.query(`RELEASE SAVEPOINT ${name}`);}
         if(command==='ROLLBACK'){if(!active)return;active=false;await ctx.db.query(`ROLLBACK TO SAVEPOINT ${name}`);return ctx.db.query(`RELEASE SAVEPOINT ${name}`);}
         return ctx.db.query(sql,...args);
-      },release(){if(active)throw fault(500,'unfinished_business_transaction');released=true;}};
+      }),release(){if(active)throw fault(500,'unfinished_business_transaction');released=true;}};
     };
     const value=target[key];return typeof value==='function'?value.bind(target):value;
   }});
@@ -51,7 +65,7 @@ export function afterCommit(callback){
  else storage.exit(callback);
 }
 export async function transaction(pool,fn){
- const parent=storage.getStore(),db=await pool.connect(),ctx={db,active:true,afterCommit:[]};let result;
+ const parent=storage.getStore(),db=await pool.connect(),ctx={db,active:true,afterCommit:[],businessBlockQueue:parent?.businessBlockQueue||{pending:Promise.resolve()}};let result;
  try {await db.query('BEGIN');await db.query("SET LOCAL statement_timeout='15s'; SET LOCAL lock_timeout='5s'; SET LOCAL idle_in_transaction_session_timeout='20s'");
   result=await storage.run(ctx,()=>fn(db));const committed=await db.query('COMMIT');
   if(!['COMMIT','RELEASE'].includes(committed.command))throw fault(500,'transaction_aborted');

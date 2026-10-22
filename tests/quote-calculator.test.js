@@ -20,3 +20,19 @@ test('direct line quantity links support override and relink without extra quest
  c.components[0].quantity_component='inside';assert.throws(()=>validateCatalog(c),/outside|inside/);c.components[0].quantity_component=null;c.components[1].unit='foot';assert.throws(()=>validateCatalog(c),/Cannot convert/);
 });
 test('item time is visible before staffing is configured; automatic booking stays blocked',()=>{const c=fixture();c.services[0].crew_size=null;const r=calc(c);assert.equal(r.elapsed_seconds,4200);assert.equal(r.complete_for_presentation,true);assert.equal(r.complete_for_scheduling,false);assert.ok(r.missing.some(m=>m.kind==='staffing'));});
+test('service duration fills absent line time, never adds to line time, and manual duration wins',()=>{
+ const c=fixture(), saved=[{id:serviceID,name:'Windows',estimated_duration_minutes:45}];
+ const lineTime=calculate({catalog:c,services:saved,input:input()});
+ assert.equal(lineTime.elapsed_seconds,4200);
+ assert.equal(lineTime.services[0].elapsed_seconds,4200);
+ c.components.forEach(component=>{component.time_enabled=false;delete component.unit_seconds;});
+ const fallback=calculate({catalog:c,services:saved,input:input()});
+ assert.equal(fallback.elapsed_seconds,2700);
+ assert.equal(fallback.complete_for_scheduling,true);
+ const override=calculate({catalog:c,services:saved,input:input(),manual:{reason:'Job duration override',service_cents:{},elapsed_seconds:7200}});
+ assert.equal(override.elapsed_seconds,7200);
+ assert.equal(override.services[0].elapsed_seconds,2700);
+ const legacy=calculate({catalog:c,services:[{id:serviceID,name:'Windows'}],input:input()});
+ assert.equal(legacy.elapsed_seconds,null);
+ assert.equal(legacy.complete_for_scheduling,false);
+});

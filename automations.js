@@ -11,6 +11,12 @@ import net from "net";
 import { removeQuote } from "./quote-removal.js";
 import { markGoogleSheetsContactDirty } from "./google-sheets.js";
 import { lockCompanySchedule } from "./schedule-booking-guard.js";
+import { drainTrainingEvents } from "./training/events.js";
+import { dispatchTrainingDomainEvent } from "./company-comms/training-events.js";
+import { queueExpiringCertificates } from "./training/certificates.js";
+import { queueAssignmentReminders } from "./training/reminders.js";
+import { normalizeQuoteMaterialLines, materialCostCents } from "./quote-materials.js";
+import { clearScheduleDraftsForContact } from "./schedule-drafts.js";
 
 const AUTOMATION_LIMITS = {
   maxNodesPerRun: 5000,
@@ -72,7 +78,7 @@ const CORE_TRIGGERS = new Set([
   "manual", "incoming.webhook", "time.schedule",
   "contact.created", "contact.updated", "contact.tag_added", "contact.tag_removed",
   "pipeline.stage_changed", "pipeline.won", "pipeline.lost",
-  "job.created", "job.completed", "weather.job_at_risk",
+  "job.created", "job.completed",
   "task.due",
   "sms.received", "sms.reply_received",
   "imessage.received", "imessage.sent", "imessage.delivered", "imessage.failed",
@@ -277,7 +283,6 @@ const triggerCatalog = [
   ["job.created_from_map", "Job Created from Map", "Schedule & Jobs", "A job was created from map context.", ["job"], ["job.created_from_map"]],
   ["job.created_manually", "Job Created Manually", "Schedule & Jobs", "A job was manually created.", ["job"], ["job.created_manually"]],
   ["job.created_by_automation", "Job Created by Automation", "Schedule & Jobs", "A job was created by an automation action.", ["job"], ["job.created_by_automation"]],
-  ["weather.job_at_risk", "Job Weather Risk Detected", "Schedule & Jobs", "An upcoming outdoor job crossed company weather-risk thresholds.", ["job"], ["weather.job_at_risk"]],
   ["sms.received", "SMS Received", "Phone", "An inbound SMS/MMS was received.", ["sms_conversation", "contact"], ["sms.received"]],
   ["sms.sent", "SMS Sent", "Phone", "An SMS/MMS was sent.", ["sms_conversation", "contact"], ["sms.sent"]],
   ["sms.delivered", "SMS Delivered", "Cellular Messaging", "Twilio reported an outbound message delivered.", ["sms_message", "sms_conversation", "contact"], ["sms.delivered"]],
@@ -489,6 +494,21 @@ const triggerCatalog = [
   ["task.subtask_added", "Subtask Added", "Tasks", "A subtask was added.", ["task"], ["task.subtask_added"]],
   ["task.subtask_completed", "Subtask Completed", "Tasks", "A subtask was completed.", ["task"], ["task.subtask_completed"]],
   ["task.all_subtasks_completed", "All Subtasks Completed", "Tasks", "All subtasks transitioned to completed.", ["task"], ["task.all_subtasks_completed"]],
+  ["training.assignment_assigned", "Training Assigned", "Training", "An employee received a training assignment.", ["training_recipient"], ["training.assignment_assigned"]],
+  ["training.assignment_due_soon", "Training Assignment Due Soon", "Training", "An incomplete assignment is approaching its due time.", ["training_recipient"], ["training.assignment_due_soon"]],
+  ["training.assignment_overdue", "Training Assignment Overdue", "Training", "An incomplete assignment passed its due time and grace period.", ["training_recipient"], ["training.assignment_overdue"]],
+  ["training.assignment_completed", "Training Completed", "Training", "An employee completed a training assignment.", ["training_recipient"], ["training.assignment_completed"]],
+  ["training.submission_pending_review", "Training Submitted for Review", "Training", "An employee submitted training for review.", ["training_recipient"], ["training.submission_pending_review"]],
+  ["training.submission_approved", "Training Submission Approved", "Training", "A supervisor approved a training submission.", ["training_recipient"], ["training.submission_approved"]],
+  ["training.submission_corrections_requested", "Training Corrections Requested", "Training", "A supervisor requested corrections to a training submission.", ["training_recipient"], ["training.submission_corrections_requested"]],
+  ["training.quiz_pending_grade", "Training Quiz Needs Grading", "Training", "A quiz attempt needs manual grading.", ["training_quiz_attempt"], ["training.quiz_pending_grade"]],
+  ["training.quiz_passed", "Training Quiz Passed", "Training", "A quiz attempt passed.", ["training_quiz_attempt"], ["training.quiz_passed"]],
+  ["training.quiz_failed", "Training Quiz Failed", "Training", "A quiz attempt failed.", ["training_quiz_attempt"], ["training.quiz_failed"]],
+  ["training.course_assigned", "Training Course Assigned", "Training", "An employee enrolled in a course.", ["training_course_enrollment"], ["training.course_assigned"]],
+  ["training.course_completed", "Training Course Completed", "Training", "An employee completed a course.", ["training_course_enrollment"], ["training.course_completed"]],
+  ["training.certificate_issued", "Training Certificate Issued", "Training", "A company issued a training certificate.", ["training_certificate"], ["training.certificate_issued"]],
+  ["training.certificate_expiring", "Training Certificate Expiring", "Training", "An active employee's certificate is approaching expiry.", ["training_certificate"], ["training.certificate_expiring"]],
+  ["training.certificate_revoked", "Training Certificate Revoked", "Training", "A company revoked a training certificate.", ["training_certificate"], ["training.certificate_revoked"]],
   ["routine.created", "Routine Created", "Routines", "A routine was created.", ["routine"], ["routine.created"]],
   ["routine.updated", "Routine Updated", "Routines", "A routine was updated.", ["routine"], ["routine.updated"]],
   ["routine.due", "Routine Due", "Routines", "A routine occurrence is due.", ["routine"], ["routine.due"]],
@@ -1675,6 +1695,7 @@ function templateVariableCatalog() {
 export async function installAutomationSystem(options) {
   ctx = options;
   await bootstrapAutomationSchema();
+  await retireWeatherAutomationConfigurations();
   await backfillFinancialAutomationSchedules();
   installAutomationRoutes();
   if (!options.disableProcessors) startAutomationProcessors();
@@ -1682,6 +1703,7 @@ export async function installAutomationSystem(options) {
 
 export async function emitAutomationEvent(event, { db = null } = {}) {
   if (!(db || ctx?.pool) || !event?.companyId || !event?.eventType) return null;
+  if (event.eventType === "weather.job_at_risk") return null;
   const payload = safeJson(event.payload || {});
   if (Number(payload.automation_event_depth || 0) > AUTOMATION_LIMITS.maxChildDepth) {
     console.warn("[automations] event skipped at depth limit", { eventType: event.eventType, companyId: event.companyId });
@@ -2741,6 +2763,26 @@ async function bootstrapAutomationSchema() {
   `);
 }
 
+async function retireWeatherAutomationConfigurations() {
+  // Retain versions and histories so an owner can inspect and edit the old rule.
+  // A timed pause must never reactivate a weather graph on a later timer tick.
+  await ctx.pool.query(`UPDATE automation_definitions d
+    SET status='paused', pause_until=NULL, updated_at=now(),
+        metadata=metadata || jsonb_build_object('retired_weather_trigger',true,'retired_weather_at',now())
+    WHERE d.active_version_id IS NOT NULL AND d.status IN ('published','paused')
+      AND EXISTS (SELECT 1 FROM automation_nodes n WHERE n.version_id=d.active_version_id
+        AND n.company_id=d.company_id AND n.config::text LIKE '%weather.job_at_risk%')`);
+  await ctx.pool.query(`UPDATE automation_events SET processing_status='processed',processed_at=now(),
+    error='weather_feature_retired',locked_at=NULL,locked_by=NULL
+    WHERE event_type='weather.job_at_risk' AND processing_status IN ('pending','failed','processing')`);
+  await ctx.pool.query(`UPDATE automation_scheduled_events SET status='canceled',updated_at=now()
+    WHERE event_type='weather.job_at_risk' AND status='scheduled'`);
+  await ctx.pool.query(`UPDATE automation_runs r SET status='canceled',stop_reason='weather_feature_retired',
+    completed_at=now(),updated_at=now()
+    WHERE r.status IN ('queued','running','waiting') AND EXISTS
+      (SELECT 1 FROM automation_events e WHERE e.id=r.trigger_event_id AND e.event_type='weather.job_at_risk')`);
+}
+
 function installAutomationRoutes() {
   const { app, authRequired, requireEmployer } = ctx;
 
@@ -3051,6 +3093,12 @@ function installAutomationRoutes() {
 
   app.post("/api/automations/:id/resume", authRequired, requireEmployer, async (req, res) => {
     try {
+      const retired = await ctx.pool.query(`SELECT 1 FROM automation_definitions d
+        WHERE d.id=$1 AND d.company_id=$2 AND EXISTS
+          (SELECT 1 FROM automation_nodes n WHERE n.version_id=d.active_version_id
+           AND n.company_id=d.company_id AND n.config::text LIKE '%weather.job_at_risk%')`,
+        [req.params.id, req.companyId]);
+      if (retired.rowCount) return res.status(409).json({ error: "weather_trigger_retired", message: "Remove the weather trigger and publish a revised automation before resuming." });
       const { rows } = await ctx.pool.query(
         `UPDATE automation_definitions SET status = CASE WHEN active_version_id IS NULL THEN 'draft' ELSE 'published' END,
              pause_until = NULL, updated_by_user_id = $3, updated_at = now()
@@ -3338,6 +3386,7 @@ function validateGraphPayload(payload) {
     const config = node.config || {};
     validateNodeSafetyConfig(nodeKey, nodeType, config, errors, warnings);
     if (nodeType === "trigger" && config.trigger_key === "time.schedule" && !timeScheduleSchema.safeParse(config.schedule).success) errors.push(`invalid_time_schedule:${nodeKey}`);
+    if (JSON.stringify(config).includes("weather.job_at_risk")) errors.push(`retired_weather_trigger:${nodeKey}`);
     if (nodeType === "trigger" && config.trigger_key === "facebook_ads.metric") { try { validateMetricRule(config.ads); } catch { errors.push(`invalid_facebook_metric_rule:${nodeKey}`); } }
     if(nodeType === "trigger" && config.trigger_key === "incoming.webhook" && !/^[0-9a-f-]{36}$/i.test(config.connection_id||"")) errors.push(`webhook_connection_required:${nodeKey}`);
     if (nodeType === "trigger" && !triggerCatalog.find((t) => t.key === config.trigger_key)) errors.push(`invalid_trigger:${nodeKey}`);
@@ -3831,6 +3880,7 @@ async function processAutomationEvents() {
 }
 
 async function startRunsForEvent(event) {
+  if (event.event_type === "weather.job_at_risk") return;
   const { rows } = await ctx.pool.query(
     `SELECT DISTINCT d.*, v.id AS version_id, c.timezone AS company_timezone,
             c.automations_enabled, c.automation_emergency_stopped_at
@@ -4999,6 +5049,9 @@ async function resumeWait(wait, port) {
 }
 
 function startAutomationProcessors() {
+  setInterval(() => drainTrainingEvents(ctx.pool, (event,{db}) =>
+    dispatchTrainingDomainEvent(db,event,{notifications:ctx.app?.locals?.comms?.notifications,emitAutomationEvent}))
+    .catch((e) => console.error("[automations] training event drain failed", e?.message || e)), 5000).unref?.();
   setInterval(() => processAutomationEvents().catch((e) => console.error("[automations] processor failed", e?.message || e)), 5000).unref?.();
   setInterval(() => processDueWaits().catch((e) => console.error("[automations] wait processor failed", e?.message || e)), 5000).unref?.();
   setInterval(() => processScheduledAutomationEvents().catch((e) => console.error("[automations] scheduled event processor failed", e?.message || e)), 30000).unref?.();
@@ -5006,8 +5059,29 @@ function startAutomationProcessors() {
 }
 
 let adsEvaluationInFlight = false;
+let certificateExpiryLastScanAt = 0;
+let assignmentReminderLastScanAt = 0;
 async function processScheduledAutomationEvents(now = new Date()) {
   await enqueueTimeSchedules(ctx.pool,now);
+  // The training producer is idempotent and uses the existing domain-event outbox.
+  // Scan on startup and then at most every five minutes; a failed scan retries on
+  // the next scheduler tick. Delivery remains subject to configured automations.
+  if (ctx.app?.locals?.training && now.getTime() - certificateExpiryLastScanAt >= 5 * 60 * 1000) {
+    try {
+      await queueExpiringCertificates(ctx.pool);
+      certificateExpiryLastScanAt = now.getTime();
+    } catch (error) {
+      console.error('[automations] certificate expiry scan failed', error?.message || error);
+    }
+  }
+  if (ctx.app?.locals?.training && now.getTime() - assignmentReminderLastScanAt >= 5 * 60 * 1000) {
+    try {
+      await queueAssignmentReminders(ctx.pool,{now});
+      assignmentReminderLastScanAt = now.getTime();
+    } catch (error) {
+      console.error('[automations] training reminder scan failed', error?.message || error);
+    }
+  }
   // Use the existing scheduler, but isolate slow provider polling from due CRM jobs.
   if (!adsEvaluationInFlight) {
     adsEvaluationInFlight = true;
@@ -5408,7 +5482,8 @@ async function loadTimeEntryContext(companyId, entryId) {
 
 async function loadMeasurementContext(companyId, measurementId) {
   const measurement = (await ctx.pool.query(
-    `SELECT m.* FROM measurements m JOIN users u ON u.id = m.user_id WHERE m.id = $1 AND u.company_id = $2`,
+    `SELECT m.* FROM measurements m JOIN users u ON u.id = m.user_id
+      WHERE m.id = $1 AND m.scope_verified = true AND m.company_id = $2 AND u.company_id = $2`,
     [measurementId, companyId]
   )).rows[0];
   if (!measurement) return { exists: false };
@@ -6456,7 +6531,7 @@ async function resolveTimeEntry(companyId, entryId) {
 
 async function resolveMeasurement(companyId, measurementId) {
   if (!measurementId) throw new Error("measurement_required");
-  const measurement = (await ctx.pool.query(`SELECT m.* FROM measurements m JOIN users u ON u.id = m.user_id WHERE m.id = $1 AND u.company_id = $2`, [measurementId, companyId])).rows[0];
+  const measurement = (await ctx.pool.query(`SELECT m.* FROM measurements m JOIN users u ON u.id = m.user_id WHERE m.id = $1 AND m.scope_verified = true AND m.company_id = $2 AND u.company_id = $2`, [measurementId, companyId])).rows[0];
   if (!measurement) throw new Error("measurement_not_found");
   return measurement;
 }
@@ -6730,9 +6805,11 @@ async function executeTaskCreate(run, node, config, scopeKey = "root") {
     const existing = await loadTaskContext(run.company_id, existingId);
     if (existing?.exists) return { task_id: existingId, reused: true };
   }
+  const owner = await personalTaskAutomationOwner(run);
   const context = await buildRunContext(run, { scopeKey });
   const title = resolveTemplate(config.title || "Automation task", context);
-  const assignee = await resolveCompanyUser(run.company_id, resolveTemplate(config.assigned_user_id || "", context));
+  const requestedOwner = resolveTemplate(config.assigned_user_id || "", context);
+  if (requestedOwner && requestedOwner !== owner) throw new Error("personal_task_assignment_not_supported");
   const dueDate = config.due_date || config.due_at ? resolveDateExpression(config.due_date || config.due_at, context) : null;
   const due = dueDate?.toISOString() || null;
   const id = randomUUID();
@@ -6740,7 +6817,7 @@ async function executeTaskCreate(run, node, config, scopeKey = "root") {
   const { rows } = await ctx.pool.query(
     `INSERT INTO todo_tasks(id, user_id, title, due_date, reminders, subtasks, completed, color_hex)
      VALUES($1,$2,$3,$4::timestamptz,'[]'::jsonb,$5::jsonb,false,$6) RETURNING *`,
-    [id, assignee, title, due, JSON.stringify(subtasks), config.color_hex || "#3478F6"]
+    [id, owner, title, due, JSON.stringify(subtasks), config.color_hex || "#3478F6"]
   );
   await setRunVariable(run.id, `idempotency:${node.id}${scopeKey === "root" ? "" : ":" + scopeKey}:task_id`, id);
   await emitAutomationEvent({ companyId: run.company_id, eventType: "task.created", subjectType: "task", subjectId: id, source: "automation", dedupeKey: `task.created:${id}`, payload: automationPayload(run, node, { task_id: id, title, due_date: due }) });
@@ -6750,23 +6827,23 @@ async function executeTaskCreate(run, node, config, scopeKey = "root") {
 
 async function executeTaskUpdate(run, node, config, scopeKey = "root") {
   const context = await buildRunContext(run, { scopeKey });
-  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  const task = await resolveTask(run, config.task_id, context);
   const updates = {};
   if (config.title != null) updates.title = resolveTemplate(config.title, context);
   if (config.due_date != null) updates.due_date = resolveDateExpression(config.due_date, context)?.toISOString() || null;
   if (config.completed != null) updates.completed = !!config.completed;
-  if (config.assigned_user_id != null) updates.user_id = await resolveCompanyUser(run.company_id, resolveTemplate(config.assigned_user_id, context));
+  if (config.assigned_user_id != null) throw new Error("personal_task_assignment_not_supported");
   return updateTaskRow(run, node, task, updates);
 }
 async function executeTaskComplete(run, node, config, scopeKey = "root") { return executeTaskUpdate(run, node, { ...config, completed: true }, scopeKey); }
 async function executeTaskReopen(run, node, config) { return executeTaskUpdate(run, node, { ...config, completed: false }); }
 async function executeTaskReschedule(run, node, config) { return executeTaskUpdate(run, node, { ...config, due_date: config.due_date }); }
-async function executeTaskAssign(run, node, config) { return executeTaskUpdate(run, node, { ...config, assigned_user_id: config.assigned_user_id || config.user_id }); }
-async function executeTaskUnassign(run, node, config) { return executeTaskUpdate(run, node, { ...config, assigned_user_id: "" }); }
+async function executeTaskAssign() { throw new Error("personal_task_assignment_not_supported"); }
+async function executeTaskUnassign() { throw new Error("personal_task_assignment_not_supported"); }
 
 async function executeTaskDelete(run, node, config) {
   const context = await buildRunContext(run);
-  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  const task = await resolveTask(run, config.task_id, context);
   await ctx.pool.query(`DELETE FROM todo_tasks WHERE id = $1`, [task.id]);
   await cancelScheduledForSubject(run.company_id, "task", task.id, ["task.due", "task.overdue"]);
   await emitAutomationEvent({ companyId: run.company_id, eventType: "task.deleted", subjectType: "task", subjectId: task.id, source: "automation", payload: automationPayload(run, node, { task_id: task.id, title: task.title }) });
@@ -6775,7 +6852,7 @@ async function executeTaskDelete(run, node, config) {
 
 async function executeTaskAddSubtask(run, node, config) {
   const context = await buildRunContext(run);
-  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  const task = await resolveTask(run, config.task_id, context);
   const title = resolveTemplate(config.title || "", context).trim();
   if (!title) throw new Error("subtask_title_required");
   const subtasks = jsonArray(task.subtasks);
@@ -6785,7 +6862,7 @@ async function executeTaskAddSubtask(run, node, config) {
 
 async function executeTaskCompleteSubtask(run, node, config) {
   const context = await buildRunContext(run);
-  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  const task = await resolveTask(run, config.task_id, context);
   const title = resolveTemplate(config.title || "", context).trim().toLowerCase();
   const subtasks = jsonArray(task.subtasks).map((s) => (String(s.title || "").toLowerCase() === title ? { ...s, completed: true } : s));
   return updateTaskRow(run, node, task, { subtasks });
@@ -6793,15 +6870,16 @@ async function executeTaskCompleteSubtask(run, node, config) {
 
 async function executeTaskDeleteSubtask(run, node, config) {
   const context = await buildRunContext(run);
-  const task = await resolveTask(run.company_id, run.subject_id, config.task_id, context);
+  const task = await resolveTask(run, config.task_id, context);
   const title = resolveTemplate(config.title || "", context).trim().toLowerCase();
   const subtasks = jsonArray(task.subtasks).filter((s) => String(s.title || "").toLowerCase() !== title);
   return updateTaskRow(run, node, task, { subtasks });
 }
 
-async function resolveTask(companyId, subjectId, explicitId, context) {
-  const taskId = resolveTemplate(explicitId || context.task?.id || subjectId || "", context);
-  const task = (await ctx.pool.query(`SELECT tt.* FROM todo_tasks tt JOIN users u ON u.id = tt.user_id WHERE tt.id = $1 AND u.company_id = $2`, [taskId, companyId])).rows[0];
+async function resolveTask(run, explicitId, context) {
+  const owner = await personalTaskAutomationOwner(run);
+  const taskId = resolveTemplate(explicitId || context.task?.id || run.subject_id || "", context);
+  const task = (await ctx.pool.query(`SELECT tt.* FROM todo_tasks tt JOIN users u ON u.id = tt.user_id WHERE tt.id = $1 AND u.company_id = $2 AND tt.user_id = $3`, [taskId, run.company_id, owner])).rows[0];
   if (!task) throw new Error("task_not_found");
   return task;
 }
@@ -6969,6 +7047,20 @@ async function resolveCompanyUser(companyId, userId) {
   }
   const owner = (await ctx.pool.query(`SELECT owner_user_id FROM companies WHERE id = $1`, [companyId])).rows[0];
   return owner?.owner_user_id;
+}
+
+async function personalTaskAutomationOwner(run) {
+  const authoredBy = run.manual_started_by_user_id || (await ctx.pool.query(
+    `SELECT created_by_user_id FROM automation_versions WHERE id = $1 AND company_id = $2`,
+    [run.automation_version_id, run.company_id]
+  )).rows[0]?.created_by_user_id;
+  if (!authoredBy) throw new Error("personal_task_owner_unavailable");
+  const owner = (await ctx.pool.query(
+    `SELECT id FROM users WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+    [authoredBy, run.company_id]
+  )).rows[0];
+  if (!owner) throw new Error("personal_task_owner_unavailable");
+  return owner.id;
 }
 
 async function executePushNotification(run, node, config) {
@@ -8277,8 +8369,7 @@ async function executeEmployeeSendInternalMessage(run, node, config) {
 }
 
 async function executeEmployeeCreateTask(run, node, config) {
-  const employee = await resolveEmployee(run.company_id, config.employee_id || run.subject_id);
-  return executeTaskCreate(run, node, { ...config, assigned_user_id: employee.id, title: config.title || "Employee follow-up" });
+  throw new Error("personal_task_assignment_not_supported");
 }
 
 async function executeTimeClockCreateReviewTask(run, node, config) {
@@ -8315,7 +8406,7 @@ async function executeMeasurementCreateRecord(run, node, config) {
   const owner = await resolveCompanyUser(run.company_id, "");
   const id = randomUUID();
   const points = Array.isArray(config.points) ? config.points : [];
-  const { rows } = await ctx.pool.query(`INSERT INTO measurements(id, user_id, name, points, linked_contact_ids, units) VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6) RETURNING *`, [id, owner, config.name || "Automation Measurement", JSON.stringify(points), JSON.stringify(config.linked_contact_ids || []), config.units === "meters" ? "meters" : "feet"]);
+  const { rows } = await ctx.pool.query(`INSERT INTO measurements(id, user_id, company_id, scope_verified, name, points, linked_contact_ids, units) VALUES($1,$2,$3,true,$4,$5::jsonb,$6::jsonb,$7) RETURNING *`, [id, owner, run.company_id, config.name || "Automation Measurement", JSON.stringify(points), JSON.stringify(config.linked_contact_ids || []), config.units === "meters" ? "meters" : "feet"]);
   await setRunVariable(run.id, `idempotency:${node.id}:measurement_id`, id);
   await emitAutomationEvent({ companyId: run.company_id, eventType: "measurement.created", subjectType: "measurement", subjectId: id, source: "automation", payload: automationPayload(run, node, measurementPayload(rows[0])) });
   if (points.length >= 2) await emitAutomationEvent({ companyId: run.company_id, eventType: "measurement.completed", subjectType: "measurement", subjectId: id, source: "automation", payload: automationPayload(run, node, measurementPayload(rows[0])) });
@@ -8324,7 +8415,8 @@ async function executeMeasurementCreateRecord(run, node, config) {
 
 async function executeMeasurementUpdateLabel(run, node, config) {
   const measurement = await resolveMeasurement(run.company_id, config.measurement_id || run.subject_id);
-  const { rows } = await ctx.pool.query(`UPDATE measurements SET name = $3, updated_at = now() WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [measurement.id, run.company_id, config.name || measurement.name]);
+  const { rows } = await ctx.pool.query(`UPDATE measurements SET name = $3, updated_at = now() WHERE id = $1 AND scope_verified = true AND company_id = $2 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [measurement.id, run.company_id, config.name || measurement.name]);
+  if (!rows.length) throw new Error("measurement_not_found");
   await emitAutomationEvent({ companyId: run.company_id, eventType: "measurement.updated", subjectType: "measurement", subjectId: measurement.id, source: "automation", payload: automationPayload(run, node, measurementPayload(rows[0])) });
   return { measurement_id: measurement.id, name: rows[0].name };
 }
@@ -8335,7 +8427,8 @@ async function executeMeasurementLinkContact(run, node, config) {
   const measurement = await resolveMeasurement(run.company_id, config.measurement_id || run.subject_id);
   const ids = Array.isArray(measurement.linked_contact_ids) ? measurement.linked_contact_ids.map(String) : [];
   if (!ids.includes(String(contactId))) ids.push(String(contactId));
-  const { rows } = await ctx.pool.query(`UPDATE measurements SET linked_contact_ids = $3::jsonb, updated_at = now() WHERE id = $1 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [measurement.id, run.company_id, JSON.stringify(ids)]);
+  const { rows } = await ctx.pool.query(`UPDATE measurements SET linked_contact_ids = $3::jsonb, updated_at = now() WHERE id = $1 AND scope_verified = true AND company_id = $2 AND user_id IN (SELECT id FROM users WHERE company_id = $2) RETURNING *`, [measurement.id, run.company_id, JSON.stringify(ids)]);
+  if (!rows.length) throw new Error("measurement_not_found");
   await emitAutomationEvent({ companyId: run.company_id, eventType: "measurement.linked_to_contact", subjectType: "measurement", subjectId: measurement.id, source: "automation", payload: automationPayload(run, node, { ...measurementPayload(rows[0]), contact_id: contactId }) });
   return { measurement_id: measurement.id, contact_id: contactId };
 }
@@ -8347,6 +8440,13 @@ async function executeJobCreate(run, node, config, scopeKey = "root", { sourceQu
     if (existing) return { job_id: existingId, reused: true };
   }
   const context = await buildRunContext(run, { scopeKey });
+  if (!sourceQuote && config.quote_id) {
+    const requestedQuoteID = resolveTemplate(config.quote_id, context);
+    sourceQuote = (await ctx.pool.query('SELECT * FROM quotes WHERE id=$1 AND company_id=$2 AND deleted_at IS NULL', [requestedQuoteID, run.company_id])).rows[0] || null;
+  }
+  if (!sourceQuote || sourceQuote.deleted_at) {
+    throw new AutomationError('schedule_quote_required', 'Create or select a saved quote before this automation schedules a job.', { retryable: false });
+  }
   const owner = await resolveCompanyUser(run.company_id, config.assigned_user_id);
   const id = randomUUID();
   const title = resolveTemplate(config.title || "Automation job", context);
@@ -8354,17 +8454,32 @@ async function executeJobCreate(run, node, config, scopeKey = "root", { sourceQu
   // The shared expression parser treats an empty expression as now. An omitted
   // end must instead use the job's default duration, not create a zero interval.
   const endExpression = config.end_at || config.end;
-  const end = (endExpression ? resolveDateExpression(endExpression, context) : null) || new Date(start.getTime() + 3600000);
-  const contactId = config.contact_id ? resolveTemplate(config.contact_id, context) : (run.subject_type === "contact" ? run.subject_id : null);
+  const estimatedMinutes = Number(sourceQuote.quote_options?.duration_minutes);
+  if (!Number.isSafeInteger(estimatedMinutes) || estimatedMinutes < 1 || estimatedMinutes > 10080) {
+    throw new AutomationError('schedule_quote_duration_required', 'The saved quote needs an estimated job duration before scheduling.', { retryable: false });
+  }
+  const end = (endExpression ? resolveDateExpression(endExpression, context) : null) || new Date(start.getTime() + estimatedMinutes * 60000);
+  const contactId = config.contact_id ? resolveTemplate(config.contact_id, context) : sourceQuote.contact_id;
+  if (contactId !== sourceQuote.contact_id || !(sourceQuote.line_items?.length || sourceQuote.materials?.length)) {
+    throw new AutomationError('schedule_valid_quote_required', 'The selected quote must belong to this customer and contain work scope.', { retryable: false });
+  }
+  if (end - start < estimatedMinutes * 60000) {
+    throw new AutomationError('schedule_quote_duration_required', 'Reserve at least the quote’s saved job duration.', { retryable: false });
+  }
   if (contactId) await validateSubject(run.company_id, "contact", contactId);
   const sales = await resolveCompanyUsers(run.company_id, config.sales_user_ids || [owner]);
   const workers = await resolveCompanyUsers(run.company_id, config.worker_user_ids || []);
-  const serviceItems = normalizeServiceItems(resolveConfig(config.service_items || [], context));
+  if (!sales.length || !workers.length) {
+    throw new AutomationError('schedule_assignments_required', 'Assign a salesperson and at least one technician before scheduling.', { retryable: false });
+  }
+  const serviceItems = normalizeServiceItems(sourceQuote.line_items || []);
+  const materialEstimate = materialCostCents(normalizeQuoteMaterialLines(sourceQuote.materials || []));
   const insertJob = async db => db.query(
-    `INSERT INTO schedule_events(id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, reminder_minutes, services, service_items, price_cents, material_cost_cents, sales_user_ids, worker_user_ids)
-     VALUES($1,$2,$3,$2,$4,$5,$6,$7,$8,$9,'[]'::jsonb,$10::jsonb,$11::jsonb,$12,$13,$14::jsonb,$15::jsonb)
+    `INSERT INTO schedule_events(id, user_id, company_id, created_by, title, start_at, end_at, color, notes, contact_id, quote_id, reminder_minutes, services, service_items, price_cents, material_cost_cents, quote_material_estimate_cents, sales_user_ids, worker_user_ids)
+     VALUES($1,$2,$3,$2,$4,$5,$6,$7,$8,$9,$10,'[]'::jsonb,$11::jsonb,$12::jsonb,$13,$14,$15,$16::jsonb,$17::jsonb)
      RETURNING *`,
-    [id, owner, run.company_id, title, start.toISOString(), end.toISOString(), config.color || "#3478F6", resolveTemplate(config.notes || "", context) || null, contactId, JSON.stringify(serviceItems.map((s) => s.name)), JSON.stringify(serviceItems), intOrNull(config.price_cents), intOrNull(config.material_cost_cents), JSON.stringify(sales), JSON.stringify(workers)]
+    [id, owner, run.company_id, title, start.toISOString(), end.toISOString(), config.color || "#3478F6", resolveTemplate(config.notes || "", context) || null, contactId, sourceQuote.id,
+      JSON.stringify(serviceItems.map((s) => s.name)), JSON.stringify(serviceItems), sourceQuote.total_cents, null, materialEstimate, JSON.stringify(sales), JSON.stringify(workers)]
   );
   let rows;
   if (sourceQuote) {
@@ -8379,6 +8494,7 @@ async function executeJobCreate(run, node, config, scopeKey = "root", { sourceQu
       if (new Date(active.updated_at).getTime() !== new Date(sourceQuote.updated_at).getTime()) throw new Error("quote_changed");
       ({ rows } = await insertJob(db));
       await db.query("UPDATE quotes SET status='converted',converted_job_id=$3,updated_at=now() WHERE id=$1 AND company_id=$2", [sourceQuote.id, run.company_id, id]);
+      await clearScheduleDraftsForContact(db,run.company_id,contactId);
       await db.query("COMMIT");
     } catch (error) { await db.query("ROLLBACK"); throw error; }
     finally { db.release(); }
